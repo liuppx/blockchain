@@ -3,6 +3,7 @@
 //!   cargo run --release --bin node -- demo             # in-memory demo chain
 //!   cargo run --release --bin node -- build            # mempool builds a block
 //!   cargo run --release --bin node -- prove            # light-client Merkle proof
+//!   cargo run --release --bin node -- bft              # BFT commit certificate over a block
 //!   cargo run --release --bin node -- run  --dir DIR   # persistent chain (block log)
 //!   cargo run --release --bin node -- status --dir DIR # replay log, print state
 //!
@@ -10,12 +11,15 @@
 //! DIR/blocks.log; every later `run`/`status` replays that log and reconstructs
 //! byte-identical state (same state_root) — the point of the persistence layer.
 
+use std::collections::BTreeMap;
 use std::process::exit;
 
 use zhixing_engine::{DeltaKParams, DIM};
+use zhixing_node::consensus::{commit_block, detect_equivocation};
 use zhixing_node::mempool::Mempool;
 use zhixing_node::merkle;
 use zhixing_node::store::BlockLog;
+use zhixing_node::validator::{Validator, ValidatorSet};
 use zhixing_node::{hex, Block, Chain, Genesis, Keypair, Review, SubmissionTx, MICRO};
 
 type Emb = [f32; DIM];
@@ -114,6 +118,7 @@ fn main() {
         "demo" => cmd_demo(),
         "build" => cmd_build(),
         "prove" => cmd_prove(),
+        "bft" => cmd_bft(),
         "run" => cmd_run(dir_arg(&args)),
         "status" => cmd_status(dir_arg(&args)),
         "-h" | "--help" | "help" => usage(),
@@ -142,6 +147,7 @@ fn usage() {
     eprintln!("  node demo               run an in-memory demo chain");
     eprintln!("  node build              feed a mempool (scrambled order) and build one block");
     eprintln!("  node prove              build+verify a light-client Merkle proof of an account");
+    eprintln!("  node bft                4 validators certify a block; show fault tolerance + equivocation");
     eprintln!("  node run    --dir DIR   persistent chain (seeds demo blocks once, then replays)");
     eprintln!("  node status --dir DIR   replay the block log and print state");
 }
@@ -214,6 +220,64 @@ fn cmd_prove() {
     lying.balance += 1_000 * MICRO;
     let lie = merkle::verify(&root, &merkle::leaf_hash(&lying.merkle_leaf(id)), &proof);
     println!("verify an inflated balance -> {lie} (must be false)");
+}
+
+/// Demonstrate BFT finality: 4 equal-power validators certify a block. Shows
+/// the deterministic proposer, a quorum commit that tolerates one crash, a
+/// sub-quorum that fails to commit, and equivocation being caught.
+fn cmd_bft() {
+    // a fresh chain and one built block to certify
+    let chain = Chain::new(demo_genesis());
+    let mut mp = Mempool::new(16);
+    for t in [
+        tx(1, unit(1), 1, reviews(&[(10, 0.9), (11, 0.85), (12, 0.9)]), (3, 3), 1.0),
+        tx(2, unit(2), 2, reviews(&[(10, 0.88), (11, 0.9), (12, 0.86)]), (3, 3), 1.0),
+    ] {
+        mp.insert(&chain, t).unwrap();
+    }
+    let blk = mp.build_block(&chain, 1.0).expect("a block to certify");
+
+    // 4 equal-power validators (ids 21..=24)
+    let ids = [21u64, 22, 23, 24];
+    let keys: BTreeMap<u64, Keypair> = ids.iter().map(|&id| (id, kp(id))).collect();
+    let vset = ValidatorSet::new(
+        ids.iter()
+            .map(|&id| Validator { id, pubkey: kp(id).public(), power: 1 })
+            .collect(),
+    );
+    println!("validators   {ids:?}  (equal power)");
+    println!("total power  {}   quorum {} (> 2/3)", vset.total_power(), vset.quorum());
+    println!("proposer(h=1) #{}\n", vset.proposer_for(blk.height).unwrap());
+    println!("certifying block {} ({})", blk.height, short(&blk.hash()));
+
+    // happy path: one validator crashes (24), the other 3 still commit
+    match commit_block(&vset, &keys, &blk, 0, &[21, 22, 23]) {
+        Some(c) => {
+            let power = c.verify(&vset).unwrap();
+            println!(
+                "  3 of 4 precommit (v24 crashed) -> COMMIT, power {}/{} ✓ finalized",
+                power,
+                vset.total_power()
+            );
+        }
+        None => println!("  unexpected: quorum not reached"),
+    }
+
+    // sub-quorum: only 2 of 4 -> no commit
+    match commit_block(&vset, &keys, &blk, 0, &[21, 22]) {
+        Some(_) => println!("  2 of 4 -> unexpectedly committed"),
+        None => println!("  2 of 4 precommit -> NO commit (below quorum) ✓ safe"),
+    }
+
+    // equivocation: a conflicting block certified by an overlapping quorum
+    let blk2 = Block { prev_hash: [7u8; 32], ..blk.clone() }; // different hash, same height
+    if let (Some(c1), Some(c2)) = (
+        commit_block(&vset, &keys, &blk, 0, &[21, 22, 23]),
+        commit_block(&vset, &keys, &blk2, 0, &[21, 22, 24]),
+    ) {
+        let guilty = detect_equivocation(&c1, &c2);
+        println!("  two conflicting commits require double-signers -> equivocation by {guilty:?} (slashable)");
+    }
 }
 
 fn cmd_run(dir: String) {

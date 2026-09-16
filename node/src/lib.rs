@@ -11,19 +11,25 @@
 //! finalization, mint/slash accounting, on-chain (outcome-based) reviewer
 //! reputation, ed25519-authenticated transactions, a content-addressed block
 //! hash chain, a state root, a Merkle-authenticated account state with
-//! light-client inclusion proofs, an append-only block log with replay, and a
-//! deterministic mempool/block builder (see the sibling modules).
+//! light-client inclusion proofs, an append-only block log with replay, a
+//! deterministic mempool/block builder, and a BFT finality core (validator
+//! set, proposer selection, verifiable commit certificates — see the sibling
+//! modules).
 //!
-//! What this layer is NOT (yet): P2P networking and BFT block ordering / leader
-//! election. Those are later milestones; see README. Money is integer
-//! micro-$COG (no floats), so accounting is exact.
+//! What this layer is NOT (yet): P2P networking and the BFT round state machine
+//! that drives liveness under partial synchrony (timeouts, locking, round
+//! changes) — the finality *certificate* here is the safety half. Those are
+//! later milestones; see README. Money is integer micro-$COG (no floats), so
+//! accounting is exact.
 
 pub mod codec;
+pub mod consensus;
 pub mod crypto;
 pub mod hash;
 pub mod mempool;
 pub mod merkle;
 pub mod store;
+pub mod validator;
 
 use std::collections::BTreeMap;
 

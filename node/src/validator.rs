@@ -1,0 +1,154 @@
+//! Validator set and deterministic proposer selection for BFT consensus.
+//!
+//! A validator is an identity (id + ed25519 pubkey) with integer *voting power*
+//! (its stake weight). Consensus is by voting power, not head-count: a decision
+//! needs strictly more than 2/3 of total power (see [`ValidatorSet::quorum`]),
+//! the classic BFT threshold that tolerates < 1/3 Byzantine power while keeping
+//! safety (any two quorums intersect in > 1/3 power, so they cannot certify
+//! conflicting blocks without some validator equivocating).
+//!
+//! Proposer selection is Tendermint's proposer-priority accumulator: over
+//! successive heights each validator accrues priority equal to its power, the
+//! highest-priority validator proposes and then has the total power subtracted.
+//! This yields a deterministic, stake-proportional, drift-free rotation that
+//! every node computes identically.
+
+use crate::PubKey;
+
+#[derive(Clone, Debug)]
+pub struct Validator {
+    pub id: u64,
+    pub pubkey: PubKey,
+    pub power: u64,
+}
+
+/// An ordered validator set (sorted by id for deterministic iteration/tie-break).
+#[derive(Clone, Debug)]
+pub struct ValidatorSet {
+    validators: Vec<Validator>,
+}
+
+impl ValidatorSet {
+    pub fn new(mut validators: Vec<Validator>) -> Self {
+        validators.sort_by_key(|v| v.id);
+        ValidatorSet { validators }
+    }
+
+    pub fn len(&self) -> usize {
+        self.validators.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.validators.is_empty()
+    }
+
+    pub fn validators(&self) -> &[Validator] {
+        &self.validators
+    }
+
+    pub fn get(&self, id: u64) -> Option<&Validator> {
+        self.validators
+            .binary_search_by_key(&id, |v| v.id)
+            .ok()
+            .map(|i| &self.validators[i])
+    }
+
+    pub fn total_power(&self) -> u64 {
+        self.validators.iter().map(|v| v.power).sum()
+    }
+
+    /// Minimum voting power for a decision: strictly more than 2/3 of total,
+    /// i.e. `floor(2*total/3) + 1`.
+    pub fn quorum(&self) -> u64 {
+        self.total_power() * 2 / 3 + 1
+    }
+
+    /// Deterministic proposer for `height` via the proposer-priority accumulator.
+    /// Every honest node returns the same id. Ties break to the lowest id
+    /// (validators are kept sorted). Returns `None` for an empty set.
+    pub fn proposer_for(&self, height: u64) -> Option<u64> {
+        let n = self.validators.len();
+        if n == 0 {
+            return None;
+        }
+        let total = self.total_power() as i128;
+        let mut prio = vec![0i128; n];
+        let mut chosen = self.validators[0].id;
+        for _ in 0..height.max(1) {
+            for (i, v) in self.validators.iter().enumerate() {
+                prio[i] += v.power as i128;
+            }
+            let mut best = 0usize;
+            for i in 1..n {
+                if prio[i] > prio[best] {
+                    best = i;
+                }
+            }
+            prio[best] -= total;
+            chosen = self.validators[best].id;
+        }
+        Some(chosen)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::Keypair;
+
+    fn kp(id: u64) -> Keypair {
+        let mut seed = [0u8; 32];
+        seed[..8].copy_from_slice(&id.to_le_bytes());
+        Keypair::from_seed(seed)
+    }
+
+    fn vset(powers: &[(u64, u64)]) -> ValidatorSet {
+        ValidatorSet::new(
+            powers
+                .iter()
+                .map(|&(id, power)| Validator {
+                    id,
+                    pubkey: kp(id).public(),
+                    power,
+                })
+                .collect(),
+        )
+    }
+
+    #[test]
+    fn quorum_is_strictly_more_than_two_thirds() {
+        assert_eq!(vset(&[(1, 1), (2, 1), (3, 1)]).quorum(), 3); // 3 of 3
+        assert_eq!(vset(&[(1, 1), (2, 1), (3, 1), (4, 1)]).quorum(), 3); // 3 of 4
+        // stake-weighted: total 100, quorum 67
+        assert_eq!(vset(&[(1, 50), (2, 30), (3, 20)]).quorum(), 67);
+    }
+
+    #[test]
+    fn proposer_rotates_proportionally_to_power() {
+        // equal power -> round-robin over a full cycle hits everyone once
+        let vs = vset(&[(1, 1), (2, 1), (3, 1)]);
+        let seq: Vec<u64> = (1..=3).map(|h| vs.proposer_for(h).unwrap()).collect();
+        let mut sorted = seq.clone();
+        sorted.sort();
+        sorted.dedup();
+        assert_eq!(sorted, vec![1, 2, 3]); // each proposes once per cycle
+    }
+
+    #[test]
+    fn higher_power_proposes_more_often() {
+        let vs = vset(&[(1, 3), (2, 1)]); // 1 has 3x the stake
+        let mut count = [0u32; 3];
+        for h in 1..=8 {
+            count[vs.proposer_for(h).unwrap() as usize] += 1;
+        }
+        assert!(count[1] > count[2], "id1={} id2={}", count[1], count[2]);
+    }
+
+    #[test]
+    fn proposer_is_deterministic() {
+        let vs = vset(&[(1, 2), (2, 5), (3, 3)]);
+        for h in 0..20 {
+            assert_eq!(vs.proposer_for(h), vs.proposer_for(h));
+        }
+    }
+}
