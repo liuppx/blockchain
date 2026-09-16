@@ -112,6 +112,7 @@ mod tests {
                 repl_success: 3,
                 repl_total: 3,
                 timestamp_days: height as f32,
+                signature: [7u8; 64],
             }],
         }
     }

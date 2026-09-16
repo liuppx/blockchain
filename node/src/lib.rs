@@ -16,6 +16,7 @@
 //! README. Money is integer micro-$COG (no floats), so accounting is exact.
 
 pub mod codec;
+pub mod crypto;
 pub mod hash;
 pub mod store;
 
@@ -23,6 +24,7 @@ use std::collections::BTreeMap;
 
 use zhixing_engine::{compute_delta_k, CognitiveGraph, DeltaKParams, GraphNode, Submission, DIM};
 
+pub use crypto::{Keypair, PubKey, Sig};
 pub use hash::{hex, sha256};
 
 /// 1 $COG == 1_000_000 micro-$COG. All balances are integer micro-$COG.
@@ -55,6 +57,17 @@ pub struct SubmissionTx {
     pub repl_total: u32,
     /// Author-claimed authoring time in days (used for freshness in ΔK).
     pub timestamp_days: f32,
+    /// ed25519 signature by `author`'s key over [`codec::tx_signing_bytes`].
+    pub signature: Sig,
+}
+
+impl SubmissionTx {
+    /// Sign this tx's canonical fields with `kp`, filling in `signature`.
+    /// The keypair's public key must be the one registered for `author`.
+    pub fn signed(mut self, kp: &Keypair) -> Self {
+        self.signature = kp.sign(&codec::tx_signing_bytes(&self));
+        self
+    }
 }
 
 /// A block: an ordered batch of submissions applied atomically.
@@ -79,6 +92,7 @@ impl Block {
 
 #[derive(Clone, Debug, Default)]
 pub struct Account {
+    pub pubkey: PubKey,
     pub balance: u64,
     pub staked_total: u64,
     pub earned_total: u64,
@@ -107,7 +121,7 @@ pub struct ChainState {
 
 /// Genesis configuration.
 pub struct Genesis {
-    pub accounts: Vec<(u64, u64)>,          // (id, endowment micro-$COG)
+    pub accounts: Vec<(u64, u64, PubKey)>,  // (id, endowment micro-$COG, pubkey)
     pub reviewers: Vec<(u64, f32)>,         // (id, initial reputation)
     pub seed_nodes: Vec<(Embedding, u32)>,  // pre-existing graph nodes
     pub params: DeltaKParams,
@@ -125,6 +139,7 @@ pub enum ChainError {
     InsufficientBalance { account: u64, need: u64, have: u64 },
     BadScore { reviewer: u64, score: f32 },
     EmptyReviews(u64),
+    BadSignature(u64),
 }
 
 impl std::fmt::Display for ChainError {
@@ -144,6 +159,7 @@ impl std::fmt::Display for ChainError {
                 write!(f, "reviewer {reviewer} score {score} out of [0,1]")
             }
             ChainError::EmptyReviews(a) => write!(f, "submission by {a} has no reviews"),
+            ChainError::BadSignature(a) => write!(f, "invalid signature for account {a}"),
         }
     }
 }
@@ -178,11 +194,12 @@ impl ChainState {
     pub fn genesis(g: Genesis) -> (ChainState, Hash) {
         let mut accounts = BTreeMap::new();
         let mut supply = 0u64;
-        for (id, endow) in g.accounts {
+        for (id, endow, pubkey) in g.accounts {
             supply = supply.saturating_add(endow);
             accounts.insert(
                 id,
                 Account {
+                    pubkey,
                     balance: endow,
                     ..Default::default()
                 },
@@ -276,11 +293,15 @@ impl ChainState {
                 return Err(ChainError::UnknownReviewer(r.reviewer));
             }
         }
-        let bal = self
+        let acct_ref = self
             .accounts
             .get(&tx.author)
-            .ok_or(ChainError::UnknownAccount(tx.author))?
-            .balance;
+            .ok_or(ChainError::UnknownAccount(tx.author))?;
+        // authenticate: the signature must be by the account's registered key.
+        if !crypto::verify(&acct_ref.pubkey, &codec::tx_signing_bytes(tx), &tx.signature) {
+            return Err(ChainError::BadSignature(tx.author));
+        }
+        let bal = acct_ref.balance;
         if bal < tx.stake {
             return Err(ChainError::InsufficientBalance {
                 account: tx.author,
@@ -386,6 +407,7 @@ impl ChainState {
         e.u64(self.accounts.len() as u64);
         for (id, a) in &self.accounts {
             e.u64(*id);
+            e.raw(&a.pubkey);
             e.u64(a.balance);
             e.u64(a.staked_total);
             e.u64(a.earned_total);
@@ -475,9 +497,20 @@ mod tests {
         e
     }
 
+    /// Deterministic test keypair for account `id`.
+    fn kp(id: u64) -> Keypair {
+        let mut seed = [0u8; 32];
+        seed[..8].copy_from_slice(&id.to_le_bytes());
+        Keypair::from_seed(seed)
+    }
+
     fn base_genesis() -> Genesis {
         Genesis {
-            accounts: vec![(1, 30 * MICRO), (2, 30 * MICRO), (3, 30 * MICRO)],
+            accounts: vec![
+                (1, 30 * MICRO, kp(1).public()),
+                (2, 30 * MICRO, kp(2).public()),
+                (3, 30 * MICRO, kp(3).public()),
+            ],
             reviewers: vec![(10, 1.0), (11, 1.0), (12, 1.0)],
             seed_nodes: vec![(unit(1.0, 0), 0)], // domain 0 already occupied
             params: DeltaKParams::default(),
@@ -505,7 +538,9 @@ mod tests {
             repl_success: 3,
             repl_total: 3,
             timestamp_days: day,
+            signature: [0u8; 64],
         }
+        .signed(&kp(author))
     }
 
     fn block(chain: &Chain, height: u64, txs: Vec<SubmissionTx>) -> Block {
@@ -542,7 +577,9 @@ mod tests {
             repl_success: 3,
             repl_total: 3,
             timestamp_days: 1.0,
-        };
+            signature: [0u8; 64],
+        }
+        .signed(&kp(1));
         let b = block(&chain, 1, vec![dup]);
         let r = chain.commit(&b).unwrap();
         assert_eq!(r.rejected, 1);
@@ -603,15 +640,39 @@ mod tests {
     #[test]
     fn cannot_stake_more_than_balance() {
         let mut chain = Chain::new(base_genesis());
+        // re-sign after raising the stake, so it reaches the balance check
         let broke = SubmissionTx {
             stake: 1_000 * MICRO,
             ..novel_tx(1, 1, 1, 1.0)
-        };
+        }
+        .signed(&kp(1));
         let b = block(&chain, 1, vec![broke]);
         assert!(matches!(
             chain.commit(&b),
             Err(ChainError::InsufficientBalance { .. })
         ));
+    }
+
+    #[test]
+    fn forged_signature_is_rejected() {
+        let mut chain = Chain::new(base_genesis());
+        // account 1's submission signed by account 2's key
+        let forged = SubmissionTx {
+            author: 1,
+            ..novel_tx(1, 1, 1, 1.0)
+        }
+        .signed(&kp(2));
+        let b = block(&chain, 1, vec![forged]);
+        assert!(matches!(chain.commit(&b), Err(ChainError::BadSignature(1))));
+    }
+
+    #[test]
+    fn tampering_a_signed_field_is_rejected() {
+        let mut chain = Chain::new(base_genesis());
+        let mut tx = novel_tx(1, 1, 1, 1.0); // validly signed
+        tx.stake += 1; // mutate after signing -> signature no longer matches
+        let b = block(&chain, 1, vec![tx]);
+        assert!(matches!(chain.commit(&b), Err(ChainError::BadSignature(1))));
     }
 
     #[test]

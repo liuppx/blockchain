@@ -12,9 +12,17 @@ use std::process::exit;
 
 use zhixing_engine::{DeltaKParams, DIM};
 use zhixing_node::store::BlockLog;
-use zhixing_node::{hex, Block, Chain, Genesis, Review, SubmissionTx, MICRO};
+use zhixing_node::{hex, Block, Chain, Genesis, Keypair, Review, SubmissionTx, MICRO};
 
 type Emb = [f32; DIM];
+
+/// Deterministic keypair for account `id` (demo only; real keys come from a
+/// CSPRNG / HSM). Both the writer and any replayer derive the same keys.
+fn kp(id: u64) -> Keypair {
+    let mut seed = [0u8; 32];
+    seed[..8].copy_from_slice(&id.to_le_bytes());
+    Keypair::from_seed(seed)
+}
 
 fn unit(dim: usize) -> Emb {
     let mut e = [0.0f32; DIM];
@@ -37,6 +45,7 @@ fn reviews(scores: &[(u64, f32)]) -> Vec<Review> {
         .collect()
 }
 
+/// Build and sign a submission with `author`'s key.
 fn tx(author: u64, emb: Emb, domain: u32, revs: Vec<Review>, repl: (u32, u32), day: f32) -> SubmissionTx {
     SubmissionTx {
         author,
@@ -47,14 +56,20 @@ fn tx(author: u64, emb: Emb, domain: u32, revs: Vec<Review>, repl: (u32, u32), d
         repl_success: repl.0,
         repl_total: repl.1,
         timestamp_days: day,
+        signature: [0u8; 64],
     }
+    .signed(&kp(author))
 }
 
 /// The fixed genesis of this reference network (a network constant: both writers
 /// and replayers must reconstruct it identically).
 fn demo_genesis() -> Genesis {
     Genesis {
-        accounts: vec![(1, 30 * MICRO), (2, 30 * MICRO), (3, 30 * MICRO)],
+        accounts: vec![
+            (1, 30 * MICRO, kp(1).public()),
+            (2, 30 * MICRO, kp(2).public()),
+            (3, 30 * MICRO, kp(3).public()),
+        ],
         reviewers: vec![(10, 1.0), (11, 1.0), (12, 1.0)],
         seed_nodes: vec![(unit(0), 0)],
         params: DeltaKParams::default(),

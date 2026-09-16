@@ -13,10 +13,12 @@ path = "src/lib.rs"
 name = "node"
 path = "src/main.rs"
 
-# The engine is reused as a plain rlib (no `python` feature, no pyo3): the node
-# builds offline with zero external crates, same policy as the engine.
+# The engine is reused as a plain rlib (no `python` feature, no pyo3). The node
+# is an *application*, so it takes an audited crypto dependency for signatures
+# (hand-rolling ed25519 would be irresponsible); the engine itself stays zero-dep.
 [dependencies]
 zhixing-engine = { path = "../engine" }
+ed25519-dalek = "2"
 
 [profile.release]
 lto = true

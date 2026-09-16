@@ -38,20 +38,35 @@ pub fn encode_block(b: &Block) -> Vec<u8> {
     e.f32(b.timestamp_days);
     e.u64(b.txs.len() as u64);
     for t in &b.txs {
-        e.u64(t.author);
-        e.emb(&t.embedding);
-        e.u32(t.domain);
-        e.u64(t.stake);
-        e.u64(t.reviews.len() as u64);
-        for r in &t.reviews {
-            e.u64(r.reviewer);
-            e.f32(r.score);
-        }
-        e.u32(t.repl_success);
-        e.u32(t.repl_total);
-        e.f32(t.timestamp_days);
+        enc_tx(&mut e, t, true);
     }
     e.0
+}
+
+/// The exact bytes a submission's author signs: all tx fields EXCEPT the
+/// signature itself. Verifying `signature` over these bytes authenticates the tx.
+pub fn tx_signing_bytes(t: &SubmissionTx) -> Vec<u8> {
+    let mut e = Enc(Vec::new());
+    enc_tx(&mut e, t, false);
+    e.0
+}
+
+fn enc_tx(e: &mut Enc, t: &SubmissionTx, include_sig: bool) {
+    e.u64(t.author);
+    e.emb(&t.embedding);
+    e.u32(t.domain);
+    e.u64(t.stake);
+    e.u64(t.reviews.len() as u64);
+    for r in &t.reviews {
+        e.u64(r.reviewer);
+        e.f32(r.score);
+    }
+    e.u32(t.repl_success);
+    e.u32(t.repl_total);
+    e.f32(t.timestamp_days);
+    if include_sig {
+        e.raw(&t.signature);
+    }
 }
 
 pub(crate) struct Enc(pub Vec<u8>);
@@ -104,6 +119,8 @@ pub fn decode_block(buf: &[u8]) -> Result<Block, CodecError> {
         let repl_success = d.u32()?;
         let repl_total = d.u32()?;
         let ts = d.f32()?;
+        let mut signature = [0u8; 64];
+        signature.copy_from_slice(d.take(64)?);
         txs.push(SubmissionTx {
             author,
             embedding,
@@ -113,6 +130,7 @@ pub fn decode_block(buf: &[u8]) -> Result<Block, CodecError> {
             repl_success,
             repl_total,
             timestamp_days: ts,
+            signature,
         });
     }
     if d.pos != d.buf.len() {
@@ -190,6 +208,7 @@ mod tests {
                 repl_success: 2,
                 repl_total: 3,
                 timestamp_days: 3.0,
+                signature: [9u8; 64],
             }],
         }
     }
