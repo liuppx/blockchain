@@ -17,3 +17,7 @@
 # Python (simulation)
 __pycache__/
 *.pyc
+
+# Rust (engine)
+/engine/target/
+**/*.rs.bk

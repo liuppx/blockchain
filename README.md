@@ -22,6 +22,16 @@ python3 sim/run.py --md     # 并写出 sim/RESULTS.md
 
 核心结论（详见 [sim/README.md](sim/README.md)）：在女巫 + 合谋攻击场景下，**攻击者净回报为负（亏损），诚实贡献者为正**，伪贡献通过率随声誉机制收敛到 0。
 
+## 性能引擎（Rust）
+
+- ⚙️ **[`engine/`](engine/)** — 认知图谱热路径（kNN + ΔK）的 Rust 实现（纯 std、零依赖），与 Python 参考实现共享同一份 B.2.3 契约。
+
+```bash
+cd engine && cargo run --release --bin bench
+```
+
+同工况下 **Rust ≈ 230× 于 Python**（10,900 vs 47 submissions/sec），校验和一致。详见 [engine/README.md](engine/README.md)。
+
 ## 核心概念速查
 
 | 术语 | 含义 |
@@ -33,7 +43,7 @@ python3 sim/run.py --md     # 并写出 sim/RESULTS.md
 
 ## 状态
 
-Draft v0.2 · RFC。所有参数、公式、经济模型均为待验证的初始设计，欢迎社区评审与 PR。
+Draft v0.3 · RFC。所有参数、公式、经济模型均为待验证的初始设计，欢迎社区评审与 PR。
 
 ## License
 

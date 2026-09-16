@@ -1,0 +1,18 @@
+[package]
+name = "zhixing-engine"
+version = "0.1.0"
+edition = "2021"
+description = "Performance-critical cognitive-graph + ΔK engine for ZhixingGraph (whitepaper §7.3)"
+license = "MIT"
+
+# Dependency-free (std only) so it builds fully offline: cargo build --release
+[dependencies]
+
+[[bin]]
+name = "bench"
+path = "src/bench.rs"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
