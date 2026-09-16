@@ -14,7 +14,7 @@
 | 辅代币 | $WATT（电力凭证）、$FLOP（算力凭证） |
 | 贡献凭证 | cNFT（Cognitive Contribution NFT） |
 | 共识机制 | PoK — Proof of Knowledge（认知证明） |
-| 版本 | Draft v0.3 |
+| 版本 | Draft v0.4 |
 | 日期 | 2026-09 |
 | 状态 | 草稿 · 征求意见（RFC） |
 
@@ -348,6 +348,15 @@ mint($COG) = base_emission × impact_score(ΔK) × time_decay
 
 **设计原则**：性能关键路径用 Rust 并以校验和与 Python 参考实现交叉验证；建模与仿真保留在 Python；两者绑定同一份形式化契约（B.2.3），避免"文档、仿真、实现"三者漂移。生产环境的 kNN 应从暴力扫描升级为 HNSW/IVF 等近似最近邻索引。详见 [`engine/README.md`](../engine/README.md)。
 
+**Python 绑定（pyo3）**：同一个 Rust 引擎通过 pyo3（abi3，无需 maturin）导出为 Python 扩展模块 `zhixing_engine`，使经济仿真（`sim/`）在**不改变契约**的前提下把 ΔK 热路径交给 Rust——既加速离线参数扫描，也加速 ABM 仿真本身。实测：
+
+| 工作负载 | 纯 Python | Rust（pyo3） | 加速比 | 一致性 |
+|---|---|---|---|---|
+| 参数扫描（18 组 × 400 提交） | ≈ 31.7s | ≈ 0.14s | **≈ 225×** | 校验和相对误差 1.5e-7 |
+| 整条 ABM 仿真（baseline，200 轮） | ≈ 11.8s | ≈ 0.12s | **≈ 96×** | 逐指标完全一致 |
+
+> ΔK 只是 ABM 每轮工作的一部分（评审抽样、复现、记账仍在 Python 侧），故整条仿真加速比低于纯 ΔK 基准，但结果零漂移——同一种子下 Python 与 Rust 后端产出逐字节相同的指标，印证"一份契约、多种运行时"的架构目标。`sim/run.py --compare` 可复现该对比。
+
 ---
 
 ## 8. 认知地形图（Human Cognition Topography）
@@ -431,7 +440,7 @@ mint($COG) = base_emission × impact_score(ΔK) × time_decay
 
 ## 附录 B · 待深化清单
 
-> 状态说明：以下条目已从"待办"推进为"初稿（Draft）"，详见对应深化章节 B.1–B.6。仍需社区评审、形式化验证与仿真回归后方可定稿。
+> 状态说明：以下条目已从"待办"推进为"初稿（Draft）"，详见对应深化章节 B.1–B.6。仍需社区评审、形式化验证与仿真回归后方可定稿。此外，ΔK 契约已有可运行的双实现（Python 参考 + Rust 引擎，见 §7.3 与 [`engine/`](../engine/)），并由 pyo3 绑定使仿真直接运行 Rust 热路径、结果按种子逐字节一致。
 
 - [x] PoK 共识的博弈论建模与攻击面分析 → 见 [B.1](#b1-pok-共识的博弈论建模与攻击面分析)（初稿）
 - [x] ΔK 计算公式的形式化定义与参数标定 → 见 [B.2](#b2-δk-计算公式的形式化定义与参数标定)（初稿）

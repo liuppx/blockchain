@@ -30,7 +30,14 @@ python3 sim/run.py --md     # 并写出 sim/RESULTS.md
 cd engine && cargo run --release --bin bench
 ```
 
-同工况下 **Rust ≈ 230× 于 Python**（10,900 vs 47 submissions/sec），校验和一致。详见 [engine/README.md](engine/README.md)。
+同工况下 **Rust ≈ 230× 于 Python**（10,900 vs 47 submissions/sec），校验和一致。引擎还通过 **pyo3** 绑定导出为 Python 模块，让仿真直接调用 Rust 热路径——整条 ABM 仿真 **≈ 96×** 提速且结果按种子逐字节一致：
+
+```bash
+./engine/build_python.sh      # 构建 pyo3 扩展模块（cargo + abi3，无需 maturin）
+python3 sim/run.py --compare  # baseline 场景 Python vs Rust 后端对比
+```
+
+详见 [engine/README.md](engine/README.md)。
 
 ## 核心概念速查
 
@@ -43,7 +50,7 @@ cd engine && cargo run --release --bin bench
 
 ## 状态
 
-Draft v0.3 · RFC。所有参数、公式、经济模型均为待验证的初始设计，欢迎社区评审与 PR。
+Draft v0.4 · RFC。所有参数、公式、经济模型均为待验证的初始设计，欢迎社区评审与 PR。
 
 ## License
 
