@@ -41,7 +41,7 @@ python3 sim/run.py --compare  # baseline 场景 Python vs Rust 后端对比
 
 ## 参考节点（Rust · PoK 共识状态机）
 
-- ⛓️ **[`node/`](node/)** — 把 PoK 规则落成一个**确定性的共识状态机**：区块 / 交易 / 账户 / 状态转移 / 铸造罚没 / 链上声誉 / ed25519 签名交易 / 追加式持久化 / 确定性 mempool 出块 / Merkle 认证状态与轻客户端证明 / BFT 最终性证书 / BFT 轮次状态机（超时·锁定·换轮）/ 内容寻址区块哈希链 + 状态根。ΔK 复用引擎，与白皮书 B.2.3 是同一份契约。纯 std、零外部依赖（签名用审计过的 `ed25519-dalek`）、可离线编译。
+- ⛓️ **[`node/`](node/)** — 把 PoK 规则落成一个**确定性的共识状态机**：区块 / 交易 / 账户 / 状态转移 / 铸造罚没 / 链上声誉 / ed25519 签名交易 / 追加式持久化 / 确定性 mempool 出块 / Merkle 认证状态与轻客户端证明 / BFT 最终性证书 / BFT 轮次状态机（超时·锁定·换轮）/ 逐高度生长的 BFT 认证链 / 内容寻址区块哈希链 + 状态根。ΔK 复用引擎，与白皮书 B.2.3 是同一份契约。纯 std、零外部依赖（签名用审计过的 `ed25519-dalek`）、可离线编译。
 
 ```bash
 cd node && cargo run --release --bin node -- demo    # 内存演示链
@@ -49,11 +49,12 @@ cargo run --release --bin node -- build              # mempool 规范排序出�
 cargo run --release --bin node -- prove              # 轻客户端 Merkle 证明
 cargo run --release --bin node -- bft                # BFT 最终性证书
 cargo run --release --bin node -- live               # BFT 活性：轮次状态机驱动出块（含换轮）
+cargo run --release --bin node -- chain              # BFT 认证链：mempool → 共识 → 提交，逐高度生长
 cargo run --release --bin node -- run --dir ./data   # 持久化链（落盘 + 重放）
-cargo test --release                                 # 55 项测试（确定性/守恒/回滚/持久化/Merkle/BFT）
+cargo test --release                                 # 61 项测试（确定性/守恒/回滚/持久化/Merkle/BFT/认证链）
 ```
 
-> 共识的前提是确定性：相同创世 + 相同区块 → 逐字节相同的 `state_root`；状态落盘为追加式区块日志，重启重放可完整重建；> 2/3 投票权的最终性证书 + Merkle 状态根让轻客户端可离线验证区块与账户；Tendermint 式轮次状态机在提议人宕机时仍能换轮出块（活性）。P2P gossip 与多高度链循环为后续里程碑，详见 [node/README.md](node/README.md)。
+> 共识的前提是确定性：相同创世 + 相同区块 → 逐字节相同的 `state_root`；状态落盘为追加式区块日志，重启重放可完整重建；> 2/3 投票权的最终性证书 + Merkle 状态根让轻客户端可离线验证区块与账户；Tendermint 式轮次状态机在提议人宕机时仍能换轮出块（活性）；驱动器逐高度串起 mempool→共识→提交，长出一条每块附可验证证书的认证链——低于 1/3 宕机仍生长，达 1/3 则安全停摆。证书落盘复验、P2P gossip 与动态验证人集为后续里程碑，详见 [node/README.md](node/README.md)。
 
 ## 核心概念速查
 
@@ -66,7 +67,7 @@ cargo test --release                                 # 55 项测试（确定性/
 
 ## 状态
 
-Draft v0.7 · RFC。所有参数、公式、经济模型均为待验证的初始设计，欢迎社区评审与 PR。
+Draft v0.8 · RFC。所有参数、公式、经济模型均为待验证的初始设计，欢迎社区评审与 PR。
 
 ## License
 

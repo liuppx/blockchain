@@ -13,19 +13,20 @@
 //! hash chain, a state root, a Merkle-authenticated account state with
 //! light-client inclusion proofs, an append-only block log with replay, a
 //! deterministic mempool/block builder, a BFT finality core (validator
-//! set, proposer selection, verifiable commit certificates), and a BFT round
+//! set, proposer selection, verifiable commit certificates), a BFT round
 //! state machine that drives liveness under faults (timeouts, prevote/precommit
-//! locking, round changes) with an in-process network simulator — see the
-//! sibling modules.
+//! locking, round changes), and a chain driver that strings single-height
+//! consensus into a growing, certificate-backed chain — see the sibling modules.
 //!
-//! What this layer is NOT (yet): real P2P networking — the round FSM is driven
-//! by an in-process message bus (`round::Sim`) standing in for gossip. That is a
-//! later milestone; see README. Money is integer micro-$COG (no floats), so
-//! accounting is exact.
+//! What this layer is NOT (yet): real P2P networking — consensus is driven over
+//! an in-process message bus (`round::Sim`, used by `driver`) standing in for
+//! gossip. That is a later milestone; see README. Money is integer micro-$COG
+//! (no floats), so accounting is exact.
 
 pub mod codec;
 pub mod consensus;
 pub mod crypto;
+pub mod driver;
 pub mod hash;
 pub mod mempool;
 pub mod merkle;

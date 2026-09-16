@@ -14,7 +14,7 @@
 | 辅代币 | $WATT（电力凭证）、$FLOP（算力凭证） |
 | 贡献凭证 | cNFT（Cognitive Contribution NFT） |
 | 共识机制 | PoK — Proof of Knowledge（认知证明） |
-| 版本 | Draft v0.7 |
+| 版本 | Draft v0.8 |
 | 日期 | 2026-09 |
 | 状态 | 草稿 · 征求意见（RFC） |
 
@@ -357,7 +357,7 @@ mint($COG) = base_emission × impact_score(ΔK) × time_decay
 
 > ΔK 只是 ABM 每轮工作的一部分（评审抽样、复现、记账仍在 Python 侧），故整条仿真加速比低于纯 ΔK 基准，但结果零漂移——同一种子下 Python 与 Rust 后端产出逐字节相同的指标，印证"一份契约、多种运行时"的架构目标。`sim/run.py --compare` 可复现该对比。
 
-**节点运行时（[`node/`](../node/)，M6–M12）**：ΔK 引擎之上的最小 PoK 共识状态机：确定性区块/交易/账户、ΔK 定稿铸造或罚没入 treasury、供应守恒、链上评审声誉；ed25519 签名交易；追加式块日志 + 崩溃安全重放（落盘与区块哈希共用一份编码，重放得到**逐字节相同**的 `state_root` `0949627b…becb4f`）；确定性 mempool + 试算式 `build_block`（按 tx 哈希规范排序出块，到达顺序无法改变区块哈希）；**Merkle 认证状态**——accounts/reviewers 的二叉 Merkle 树（`merkle_root` `7a08962f…cccdd1`）支持**轻客户端单账户包含证明**；**BFT 最终性内核**——按投票权（质押）计票、需严格 > 2/3 总权的 ed25519 预提交组成**可验证的 `Commit` 最终性证书**，配合 Tendermint 提议人优先级选择与 `detect_equivocation` 双签问责；以及**驱动活性的 BFT 轮次状态机**——忠实转写 Tendermint（Buchman–Kwon–Milosevic 2018）的 `upon` 规则（propose/prevote/precommit + 超时 + `lockedValue`/`validValue` 锁定 + 换轮），提议人宕机时经超时**换轮**由确定性轮换出的新提议人接手并定稿同一区块，锁定规则保证跨轮永不最终化冲突区块；轮次由进程内网络模拟器 `round::Sim`（P2P gossip 的占位）端到端驱动。最终性证书 + Merkle 状态根让轻客户端能**离线**验证"某区块已被 > 2/3 权重最终确定，且该账户确属此状态"。当前共识的**安全性与活性**内核均已就绪；P2P gossip 与多高度链循环为后续里程碑。55 项测试（编解码、签名、持久化、hash、Merkle 树、验证人集、BFT 证书、轮次状态机、状态机端到端）覆盖。
+**节点运行时（[`node/`](../node/)，M6–M13）**：ΔK 引擎之上的最小 PoK 共识状态机：确定性区块/交易/账户、ΔK 定稿铸造或罚没入 treasury、供应守恒、链上评审声誉；ed25519 签名交易；追加式块日志 + 崩溃安全重放（落盘与区块哈希共用一份编码，重放得到**逐字节相同**的 `state_root` `0949627b…becb4f`）；确定性 mempool + 试算式 `build_block`（按 tx 哈希规范排序出块，到达顺序无法改变区块哈希）；**Merkle 认证状态**——accounts/reviewers 的二叉 Merkle 树（`merkle_root` `7a08962f…cccdd1`）支持**轻客户端单账户包含证明**；**BFT 最终性内核**——按投票权（质押）计票、需严格 > 2/3 总权的 ed25519 预提交组成**可验证的 `Commit` 最终性证书**，配合 Tendermint 提议人优先级选择与 `detect_equivocation` 双签问责；**驱动活性的 BFT 轮次状态机**——忠实转写 Tendermint（Buchman–Kwon–Milosevic 2018）的 `upon` 规则（propose/prevote/precommit + 超时 + `lockedValue`/`validValue` 锁定 + 换轮），提议人宕机时经超时**换轮**由确定性轮换出的新提议人接手并定稿同一区块，锁定规则保证跨轮永不最终化冲突区块；以及**逐高度生长的 BFT 认证链驱动**——`ChainDriver` 把 mempool 造块 → 共识定稿 → `Chain` 提交串成一条链，每个已提交区块都由**复验过的 > 2/3 证书**背书，低于 1/3 权重宕机仍生长（活性），达到 1/3 则**安全停摆**而非无证书出块，且相同输入的两台驱动器长出逐字节相同的链。轮次与链驱动均跑在进程内网络模拟器 `round::Sim`（P2P gossip 的占位）上。最终性证书 + Merkle 状态根让轻客户端能**离线**验证"某区块已被 > 2/3 权重最终确定，且该账户确属此状态"。当前共识的**安全性与活性**内核、以及端到端的**链生长**均已就绪；证书落盘复验、P2P gossip 与动态验证人集为后续里程碑。61 项测试（编解码、签名、持久化、hash、Merkle 树、验证人集、BFT 证书、轮次状态机、认证链驱动、状态机端到端）覆盖。
 
 ---
 

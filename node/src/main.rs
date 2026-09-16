@@ -16,6 +16,7 @@ use std::process::exit;
 
 use zhixing_engine::{DeltaKParams, DIM};
 use zhixing_node::consensus::{commit_block, detect_equivocation};
+use zhixing_node::driver::ChainDriver;
 use zhixing_node::mempool::Mempool;
 use zhixing_node::merkle;
 use zhixing_node::round::Sim;
@@ -121,6 +122,7 @@ fn main() {
         "prove" => cmd_prove(),
         "bft" => cmd_bft(),
         "live" => cmd_live(),
+        "chain" => cmd_chain(),
         "run" => cmd_run(dir_arg(&args)),
         "status" => cmd_status(dir_arg(&args)),
         "-h" | "--help" | "help" => usage(),
@@ -151,6 +153,7 @@ fn usage() {
     eprintln!("  node prove              build+verify a light-client Merkle proof of an account");
     eprintln!("  node bft                4 validators certify a block; show fault tolerance + equivocation");
     eprintln!("  node live               drive the BFT round FSM to a commit (incl. a dead proposer)");
+    eprintln!("  node chain              grow a BFT-certified chain height by height (mempool -> consensus -> commit)");
     eprintln!("  node run    --dir DIR   persistent chain (seeds demo blocks once, then replays)");
     eprintln!("  node status --dir DIR   replay the block log and print state");
 }
@@ -342,6 +345,84 @@ fn report_live(
     if let Some(c) = dec.values().next() {
         println!("    finalized {} with a quorum certificate", short(&c.block_hash));
     }
+}
+
+/// Demonstrate the full pipeline as a growing, BFT-certified chain: submit
+/// transactions to a mempool, then have a validator set finalize them one block
+/// per height — each committed block backed by a verifiable > 2/3 certificate.
+/// Then show the chain still advancing with a crashed validator, and stalling
+/// (without ever forging a block) when a quorum is impossible.
+fn cmd_chain() {
+    let ids = [21u64, 22, 23, 24];
+    let vset = ValidatorSet::new(
+        ids.iter()
+            .map(|&id| Validator { id, pubkey: kp(id).public(), power: 1 })
+            .collect(),
+    );
+    let seeds: BTreeMap<u64, [u8; 32]> = ids
+        .iter()
+        .map(|&id| {
+            let mut s = [0u8; 32];
+            s[..8].copy_from_slice(&id.to_le_bytes());
+            (id, s)
+        })
+        .collect();
+
+    // one block per height so the chain visibly grows tx by tx
+    let mut d = ChainDriver::new(demo_genesis(), vset.clone(), seeds, 1);
+    for t in [
+        tx(1, unit(1), 1, reviews(&[(10, 0.9), (11, 0.85), (12, 0.9)]), (3, 3), 1.0),
+        tx(2, unit(2), 2, reviews(&[(10, 0.88), (11, 0.9), (12, 0.86)]), (3, 3), 1.0),
+        tx(3, blend(1, 2), 3, reviews(&[(10, 0.9), (11, 0.9), (12, 0.85)]), (3, 3), 1.0),
+    ] {
+        d.submit(t).unwrap();
+    }
+    println!("validators {ids:?}  quorum {} (> 2/3)\n", vset.quorum());
+    println!("growing the chain (all honest):");
+    let mut day = 1.0;
+    while let Some(c) = d.produce(day, &BTreeSet::new()).unwrap() {
+        let power = c.verify(&vset).unwrap();
+        println!(
+            "  height {}  block {}  cert power {}/{}  state_root {}",
+            c.height,
+            short(&c.block_hash),
+            power,
+            vset.total_power(),
+            short(&d.chain.state.state_root())
+        );
+        day += 1.0;
+    }
+    println!("head {} at height {}\n", short(&d.head()), d.height());
+
+    // fault tolerance: submit one more, finalize it with a validator offline
+    d.submit(tx(1, unit(4), 4, reviews(&[(10, 0.8), (11, 0.75), (12, 0.82)]), (0, 3), day)).unwrap();
+    let mut silent = BTreeSet::new();
+    silent.insert(24u64);
+    match d.produce(day, &silent) {
+        Ok(Some(c)) => println!(
+            "with validator #24 offline: height {} still finalized (power {}/{}) ✓ liveness",
+            c.height,
+            c.verify(&vset).unwrap(),
+            vset.total_power()
+        ),
+        other => println!("unexpected: {other:?}"),
+    }
+
+    // safety: with two offline, quorum is impossible -> stall, no block forged
+    d.submit(tx(2, unit(5), 5, reviews(&[(10, 0.85), (11, 0.8), (12, 0.88)]), (3, 3), day + 1.0)).unwrap();
+    let mut two_down = BTreeSet::new();
+    two_down.insert(23u64);
+    two_down.insert(24u64);
+    let h_before = d.height();
+    match d.produce(day + 1.0, &two_down) {
+        Err(e) => println!(
+            "with #23 and #24 offline: {e} — chain stays at height {} ✓ safety",
+            d.height()
+        ),
+        Ok(_) => println!("unexpected: a block was produced below quorum"),
+    }
+    debug_assert_eq!(d.height(), h_before);
+    println!("\nfinal head {} · height {} · {} certificates", short(&d.head()), d.height(), d.certificates().len());
 }
 
 fn cmd_run(dir: String) {    let path = format!("{dir}/blocks.log");
