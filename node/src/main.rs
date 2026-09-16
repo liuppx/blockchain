@@ -11,13 +11,14 @@
 //! DIR/blocks.log; every later `run`/`status` replays that log and reconstructs
 //! byte-identical state (same state_root) — the point of the persistence layer.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::process::exit;
 
 use zhixing_engine::{DeltaKParams, DIM};
 use zhixing_node::consensus::{commit_block, detect_equivocation};
 use zhixing_node::mempool::Mempool;
 use zhixing_node::merkle;
+use zhixing_node::round::Sim;
 use zhixing_node::store::BlockLog;
 use zhixing_node::validator::{Validator, ValidatorSet};
 use zhixing_node::{hex, Block, Chain, Genesis, Keypair, Review, SubmissionTx, MICRO};
@@ -119,6 +120,7 @@ fn main() {
         "build" => cmd_build(),
         "prove" => cmd_prove(),
         "bft" => cmd_bft(),
+        "live" => cmd_live(),
         "run" => cmd_run(dir_arg(&args)),
         "status" => cmd_status(dir_arg(&args)),
         "-h" | "--help" | "help" => usage(),
@@ -148,6 +150,7 @@ fn usage() {
     eprintln!("  node build              feed a mempool (scrambled order) and build one block");
     eprintln!("  node prove              build+verify a light-client Merkle proof of an account");
     eprintln!("  node bft                4 validators certify a block; show fault tolerance + equivocation");
+    eprintln!("  node live               drive the BFT round FSM to a commit (incl. a dead proposer)");
     eprintln!("  node run    --dir DIR   persistent chain (seeds demo blocks once, then replays)");
     eprintln!("  node status --dir DIR   replay the block log and print state");
 }
@@ -280,8 +283,68 @@ fn cmd_bft() {
     }
 }
 
-fn cmd_run(dir: String) {
-    let path = format!("{dir}/blocks.log");
+/// Demonstrate BFT *liveness*: the round state machine drives a set of
+/// validators to a commit over an in-process message bus — first with everyone
+/// honest (commits at round 0), then with the round-0 proposer dead (a timeout
+/// forces a round change and a live proposer finalizes the same block).
+fn cmd_live() {
+    let chain = Chain::new(demo_genesis());
+    let mut mp = Mempool::new(16);
+    for t in [
+        tx(1, unit(1), 1, reviews(&[(10, 0.9), (11, 0.85), (12, 0.9)]), (3, 3), 1.0),
+        tx(2, unit(2), 2, reviews(&[(10, 0.88), (11, 0.9), (12, 0.86)]), (3, 3), 1.0),
+    ] {
+        mp.insert(&chain, t).unwrap();
+    }
+    let blk = mp.build_block(&chain, 1.0).expect("a candidate block");
+
+    let ids = [21u64, 22, 23, 24];
+    let vset = ValidatorSet::new(
+        ids.iter()
+            .map(|&id| Validator { id, pubkey: kp(id).public(), power: 1 })
+            .collect(),
+    );
+    let mkkeys = || -> BTreeMap<u64, Keypair> { ids.iter().map(|&id| (id, kp(id))).collect() };
+    println!("validators {ids:?}  quorum {} (> 2/3)", vset.quorum());
+    println!("candidate block {} ({})\n", blk.height, short(&blk.hash()));
+
+    // scenario 1: everyone honest
+    let mut sim = Sim::new(vset.clone(), mkkeys(), blk.height, blk.clone(), &BTreeSet::new());
+    let dec = sim.run();
+    report_live("all honest", &sim, &dec, &vset, &blk);
+
+    // scenario 2: the round-0 proposer is offline
+    let dead = vset.proposer_for_round(blk.height, 0).unwrap();
+    let mut silent = BTreeSet::new();
+    silent.insert(dead);
+    let mut sim2 = Sim::new(vset.clone(), mkkeys(), blk.height, blk.clone(), &silent);
+    let dec2 = sim2.run();
+    println!("\nround-0 proposer #{dead} is offline:");
+    report_live("dead proposer", &sim2, &dec2, &vset, &blk);
+}
+
+fn report_live(
+    label: &str,
+    sim: &Sim,
+    dec: &BTreeMap<u64, zhixing_node::consensus::Commit>,
+    vset: &ValidatorSet,
+    blk: &Block,
+) {
+    let agreed = dec.values().all(|c| c.block_hash == blk.hash());
+    let verified = dec.values().all(|c| c.verify(vset).is_ok());
+    println!(
+        "  {label}: {} validator(s) decided at round {} — agree={} certificate_valid={}",
+        dec.len(),
+        sim.max_round(),
+        agreed,
+        verified
+    );
+    if let Some(c) = dec.values().next() {
+        println!("    finalized {} with a quorum certificate", short(&c.block_hash));
+    }
+}
+
+fn cmd_run(dir: String) {    let path = format!("{dir}/blocks.log");
     let log = BlockLog::open(&path).unwrap_or_else(|e| fail("open log", e));
     let blocks = log.read_all().unwrap_or_else(|e| fail("read log", e));
 

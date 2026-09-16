@@ -1,8 +1,8 @@
-# ZhixingGraph 参考节点（Rust · Milestone 6–11）
+# ZhixingGraph 参考节点（Rust · Milestone 6–12）
 
 对应白皮书 [`docs/WHITEPAPER.md`](../docs/WHITEPAPER.md) §5「PoK 共识」与 §7「技术架构」。
 
-这是把 ΔK 引擎（[`engine/`](../engine/)）与经济仿真（[`sim/`](../sim/)）背后的规则，落成一个**可运行、确定性的 PoK 共识状态机**——真正"跑链"的最小内核：区块、交易、账户、状态转移、铸造/罚没、链上声誉、ed25519 签名交易、追加式持久化、确定性 mempool 出块、Merkle 认证状态与轻客户端证明、BFT 最终性证书与验证人集，以及内容寻址的区块哈希链与状态根。
+这是把 ΔK 引擎（[`engine/`](../engine/)）与经济仿真（[`sim/`](../sim/)）背后的规则，落成一个**可运行、确定性的 PoK 共识状态机**——真正"跑链"的最小内核：区块、交易、账户、状态转移、铸造/罚没、链上声誉、ed25519 签名交易、追加式持久化、确定性 mempool 出块、Merkle 认证状态与轻客户端证明、BFT 最终性证书与验证人集、驱动活性的 BFT 轮次状态机（超时 / 锁定 / 换轮），以及内容寻址的区块哈希链与状态根。
 
 > **共识的前提是确定性**：给定相同的创世与相同的区块序列，每个诚实节点算出**逐字节相同**的状态（`state_root` 一致）。本 crate 就是那个状态转移函数 `apply_block`，其 ΔK 由 `zhixing_engine::compute_delta_k` 计算——与白皮书 B.2.3、Python 仿真是**同一份契约**。
 
@@ -14,9 +14,10 @@ cargo run --release --bin node -- demo             # 内存演示链：创世 �
 cargo run --release --bin node -- build            # mempool：乱序投递交易 → 规范排序出块
 cargo run --release --bin node -- prove            # 轻客户端 Merkle 证明：单账户对状态根验证
 cargo run --release --bin node -- bft              # BFT：4 验证人对区块出具可验证的最终性证书
+cargo run --release --bin node -- live             # BFT 活性：轮次状态机驱动出块（含提议人宕机换轮）
 cargo run --release --bin node -- run  --dir DIR   # 持久化链：首次落盘演示块，之后重放
 cargo run --release --bin node -- status --dir DIR # 重放区块日志并打印状态
-cargo test --release                               # 47 项单元测试（见下）
+cargo test --release                               # 55 项单元测试（见下）
 ```
 
 演示链展示：新颖提交铸造 $COG、跨域桥接拿到 novelty+bonus（ΔK>1）、近重复/低质提交被**罚没入 treasury**、供应守恒、评审声誉按链上结果升降。
@@ -90,6 +91,20 @@ cargo run --release --bin node -- prove   # 验证账户 #1 -> true；把余额�
 cargo run --release --bin node -- bft   # 4 验证人：3/4 提交（容 1 崩溃）、2/4 不提交、冲突证书暴露双签者
 ```
 
+## BFT 轮次状态机与活性（Milestone 12）
+
+M11 给了**安全性**（可验证的最终性证书），但没有任何东西**驱动**验证人去产生它。M12 补上**活性**：一个逐验证人、逐高度的 Tendermint 式状态机（`round.rs`），忠实转写 Buchman–Kwon–Milosevic (2018) 的 `upon` 规则——propose → prevote → precommit，配合 `lockedValue`/`validValue` 与跨轮锁定。
+
+- **超时驱动换轮**：提议人宕机/沉默时，`propose` 超时 → 全体 prevote nil → precommit nil → `precommit` 超时 → 进入下一轮，由**确定性轮换**出的新提议人（`proposer_for_round`）接手，直到出块。超时被建模为**显式事件**（无时钟），整台机器因此完全确定、可复现、可离线测试。
+- **锁定保安全**：precommit 时锁定某值，`upon` 规则（L28 的 proof-of-lock、L36 的锁定/解锁条件）确保**两轮永远无法最终化相互冲突的区块**——活性机制不破坏 M11 的安全性。
+- **进程内网络模拟器**：`round::Sim` 用一条进程内消息总线把 N 台状态机接起来（P2P gossip 的占位，属后续里程碑），让机制**端到端可跑**：广播送达每个存活验证人，消息静默后按固定顺序触发超时。
+
+本里程碑仍是**单高度共识**（就一个高度定稿一个区块）；把高度串起来的链循环与真实网络在其之上。
+
+```bash
+cargo run --release --bin node -- live   # 全诚实：round 0 出块；提议人宕机：超时换轮，round 1 仍定稿同一区块
+```
+
 ## 设计要点
 
 | 主题 | 做法 |
@@ -103,6 +118,7 @@ cargo run --release --bin node -- bft   # 4 验证人：3/4 提交（容 1 崩�
 | **确定性出块** | mempool 按 tx 哈希规范排序、在克隆上试算后只纳入可提交交易；相同待处理集 + 相同状态 → 逐字节相同区块（M9） |
 | **认证状态** | accounts/reviewers 维护二叉 Merkle 树；轻客户端凭 `merkle_root` + `account_proof` 验证单账户，域分隔 + 奇数提升（M10） |
 | **BFT 最终性** | 投票权 > 2/3 的 ed25519 预提交组成可验证 `Commit` 证书；确定性提议人；双签可被 `detect_equivocation` 问责（M11） |
+| **BFT 活性** | Tendermint 轮次状态机：propose/prevote/precommit + 超时 + 锁定 + 换轮；确定性提议人轮换，提议人宕机也能出块；进程内模拟器端到端验证（M12） |
 | **依赖策略** | 引擎零依赖（可嵌入/WASM）；节点作为应用引入审计过的 `ed25519-dalek` 做签名，绝不自实现密码学 |
 
 ## 测试覆盖
@@ -146,7 +162,7 @@ proof_for_unknown_account_is_none
 # 验证人集（validator.rs）
 quorum_is_strictly_more_than_two_thirds       法定人数 > 2/3 总投票权
 proposer_rotates_proportionally_to_power / higher_power_proposes_more_often
-proposer_is_deterministic
+proposer_is_deterministic / round_changes_the_proposer
 # BFT 共识（consensus.rs）
 quorum_of_precommits_commits                  3/4 预提交 → 提交（容 1 崩溃）
 below_quorum_does_not_commit                  2/4 → 不提交（安全）
@@ -154,6 +170,14 @@ forged_precommit_is_rejected / double_counting_a_validator_is_rejected
 a_prevote_is_not_a_valid_precommit
 conflicting_commits_require_equivocation       冲突证书 → 揪出双签者
 honest_validators_cannot_form_conflicting_commits  无双签则无法造冲突证书
+# BFT 轮次状态机（round.rs）
+all_honest_commit_in_round_zero               全诚实 → round 0 定稿
+all_honest_agree_on_the_same_block            全体对同一区块达成一致
+one_crash_still_commits                       1 崩溃 → 仍定稿（容错）
+silent_proposer_triggers_round_change_and_still_commits  提议人宕机 → 换轮仍出块（活性）
+too_many_crashes_stalls_without_forging_a_commit  2 崩溃 → 停摆但绝不伪造证书（安全）
+a_proposal_from_a_non_proposer_is_ignored     非提议人的提案被丢弃
+run_is_deterministic                          同输入 → 同结果同轮次
 ```
 
 ## 文件
@@ -165,23 +189,25 @@ honest_validators_cannot_form_conflicting_commits  无双签则无法造冲突�
 | `src/merkle.rs` | 二叉 Merkle 树：域分隔叶/节点、奇数提升、包含证明 `Proof`/`verify` + 测试 |
 | `src/validator.rs` | 验证人集与确定性提议人（Tendermint 优先级累加器）+ 测试 |
 | `src/consensus.rs` | BFT 投票/最终性证书：`Vote`/`Commit`/`verify`、`commit_block`、`detect_equivocation` + 测试 |
+| `src/round.rs` | BFT 轮次状态机（Tendermint `upon` 规则、超时/锁定/换轮）+ 进程内网络模拟器 `Sim` + 测试 |
 | `src/crypto.rs` | ed25519 身份：`Keypair`/`verify`（封装 `ed25519-dalek`）+ 测试 |
 | `src/codec.rs` | 区块的规范二进制编解码（哈希与落盘共用）+ `tx_signing_bytes`/`encode_tx`（签名/tx 哈希字节）+ 测试 |
 | `src/store.rs` | 追加式区块日志（长度前缀记录、残缺尾检测）+ 测试 |
 | `src/hash.rs` | 纯 std SHA-256（FIPS 180-4，含已知向量测试）——离线零依赖 |
-| `src/main.rs` | 节点 CLI：`demo` / `build` / `prove` / `bft` / `run` / `status`（含确定性演示密钥） |
+| `src/main.rs` | 节点 CLI：`demo` / `build` / `prove` / `bft` / `live` / `run` / `status`（含确定性演示密钥） |
 
 ## 局限与后续（离生产还差什么）
 
-本里程碑刻意只做**确定性状态机内核 + 单机出块 + BFT 安全性内核**，尚未包含：
+本里程碑刻意只做**确定性状态机内核 + 单机出块 + BFT 安全性与活性内核**，尚未包含：
 
 - **~~密码学身份~~**：✅ 已完成（M8，ed25519 签名交易）。后续：账户 = 公钥的完整身份模型、动态开户、评审签名、密钥轮换。
 - **~~确定性出块~~**：✅ 已完成（M9，mempool + 试算式 `build_block`）。后续：手续费/优先级排序、区块 gas 上限、交易过期。
-- **BFT 活性（轮次状态机）**：✅ 安全性内核已完成（M11，投票权 > 2/3 的最终性证书 + 提议人选择 + 双签问责）；**待补活性**——提案超时、prevote/precommit 锁定与解锁、换轮，才能在部分同步下保证*一定*出块。
-- **P2P 网络**：交易/区块/投票的 gossip、状态同步（当前 `commit_block` 在进程内模拟一轮）。
+- **~~BFT 安全性（最终性证书）~~**：✅ 已完成（M11，投票权 > 2/3 的证书 + 提议人选择 + 双签问责）。
+- **~~BFT 活性（轮次状态机）~~**：✅ 已完成（M12，propose/prevote/precommit + 超时 + 锁定 + 换轮 + 进程内模拟器）。后续：动态验证人集变更、多高度链循环、把 `Commit` 证书接入区块日志、拜占庭对抗测试（等价/延迟/审查）。
+- **P2P 网络**：交易/区块/投票的 gossip、状态同步（当前 `round::Sim` 在进程内模拟消息总线）。
 - **~~持久化~~**：✅ 已完成（M7，追加式区块日志 + 重放）。后续可换 RocksDB、加 per-record 校验和与 segment 轮转、并持久化 `Commit` 证书。
 - **~~Merkle 化状态树~~**：✅ 已完成（M10，二叉 Merkle 树 + 账户包含证明）。后续：非成员证明、增量更新的 Merkle-Patricia trie、把 graph/头字段也纳入根。
 - **手写 SHA-256** 仅为离线零依赖演示，**生产必须换审计实现**（`sha2`）。
 - **kNN 暴力扫描**：随图谱增长需换 HNSW/IVF（见 engine 局限）。
 
-这些构成后续里程碑（~~M7 持久化~~ ✅、~~M8 签名~~ ✅、~~M9 mempool 出块~~ ✅、~~M10 Merkle 认证状态~~ ✅、~~M11 BFT 最终性内核~~ ✅、M12 BFT 轮次状态机/活性、M13 P2P + gossip……），每步仍遵循"可运行、可测试、契约一致"。
+这些构成后续里程碑（~~M7 持久化~~ ✅、~~M8 签名~~ ✅、~~M9 mempool 出块~~ ✅、~~M10 Merkle 认证状态~~ ✅、~~M11 BFT 最终性内核~~ ✅、~~M12 BFT 轮次状态机/活性~~ ✅、M13 P2P + gossip、M14 多高度链循环 + 动态验证人集……），每步仍遵循"可运行、可测试、契约一致"。

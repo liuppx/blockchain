@@ -12,14 +12,15 @@
 //! reputation, ed25519-authenticated transactions, a content-addressed block
 //! hash chain, a state root, a Merkle-authenticated account state with
 //! light-client inclusion proofs, an append-only block log with replay, a
-//! deterministic mempool/block builder, and a BFT finality core (validator
-//! set, proposer selection, verifiable commit certificates — see the sibling
-//! modules).
+//! deterministic mempool/block builder, a BFT finality core (validator
+//! set, proposer selection, verifiable commit certificates), and a BFT round
+//! state machine that drives liveness under faults (timeouts, prevote/precommit
+//! locking, round changes) with an in-process network simulator — see the
+//! sibling modules.
 //!
-//! What this layer is NOT (yet): P2P networking and the BFT round state machine
-//! that drives liveness under partial synchrony (timeouts, locking, round
-//! changes) — the finality *certificate* here is the safety half. Those are
-//! later milestones; see README. Money is integer micro-$COG (no floats), so
+//! What this layer is NOT (yet): real P2P networking — the round FSM is driven
+//! by an in-process message bus (`round::Sim`) standing in for gossip. That is a
+//! later milestone; see README. Money is integer micro-$COG (no floats), so
 //! accounting is exact.
 
 pub mod codec;
@@ -28,6 +29,7 @@ pub mod crypto;
 pub mod hash;
 pub mod mempool;
 pub mod merkle;
+pub mod round;
 pub mod store;
 pub mod validator;
 

@@ -67,14 +67,24 @@ impl ValidatorSet {
     /// Every honest node returns the same id. Ties break to the lowest id
     /// (validators are kept sorted). Returns `None` for an empty set.
     pub fn proposer_for(&self, height: u64) -> Option<u64> {
+        self.proposer_for_round(height, 0)
+    }
+
+    /// Deterministic proposer for a specific (`height`, `round`). When a round
+    /// times out (a silent/faulty proposer), consensus advances to the next
+    /// round and needs a *different* proposer to make progress; folding `round`
+    /// into the accumulator sequence rotates the proposer deterministically
+    /// while staying stake-proportional. Every honest node computes the same id.
+    pub fn proposer_for_round(&self, height: u64, round: u32) -> Option<u64> {
         let n = self.validators.len();
         if n == 0 {
             return None;
         }
         let total = self.total_power() as i128;
+        let steps = (height + round as u64).max(1);
         let mut prio = vec![0i128; n];
         let mut chosen = self.validators[0].id;
-        for _ in 0..height.max(1) {
+        for _ in 0..steps {
             for (i, v) in self.validators.iter().enumerate() {
                 prio[i] += v.power as i128;
             }
@@ -150,5 +160,15 @@ mod tests {
         for h in 0..20 {
             assert_eq!(vs.proposer_for(h), vs.proposer_for(h));
         }
+    }
+
+    #[test]
+    fn round_changes_the_proposer() {
+        // A silent proposer at round 0 must be replaced at round 1 for liveness.
+        let vs = vset(&[(1, 1), (2, 1), (3, 1)]);
+        let h = 5;
+        assert_ne!(vs.proposer_for_round(h, 0), vs.proposer_for_round(h, 1));
+        // round 0 is exactly the height-only proposer (back-compat)
+        assert_eq!(vs.proposer_for_round(h, 0), vs.proposer_for(h));
     }
 }
