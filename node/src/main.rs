@@ -1,6 +1,7 @@
 //! Reference-node CLI.
 //!
 //!   cargo run --release --bin node -- demo             # in-memory demo chain
+//!   cargo run --release --bin node -- build            # mempool builds a block
 //!   cargo run --release --bin node -- run  --dir DIR   # persistent chain (block log)
 //!   cargo run --release --bin node -- status --dir DIR # replay log, print state
 //!
@@ -11,6 +12,7 @@
 use std::process::exit;
 
 use zhixing_engine::{DeltaKParams, DIM};
+use zhixing_node::mempool::Mempool;
 use zhixing_node::store::BlockLog;
 use zhixing_node::{hex, Block, Chain, Genesis, Keypair, Review, SubmissionTx, MICRO};
 
@@ -108,6 +110,7 @@ fn main() {
     let cmd = args.get(1).map(String::as_str).unwrap_or("demo");
     match cmd {
         "demo" => cmd_demo(),
+        "build" => cmd_build(),
         "run" => cmd_run(dir_arg(&args)),
         "status" => cmd_status(dir_arg(&args)),
         "-h" | "--help" | "help" => usage(),
@@ -134,6 +137,7 @@ fn dir_arg(args: &[String]) -> String {
 fn usage() {
     eprintln!("zhixing reference node");
     eprintln!("  node demo               run an in-memory demo chain");
+    eprintln!("  node build              feed a mempool (scrambled order) and build one block");
     eprintln!("  node run    --dir DIR   persistent chain (seeds demo blocks once, then replays)");
     eprintln!("  node status --dir DIR   replay the block log and print state");
 }
@@ -145,6 +149,38 @@ fn cmd_demo() {
         let label = format!("block {}", blk.height);
         commit_print(&mut chain, None, &label, blk);
     }
+    print_summary(&chain);
+}
+
+/// Demonstrate the deterministic mempool: submit transactions in a scrambled
+/// order, let the builder lay them out canonically (by tx hash), and show that
+/// the resulting block hash does not depend on arrival order.
+fn cmd_build() {
+    let chain = Chain::new(demo_genesis());
+    // three novel submissions, offered to the pool in a deliberately odd order
+    let candidates = vec![
+        tx(3, blend(1, 2), 3, reviews(&[(10, 0.9), (11, 0.9), (12, 0.85)]), (3, 3), 1.0),
+        tx(1, unit(1), 1, reviews(&[(10, 0.9), (11, 0.85), (12, 0.9)]), (3, 3), 1.0),
+        tx(2, unit(2), 2, reviews(&[(10, 0.88), (11, 0.9), (12, 0.86)]), (3, 3), 1.0),
+    ];
+
+    let mut mp = Mempool::new(16);
+    println!("submitting {} txs to the mempool (arrival order):", candidates.len());
+    for t in &candidates {
+        let h = mp.insert(&chain, t.clone()).unwrap();
+        println!("  author #{}  tx={}", t.author, short(&h));
+    }
+
+    let blk = mp.build_block(&chain, 1.0).expect("pool builds a block");
+    println!("\nbuilder laid out block {} (canonical, hash-ordered):", blk.height);
+    for t in &blk.txs {
+        println!("  author #{}  tx={}", t.author, short(&t.hash()));
+    }
+    println!("block hash = {}", short(&blk.hash()));
+    println!("(arrival order does not affect this hash — see mempool tests)\n");
+
+    let mut chain = chain;
+    commit_print(&mut chain, None, &format!("block {}", blk.height), blk);
     print_summary(&chain);
 }
 

@@ -9,15 +9,18 @@
 //!
 //! What this layer IS: block/tx/account types, escrow-staked submissions, ΔK
 //! finalization, mint/slash accounting, on-chain (outcome-based) reviewer
-//! reputation, a content-addressed block hash chain, and a state root.
+//! reputation, ed25519-authenticated transactions, a content-addressed block
+//! hash chain, a state root, an append-only block log with replay, and a
+//! deterministic mempool/block builder (see the sibling modules).
 //!
-//! What this layer is NOT (yet): P2P networking, BFT block ordering, signatures,
-//! persistence, and a Merkle-ized state trie. Those are later milestones; see
+//! What this layer is NOT (yet): P2P networking, BFT block ordering / leader
+//! election, and a Merkle-ized state trie. Those are later milestones; see
 //! README. Money is integer micro-$COG (no floats), so accounting is exact.
 
 pub mod codec;
 pub mod crypto;
 pub mod hash;
+pub mod mempool;
 pub mod store;
 
 use std::collections::BTreeMap;
@@ -67,6 +70,12 @@ impl SubmissionTx {
     pub fn signed(mut self, kp: &Keypair) -> Self {
         self.signature = kp.sign(&codec::tx_signing_bytes(&self));
         self
+    }
+
+    /// Content-addressed tx hash over the full signed encoding. The mempool
+    /// orders by this, so every honest builder lays out identical blocks.
+    pub fn hash(&self) -> Hash {
+        sha256(&codec::encode_tx(self))
     }
 }
 
@@ -277,8 +286,11 @@ impl ChainState {
         })
     }
 
-    fn apply_tx(&mut self, tx: &SubmissionTx) -> Result<TxReceipt, ChainError> {
-        // -- validate --------------------------------------------------------
+    /// Static validity checks that do NOT depend on ΔK or mutate state: reviews
+    /// well-formed, reviewers/account known, signature authentic, stake covered.
+    /// The mempool uses this for admission; `apply_tx` runs it first, so a tx
+    /// that passes here never partially mutates state when applied.
+    pub(crate) fn validate_tx(&self, tx: &SubmissionTx) -> Result<(), ChainError> {
         if tx.reviews.is_empty() {
             return Err(ChainError::EmptyReviews(tx.author));
         }
@@ -293,23 +305,27 @@ impl ChainState {
                 return Err(ChainError::UnknownReviewer(r.reviewer));
             }
         }
-        let acct_ref = self
+        let acct = self
             .accounts
             .get(&tx.author)
             .ok_or(ChainError::UnknownAccount(tx.author))?;
         // authenticate: the signature must be by the account's registered key.
-        if !crypto::verify(&acct_ref.pubkey, &codec::tx_signing_bytes(tx), &tx.signature) {
+        if !crypto::verify(&acct.pubkey, &codec::tx_signing_bytes(tx), &tx.signature) {
             return Err(ChainError::BadSignature(tx.author));
         }
-        let bal = acct_ref.balance;
-        if bal < tx.stake {
+        if acct.balance < tx.stake {
             return Err(ChainError::InsufficientBalance {
                 account: tx.author,
                 need: tx.stake,
-                have: bal,
+                have: acct.balance,
             });
         }
+        Ok(())
+    }
 
+    pub(crate) fn apply_tx(&mut self, tx: &SubmissionTx) -> Result<TxReceipt, ChainError> {
+        // -- validate (never mutates; see validate_tx) -----------------------
+        self.validate_tx(tx)?;
         // -- escrow stake ----------------------------------------------------
         {
             let acct = self.accounts.get_mut(&tx.author).unwrap();

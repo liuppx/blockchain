@@ -51,6 +51,14 @@ pub fn tx_signing_bytes(t: &SubmissionTx) -> Vec<u8> {
     e.0
 }
 
+/// Canonical bytes of a full (signed) transaction, used for the content-addressed
+/// tx hash that gives the mempool a deterministic, builder-independent ordering.
+pub fn encode_tx(t: &SubmissionTx) -> Vec<u8> {
+    let mut e = Enc(Vec::new());
+    enc_tx(&mut e, t, true);
+    e.0
+}
+
 fn enc_tx(e: &mut Enc, t: &SubmissionTx, include_sig: bool) {
     e.u64(t.author);
     e.emb(&t.embedding);
