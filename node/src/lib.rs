@@ -10,17 +10,19 @@
 //! What this layer IS: block/tx/account types, escrow-staked submissions, ΔK
 //! finalization, mint/slash accounting, on-chain (outcome-based) reviewer
 //! reputation, ed25519-authenticated transactions, a content-addressed block
-//! hash chain, a state root, an append-only block log with replay, and a
+//! hash chain, a state root, a Merkle-authenticated account state with
+//! light-client inclusion proofs, an append-only block log with replay, and a
 //! deterministic mempool/block builder (see the sibling modules).
 //!
-//! What this layer is NOT (yet): P2P networking, BFT block ordering / leader
-//! election, and a Merkle-ized state trie. Those are later milestones; see
-//! README. Money is integer micro-$COG (no floats), so accounting is exact.
+//! What this layer is NOT (yet): P2P networking and BFT block ordering / leader
+//! election. Those are later milestones; see README. Money is integer
+//! micro-$COG (no floats), so accounting is exact.
 
 pub mod codec;
 pub mod crypto;
 pub mod hash;
 pub mod mempool;
+pub mod merkle;
 pub mod store;
 
 use std::collections::BTreeMap;
@@ -108,6 +110,25 @@ pub struct Account {
     pub slashed_total: u64,
     pub submissions: u64,
     pub accepted: u64,
+}
+
+impl Account {
+    /// Canonical leaf bytes for this account under `id` — the exact preimage a
+    /// light client hashes (via [`merkle::leaf_hash`]) to check an inclusion
+    /// proof against [`ChainState::merkle_root`]. Kept here so a verifier needs
+    /// only the account it was told, not the whole state.
+    pub fn merkle_leaf(&self, id: u64) -> Vec<u8> {
+        let mut e = codec::Enc(Vec::new());
+        e.u64(id);
+        e.raw(&self.pubkey);
+        e.u64(self.balance);
+        e.u64(self.staked_total);
+        e.u64(self.earned_total);
+        e.u64(self.slashed_total);
+        e.u64(self.submissions);
+        e.u64(self.accepted);
+        e.0
+    }
 }
 
 /// The full replicated state. Cloneable so blocks can be applied on a trial copy
@@ -444,6 +465,44 @@ impl ChainState {
         sha256(&e.0)
     }
 
+    /// Authenticated state root: a Merkle commitment to the same accounts
+    /// field as `state_root`, but in the form of a binary tree whose leaves
+    /// can be opened individually. A light client holds only this root and can
+    /// verify any single `Account` (or reviewer entry) it knows by id.
+    ///
+    /// Uses the same canonical `codec::Enc` byte layout for each leaf so the
+    /// Merkle root is content-addressed in lockstep with `state_root`: a change
+    /// to any field flips both, but a change in the *encoding* would flip the
+    /// Merkle root only and break the proof.
+    pub fn merkle_root(&self) -> Hash {
+        merkle::MerkleTree::from_leaf_hashes(self.merkle_leaves()).root()
+    }
+
+    /// Build an inclusion proof for `account_id` against [`Self::merkle_root`].
+    /// Returns `None` if the id is unknown. Leaves are laid out with all
+    /// accounts first, then reviewers, in `BTreeMap` order (deterministic).
+    pub fn account_proof(&self, account_id: u64) -> Option<merkle::Proof> {
+        let ids: Vec<u64> = self.accounts.keys().copied().collect();
+        let index = ids.iter().position(|&k| k == account_id)?;
+        merkle::MerkleTree::from_leaf_hashes(self.merkle_leaves()).proof(index)
+    }
+
+    /// Internal: collect each accounts/reviewers entry as a domain-separated
+    /// leaf hash, in canonical BTreeMap order.
+    fn merkle_leaves(&self) -> Vec<Hash> {
+        let mut leaves = Vec::with_capacity(self.accounts.len() + self.reviewers.len());
+        for (id, a) in &self.accounts {
+            leaves.push(merkle::leaf_hash(&a.merkle_leaf(*id)));
+        }
+        for (id, rep) in &self.reviewers {
+            let mut e = codec::Enc(Vec::new());
+            e.u64(*id);
+            e.f32(*rep);
+            leaves.push(merkle::leaf_hash(&e.0));
+        }
+        leaves
+    }
+
     /// Accounting invariant: every micro-$COG is either in an account balance or
     /// in the treasury (stake escrow is always resolved within a tx). Should
     /// hold after any sequence of blocks.
@@ -689,6 +748,63 @@ mod tests {
         tx.stake += 1; // mutate after signing -> signature no longer matches
         let b = block(&chain, 1, vec![tx]);
         assert!(matches!(chain.commit(&b), Err(ChainError::BadSignature(1))));
+    }
+
+    #[test]
+    fn merkle_root_authenticates_an_account_via_inclusion_proof() {
+        let mut chain = Chain::new(base_genesis());
+        let b = block(&chain, 1, vec![novel_tx(1, 1, 1, 1.0)]);
+        chain.commit(&b).unwrap();
+
+        let root = chain.state.merkle_root();
+        // a light client is told account 1's contents and given a proof
+        let acct = chain.state.accounts.get(&1).unwrap().clone();
+        let proof = chain.state.account_proof(1).unwrap();
+        let leaf = merkle::leaf_hash(&acct.merkle_leaf(1));
+        assert!(merkle::verify(&root, &leaf, &proof));
+    }
+
+    #[test]
+    fn a_tampered_account_value_fails_the_proof() {
+        let chain = Chain::new(base_genesis());
+        let root = chain.state.merkle_root();
+        let proof = chain.state.account_proof(2).unwrap();
+        // claim a fatter balance than the state actually commits to
+        let mut lying = chain.state.accounts.get(&2).unwrap().clone();
+        lying.balance += 1_000 * MICRO;
+        let leaf = merkle::leaf_hash(&lying.merkle_leaf(2));
+        assert!(!merkle::verify(&root, &leaf, &proof));
+    }
+
+    #[test]
+    fn proof_against_a_stale_root_fails_after_state_changes() {
+        let mut chain = Chain::new(base_genesis());
+        let old_root = chain.state.merkle_root();
+        let acct1 = chain.state.accounts.get(&1).unwrap().clone();
+        let old_proof = chain.state.account_proof(1).unwrap();
+        assert!(merkle::verify(
+            &old_root,
+            &merkle::leaf_hash(&acct1.merkle_leaf(1)),
+            &old_proof
+        ));
+
+        // account 1 mints; its leaf (and the root) move
+        let b = block(&chain, 1, vec![novel_tx(1, 1, 1, 1.0)]);
+        chain.commit(&b).unwrap();
+        let new_root = chain.state.merkle_root();
+        assert_ne!(old_root, new_root);
+        // the old (id,account,proof) no longer verifies against the new root
+        assert!(!merkle::verify(
+            &new_root,
+            &merkle::leaf_hash(&acct1.merkle_leaf(1)),
+            &old_proof
+        ));
+    }
+
+    #[test]
+    fn proof_for_unknown_account_is_none() {
+        let chain = Chain::new(base_genesis());
+        assert!(chain.state.account_proof(999).is_none());
     }
 
     #[test]

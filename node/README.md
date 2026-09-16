@@ -1,8 +1,8 @@
-# ZhixingGraph 参考节点（Rust · Milestone 6–9）
+# ZhixingGraph 参考节点（Rust · Milestone 6–10）
 
 对应白皮书 [`docs/WHITEPAPER.md`](../docs/WHITEPAPER.md) §5「PoK 共识」与 §7「技术架构」。
 
-这是把 ΔK 引擎（[`engine/`](../engine/)）与经济仿真（[`sim/`](../sim/)）背后的规则，落成一个**可运行、确定性的 PoK 共识状态机**——真正"跑链"的最小内核：区块、交易、账户、状态转移、铸造/罚没、链上声誉、ed25519 签名交易、追加式持久化、确定性 mempool 出块，以及内容寻址的区块哈希链与状态根。
+这是把 ΔK 引擎（[`engine/`](../engine/)）与经济仿真（[`sim/`](../sim/)）背后的规则，落成一个**可运行、确定性的 PoK 共识状态机**——真正"跑链"的最小内核：区块、交易、账户、状态转移、铸造/罚没、链上声誉、ed25519 签名交易、追加式持久化、确定性 mempool 出块、Merkle 认证状态与轻客户端证明，以及内容寻址的区块哈希链与状态根。
 
 > **共识的前提是确定性**：给定相同的创世与相同的区块序列，每个诚实节点算出**逐字节相同**的状态（`state_root` 一致）。本 crate 就是那个状态转移函数 `apply_block`，其 ΔK 由 `zhixing_engine::compute_delta_k` 计算——与白皮书 B.2.3、Python 仿真是**同一份契约**。
 
@@ -12,9 +12,10 @@
 cd node
 cargo run --release --bin node -- demo             # 内存演示链：创世 → 出块 → 打印
 cargo run --release --bin node -- build            # mempool：乱序投递交易 → 规范排序出块
+cargo run --release --bin node -- prove            # 轻客户端 Merkle 证明：单账户对状态根验证
 cargo run --release --bin node -- run  --dir DIR   # 持久化链：首次落盘演示块，之后重放
 cargo run --release --bin node -- status --dir DIR # 重放区块日志并打印状态
-cargo test --release                               # 26 项单元测试（见下）
+cargo test --release                               # 36 项单元测试（见下）
 ```
 
 演示链展示：新颖提交铸造 $COG、跨域桥接拿到 novelty+bonus（ΔK>1）、近重复/低质提交被**罚没入 treasury**、供应守恒、评审声誉按链上结果升降。
@@ -61,6 +62,19 @@ crypto::{sign_and_verify_roundtrip, tampered_message_fails, wrong_key_fails}
 cargo run --release --bin node -- build   # 乱序投递 3 笔 -> 构造器按 tx 哈希排序 -> 区块哈希与到达顺序无关
 ```
 
+## 认证状态与轻客户端证明（Milestone 10）
+
+`state_root` 之外，节点再对 accounts/reviewers 状态维护一棵**二叉 Merkle 树**（`merkle_root`）。它把"整块状态摘要"升级成**可逐叶打开**的认证结构：轻客户端只持有 `merkle_root`，拿到某个账户的内容 + 一条**包含证明**（`account_proof`）即可验证该账户真属于此状态——无需全量状态。
+
+- **域分隔**：叶 `sha256(0x00‖data)`、内部节点 `sha256(0x01‖left‖right)`，杜绝把叶当内部节点的第二原象攻击。
+- **奇数节点提升而非复制**：末尾落单节点原样上提（避免 CT 式"自我复制"陷阱），证明在该层不记录兄弟。
+- **同一份编码**：叶字节用与 `state_root` 相同的 `codec::Enc` 布局（`Account::merkle_leaf`），两根内容寻址地同步变化；改字段两根都变，改编码只会让证明失配——leaf 契约不漂移。
+- 当前是"每块从全量叶重建"的排序 Merkle 树（对参考节点足够）；生产大状态会换增量更新的 trie。非成员证明不在本里程碑范围。
+
+```bash
+cargo run --release --bin node -- prove   # 验证账户 #1 -> true；把余额谎报大一点 -> false
+```
+
 ## 设计要点
 
 | 主题 | 做法 |
@@ -72,6 +86,7 @@ cargo run --release --bin node -- build   # 乱序投递 3 笔 -> 构造器按 t
 | **链上声誉** | 链上看不到"真实质量"，只能按**已定稿的结果**更新：给通过项打高分者加分，给被拒项打高分者扣分 |
 | **交易认证** | 账户 = 创世登记的 ed25519 公钥；提交须带作者签名，验签通过才处理（M8） |
 | **确定性出块** | mempool 按 tx 哈希规范排序、在克隆上试算后只纳入可提交交易；相同待处理集 + 相同状态 → 逐字节相同区块（M9） |
+| **认证状态** | accounts/reviewers 维护二叉 Merkle 树；轻客户端凭 `merkle_root` + `account_proof` 验证单账户，域分隔 + 奇数提升（M10） |
 | **依赖策略** | 引擎零依赖（可嵌入/WASM）；节点作为应用引入审计过的 `ed25519-dalek` 做签名，绝不自实现密码学 |
 
 ## 测试覆盖
@@ -102,19 +117,30 @@ two_builders_produce_identical_blocks         到达顺序不同 → 区块哈�
 builder_skips_a_tx_that_would_not_apply       余额不够的候选被跳过，区块仍干净提交
 remove_included_clears_committed_txs           已入块交易出池
 empty_pool_builds_nothing / rejects_forged_tx_at_admission
+# Merkle 树（merkle.rs）
+single_leaf_root_is_the_leaf_hash / empty_tree_root_is_zero
+proofs_roundtrip_for_all_sizes_and_indices    1..=17 叶、各下标包含证明往返
+tampered_leaf_fails_verification / proof_from_one_index_does_not_verify_another_leaf
+changing_any_leaf_changes_the_root
+# 认证状态（lib.rs）
+merkle_root_authenticates_an_account_via_inclusion_proof  轻客户端凭证明验证账户
+a_tampered_account_value_fails_the_proof      谎报余额 → 验证失败
+proof_against_a_stale_root_fails_after_state_changes  旧证明对新根失效
+proof_for_unknown_account_is_none
 ```
 
 ## 文件
 
 | 文件 | 作用 |
 |---|---|
-| `src/lib.rs` | 状态机核心：`Block`/`SubmissionTx`/`Account`/`ChainState`/`Chain`、`apply_block`、`replay`、验签、`state_root`、供应守恒不变量 + 测试 |
+| `src/lib.rs` | 状态机核心：`Block`/`SubmissionTx`/`Account`/`ChainState`/`Chain`、`apply_block`、`replay`、验签、`state_root`/`merkle_root`/`account_proof`、供应守恒不变量 + 测试 |
 | `src/mempool.rs` | 确定性 mempool 与出块：内容寻址排序 + 试算式 `build_block` + 测试 |
+| `src/merkle.rs` | 二叉 Merkle 树：域分隔叶/节点、奇数提升、包含证明 `Proof`/`verify` + 测试 |
 | `src/crypto.rs` | ed25519 身份：`Keypair`/`verify`（封装 `ed25519-dalek`）+ 测试 |
 | `src/codec.rs` | 区块的规范二进制编解码（哈希与落盘共用）+ `tx_signing_bytes`/`encode_tx`（签名/tx 哈希字节）+ 测试 |
 | `src/store.rs` | 追加式区块日志（长度前缀记录、残缺尾检测）+ 测试 |
 | `src/hash.rs` | 纯 std SHA-256（FIPS 180-4，含已知向量测试）——离线零依赖 |
-| `src/main.rs` | 节点 CLI：`demo` / `build` / `run` / `status`（含确定性演示密钥） |
+| `src/main.rs` | 节点 CLI：`demo` / `build` / `prove` / `run` / `status`（含确定性演示密钥） |
 
 ## 局限与后续（离生产还差什么）
 
@@ -125,8 +151,8 @@ empty_pool_builds_nothing / rejects_forged_tx_at_admission
 - **BFT 共识与出块权**：谁有权出块、如何对区块达成一致（当前是单一提议者，只做"给定/构造区块→应用"，不含出块权选举/最终性）。→ 引入 Tendermint/HotStuff 类 BFT 或 PoS 出块。
 - **P2P 网络**：交易/区块的 gossip、状态同步。
 - **~~持久化~~**：✅ 已完成（M7，追加式区块日志 + 重放）。后续可换 RocksDB、加 per-record 校验和与 segment 轮转。
-- **Merkle 化状态树**：当前 `state_root` 是全状态摘要，无法做轻客户端证明。→ Merkle Patricia Trie。
+- **~~Merkle 化状态树~~**：✅ 已完成（M10，二叉 Merkle 树 + 账户包含证明）。后续：非成员证明、增量更新的 Merkle-Patricia trie、把 graph/头字段也纳入根。
 - **手写 SHA-256** 仅为离线零依赖演示，**生产必须换审计实现**（`sha2`）。
 - **kNN 暴力扫描**：随图谱增长需换 HNSW/IVF（见 engine 局限）。
 
-这些构成后续里程碑（~~M7 持久化~~ ✅、~~M8 签名~~ ✅、~~M9 mempool 出块~~ ✅、M10 P2P + gossip、M11 BFT 共识……），每步仍遵循"可运行、可测试、契约一致"。
+这些构成后续里程碑（~~M7 持久化~~ ✅、~~M8 签名~~ ✅、~~M9 mempool 出块~~ ✅、~~M10 Merkle 认证状态~~ ✅、M11 P2P + gossip、M12 BFT 共识……），每步仍遵循"可运行、可测试、契约一致"。

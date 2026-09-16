@@ -2,6 +2,7 @@
 //!
 //!   cargo run --release --bin node -- demo             # in-memory demo chain
 //!   cargo run --release --bin node -- build            # mempool builds a block
+//!   cargo run --release --bin node -- prove            # light-client Merkle proof
 //!   cargo run --release --bin node -- run  --dir DIR   # persistent chain (block log)
 //!   cargo run --release --bin node -- status --dir DIR # replay log, print state
 //!
@@ -13,6 +14,7 @@ use std::process::exit;
 
 use zhixing_engine::{DeltaKParams, DIM};
 use zhixing_node::mempool::Mempool;
+use zhixing_node::merkle;
 use zhixing_node::store::BlockLog;
 use zhixing_node::{hex, Block, Chain, Genesis, Keypair, Review, SubmissionTx, MICRO};
 
@@ -111,6 +113,7 @@ fn main() {
     match cmd {
         "demo" => cmd_demo(),
         "build" => cmd_build(),
+        "prove" => cmd_prove(),
         "run" => cmd_run(dir_arg(&args)),
         "status" => cmd_status(dir_arg(&args)),
         "-h" | "--help" | "help" => usage(),
@@ -138,6 +141,7 @@ fn usage() {
     eprintln!("zhixing reference node");
     eprintln!("  node demo               run an in-memory demo chain");
     eprintln!("  node build              feed a mempool (scrambled order) and build one block");
+    eprintln!("  node prove              build+verify a light-client Merkle proof of an account");
     eprintln!("  node run    --dir DIR   persistent chain (seeds demo blocks once, then replays)");
     eprintln!("  node status --dir DIR   replay the block log and print state");
 }
@@ -182,6 +186,34 @@ fn cmd_build() {
     let mut chain = chain;
     commit_print(&mut chain, None, &format!("block {}", blk.height), blk);
     print_summary(&chain);
+}
+
+/// Demonstrate a light-client inclusion proof: run the demo chain, then verify
+/// one account against the Merkle state root using only that account's contents
+/// and a proof — no full state needed.
+fn cmd_prove() {
+    let mut chain = Chain::new(demo_genesis());
+    for blk in demo_blocks(&chain) {
+        chain.commit(&blk).unwrap();
+    }
+    let root = chain.state.merkle_root();
+    println!("merkle_root = {}\n", short(&root));
+
+    let id = 1u64;
+    let acct = chain.state.accounts.get(&id).expect("account exists").clone();
+    let proof = chain.state.account_proof(id).expect("proof exists");
+    let leaf = merkle::leaf_hash(&acct.merkle_leaf(id));
+
+    println!("light client is told: account #{id} balance={} COG", cog(acct.balance));
+    println!("proof: {} sibling hash(es) up to the root", proof.steps.len());
+    let ok = merkle::verify(&root, &leaf, &proof);
+    println!("verify against merkle_root -> {ok}");
+
+    // negative case: a lie about the balance must fail
+    let mut lying = acct.clone();
+    lying.balance += 1_000 * MICRO;
+    let lie = merkle::verify(&root, &merkle::leaf_hash(&lying.merkle_leaf(id)), &proof);
+    println!("verify an inflated balance -> {lie} (must be false)");
 }
 
 fn cmd_run(dir: String) {
@@ -249,6 +281,7 @@ fn print_summary(chain: &Chain) {
     println!("height           {}", chain.state.height);
     println!("head             {}", short(&chain.head));
     println!("state_root       {}", short(&chain.state.state_root()));
+    println!("merkle_root      {}", short(&chain.state.merkle_root()));
     println!("supply           {} COG", cog(chain.state.supply));
     println!("treasury         {} COG", cog(chain.state.treasury));
     println!("graph nodes      {}", chain.state.graph.len());
