@@ -21,3 +21,6 @@ __pycache__/
 # Rust (engine)
 /engine/target/
 **/*.rs.bk
+
+# Rust (node)
+/node/target/

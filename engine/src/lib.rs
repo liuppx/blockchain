@@ -50,6 +50,7 @@ pub struct Submission {
     pub timestamp_days: f32,
 }
 
+#[derive(Clone)]
 pub struct GraphNode {
     pub embedding: Embedding,
     pub domain: u32,
@@ -57,6 +58,7 @@ pub struct GraphNode {
 
 /// Minimal cognitive graph with same-domain kNN and a cross-domain bridge probe.
 /// Nodes are stored in a flat contiguous vector for cache-friendly scans.
+#[derive(Clone)]
 pub struct CognitiveGraph {
     pub nodes: Vec<GraphNode>,
 }

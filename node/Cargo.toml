@@ -1,0 +1,23 @@
+[package]
+name = "zhixing-node"
+version = "0.1.0"
+edition = "2021"
+description = "Reference PoK consensus node for ZhixingGraph: a deterministic state machine over the ΔK engine"
+license = "MIT"
+
+[lib]
+name = "zhixing_node"
+path = "src/lib.rs"
+
+[[bin]]
+name = "node"
+path = "src/main.rs"
+
+# The engine is reused as a plain rlib (no `python` feature, no pyo3): the node
+# builds offline with zero external crates, same policy as the engine.
+[dependencies]
+zhixing-engine = { path = "../engine" }
+
+[profile.release]
+lto = true
+codegen-units = 1

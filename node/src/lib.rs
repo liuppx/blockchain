@@ -1,0 +1,648 @@
+//! Reference PoK consensus node for ZhixingGraph (deterministic state machine).
+//!
+//! This is the on-chain counterpart to the economic simulation (`sim/`) and the
+//! ΔK engine (`engine/`): a *deterministic* state transition function that turns
+//! a block of submissions into minted/slashed $COG, driven by the SAME B.2.3 ΔK
+//! contract (`zhixing_engine::compute_delta_k`). Given identical genesis and
+//! identical blocks, every node computes byte-identical state — the prerequisite
+//! for consensus.
+//!
+//! What this layer IS: block/tx/account types, escrow-staked submissions, ΔK
+//! finalization, mint/slash accounting, on-chain (outcome-based) reviewer
+//! reputation, a content-addressed block hash chain, and a state root.
+//!
+//! What this layer is NOT (yet): P2P networking, BFT block ordering, signatures,
+//! persistence, and a Merkle-ized state trie. Those are later milestones; see
+//! README. Money is integer micro-$COG (no floats), so accounting is exact.
+
+pub mod hash;
+
+use std::collections::BTreeMap;
+
+use zhixing_engine::{compute_delta_k, CognitiveGraph, DeltaKParams, GraphNode, Submission, DIM};
+
+pub use hash::{hex, sha256};
+
+/// 1 $COG == 1_000_000 micro-$COG. All balances are integer micro-$COG.
+pub const MICRO: u64 = 1_000_000;
+
+pub type Hash = [u8; 32];
+pub type Embedding = [f32; DIM];
+
+// --- Transactions ------------------------------------------------------------
+
+/// A reviewer's score for a submission, in [0, 1]. The reviewer's *reputation*
+/// is not carried in the tx — it is read from chain state at apply time.
+#[derive(Clone, Debug)]
+pub struct Review {
+    pub reviewer: u64,
+    pub score: f32,
+}
+
+/// A knowledge submission: the unit of work that PoK mints against.
+#[derive(Clone, Debug)]
+pub struct SubmissionTx {
+    pub author: u64,
+    pub embedding: Embedding,
+    pub domain: u32,
+    /// Escrow staked with the submission, in micro-$COG. Returned on accept,
+    /// slashed to treasury on reject.
+    pub stake: u64,
+    pub reviews: Vec<Review>,
+    pub repl_success: u32,
+    pub repl_total: u32,
+    /// Author-claimed authoring time in days (used for freshness in ΔK).
+    pub timestamp_days: f32,
+}
+
+/// A block: an ordered batch of submissions applied atomically.
+#[derive(Clone, Debug)]
+pub struct Block {
+    pub height: u64,
+    pub prev_hash: Hash,
+    /// Wall-clock of the block in days; becomes `now_days` for ΔK freshness.
+    pub timestamp_days: f32,
+    pub txs: Vec<SubmissionTx>,
+}
+
+impl Block {
+    /// Content-addressed block hash over a canonical byte encoding.
+    pub fn hash(&self) -> Hash {
+        let mut e = Enc::new();
+        e.u64(self.height);
+        e.raw(&self.prev_hash);
+        e.f32(self.timestamp_days);
+        e.u64(self.txs.len() as u64);
+        for t in &self.txs {
+            e.u64(t.author);
+            e.emb(&t.embedding);
+            e.u32(t.domain);
+            e.u64(t.stake);
+            e.u64(t.reviews.len() as u64);
+            for r in &t.reviews {
+                e.u64(r.reviewer);
+                e.f32(r.score);
+            }
+            e.u32(t.repl_success);
+            e.u32(t.repl_total);
+            e.f32(t.timestamp_days);
+        }
+        sha256(&e.0)
+    }
+}
+
+// --- State -------------------------------------------------------------------
+
+#[derive(Clone, Debug, Default)]
+pub struct Account {
+    pub balance: u64,
+    pub staked_total: u64,
+    pub earned_total: u64,
+    pub slashed_total: u64,
+    pub submissions: u64,
+    pub accepted: u64,
+}
+
+/// The full replicated state. Cloneable so blocks can be applied on a trial copy
+/// and rolled back atomically if any tx is invalid.
+#[derive(Clone)]
+pub struct ChainState {
+    pub accounts: BTreeMap<u64, Account>,
+    pub reviewers: BTreeMap<u64, f32>, // reviewer id -> reputation
+    pub graph: CognitiveGraph,
+    pub params: DeltaKParams,
+    /// micro-$COG minted per unit ΔK (governance knob, B.2.3 / §5.1).
+    pub base_emission_micro: u64,
+    /// Fraction of stake slashed on reject, in basis points (10000 = 100%).
+    pub slash_bps: u32,
+    pub supply: u64,   // total $COG in existence (micro)
+    pub treasury: u64, // slashed stake pool (redistributed, not burned)
+    pub height: u64,
+    pub now_days: f32,
+}
+
+/// Genesis configuration.
+pub struct Genesis {
+    pub accounts: Vec<(u64, u64)>,          // (id, endowment micro-$COG)
+    pub reviewers: Vec<(u64, f32)>,         // (id, initial reputation)
+    pub seed_nodes: Vec<(Embedding, u32)>,  // pre-existing graph nodes
+    pub params: DeltaKParams,
+    pub base_emission_micro: u64,
+    pub slash_bps: u32,
+    pub timestamp_days: f32,
+}
+
+#[derive(Clone, Debug)]
+pub enum ChainError {
+    BadHeight { expected: u64, got: u64 },
+    BadPrevHash,
+    UnknownAccount(u64),
+    UnknownReviewer(u64),
+    InsufficientBalance { account: u64, need: u64, have: u64 },
+    BadScore { reviewer: u64, score: f32 },
+    EmptyReviews(u64),
+}
+
+impl std::fmt::Display for ChainError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ChainError::BadHeight { expected, got } => {
+                write!(f, "bad height: expected {expected}, got {got}")
+            }
+            ChainError::BadPrevHash => write!(f, "prev_hash does not match head"),
+            ChainError::UnknownAccount(a) => write!(f, "unknown account {a}"),
+            ChainError::UnknownReviewer(r) => write!(f, "unknown reviewer {r}"),
+            ChainError::InsufficientBalance { account, need, have } => write!(
+                f,
+                "account {account} cannot stake {need} (has {have})"
+            ),
+            ChainError::BadScore { reviewer, score } => {
+                write!(f, "reviewer {reviewer} score {score} out of [0,1]")
+            }
+            ChainError::EmptyReviews(a) => write!(f, "submission by {a} has no reviews"),
+        }
+    }
+}
+
+impl std::error::Error for ChainError {}
+
+// --- Receipts ----------------------------------------------------------------
+
+#[derive(Clone, Debug)]
+pub struct TxReceipt {
+    pub author: u64,
+    pub accepted: bool,
+    pub delta_k: f32,
+    pub minted: u64,
+    pub slashed: u64,
+}
+
+#[derive(Clone, Debug)]
+pub struct BlockReceipt {
+    pub height: u64,
+    pub hash: Hash,
+    pub minted: u64,
+    pub slashed: u64,
+    pub accepted: usize,
+    pub rejected: usize,
+    pub txs: Vec<TxReceipt>,
+}
+
+impl ChainState {
+    /// Build genesis state; returns the state and the genesis block hash (which
+    /// becomes the head every honest node starts from).
+    pub fn genesis(g: Genesis) -> (ChainState, Hash) {
+        let mut accounts = BTreeMap::new();
+        let mut supply = 0u64;
+        for (id, endow) in g.accounts {
+            supply = supply.saturating_add(endow);
+            accounts.insert(
+                id,
+                Account {
+                    balance: endow,
+                    ..Default::default()
+                },
+            );
+        }
+        let reviewers: BTreeMap<u64, f32> = g.reviewers.into_iter().collect();
+        let mut graph = CognitiveGraph::new();
+        for (emb, dom) in g.seed_nodes {
+            graph.add(GraphNode {
+                embedding: emb,
+                domain: dom,
+            });
+        }
+        let state = ChainState {
+            accounts,
+            reviewers,
+            graph,
+            params: g.params,
+            base_emission_micro: g.base_emission_micro,
+            slash_bps: g.slash_bps,
+            supply,
+            treasury: 0,
+            height: 0,
+            now_days: g.timestamp_days,
+        };
+        // genesis "block" hash: height 0, zero prev, no txs
+        let gh = Block {
+            height: 0,
+            prev_hash: [0u8; 32],
+            timestamp_days: g.timestamp_days,
+            txs: Vec::new(),
+        }
+        .hash();
+        (state, gh)
+    }
+
+    /// Apply a block, mutating self. On `Err` self may be partially mutated —
+    /// callers wanting atomicity should apply to a clone (see [`Chain::commit`]).
+    pub fn apply_block(&mut self, block: &Block) -> Result<BlockReceipt, ChainError> {
+        if block.height != self.height + 1 {
+            return Err(ChainError::BadHeight {
+                expected: self.height + 1,
+                got: block.height,
+            });
+        }
+        self.now_days = block.timestamp_days;
+
+        let mut receipts = Vec::with_capacity(block.txs.len());
+        let mut minted_total = 0u64;
+        let mut slashed_total = 0u64;
+        let mut n_accept = 0usize;
+        let mut n_reject = 0usize;
+
+        for tx in &block.txs {
+            let r = self.apply_tx(tx)?;
+            minted_total += r.minted;
+            slashed_total += r.slashed;
+            if r.accepted {
+                n_accept += 1;
+            } else {
+                n_reject += 1;
+            }
+            receipts.push(r);
+        }
+
+        self.height = block.height;
+        Ok(BlockReceipt {
+            height: block.height,
+            hash: block.hash(),
+            minted: minted_total,
+            slashed: slashed_total,
+            accepted: n_accept,
+            rejected: n_reject,
+            txs: receipts,
+        })
+    }
+
+    fn apply_tx(&mut self, tx: &SubmissionTx) -> Result<TxReceipt, ChainError> {
+        // -- validate --------------------------------------------------------
+        if tx.reviews.is_empty() {
+            return Err(ChainError::EmptyReviews(tx.author));
+        }
+        for r in &tx.reviews {
+            if !(0.0..=1.0).contains(&r.score) {
+                return Err(ChainError::BadScore {
+                    reviewer: r.reviewer,
+                    score: r.score,
+                });
+            }
+            if !self.reviewers.contains_key(&r.reviewer) {
+                return Err(ChainError::UnknownReviewer(r.reviewer));
+            }
+        }
+        let bal = self
+            .accounts
+            .get(&tx.author)
+            .ok_or(ChainError::UnknownAccount(tx.author))?
+            .balance;
+        if bal < tx.stake {
+            return Err(ChainError::InsufficientBalance {
+                account: tx.author,
+                need: tx.stake,
+                have: bal,
+            });
+        }
+
+        // -- escrow stake ----------------------------------------------------
+        {
+            let acct = self.accounts.get_mut(&tx.author).unwrap();
+            acct.balance -= tx.stake;
+            acct.staked_total += tx.stake;
+            acct.submissions += 1;
+        }
+
+        // -- ΔK via the shared B.2.3 contract --------------------------------
+        let reviews_engine: Vec<(f32, f32)> = tx
+            .reviews
+            .iter()
+            .map(|r| (*self.reviewers.get(&r.reviewer).unwrap(), r.score))
+            .collect();
+        let sub = Submission {
+            embedding: tx.embedding,
+            domain: tx.domain,
+            timestamp_days: tx.timestamp_days,
+        };
+        let dk = compute_delta_k(
+            &sub,
+            &self.graph,
+            &reviews_engine,
+            (tx.repl_success, tx.repl_total),
+            &self.params,
+            self.now_days,
+        );
+
+        // -- finalize: mint or slash ----------------------------------------
+        let (minted, slashed, accepted);
+        if dk > 0.0 {
+            let reward = ((self.base_emission_micro as f64) * (dk as f64)).round() as u64;
+            {
+                let acct = self.accounts.get_mut(&tx.author).unwrap();
+                acct.balance += tx.stake + reward; // escrow returned + reward
+                acct.earned_total += reward;
+                acct.accepted += 1;
+            }
+            self.supply += reward;
+            self.graph.add(GraphNode {
+                embedding: tx.embedding,
+                domain: tx.domain,
+            });
+            self.reward_reviewers(&tx.reviews, true);
+            minted = reward;
+            slashed = 0;
+            accepted = true;
+        } else {
+            let slash = ((tx.stake as u128 * self.slash_bps as u128) / 10_000) as u64;
+            {
+                let acct = self.accounts.get_mut(&tx.author).unwrap();
+                acct.balance += tx.stake - slash; // remainder returned
+                acct.slashed_total += slash;
+            }
+            self.treasury += slash; // redistributed, not burned (supply-neutral)
+            self.reward_reviewers(&tx.reviews, false);
+            minted = 0;
+            slashed = slash;
+            accepted = false;
+        }
+
+        Ok(TxReceipt {
+            author: tx.author,
+            accepted,
+            delta_k: dk,
+            minted,
+            slashed,
+        })
+    }
+
+    /// Outcome-based reputation update: on-chain we cannot see "true quality",
+    /// only the finalized decision. Reviewers who scored high on an accepted
+    /// item gain; reviewers who scored high on a rejected item lose.
+    fn reward_reviewers(&mut self, reviews: &[Review], accepted: bool) {
+        for r in reviews {
+            if let Some(rep) = self.reviewers.get_mut(&r.reviewer) {
+                let delta = if accepted {
+                    if r.score > 0.6 { 0.02 } else { -0.005 }
+                } else if r.score > 0.6 {
+                    -0.03
+                } else {
+                    0.01
+                };
+                *rep = (*rep + delta).max(0.05);
+            }
+        }
+    }
+
+    /// Deterministic state root: SHA-256 over a canonical digest of all state.
+    pub fn state_root(&self) -> Hash {
+        let mut e = Enc::new();
+        e.u64(self.height);
+        e.u64(self.supply);
+        e.u64(self.treasury);
+        e.u64(self.accounts.len() as u64);
+        for (id, a) in &self.accounts {
+            e.u64(*id);
+            e.u64(a.balance);
+            e.u64(a.staked_total);
+            e.u64(a.earned_total);
+            e.u64(a.slashed_total);
+            e.u64(a.submissions);
+            e.u64(a.accepted);
+        }
+        e.u64(self.reviewers.len() as u64);
+        for (id, rep) in &self.reviewers {
+            e.u64(*id);
+            e.f32(*rep);
+        }
+        e.u64(self.graph.len() as u64);
+        for n in &self.graph.nodes {
+            e.emb(&n.embedding);
+            e.u32(n.domain);
+        }
+        sha256(&e.0)
+    }
+
+    /// Accounting invariant: every micro-$COG is either in an account balance or
+    /// in the treasury (stake escrow is always resolved within a tx). Should
+    /// hold after any sequence of blocks.
+    pub fn supply_conserved(&self) -> bool {
+        let held: u128 =
+            self.accounts.values().map(|a| a.balance as u128).sum::<u128>() + self.treasury as u128;
+        held == self.supply as u128
+    }
+}
+
+// --- Chain: hash-linked sequence of blocks over the state --------------------
+
+pub struct Chain {
+    pub state: ChainState,
+    pub head: Hash,
+    pub genesis_hash: Hash,
+    pub block_hashes: Vec<Hash>,
+}
+
+impl Chain {
+    pub fn new(g: Genesis) -> Self {
+        let (state, gh) = ChainState::genesis(g);
+        Chain {
+            state,
+            head: gh,
+            genesis_hash: gh,
+            block_hashes: vec![gh],
+        }
+    }
+
+    /// Validate and commit a block atomically: the block must extend `head`, and
+    /// the whole block is applied on a trial clone so a single invalid tx rolls
+    /// the entire block back (no partial state).
+    pub fn commit(&mut self, block: &Block) -> Result<BlockReceipt, ChainError> {
+        if block.prev_hash != self.head {
+            return Err(ChainError::BadPrevHash);
+        }
+        let mut trial = self.state.clone();
+        let receipt = trial.apply_block(block)?;
+        self.state = trial;
+        self.head = receipt.hash;
+        self.block_hashes.push(receipt.hash);
+        Ok(receipt)
+    }
+}
+
+// --- canonical byte encoder (deterministic hashing) --------------------------
+
+struct Enc(Vec<u8>);
+
+impl Enc {
+    fn new() -> Self {
+        Enc(Vec::new())
+    }
+    fn raw(&mut self, b: &[u8]) {
+        self.0.extend_from_slice(b);
+    }
+    fn u32(&mut self, v: u32) {
+        self.0.extend_from_slice(&v.to_be_bytes());
+    }
+    fn u64(&mut self, v: u64) {
+        self.0.extend_from_slice(&v.to_be_bytes());
+    }
+    fn f32(&mut self, v: f32) {
+        // hash the bit pattern; canonicalize NaN so equal states hash equal
+        let bits = if v.is_nan() { 0x7fc0_0000 } else { v.to_bits() };
+        self.0.extend_from_slice(&bits.to_be_bytes());
+    }
+    fn emb(&mut self, e: &Embedding) {
+        for x in e {
+            self.f32(*x);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn unit(x: f32, d: usize) -> Embedding {
+        let mut e = [0.0f32; DIM];
+        e[d] = x;
+        e
+    }
+
+    fn base_genesis() -> Genesis {
+        Genesis {
+            accounts: vec![(1, 30 * MICRO), (2, 30 * MICRO), (3, 30 * MICRO)],
+            reviewers: vec![(10, 1.0), (11, 1.0), (12, 1.0)],
+            seed_nodes: vec![(unit(1.0, 0), 0)], // domain 0 already occupied
+            params: DeltaKParams::default(),
+            base_emission_micro: 8 * MICRO,
+            slash_bps: 10_000,
+            timestamp_days: 0.0,
+        }
+    }
+
+    fn good_reviews() -> Vec<Review> {
+        vec![
+            Review { reviewer: 10, score: 0.9 },
+            Review { reviewer: 11, score: 0.85 },
+            Review { reviewer: 12, score: 0.9 },
+        ]
+    }
+
+    fn novel_tx(author: u64, domain: u32, dim: usize, day: f32) -> SubmissionTx {
+        SubmissionTx {
+            author,
+            embedding: unit(1.0, dim),
+            domain,
+            stake: 2 * MICRO,
+            reviews: good_reviews(),
+            repl_success: 3,
+            repl_total: 3,
+            timestamp_days: day,
+        }
+    }
+
+    fn block(chain: &Chain, height: u64, txs: Vec<SubmissionTx>) -> Block {
+        Block {
+            height,
+            prev_hash: chain.head,
+            timestamp_days: height as f32,
+            txs,
+        }
+    }
+
+    #[test]
+    fn novel_submission_mints_and_conserves_supply() {
+        let mut chain = Chain::new(base_genesis());
+        let start_supply = chain.state.supply;
+        let b = block(&chain, 1, vec![novel_tx(1, 1, 1, 1.0)]); // fresh domain 1
+        let r = chain.commit(&b).unwrap();
+        assert_eq!(r.accepted, 1);
+        assert!(r.minted > 0);
+        assert!(chain.state.supply > start_supply); // reward minted
+        assert!(chain.state.supply_conserved());
+    }
+
+    #[test]
+    fn near_duplicate_is_slashed_to_treasury() {
+        let mut chain = Chain::new(base_genesis());
+        // domain 0 already has unit(1.0,0); resubmit the same -> novelty 0 -> ΔK 0
+        let dup = SubmissionTx {
+            author: 1,
+            embedding: unit(1.0, 0),
+            domain: 0,
+            stake: 2 * MICRO,
+            reviews: good_reviews(),
+            repl_success: 3,
+            repl_total: 3,
+            timestamp_days: 1.0,
+        };
+        let b = block(&chain, 1, vec![dup]);
+        let r = chain.commit(&b).unwrap();
+        assert_eq!(r.rejected, 1);
+        assert_eq!(r.minted, 0);
+        assert_eq!(chain.state.treasury, 2 * MICRO); // whole stake slashed
+        assert!(chain.state.supply_conserved());
+    }
+
+    #[test]
+    fn deterministic_replay_same_state_root() {
+        let build = || {
+            let mut chain = Chain::new(base_genesis());
+            let b1 = block(&chain, 1, vec![novel_tx(1, 1, 1, 1.0)]);
+            chain.commit(&b1).unwrap();
+            let b2 = block(&chain, 2, vec![novel_tx(2, 2, 2, 2.0)]);
+            chain.commit(&b2).unwrap();
+            chain
+        };
+        let a = build();
+        let b = build();
+        assert_eq!(a.head, b.head);
+        assert_eq!(a.state.state_root(), b.state.state_root());
+    }
+
+    #[test]
+    fn tampering_a_tx_changes_the_block_hash() {
+        let chain = Chain::new(base_genesis());
+        let b = block(&chain, 1, vec![novel_tx(1, 1, 1, 1.0)]);
+        let h1 = b.hash();
+        let mut b2 = b.clone();
+        b2.txs[0].stake += 1;
+        assert_ne!(h1, b2.hash());
+    }
+
+    #[test]
+    fn wrong_prev_hash_is_rejected() {
+        let mut chain = Chain::new(base_genesis());
+        let mut b = block(&chain, 1, vec![novel_tx(1, 1, 1, 1.0)]);
+        b.prev_hash = [9u8; 32];
+        assert!(matches!(chain.commit(&b), Err(ChainError::BadPrevHash)));
+    }
+
+    #[test]
+    fn invalid_tx_rolls_back_whole_block() {
+        let mut chain = Chain::new(base_genesis());
+        let root_before = chain.state.state_root();
+        // second tx references unknown account -> whole block must roll back
+        let bad = SubmissionTx {
+            author: 999,
+            ..novel_tx(1, 3, 3, 1.0)
+        };
+        let b = block(&chain, 1, vec![novel_tx(1, 1, 1, 1.0), bad]);
+        assert!(chain.commit(&b).is_err());
+        assert_eq!(chain.state.state_root(), root_before); // unchanged
+        assert_eq!(chain.state.height, 0);
+    }
+
+    #[test]
+    fn cannot_stake_more_than_balance() {
+        let mut chain = Chain::new(base_genesis());
+        let broke = SubmissionTx {
+            stake: 1_000 * MICRO,
+            ..novel_tx(1, 1, 1, 1.0)
+        };
+        let b = block(&chain, 1, vec![broke]);
+        assert!(matches!(
+            chain.commit(&b),
+            Err(ChainError::InsufficientBalance { .. })
+        ));
+    }
+}
