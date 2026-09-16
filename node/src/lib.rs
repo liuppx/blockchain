@@ -205,6 +205,39 @@ impl std::fmt::Display for ChainError {
 
 impl std::error::Error for ChainError {}
 
+/// Error from replaying a chain *with finality re-verification*
+/// ([`Chain::replay_verified`]). Distinguishes a state-transition failure from a
+/// certificate that does not finalize the block it accompanies.
+#[derive(Debug)]
+pub enum ReplayError {
+    /// A block failed to apply (bad height/prev-hash/tx) — see [`ChainError`].
+    Chain(ChainError),
+    /// A block's certificate is not a valid > 2/3 quorum for the validator set.
+    Consensus(consensus::ConsensusError),
+    /// The certificate at this height does not bind the block it accompanies
+    /// (wrong height or block hash) — a certificate for some *other* block.
+    CertificateMismatch { height: u64 },
+    /// The block log and certificate log have different lengths.
+    CountMismatch { blocks: usize, certs: usize },
+}
+
+impl std::fmt::Display for ReplayError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ReplayError::Chain(e) => write!(f, "replay: {e}"),
+            ReplayError::Consensus(e) => write!(f, "finality: {e}"),
+            ReplayError::CertificateMismatch { height } => {
+                write!(f, "certificate at height {height} does not bind its block")
+            }
+            ReplayError::CountMismatch { blocks, certs } => {
+                write!(f, "have {blocks} block(s) but {certs} certificate(s)")
+            }
+        }
+    }
+}
+
+impl std::error::Error for ReplayError {}
+
 // --- Receipts ----------------------------------------------------------------
 
 #[derive(Clone, Debug)]
@@ -564,6 +597,42 @@ impl Chain {
         let mut chain = Chain::new(genesis);
         for b in blocks {
             chain.commit(b)?;
+        }
+        Ok(chain)
+    }
+
+    /// Replay `blocks` *and re-verify finality*: for each height the accompanying
+    /// certificate in `certs` must be a valid > 2/3 quorum (`Commit::verify`
+    /// against `vset`) that binds exactly this block (matching height and hash),
+    /// before the block is applied. Where [`Self::replay`] recovers deterministic
+    /// *state*, this recovers *finality* — a restarted node (or a following light
+    /// client) re-establishes that every block was finalized by a super-majority,
+    /// not merely that it re-derives the same bytes. A dropped, swapped, or forged
+    /// certificate is rejected here even though the block itself is well-formed.
+    ///
+    /// The validator set is supplied by the caller (a network constant here;
+    /// on-chain/dynamic validator sets are a later milestone).
+    pub fn replay_verified(
+        genesis: Genesis,
+        blocks: &[Block],
+        certs: &[consensus::Commit],
+        vset: &validator::ValidatorSet,
+    ) -> Result<Self, ReplayError> {
+        if blocks.len() != certs.len() {
+            return Err(ReplayError::CountMismatch {
+                blocks: blocks.len(),
+                certs: certs.len(),
+            });
+        }
+        let mut chain = Chain::new(genesis);
+        for (b, c) in blocks.iter().zip(certs.iter()) {
+            // the certificate must finalize *this* block, not some other one
+            if c.height != b.height || c.block_hash != b.hash() {
+                return Err(ReplayError::CertificateMismatch { height: b.height });
+            }
+            // ...and be a real super-majority under the validator set
+            c.verify(vset).map_err(ReplayError::Consensus)?;
+            chain.commit(b).map_err(ReplayError::Chain)?;
         }
         Ok(chain)
     }

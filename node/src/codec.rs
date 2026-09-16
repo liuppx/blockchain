@@ -4,6 +4,7 @@
 //! (b) the on-disk block log, so a block's hash covers exactly the bytes that
 //! were persisted. Big-endian, length-prefixed, no external serialization crate.
 
+use crate::consensus::{Commit, Vote, VoteType};
 use crate::{Block, Embedding, Review, SubmissionTx};
 use zhixing_engine::DIM;
 
@@ -12,6 +13,7 @@ pub enum CodecError {
     UnexpectedEof,
     TrailingBytes,
     TooManyItems(u64),
+    BadEnum(u32),
 }
 
 impl std::fmt::Display for CodecError {
@@ -20,6 +22,7 @@ impl std::fmt::Display for CodecError {
             CodecError::UnexpectedEof => write!(f, "unexpected end of input"),
             CodecError::TrailingBytes => write!(f, "trailing bytes after block"),
             CodecError::TooManyItems(n) => write!(f, "implausible item count {n}"),
+            CodecError::BadEnum(v) => write!(f, "invalid enum discriminant {v}"),
         }
     }
 }
@@ -75,6 +78,67 @@ fn enc_tx(e: &mut Enc, t: &SubmissionTx, include_sig: bool) {
     if include_sig {
         e.raw(&t.signature);
     }
+}
+
+// --- commit certificates -----------------------------------------------------
+
+/// Canonical bytes of a finality certificate ([`Commit`]) — used to persist
+/// certificates alongside blocks so a replaying node can re-verify finality
+/// (not just re-derive state). Same big-endian, length-prefixed layout.
+pub fn encode_commit(c: &Commit) -> Vec<u8> {
+    let mut e = Enc(Vec::new());
+    e.u64(c.height);
+    e.u32(c.round);
+    e.raw(&c.block_hash);
+    e.u64(c.precommits.len() as u64);
+    for v in &c.precommits {
+        e.u64(v.validator);
+        e.u64(v.height);
+        e.u32(v.round);
+        e.raw(&v.block_hash);
+        e.u32(v.vote_type.tag() as u32);
+        e.raw(&v.signature);
+    }
+    e.0
+}
+
+pub fn decode_commit(buf: &[u8]) -> Result<Commit, CodecError> {
+    let mut d = Dec { buf, pos: 0 };
+    let height = d.u64()?;
+    let round = d.u32()?;
+    let mut block_hash = [0u8; 32];
+    block_hash.copy_from_slice(d.take(32)?);
+    let n = d.count()?;
+    let mut precommits = Vec::with_capacity(n as usize);
+    for _ in 0..n {
+        let validator = d.u64()?;
+        let v_height = d.u64()?;
+        let v_round = d.u32()?;
+        let mut v_hash = [0u8; 32];
+        v_hash.copy_from_slice(d.take(32)?);
+        let tag = d.u32()?;
+        let vote_type =
+            VoteType::from_tag(tag as u8).ok_or(CodecError::BadEnum(tag))?;
+        let mut signature = [0u8; 64];
+        signature.copy_from_slice(d.take(64)?);
+        precommits.push(Vote {
+            validator,
+            height: v_height,
+            round: v_round,
+            block_hash: v_hash,
+            vote_type,
+            signature,
+        });
+    }
+    if d.pos != d.buf.len() {
+        return Err(CodecError::TrailingBytes);
+    }
+    Ok(Commit {
+        height,
+        round,
+        block_hash,
+        precommits,
+    })
 }
 
 pub(crate) struct Enc(pub Vec<u8>);
@@ -241,5 +305,47 @@ mod tests {
         let mut bytes = encode_block(&sample_block());
         bytes.push(0);
         assert!(matches!(decode_block(&bytes), Err(CodecError::TrailingBytes)));
+    }
+
+    #[test]
+    fn commit_round_trip() {
+        use crate::consensus::{Vote, VoteType};
+        use crate::Keypair;
+
+        let mut seed = [0u8; 32];
+        seed[0] = 9;
+        let kp = Keypair::from_seed(seed);
+        let bh = [3u8; 32];
+        let commit = crate::consensus::Commit {
+            height: 42,
+            round: 2,
+            block_hash: bh,
+            precommits: vec![
+                Vote::signed(21, 42, 2, bh, VoteType::Precommit, &kp),
+                Vote::signed(22, 42, 2, bh, VoteType::Precommit, &kp),
+            ],
+        };
+        let bytes = encode_commit(&commit);
+        let back = decode_commit(&bytes).unwrap();
+        assert_eq!(encode_commit(&back), bytes); // stable re-encoding
+        assert_eq!(back.height, 42);
+        assert_eq!(back.round, 2);
+        assert_eq!(back.block_hash, bh);
+        assert_eq!(back.precommits.len(), 2);
+        assert_eq!(back.precommits[1].validator, 22);
+        assert_eq!(back.precommits[0].signature, commit.precommits[0].signature);
+    }
+
+    #[test]
+    fn decode_commit_rejects_trailing_bytes() {
+        let commit = crate::consensus::Commit {
+            height: 1,
+            round: 0,
+            block_hash: [0u8; 32],
+            precommits: Vec::new(),
+        };
+        let mut bytes = encode_commit(&commit);
+        bytes.push(0);
+        assert!(matches!(decode_commit(&bytes), Err(CodecError::TrailingBytes)));
     }
 }

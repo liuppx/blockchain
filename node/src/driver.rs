@@ -63,6 +63,9 @@ pub struct ChainDriver {
     /// Validator signing-key seeds. Keypairs are not clonable, so the driver
     /// holds seeds and rebuilds the keypair map for each height's `Sim`.
     seeds: BTreeMap<u64, [u8; 32]>,
+    /// Each committed block, in height order — retained so the chain can be
+    /// persisted (block log) alongside its certificates.
+    blocks: Vec<Block>,
     /// One finality certificate per committed height, in order.
     certs: Vec<Commit>,
 }
@@ -79,6 +82,7 @@ impl ChainDriver {
             mempool: Mempool::new(max_txs),
             vset,
             seeds,
+            blocks: Vec::new(),
             certs: Vec::new(),
         }
     }
@@ -99,6 +103,12 @@ impl ChainDriver {
     /// The finality certificates of every committed height, in order.
     pub fn certificates(&self) -> &[Commit] {
         &self.certs
+    }
+
+    /// Every committed block, in height order — pair with [`Self::certificates`]
+    /// (same order and length) to persist the certified chain.
+    pub fn blocks(&self) -> &[Block] {
+        &self.blocks
     }
 
     fn keys(&self) -> BTreeMap<u64, Keypair> {
@@ -144,6 +154,7 @@ impl ChainDriver {
         }
 
         self.apply(&candidate)?;
+        self.blocks.push(candidate);
         self.certs.push(commit.clone());
         Ok(Some(commit))
     }
@@ -323,5 +334,71 @@ mod tests {
         let ha: Vec<Hash> = a.certificates().iter().map(|c| c.block_hash).collect();
         let hb: Vec<Hash> = b.certificates().iter().map(|c| c.block_hash).collect();
         assert_eq!(ha, hb);
+    }
+
+    #[test]
+    fn retains_blocks_paired_with_certificates() {
+        let mut d = seeded_driver();
+        d.produce_until_drained(1.0, 10).unwrap();
+        assert_eq!(d.blocks().len(), d.certificates().len());
+        // each retained block is exactly the one its certificate finalizes
+        for (b, c) in d.blocks().iter().zip(d.certificates()) {
+            assert_eq!(b.height, c.height);
+            assert_eq!(b.hash(), c.block_hash);
+        }
+    }
+
+    #[test]
+    fn persisted_certified_chain_reverifies_finality() {
+        let (vset, _) = validators();
+        let mut d = seeded_driver();
+        d.produce_until_drained(1.0, 10).unwrap();
+
+        // replay the retained (blocks, certs) re-verifying every height's quorum
+        let replayed =
+            Chain::replay_verified(genesis(), d.blocks(), d.certificates(), &vset).unwrap();
+        assert_eq!(replayed.head, d.head());
+        assert_eq!(replayed.state.state_root(), d.chain.state.state_root());
+    }
+
+    #[test]
+    fn replay_rejects_a_forged_certificate() {
+        let (vset, _) = validators();
+        let mut d = seeded_driver();
+        d.produce_until_drained(1.0, 10).unwrap();
+
+        // tamper: point the first certificate at a different block hash
+        let mut certs = d.certificates().to_vec();
+        certs[0].block_hash = [0xabu8; 32];
+        let r = Chain::replay_verified(genesis(), d.blocks(), &certs, &vset);
+        assert!(matches!(
+            r,
+            Err(crate::ReplayError::CertificateMismatch { height: 1 })
+        ));
+    }
+
+    #[test]
+    fn replay_rejects_a_dropped_certificate() {
+        let (vset, _) = validators();
+        let mut d = seeded_driver();
+        d.produce_until_drained(1.0, 10).unwrap();
+
+        // a certificate goes missing -> counts no longer line up
+        let certs = &d.certificates()[..d.certificates().len() - 1];
+        let r = Chain::replay_verified(genesis(), d.blocks(), certs, &vset);
+        assert!(matches!(r, Err(crate::ReplayError::CountMismatch { .. })));
+    }
+
+    #[test]
+    fn replay_rejects_a_certificate_below_quorum() {
+        let (vset, _) = validators();
+        let mut d = seeded_driver();
+        d.produce_until_drained(1.0, 10).unwrap();
+
+        // strip the first cert down to a single precommit -> not > 2/3 power
+        let mut certs = d.certificates().to_vec();
+        certs[0].precommits.truncate(1);
+        let r = Chain::replay_verified(genesis(), d.blocks(), &certs, &vset);
+        assert!(matches!(r, Err(crate::ReplayError::Consensus(_))));
     }
 }

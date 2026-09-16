@@ -1,8 +1,8 @@
-# ZhixingGraph 参考节点（Rust · Milestone 6–13）
+# ZhixingGraph 参考节点（Rust · Milestone 6–14）
 
 对应白皮书 [`docs/WHITEPAPER.md`](../docs/WHITEPAPER.md) §5「PoK 共识」与 §7「技术架构」。
 
-这是把 ΔK 引擎（[`engine/`](../engine/)）与经济仿真（[`sim/`](../sim/)）背后的规则，落成一个**可运行、确定性的 PoK 共识状态机**——真正"跑链"的最小内核：区块、交易、账户、状态转移、铸造/罚没、链上声誉、ed25519 签名交易、追加式持久化、确定性 mempool 出块、Merkle 认证状态与轻客户端证明、BFT 最终性证书与验证人集、驱动活性的 BFT 轮次状态机（超时 / 锁定 / 换轮）、逐高度生长的**BFT 认证链**（mempool → 共识 → 提交，每块附可验证证书），以及内容寻址的区块哈希链与状态根。
+这是把 ΔK 引擎（[`engine/`](../engine/)）与经济仿真（[`sim/`](../sim/)）背后的规则，落成一个**可运行、确定性的 PoK 共识状态机**——真正"跑链"的最小内核：区块、交易、账户、状态转移、铸造/罚没、链上声誉、ed25519 签名交易、追加式持久化、确定性 mempool 出块、Merkle 认证状态与轻客户端证明、BFT 最终性证书与验证人集、驱动活性的 BFT 轮次状态机（超时 / 锁定 / 换轮）、逐高度生长的**BFT 认证链**（mempool → 共识 → 提交，每块附可验证证书）、**证书落盘 + 重放即最终性复验**（`blocks.log` + `certs.log`，重放时逐高度复验 > 2/3 证书，恢复的是*最终性*而非仅状态），以及内容寻址的区块哈希链与状态根。
 
 > **共识的前提是确定性**：给定相同的创世与相同的区块序列，每个诚实节点算出**逐字节相同**的状态（`state_root` 一致）。本 crate 就是那个状态转移函数 `apply_block`，其 ΔK 由 `zhixing_engine::compute_delta_k` 计算——与白皮书 B.2.3、Python 仿真是**同一份契约**。
 
@@ -16,9 +16,10 @@ cargo run --release --bin node -- prove            # 轻客户端 Merkle 证明�
 cargo run --release --bin node -- bft              # BFT：4 验证人对区块出具可验证的最终性证书
 cargo run --release --bin node -- live             # BFT 活性：轮次状态机驱动出块（含提议人宕机换轮）
 cargo run --release --bin node -- chain            # BFT 认证链：mempool → 共识 → 提交，逐高度生长
+cargo run --release --bin node -- certs  --dir DIR # 证书落盘：产出认证链→落盘 blocks/certs→重放复验最终性
 cargo run --release --bin node -- run  --dir DIR   # 持久化链：首次落盘演示块，之后重放
 cargo run --release --bin node -- status --dir DIR # 重放区块日志并打印状态
-cargo test --release                               # 61 项单元测试（见下）
+cargo test --release                               # 70 项单元测试（见下）
 ```
 
 演示链展示：新颖提交铸造 $COG、跨域桥接拿到 novelty+bonus（ΔK>1）、近重复/低质提交被**罚没入 treasury**、供应守恒、评审声誉按链上结果升降。
@@ -120,6 +121,22 @@ cargo run --release --bin node -- live   # 全诚实：round 0 出块；提议�
 cargo run --release --bin node -- chain   # 逐高度生长认证链；#24 离线仍出块（活性）；#23+#24 离线则停摆（安全）
 ```
 
+## 证书落盘与重放即最终性复验（Milestone 14）
+
+到 M13 为止，认证链上的 `Commit` 证书只活在内存里——重启后节点靠重放 `blocks.log` 能重建**状态**（M7），但恢复不了**最终性**：它无从判断某个区块是否真被 > 2/3 权重最终确定过。M14 把证书也落盘，并让重放**复验最终性**。
+
+- **证书编解码**：`codec::encode_commit`/`decode_commit` 给 `Commit` 一份与区块相同的规范二进制布局（大端、长度前缀），往返稳定。
+- **`certs.log`**：`store::CertLog` 与 `BlockLog` 共用同一套「长度前缀记录 + 残缺尾检测」框架，逐高度追加证书，与 `blocks.log` 顺序一一对应。
+- **重放即最终性复验**：`Chain::replay_verified(genesis, blocks, certs, vset)` 在应用每个区块**之前**，要求其证书（a）恰好绑定该区块（height 与 block_hash 一致）且（b）是 `vset` 下真正的 > 2/3 法定人数（`Commit::verify`）。**掉一份、换一份、伪造一份证书都会在此被拒**——即便区块本身格式完好。对照：`Chain::replay`（M7）只恢复状态，分辨不出"已最终化"与"未最终化"的链；`replay_verified` 能。
+- 验证人集当前由调用方作为**网络常量**传入（链上/动态验证人集是 M16）。
+
+```bash
+D=$(mktemp -d)
+cargo run --release --bin node -- certs --dir "$D"   # 首次：产出认证链并落盘 blocks.log + certs.log
+cargo run --release --bin node -- certs --dir "$D"   # 再次：重载两份日志，逐高度复验 > 2/3 证书
+# 末尾 tamper 演示：丢一份证书 -> 纯状态重放仍成功，最终性重放拒绝
+```
+
 ## 设计要点
 
 | 主题 | 做法 |
@@ -135,6 +152,7 @@ cargo run --release --bin node -- chain   # 逐高度生长认证链；#24 离�
 | **BFT 最终性** | 投票权 > 2/3 的 ed25519 预提交组成可验证 `Commit` 证书；确定性提议人；双签可被 `detect_equivocation` 问责（M11） |
 | **BFT 活性** | Tendermint 轮次状态机：propose/prevote/precommit + 超时 + 锁定 + 换轮；确定性提议人轮换，提议人宕机也能出块；进程内模拟器端到端验证（M12） |
 | **认证链** | 驱动器逐高度串起 mempool→共识→提交，每块附复验过的 > 2/3 证书；低于 1/3 宕机仍生长，达 1/3 则安全停摆；两台驱动器逐字节一致（M13） |
+| **最终性持久化** | `Commit` 证书与区块同格式落盘（`certs.log`）；`replay_verified` 逐高度复验证书绑定+法定人数，恢复最终性而非仅状态；丢/换/伪造证书均被拒（M14） |
 | **依赖策略** | 引擎零依赖（可嵌入/WASM）；节点作为应用引入审计过的 `ed25519-dalek` 做签名，绝不自实现密码学 |
 
 ## 测试覆盖
@@ -153,8 +171,12 @@ tampering_a_signed_field_is_rejected          签名后改字段 → 拒绝
 persisted_log_replays_to_identical_state      落盘日志重放 → 与内存链 state_root 一致
 # 编解码（codec.rs）
 round_trip / truncated_input_errors / trailing_bytes_error
+commit_round_trip                             证书规范编码往返稳定
+decode_commit_rejects_trailing_bytes          证书解码拒绝尾部多余字节
 # 持久化（store.rs）
 append_then_read_back / empty_log_reads_empty / torn_tail_is_detected
+cert_log_append_then_read_back                证书日志追加→读回一致
+cert_log_torn_tail_is_detected                证书日志残缺尾被检测
 # 哈希（hash.rs）
 known_vectors                                 SHA-256 对 FIPS 180-4 向量
 # 密码学（crypto.rs）
@@ -201,13 +223,19 @@ certificate_binds_to_the_committed_block      证书的 height/block_hash 与链
 progresses_with_one_crashed_validator         1 验证人离线 → 链仍生长（活性）
 stalls_safely_when_quorum_is_impossible       2 离线 → 停摆且链状态不变（安全）
 two_drivers_grow_identical_chains             同输入 → 相同 head/state_root/证书链
+# 最终性持久化（driver.rs + lib.rs）
+retains_blocks_paired_with_certificates       驱动器逐高度保留区块与证书配对
+persisted_certified_chain_reverifies_finality 落盘认证链重放复验最终性且 state_root 一致
+replay_rejects_a_forged_certificate           证书被改绑到别的区块 → 拒绝
+replay_rejects_a_dropped_certificate          证书数量与区块不符 → 拒绝
+replay_rejects_a_certificate_below_quorum     证书权重不足 > 2/3 → 拒绝
 ```
 
 ## 文件
 
 | 文件 | 作用 |
 |---|---|
-| `src/lib.rs` | 状态机核心：`Block`/`SubmissionTx`/`Account`/`ChainState`/`Chain`、`apply_block`、`replay`、验签、`state_root`/`merkle_root`/`account_proof`、供应守恒不变量 + 测试 |
+| `src/lib.rs` | 状态机核心：`Block`/`SubmissionTx`/`Account`/`ChainState`/`Chain`、`apply_block`、`replay`/`replay_verified`（重放即最终性复验）、验签、`state_root`/`merkle_root`/`account_proof`、供应守恒不变量 + 测试 |
 | `src/mempool.rs` | 确定性 mempool 与出块：内容寻址排序 + 试算式 `build_block` + 测试 |
 | `src/merkle.rs` | 二叉 Merkle 树：域分隔叶/节点、奇数提升、包含证明 `Proof`/`verify` + 测试 |
 | `src/validator.rs` | 验证人集与确定性提议人（Tendermint 优先级累加器）+ 测试 |
@@ -215,25 +243,26 @@ two_drivers_grow_identical_chains             同输入 → 相同 head/state_ro
 | `src/round.rs` | BFT 轮次状态机（Tendermint `upon` 规则、超时/锁定/换轮）+ 进程内网络模拟器 `Sim` + 测试 |
 | `src/driver.rs` | BFT 认证链驱动 `ChainDriver`：逐高度 mempool→共识→提交 + 证书保留 + 故障注入 + 测试 |
 | `src/crypto.rs` | ed25519 身份：`Keypair`/`verify`（封装 `ed25519-dalek`）+ 测试 |
-| `src/codec.rs` | 区块的规范二进制编解码（哈希与落盘共用）+ `tx_signing_bytes`/`encode_tx`（签名/tx 哈希字节）+ 测试 |
-| `src/store.rs` | 追加式区块日志（长度前缀记录、残缺尾检测）+ 测试 |
+| `src/codec.rs` | 区块的规范二进制编解码（哈希与落盘共用）+ `tx_signing_bytes`/`encode_tx`（签名/tx 哈希字节）+ `encode_commit`/`decode_commit`（证书落盘）+ 测试 |
+| `src/store.rs` | 追加式日志（长度前缀记录、残缺尾检测）：`BlockLog`（区块）+ `CertLog`（证书）+ 测试 |
 | `src/hash.rs` | 纯 std SHA-256（FIPS 180-4，含已知向量测试）——离线零依赖 |
-| `src/main.rs` | 节点 CLI：`demo` / `build` / `prove` / `bft` / `live` / `chain` / `run` / `status`（含确定性演示密钥） |
+| `src/main.rs` | 节点 CLI：`demo` / `build` / `prove` / `bft` / `live` / `chain` / `certs` / `run` / `status`（含确定性演示密钥） |
 
 ## 局限与后续（离生产还差什么）
 
-本里程碑刻意只做**确定性状态机内核 + 单机出块 + BFT 安全性与活性内核 + 认证链驱动**，尚未包含：
+本里程碑刻意只做**确定性状态机内核 + 单机出块 + BFT 安全性与活性内核 + 认证链驱动 + 证书落盘复验**，尚未包含：
 
 - **~~密码学身份~~**：✅ 已完成（M8，ed25519 签名交易）。后续：账户 = 公钥的完整身份模型、动态开户、评审签名、密钥轮换。
 - **~~确定性出块~~**：✅ 已完成（M9，mempool + 试算式 `build_block`）。后续：手续费/优先级排序、区块 gas 上限、交易过期。
 - **~~BFT 安全性（最终性证书）~~**：✅ 已完成（M11，投票权 > 2/3 的证书 + 提议人选择 + 双签问责）。
 - **~~BFT 活性（轮次状态机）~~**：✅ 已完成（M12，propose/prevote/precommit + 超时 + 锁定 + 换轮 + 进程内模拟器）。
-- **~~认证链驱动~~**：✅ 已完成（M13，逐高度 mempool→共识→提交，每块附复验证书，故障下的活性/安全行为）。后续：把 `Commit` 证书随区块**落盘**并在重放时复验最终性、多提议人异构 mempool、拜占庭对抗测试（等价/延迟/审查）。
+- **~~认证链驱动~~**：✅ 已完成（M13，逐高度 mempool→共识→提交，每块附复验证书，故障下的活性/安全行为）。
+- **~~证书落盘 + 重放复验最终性~~**：✅ 已完成（M14，`certs.log` + `replay_verified` 逐高度复验 > 2/3 证书）。后续：多提议人异构 mempool、拜占庭对抗测试（等价/延迟/审查）。
 - **P2P 网络**：交易/区块/投票的 gossip、状态同步（当前 `round::Sim` 在进程内模拟消息总线）。
-- **动态验证人集**：链上增删验证人、权重变更、跨高度的验证人集切换与轻客户端跟随。
-- **~~持久化~~**：✅ 已完成（M7，追加式区块日志 + 重放）。后续可换 RocksDB、加 per-record 校验和与 segment 轮转、并持久化 `Commit` 证书。
+- **动态验证人集**：链上增删验证人、权重变更、跨高度的验证人集切换与轻客户端跟随（`replay_verified` 目前把验证人集当网络常量）。
+- **~~持久化~~**：✅ 已完成（M7，追加式区块日志 + 重放；M14 加证书日志）。后续可换 RocksDB、加 per-record 校验和与 segment 轮转。
 - **~~Merkle 化状态树~~**：✅ 已完成（M10，二叉 Merkle 树 + 账户包含证明）。后续：非成员证明、增量更新的 Merkle-Patricia trie、把 graph/头字段也纳入根。
 - **手写 SHA-256** 仅为离线零依赖演示，**生产必须换审计实现**（`sha2`）。
 - **kNN 暴力扫描**：随图谱增长需换 HNSW/IVF（见 engine 局限）。
 
-这些构成后续里程碑（~~M7 持久化~~ ✅、~~M8 签名~~ ✅、~~M9 mempool 出块~~ ✅、~~M10 Merkle 认证状态~~ ✅、~~M11 BFT 最终性内核~~ ✅、~~M12 BFT 轮次状态机/活性~~ ✅、~~M13 认证链驱动~~ ✅、M14 证书落盘 + 重放复验、M15 P2P + gossip、M16 动态验证人集……），每步仍遵循"可运行、可测试、契约一致"。
+这些构成后续里程碑（~~M7 持久化~~ ✅、~~M8 签名~~ ✅、~~M9 mempool 出块~~ ✅、~~M10 Merkle 认证状态~~ ✅、~~M11 BFT 最终性内核~~ ✅、~~M12 BFT 轮次状态机/活性~~ ✅、~~M13 认证链驱动~~ ✅、~~M14 证书落盘 + 重放复验~~ ✅、M15 P2P + gossip、M16 动态验证人集……），每步仍遵循"可运行、可测试、契约一致"。

@@ -6,6 +6,7 @@
 //!   cargo run --release --bin node -- bft              # BFT commit certificate over a block
 //!   cargo run --release --bin node -- run  --dir DIR   # persistent chain (block log)
 //!   cargo run --release --bin node -- status --dir DIR # replay log, print state
+//!   cargo run --release --bin node -- certs  --dir DIR # persist certified chain, re-verify finality
 //!
 //! `run` is durable: the first invocation seeds a few demo blocks into
 //! DIR/blocks.log; every later `run`/`status` replays that log and reconstructs
@@ -20,7 +21,7 @@ use zhixing_node::driver::ChainDriver;
 use zhixing_node::mempool::Mempool;
 use zhixing_node::merkle;
 use zhixing_node::round::Sim;
-use zhixing_node::store::BlockLog;
+use zhixing_node::store::{BlockLog, CertLog};
 use zhixing_node::validator::{Validator, ValidatorSet};
 use zhixing_node::{hex, Block, Chain, Genesis, Keypair, Review, SubmissionTx, MICRO};
 
@@ -89,6 +90,27 @@ fn demo_genesis() -> Genesis {
     }
 }
 
+/// The fixed validator set of this reference network (ids 21..=24, equal power)
+/// and their signing-key seeds — a network constant both producers and replayers
+/// reconstruct identically.
+fn demo_validators() -> (ValidatorSet, BTreeMap<u64, [u8; 32]>) {
+    let ids = [21u64, 22, 23, 24];
+    let vset = ValidatorSet::new(
+        ids.iter()
+            .map(|&id| Validator { id, pubkey: kp(id).public(), power: 1 })
+            .collect(),
+    );
+    let seeds = ids
+        .iter()
+        .map(|&id| {
+            let mut s = [0u8; 32];
+            s[..8].copy_from_slice(&id.to_le_bytes());
+            (id, s)
+        })
+        .collect();
+    (vset, seeds)
+}
+
 /// The demo block sequence (built against the chain's current head).
 fn demo_blocks(chain: &Chain) -> Vec<Block> {
     let b1 = Block {
@@ -125,6 +147,7 @@ fn main() {
         "chain" => cmd_chain(),
         "run" => cmd_run(dir_arg(&args)),
         "status" => cmd_status(dir_arg(&args)),
+        "certs" => cmd_certs(dir_arg(&args)),
         "-h" | "--help" | "help" => usage(),
         other => {
             eprintln!("unknown command: {other}\n");
@@ -156,6 +179,7 @@ fn usage() {
     eprintln!("  node chain              grow a BFT-certified chain height by height (mempool -> consensus -> commit)");
     eprintln!("  node run    --dir DIR   persistent chain (seeds demo blocks once, then replays)");
     eprintln!("  node status --dir DIR   replay the block log and print state");
+    eprintln!("  node certs  --dir DIR   persist a certified chain (blocks+certs) and re-verify finality on reload");
 }
 
 fn cmd_demo() {
@@ -458,6 +482,84 @@ fn cmd_status(dir: String) {
     print_summary(&chain);
 }
 
+/// Demonstrate certificate persistence and *replay-as-finality-verification*.
+/// First run: produce a BFT-certified chain and persist both `blocks.log` and
+/// `certs.log`. Every run: reload both logs and replay them re-verifying each
+/// height's > 2/3 certificate — recovering *finality*, not just deterministic
+/// state. Then show that dropping a certificate is caught here even though the
+/// plain (state-only) replay still succeeds.
+fn cmd_certs(dir: String) {
+    let bpath = format!("{dir}/blocks.log");
+    let cpath = format!("{dir}/certs.log");
+    let blog = BlockLog::open(&bpath).unwrap_or_else(|e| fail("open block log", e));
+    let clog = CertLog::open(&cpath).unwrap_or_else(|e| fail("open cert log", e));
+    let (vset, seeds) = demo_validators();
+
+    // seed once: if the logs are empty, produce a certified chain and persist it
+    let existing = blog.read_all().unwrap_or_else(|e| fail("read block log", e));
+    if existing.is_empty() {
+        println!("empty logs at {dir} — producing a BFT-certified chain\n");
+        let mut d = ChainDriver::new(demo_genesis(), vset.clone(), seeds, 1);
+        for t in [
+            tx(1, unit(1), 1, reviews(&[(10, 0.9), (11, 0.85), (12, 0.9)]), (3, 3), 1.0),
+            tx(2, unit(2), 2, reviews(&[(10, 0.88), (11, 0.9), (12, 0.86)]), (3, 3), 1.0),
+            tx(3, blend(1, 2), 3, reviews(&[(10, 0.9), (11, 0.9), (12, 0.85)]), (3, 3), 1.0),
+        ] {
+            d.submit(t).unwrap();
+        }
+        d.produce_until_drained(1.0, 16)
+            .unwrap_or_else(|e| fail_msg("produce chain", &e));
+        for b in d.blocks() {
+            blog.append(b).unwrap_or_else(|e| fail("append block", e));
+        }
+        for c in d.certificates() {
+            clog.append(c).unwrap_or_else(|e| fail("append certificate", e));
+        }
+        println!(
+            "persisted {} block(s) + {} certificate(s) to {dir}\n",
+            d.blocks().len(),
+            d.certificates().len()
+        );
+    }
+
+    // reload both logs and replay re-verifying finality at every height
+    let blocks = blog.read_all().unwrap_or_else(|e| fail("read block log", e));
+    let certs = clog.read_all().unwrap_or_else(|e| fail("read cert log", e));
+    let chain = Chain::replay_verified(demo_genesis(), &blocks, &certs, &vset)
+        .unwrap_or_else(|e| fail_msg("verify finality on replay", &e));
+    println!(
+        "reloaded {} block(s) + {} certificate(s); FINALITY re-verified height by height:",
+        blocks.len(),
+        certs.len()
+    );
+    for c in &certs {
+        let power = c.verify(&vset).unwrap();
+        println!(
+            "  height {}  block {}  certificate power {}/{} (> 2/3) ✓",
+            c.height,
+            short(&c.block_hash),
+            power,
+            vset.total_power()
+        );
+    }
+    println!();
+    print_summary(&chain);
+
+    // the point of certificates: state-only replay cannot tell a finalized chain
+    // from an unfinalized one; finality replay can. Drop one cert and compare.
+    if !certs.is_empty() {
+        let dropped = &certs[..certs.len() - 1];
+        let state_ok = Chain::replay(demo_genesis(), &blocks).is_ok();
+        let finality = Chain::replay_verified(demo_genesis(), &blocks, dropped, &vset);
+        println!("\ntamper check — drop the last certificate:");
+        println!("  state-only replay still succeeds: {state_ok}");
+        match finality {
+            Err(e) => println!("  finality replay rejects it: true ({e})"),
+            Ok(_) => println!("  finality replay rejects it: false (UNEXPECTED)"),
+        }
+    }
+}
+
 fn commit_print(chain: &mut Chain, log: Option<&BlockLog>, label: &str, blk: Block) {
     match chain.commit(&blk) {
         Ok(r) => {
@@ -526,6 +628,11 @@ fn fail(ctx: &str, e: std::io::Error) -> ! {
 }
 
 fn fail_chain(ctx: &str, e: zhixing_node::ChainError) -> ! {
+    eprintln!("error: {ctx}: {e}");
+    exit(1);
+}
+
+fn fail_msg<E: std::fmt::Display>(ctx: &str, e: &E) -> ! {
     eprintln!("error: {ctx}: {e}");
     exit(1);
 }

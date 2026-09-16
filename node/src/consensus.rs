@@ -31,10 +31,18 @@ pub enum VoteType {
 }
 
 impl VoteType {
-    fn tag(self) -> u8 {
+    pub(crate) fn tag(self) -> u8 {
         match self {
             VoteType::Prevote => 0,
             VoteType::Precommit => 1,
+        }
+    }
+
+    pub(crate) fn from_tag(tag: u8) -> Option<VoteType> {
+        match tag {
+            0 => Some(VoteType::Prevote),
+            1 => Some(VoteType::Precommit),
+            _ => None,
         }
     }
 }
