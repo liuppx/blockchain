@@ -527,6 +527,85 @@ domain_gap_bonus = 1 + λ · (连接的独立子图数 − 1) · avg_gap
 
 **闭环标定（反馈控制）**：将参数视为控制变量，以生态健康指标（基尼系数、山谷填补率、伪贡献率）为被控量，用离线仿真（B.3）→ 测试网 A/B → 治理提案的方式迭代收敛。
 
+#### B.2.3 可实现规范（Implementable Spec）
+
+为使 B.3 仿真与后续实现能直接落地，此处钉死 ΔK 的输入接口、归一化与边界情形。这是 §5.2 公式的**规范化版本**，是 B.1/B.3/§6 的共同依赖。
+
+**输入接口**：`compute_delta_k(submission, graph, reviews, replications, params) -> float`
+
+| 输入 | 类型 | 来源 |
+|---|---|---|
+| `submission.embedding` | `float[d]` | Cognition Engine 抽取 |
+| `submission.domain` | `str` | 提交声明 + 本体校验（B.6）|
+| `submission.timestamp` | `int` | 链上区块时间 |
+| `graph` | 图谱句柄 | 状态层，支持同域近邻检索 |
+| `reviews` | `[(reviewer_rep, score)]` | PoK 评议阶段 |
+| `replications` | `(success, total)` | PoK 复现挑战阶段 |
+| `params` | dict | 治理参数（下表）|
+
+**归一化与边界规则**（全部因子在此夹紧，避免异常放大）：
+
+| 因子 | 计算 | 边界 / 缺省 |
+|---|---|---|
+| `novelty` | `1 − max cos_sim(x, 同域近邻)` | 域内首节点（无邻居）→ `novelty = 1`；`cos_sim > τ_dup` → `0` |
+| `correctness` | `Σ rᵢsᵢ / Σ rᵢ` | 评议数 `< n_review_min` → 因子封顶 `c_cap`（如 0.5），并触发追加评议 |
+| `reproducibility` | `success / total` | 理论型（`total=0`）→ 取评议一致性 `agreement`；`total < n_min` → 封顶 0.7 |
+| `domain_gap_bonus` | `1 + λ·(bridged−1)·avg_gap` | 无跨域 → `1.0`；夹紧到 `[1, bonus_max]` |
+| `time_freshness` | `exp(−decay · age_days)` | 夹紧到 `[fresh_min, 1]` |
+
+**统一治理参数表**（仿真与实现共用同一份默认值）：
+
+```
+τ_dup        = 0.95   # 近重复阈值
+n_review_min = 3      # 最少评议人数
+c_cap        = 0.5    # 评议不足时 correctness 上限
+n_min        = 2      # 最少复现尝试
+λ            = 0.3    # 跨域桥接系数
+bonus_max    = 2.0    # 桥接奖励上限
+decay        = 0.01   # 时间衰减率 (per day)
+fresh_min    = 0.5    # 时间因子下限
+delta_k_min  = 0.05   # ΔK 阈值，低于此视为 0（不铸币）
+```
+
+**参考实现（伪代码）**：
+
+```python
+def compute_delta_k(sub, graph, reviews, repl, p):
+    # 1. novelty
+    nbrs = graph.knn(sub.embedding, sub.domain, k=32)
+    if not nbrs:
+        novelty = 1.0
+    else:
+        max_sim = max(cos_sim(sub.embedding, v.embedding) for v in nbrs)
+        novelty = 0.0 if max_sim > p.tau_dup else (1.0 - max_sim)
+
+    # 2. correctness (reputation-weighted)
+    if len(reviews) < p.n_review_min:
+        correctness = min(weighted_mean(reviews), p.c_cap)   # + 触发追加评议
+    else:
+        correctness = weighted_mean(reviews)                 # Σrᵢsᵢ / Σrᵢ
+
+    # 3. reproducibility
+    success, total = repl
+    if total == 0:
+        reproducibility = agreement(reviews)                 # 理论型
+    else:
+        r = success / total
+        reproducibility = min(r, 0.7) if total < p.n_min else r
+
+    # 4. cross-domain bonus
+    bonus = clamp(1 + p.lam * (bridged_subgraphs(sub, graph) - 1)
+                    * avg_gap(sub, graph), 1.0, p.bonus_max)
+
+    # 5. freshness
+    fresh = clamp(exp(-p.decay * age_days(sub)), p.fresh_min, 1.0)
+
+    dk = novelty * correctness * reproducibility * bonus * fresh
+    return dk if dk >= p.delta_k_min else 0.0    # 阈值门控 → 不铸币
+```
+
+> **契约**：`compute_delta_k` 为纯函数（无副作用），输出 `∈ [0, bonus_max]`；`return 0.0` 即 §3.2 硬约束"ΔK≤0 不增发"的落点。B.3 仿真必须调用此同一函数，确保文档与仿真一致。
+
 > ⚠️ 开放问题：语义嵌入模型本身可被攻击（对抗样本抬高 novelty）；需嵌入模型版本治理与对抗鲁棒性评估。
 
 ---
