@@ -14,7 +14,7 @@
 | 辅代币 | $WATT（电力凭证）、$FLOP（算力凭证） |
 | 贡献凭证 | cNFT（Cognitive Contribution NFT） |
 | 共识机制 | PoK — Proof of Knowledge（认知证明） |
-| 版本 | Draft v0.1 |
+| 版本 | Draft v0.2 |
 | 日期 | 2026-09 |
 | 状态 | 草稿 · 征求意见（RFC） |
 
