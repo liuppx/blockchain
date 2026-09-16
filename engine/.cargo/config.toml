@@ -1,0 +1,8 @@
+# macOS: Python extension modules resolve Python symbols at import time, so the
+# cdylib must be linked with `-undefined dynamic_lookup`. Harmless for the bench
+# binary (which has no undefined symbols). Adjust the target triple if needed.
+[target.aarch64-apple-darwin]
+rustflags = ["-C", "link-arg=-undefined", "-C", "link-arg=dynamic_lookup"]
+
+[target.x86_64-apple-darwin]
+rustflags = ["-C", "link-arg=-undefined", "-C", "link-arg=dynamic_lookup"]

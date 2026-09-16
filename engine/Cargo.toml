@@ -5,8 +5,18 @@ edition = "2021"
 description = "Performance-critical cognitive-graph + ΔK engine for ZhixingGraph (whitepaper §7.3)"
 license = "MIT"
 
-# Dependency-free (std only) so it builds fully offline: cargo build --release
+[lib]
+name = "zhixing_engine"
+# rlib for the bench binary; cdylib for the Python extension module.
+crate-type = ["cdylib", "rlib"]
+
+# pyo3 is optional and lives behind the `python` feature, so the zero-dependency
+# `bench` binary still builds offline with `cargo build --release`.
+[features]
+python = ["dep:pyo3"]
+
 [dependencies]
+pyo3 = { version = "0.29", features = ["extension-module", "abi3-py38"], optional = true }
 
 [[bin]]
 name = "bench"

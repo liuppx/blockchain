@@ -283,3 +283,123 @@ mod tests {
         assert_eq!(dk, 0.0);
     }
 }
+
+// ---------------------------------------------------------------------------
+// Python bindings (behind the `python` feature). Exposes the same ΔK contract
+// to `sim/` so large parameter sweeps run at Rust speed. Build with:
+//   cargo build --release --features python
+// See engine/build_python.sh.
+// ---------------------------------------------------------------------------
+#[cfg(feature = "python")]
+mod python {
+    use super::*;
+    use pyo3::exceptions::PyValueError;
+    use pyo3::prelude::*;
+
+    fn to_embedding(v: &[f32]) -> PyResult<Embedding> {
+        if v.len() != DIM {
+            return Err(PyValueError::new_err(format!(
+                "embedding must have exactly {DIM} dimensions, got {}",
+                v.len()
+            )));
+        }
+        let mut e = [0.0f32; DIM];
+        e.copy_from_slice(v);
+        Ok(e)
+    }
+
+    /// A cognitive graph living on the Rust side. Nodes are kept in Rust so
+    /// repeated ΔK calls (e.g. a parameter sweep) avoid re-marshalling the graph.
+    #[pyclass]
+    struct PyGraph {
+        graph: CognitiveGraph,
+        params: DeltaKParams,
+    }
+
+    #[pymethods]
+    impl PyGraph {
+        #[new]
+        fn new() -> Self {
+            PyGraph {
+                graph: CognitiveGraph::new(),
+                params: DeltaKParams::default(),
+            }
+        }
+
+        fn add(&mut self, embedding: Vec<f32>, domain: u32) -> PyResult<()> {
+            let emb = to_embedding(&embedding)?;
+            self.graph.add(GraphNode { embedding: emb, domain });
+            Ok(())
+        }
+
+        fn __len__(&self) -> usize {
+            self.graph.len()
+        }
+
+        /// Override any subset of the governance parameters (B.2.3). Unspecified
+        /// keyword args keep their current value, enabling cheap parameter sweeps.
+        #[pyo3(signature = (tau_dup=None, n_review_min=None, c_cap=None, n_min=None,
+                            lam=None, bonus_max=None, decay=None, fresh_min=None,
+                            delta_k_min=None))]
+        #[allow(clippy::too_many_arguments)]
+        fn set_params(
+            &mut self,
+            tau_dup: Option<f32>,
+            n_review_min: Option<usize>,
+            c_cap: Option<f32>,
+            n_min: Option<usize>,
+            lam: Option<f32>,
+            bonus_max: Option<f32>,
+            decay: Option<f32>,
+            fresh_min: Option<f32>,
+            delta_k_min: Option<f32>,
+        ) {
+            if let Some(v) = tau_dup { self.params.tau_dup = v; }
+            if let Some(v) = n_review_min { self.params.n_review_min = v; }
+            if let Some(v) = c_cap { self.params.c_cap = v; }
+            if let Some(v) = n_min { self.params.n_min = v; }
+            if let Some(v) = lam { self.params.lam = v; }
+            if let Some(v) = bonus_max { self.params.bonus_max = v; }
+            if let Some(v) = decay { self.params.decay = v; }
+            if let Some(v) = fresh_min { self.params.fresh_min = v; }
+            if let Some(v) = delta_k_min { self.params.delta_k_min = v; }
+        }
+
+        /// Compute ΔK for one submission against the current graph and params.
+        #[pyo3(signature = (embedding, domain, reviews, repl_success, repl_total,
+                            timestamp_days=0.0, now_days=0.0))]
+        #[allow(clippy::too_many_arguments)]
+        fn compute_delta_k(
+            &self,
+            embedding: Vec<f32>,
+            domain: u32,
+            reviews: Vec<(f32, f32)>,
+            repl_success: u32,
+            repl_total: u32,
+            timestamp_days: f32,
+            now_days: f32,
+        ) -> PyResult<f32> {
+            let sub = Submission {
+                embedding: to_embedding(&embedding)?,
+                domain,
+                timestamp_days,
+            };
+            Ok(super::compute_delta_k(
+                &sub,
+                &self.graph,
+                &reviews,
+                (repl_success, repl_total),
+                &self.params,
+                now_days,
+            ))
+        }
+    }
+
+    #[pymodule]
+    fn zhixing_engine(m: &Bound<'_, PyModule>) -> PyResult<()> {
+        m.add_class::<PyGraph>()?;
+        m.add("DIM", DIM)?;
+        Ok(())
+    }
+}
+

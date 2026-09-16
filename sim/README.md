@@ -8,7 +8,11 @@
 ```bash
 python3 sim/run.py           # 运行场景矩阵，打印结果表
 python3 sim/run.py --md      # 同上，并写出 sim/RESULTS.md
+python3 sim/run.py --rust    # 用 Rust 引擎（pyo3）跑，同结果、约 100× 更快
+python3 sim/run.py --compare # baseline 场景 Python vs Rust 后端对比
 ```
+
+> `--rust` / `--compare` 需先构建引擎：`./engine/build_python.sh`（见 [`engine/README.md`](../engine/README.md) Milestone 5）。`model.py` 默认 `backend="auto"`：引擎已构建则自动走 Rust，否则纯 Python，结果按种子完全一致。
 
 ## 文件
 

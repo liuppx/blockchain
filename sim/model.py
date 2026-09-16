@@ -1,7 +1,9 @@
 """Agent-based simulation of the ZhixingGraph cognitive economy (whitepaper B.3).
 
-Dependency-free (stdlib only). Faithfully reuses compute_delta_k from delta_k.py
-so the simulation and the whitepaper share one contract.
+Stdlib-only by default. Faithfully reuses compute_delta_k from delta_k.py so the
+simulation and the whitepaper share one contract. Optionally offloads the ΔK
+hot path to the Rust engine (engine/, whitepaper §7.3) when it is built and
+`backend="rust"` (or "auto") — same contract, cross-validated by checksum.
 
 Agents: honest contributors, spammers, colluding ring, reviewers, and a demand
 side that burns $COG. Each epoch runs the PoK loop from §5.1:
@@ -11,7 +13,9 @@ side that burns $COG. Each epoch runs the PoK loop from §5.1:
 from __future__ import annotations
 
 import math
+import os
 import random
+import sys
 from dataclasses import dataclass, field
 
 from delta_k import (
@@ -22,7 +26,19 @@ from delta_k import (
     compute_delta_k,
 )
 
+# Optional Rust acceleration (engine/zhixing_engine.*.so). Import is best-effort;
+# the simulation runs pure-Python if the module is not built.
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "engine"))
+try:
+    import zhixing_engine as _rust
+except ImportError:
+    _rust = None
+
 DIM = 8
+
+
+def rust_available() -> bool:
+    return _rust is not None
 
 
 # --- Config -------------------------------------------------------------------
@@ -43,6 +59,7 @@ class SimConfig:
     demand_base: float = 0.5         # baseline service demand per epoch
     demand_rate: float = 0.9         # share of minted $COG burned as service demand
     seed: int = 42
+    backend: str = "auto"            # "python" | "rust" | "auto" (rust if built)
 
 
 # --- Agents -------------------------------------------------------------------
@@ -98,12 +115,31 @@ class Simulation:
         self.rng = random.Random(cfg.seed)
         self.p = DeltaKParams()
         self.graph = CognitiveGraph()
-        self.domains = [f"d{i}" for i in range(cfg.n_domains)]
+        self.domains = list(range(cfg.n_domains))   # int ids (Rust engine uses u32)
         self.day = 0.0
         self.total_supply = 0.0
         self.treasury = 0.0          # slashed stake pool (redistributed, not burned)
         self.burned_total = 0.0
         self.history: list[dict] = []
+
+        # choose ΔK backend: python graph always exists (storage/metrics/sampling);
+        # rust graph mirrors it and serves the ΔK hot path when enabled.
+        want_rust = cfg.backend in ("rust", "auto") and _rust is not None
+        if cfg.backend == "rust" and _rust is None:
+            raise RuntimeError("backend='rust' requested but zhixing_engine not "
+                               "built; run engine/build_python.sh")
+        self.use_rust = want_rust
+        self.backend = "rust" if want_rust else "python"
+        if self.use_rust:
+            self.rgraph = _rust.PyGraph()
+            p = self.p
+            self.rgraph.set_params(
+                tau_dup=p.tau_dup, n_review_min=p.n_review_min, c_cap=p.c_cap,
+                n_min=p.n_min, lam=p.lam, bonus_max=p.bonus_max, decay=p.decay,
+                fresh_min=p.fresh_min, delta_k_min=p.delta_k_min,
+            )
+        else:
+            self.rgraph = None
 
         self.contributors: list[Contributor] = []
         aid = 0
@@ -136,7 +172,24 @@ class Simulation:
         for dom in self.domains:
             base = rand_unit_vec(self.rng)
             for _ in range(2):
-                self.graph.add(GraphNode(jitter(base, self.rng, 0.3), dom))
+                self._add_node(jitter(base, self.rng, 0.3), dom)
+
+    # -- add a node to the python graph and (if enabled) the rust mirror -------
+    def _add_node(self, embedding: list[float], domain: int) -> None:
+        self.graph.add(GraphNode(embedding, domain))
+        if self.use_rust:
+            self.rgraph.add(embedding, domain)
+
+    # -- compute ΔK via the selected backend (same B.2.3 contract) -------------
+    def _delta_k(self, sub: Submission, reviews, replications) -> float:
+        if self.use_rust:
+            success, total = replications
+            return self.rgraph.compute_delta_k(
+                sub.embedding, sub.domain, reviews, success, total,
+                timestamp_days=sub.timestamp_days, now_days=self.day,
+            )
+        return compute_delta_k(sub, self.graph, reviews, replications, self.p,
+                               now_days=self.day)
 
     # -- one contributor produces a submission + its "true quality" ------------
     def _make_submission(self, c: Contributor) -> tuple[Submission, float]:
@@ -211,8 +264,7 @@ class Simulation:
             success = sum(1 for _ in range(attempts)
                           if self.rng.random() < true_q)
 
-            dk = compute_delta_k(sub, self.graph, reviews, (success, attempts),
-                                 p, now_days=self.day)
+            dk = self._delta_k(sub, reviews, (success, attempts))
 
             if dk > 0:
                 reward = cfg.base_emission * dk
@@ -221,7 +273,7 @@ class Simulation:
                 c.accepted += 1
                 minted += reward
                 self.total_supply += reward              # only reward is new supply
-                self.graph.add(GraphNode(sub.embedding, sub.domain))
+                self._add_node(sub.embedding, sub.domain)
                 if is_fake:
                     fake_passed += 1
                 # reviewers whose score matched outcome gain reputation
@@ -296,6 +348,7 @@ class Simulation:
         avg = lambda k: round(sum(r[k] for r in tail) / len(tail), 4)
         return {
             "epochs": self.cfg.epochs,
+            "backend": self.backend,
             "genesis_supply": round(self.cfg.initial_balance * len(self.contributors), 2),
             "final_supply": round(self.total_supply, 2),
             "avg_net_emission": avg("net_emission"),
