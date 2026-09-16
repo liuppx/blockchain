@@ -15,7 +15,9 @@
 //! persistence, and a Merkle-ized state trie. Those are later milestones; see
 //! README. Money is integer micro-$COG (no floats), so accounting is exact.
 
+pub mod codec;
 pub mod hash;
+pub mod store;
 
 use std::collections::BTreeMap;
 
@@ -66,28 +68,10 @@ pub struct Block {
 }
 
 impl Block {
-    /// Content-addressed block hash over a canonical byte encoding.
+    /// Content-addressed block hash over the canonical codec encoding (the same
+    /// bytes the block is persisted as, see [`codec`]).
     pub fn hash(&self) -> Hash {
-        let mut e = Enc::new();
-        e.u64(self.height);
-        e.raw(&self.prev_hash);
-        e.f32(self.timestamp_days);
-        e.u64(self.txs.len() as u64);
-        for t in &self.txs {
-            e.u64(t.author);
-            e.emb(&t.embedding);
-            e.u32(t.domain);
-            e.u64(t.stake);
-            e.u64(t.reviews.len() as u64);
-            for r in &t.reviews {
-                e.u64(r.reviewer);
-                e.f32(r.score);
-            }
-            e.u32(t.repl_success);
-            e.u32(t.repl_total);
-            e.f32(t.timestamp_days);
-        }
-        sha256(&e.0)
+        sha256(&codec::encode_block(self))
     }
 }
 
@@ -395,7 +379,7 @@ impl ChainState {
 
     /// Deterministic state root: SHA-256 over a canonical digest of all state.
     pub fn state_root(&self) -> Hash {
-        let mut e = Enc::new();
+        let mut e = codec::Enc(Vec::new());
         e.u64(self.height);
         e.u64(self.supply);
         e.u64(self.treasury);
@@ -466,36 +450,20 @@ impl Chain {
         self.block_hashes.push(receipt.hash);
         Ok(receipt)
     }
-}
 
-// --- canonical byte encoder (deterministic hashing) --------------------------
-
-struct Enc(Vec<u8>);
-
-impl Enc {
-    fn new() -> Self {
-        Enc(Vec::new())
-    }
-    fn raw(&mut self, b: &[u8]) {
-        self.0.extend_from_slice(b);
-    }
-    fn u32(&mut self, v: u32) {
-        self.0.extend_from_slice(&v.to_be_bytes());
-    }
-    fn u64(&mut self, v: u64) {
-        self.0.extend_from_slice(&v.to_be_bytes());
-    }
-    fn f32(&mut self, v: f32) {
-        // hash the bit pattern; canonicalize NaN so equal states hash equal
-        let bits = if v.is_nan() { 0x7fc0_0000 } else { v.to_bits() };
-        self.0.extend_from_slice(&bits.to_be_bytes());
-    }
-    fn emb(&mut self, e: &Embedding) {
-        for x in e {
-            self.f32(*x);
+    /// Rebuild a chain by replaying `blocks` on top of `genesis` (e.g. from a
+    /// [`store::BlockLog`]). Each block is validated exactly as if freshly
+    /// committed, so a tampered log fails here rather than corrupting state.
+    pub fn replay(genesis: Genesis, blocks: &[Block]) -> Result<Self, ChainError> {
+        let mut chain = Chain::new(genesis);
+        for b in blocks {
+            chain.commit(b)?;
         }
+        Ok(chain)
     }
 }
+
+// --- canonical byte encoder lives in `codec` (shared by hashing + persistence)
 
 #[cfg(test)]
 mod tests {
@@ -644,5 +612,44 @@ mod tests {
             chain.commit(&b),
             Err(ChainError::InsufficientBalance { .. })
         ));
+    }
+
+    #[test]
+    fn persisted_log_replays_to_identical_state() {
+        use crate::store::BlockLog;
+
+        // build an in-memory chain and persist each block to a temp log
+        let mut path = std::env::temp_dir();
+        path.push(format!(
+            "zhixing-replay-{}-{:?}.log",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let log = BlockLog::open(&path).unwrap();
+
+        let mut live = Chain::new(base_genesis());
+        let b1 = block(&live, 1, vec![novel_tx(1, 1, 1, 1.0)]);
+        live.commit(&b1).unwrap();
+        log.append(&b1).unwrap();
+        let b2 = Block {
+            height: 2,
+            prev_hash: live.head,
+            timestamp_days: 2.0,
+            txs: vec![novel_tx(2, 2, 2, 2.0)],
+        };
+        live.commit(&b2).unwrap();
+        log.append(&b2).unwrap();
+
+        // reopen the log, replay from genesis, and compare
+        let blocks = BlockLog::open(&path).unwrap().read_all().unwrap();
+        let replayed = Chain::replay(base_genesis(), &blocks).unwrap();
+
+        assert_eq!(replayed.head, live.head);
+        assert_eq!(replayed.state.state_root(), live.state.state_root());
+        assert!(replayed.state.supply_conserved());
+        std::fs::remove_file(&path).ok();
     }
 }

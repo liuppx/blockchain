@@ -44,11 +44,12 @@ python3 sim/run.py --compare  # baseline 场景 Python vs Rust 后端对比
 - ⛓️ **[`node/`](node/)** — 把 PoK 规则落成一个**确定性的共识状态机**：区块 / 交易 / 账户 / 状态转移 / 铸造罚没 / 链上声誉 / 内容寻址区块哈希链 + 状态根。ΔK 复用引擎，与白皮书 B.2.3 是同一份契约。纯 std、零外部依赖、可离线编译。
 
 ```bash
-cd node && cargo run --release --bin node   # 跑一条演示链
-cargo test --release                        # 8 项确定性/守恒/回滚测试
+cd node && cargo run --release --bin node -- demo   # 内存演示链
+cargo run --release --bin node -- run --dir ./data   # 持久化链（落盘 + 重放）
+cargo test --release                                 # 15 项确定性/守恒/回滚/持久化测试
 ```
 
-> 共识的前提是确定性：相同创世 + 相同区块 → 逐字节相同的 `state_root`。这是走向真正区块链的第一层内核；P2P、签名、BFT、持久化为后续里程碑，详见 [node/README.md](node/README.md)。
+> 共识的前提是确定性：相同创世 + 相同区块 → 逐字节相同的 `state_root`；状态落盘为追加式区块日志，重启重放可完整重建。这是走向真正区块链的第一层内核；P2P、签名、BFT 为后续里程碑，详见 [node/README.md](node/README.md)。
 
 ## 核心概念速查
 
