@@ -28,6 +28,7 @@ pub mod consensus;
 pub mod crypto;
 pub mod driver;
 pub mod hash;
+pub mod light;
 pub mod mempool;
 pub mod merkle;
 pub mod net;
@@ -42,6 +43,7 @@ use zhixing_engine::{compute_delta_k, CognitiveGraph, DeltaKParams, GraphNode, S
 pub use consensus::{Vote, VoteType};
 pub use crypto::{Keypair, PubKey, Sig};
 pub use hash::{hex, sha256};
+pub use light::{LightError, ValidatorTracker};
 use validator::{Validator, ValidatorSet, ValidatorUpdate};
 
 /// 1 $COG == 1_000_000 micro-$COG. All balances are integer micro-$COG.

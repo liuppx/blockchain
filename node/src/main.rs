@@ -5,6 +5,7 @@
 //!   cargo run --release --bin node -- prove            # light-client Merkle proof
 //!   cargo run --release --bin node -- bft              # BFT commit certificate over a block
 //!   cargo run --release --bin node -- gossip           # gossip + anti-entropy sync (in-proc + loopback TCP)
+//!   cargo run --release --bin node -- light            # light client: follow the validator set without full replay
 //!   cargo run --release --bin node -- staking          # bond/unbond: stake-bound validator power + unbonding
 //!   cargo run --release --bin node -- slashing         # slash an equivocating validator's bonded stake to the treasury
 //!   cargo run --release --bin node -- run  --dir DIR   # persistent chain (block log)
@@ -32,7 +33,7 @@ use zhixing_node::store::{BlockLog, CertLog};
 use zhixing_node::validator::{Validator, ValidatorSet, ValidatorUpdate};
 use zhixing_node::{
     hex, Block, BondKind, Chain, Genesis, Keypair, Review, SlashEvidence, StakeOp, SubmissionTx,
-    Vote, VoteType, MICRO,
+    ValidatorTracker, Vote, VoteType, MICRO,
 };
 
 type Emb = [f32; DIM];
@@ -171,6 +172,7 @@ fn main() {
         "staking" => cmd_staking(),
         "slashing" => cmd_slashing(),
         "gossip" => cmd_gossip(),
+        "light" => cmd_light(),
         "run" => cmd_run(dir_arg(&args)),
         "status" => cmd_status(dir_arg(&args)),
         "certs" => cmd_certs(dir_arg(&args)),
@@ -207,6 +209,7 @@ fn usage() {
     eprintln!("  node staking            bond stake to gain validator power; unbond through a delayed withdrawal");
     eprintln!("  node slashing           slash an equivocating validator's bonded stake to the treasury");
     eprintln!("  node gossip             gossip + anti-entropy sync: fresh nodes catch up to a certified chain (in-proc + TCP)");
+    eprintln!("  node light              light client: follow the validator set across heights without full replay");
     eprintln!("  node run    --dir DIR   persistent chain (seeds demo blocks once, then replays)");
     eprintln!("  node status --dir DIR   replay the block log and print state");
     eprintln!("  node certs  --dir DIR   persist a certified chain (blocks+certs) and re-verify finality on reload");
@@ -895,6 +898,104 @@ fn cmd_gossip() {
         results.len(),
         all_ok
     );
+}
+
+/// Demonstrate the light-client validator-set follow protocol: build a
+/// certified chain that changes its validator set every way it can — an
+/// explicit validator update, a self-bond, and a slashing removal, with real
+/// transactions mixed in — then have a [`ValidatorTracker`] follow the same
+/// `(block, certificate)` pairs a full node gossips and arrive at the exact
+/// same active set at every height, WITHOUT applying a single transaction or
+/// tracking any account balance.
+fn cmd_light() {
+    // seeds cover the genesis validators (21..=24), a mid-chain addition (25)
+    // and the accounts that bond into the set (1..=3).
+    let seeds: BTreeMap<u64, [u8; 32]> = [1u64, 2, 3, 21, 22, 23, 24, 25]
+        .iter()
+        .map(|&id| {
+            let mut s = [0u8; 32];
+            s[..8].copy_from_slice(&id.to_le_bytes());
+            (id, s)
+        })
+        .collect();
+    let mut d = ChainDriver::new(demo_genesis(), seeds, 4);
+
+    let show = |label: &str, vs: &ValidatorSet| {
+        let ids: Vec<String> = vs
+            .validators()
+            .iter()
+            .map(|v| format!("{}={}", v.id, cog(v.power)))
+            .collect();
+        println!("    {label}: {{ {} }}", ids.join(", "));
+    };
+
+    println!("building a certified chain that reshapes its validator set 3 ways:\n");
+
+    // height 1: two real submissions PLUS admit a brand-new validator (id 25).
+    d.submit(tx(1, unit(1), 1, reviews(&[(10, 0.9), (11, 0.85), (12, 0.9)]), (3, 3), 1.0))
+        .unwrap_or_else(|e| fail_chain("submit tx", e));
+    d.submit(tx(2, unit(2), 2, reviews(&[(10, 0.88), (11, 0.9), (12, 0.86)]), (3, 3), 1.0))
+        .unwrap_or_else(|e| fail_chain("submit tx", e));
+    d.stage_validator_update(ValidatorUpdate { id: 25, pubkey: kp(25).public(), power: 2 * MICRO });
+    println!("  height 1: 2 submissions + ADD validator 25 (power 2)");
+    d.produce(1.0, &BTreeSet::new()).unwrap_or_else(|e| fail_msg("produce h1", &e));
+
+    // height 2: account #1 self-bonds and becomes a validator.
+    d.stage_stake_op(
+        StakeOp { account: 1, kind: BondKind::Bond, amount: 6 * MICRO, signature: [0u8; 64] }
+            .signed(&kp(1)),
+    );
+    println!("  height 2: account #1 BONDs 6 $COG (becomes validator #1)");
+    d.produce(2.0, &BTreeSet::new()).unwrap_or_else(|e| fail_msg("produce h2", &e));
+
+    // height 3: validator #1 double-signs; evidence slashes and removes it.
+    let ev = SlashEvidence {
+        vote_a: Vote::signed(1, 3, 0, [0xAA; 32], VoteType::Precommit, &kp(1)),
+        vote_b: Vote::signed(1, 3, 0, [0xBB; 32], VoteType::Precommit, &kp(1)),
+    };
+    d.stage_slashing_evidence(ev);
+    println!("  height 3: validator #1 DOUBLE-SIGNs -> slashed + removed\n");
+    d.produce(3.0, &BTreeSet::new()).unwrap_or_else(|e| fail_msg("produce h3", &e));
+
+    let n_txs: usize = d.blocks().iter().map(|b| b.txs.len()).sum();
+    println!(
+        "full chain: {} certified heights, {} transactions applied, head {}\n",
+        d.blocks().len(),
+        n_txs,
+        short(&d.head()),
+    );
+
+    // The light client. Bootstrapped from ONLY the trusted genesis, it consumes
+    // the same (block, certificate) pairs a full node gossips (GossipMsg::Blocks)
+    // and follows the validator set height by height.
+    println!("light client follows the SAME (block, cert) pairs — no tx execution:");
+    let mut lt = ValidatorTracker::from_genesis(&demo_genesis());
+    show("genesis set", lt.validators());
+    for (i, (b, c)) in d.blocks().iter().zip(d.certificates()).enumerate() {
+        let power = lt
+            .follow(b, c)
+            .unwrap_or_else(|e| fail_msg("light follow", &e));
+        println!(
+            "  height {} certified by {} $COG of voting power; set for the next height ->",
+            i + 1,
+            cog(power),
+        );
+        show("tracked set", lt.validators());
+    }
+
+    // The payoff: the light-followed set equals the authoritative full-replay
+    // set at the tip — proven, not trusted (every cert was re-verified).
+    let full = Chain::replay_verified(demo_genesis(), d.blocks(), d.certificates())
+        .unwrap_or_else(|e| fail_msg("replay_verified", &e));
+    let light_ids: Vec<(u64, u64)> =
+        lt.validators().validators().iter().map(|v| (v.id, v.power)).collect();
+    let full_ids: Vec<(u64, u64)> =
+        full.state.validators.validators().iter().map(|v| (v.id, v.power)).collect();
+    println!(
+        "\nlight-followed set == authoritative replayed set: {}  (light applied 0 txs)",
+        light_ids == full_ids && lt.head() == full.head,
+    );
+    assert_eq!(light_ids, full_ids, "light client diverged from the full chain");
 }
 
 fn cmd_run(dir: String) {    let path = format!("{dir}/blocks.log");
