@@ -23,7 +23,7 @@ use crate::consensus::Commit;
 use crate::mempool::Mempool;
 use crate::round::Sim;
 use crate::validator::ValidatorUpdate;
-use crate::{Block, Chain, ChainError, Genesis, Hash, Keypair, StakeOp, SubmissionTx};
+use crate::{Block, Chain, ChainError, Genesis, Hash, Keypair, SlashEvidence, StakeOp, SubmissionTx};
 
 #[derive(Debug)]
 pub enum DriverError {
@@ -68,6 +68,8 @@ pub struct ChainDriver {
     pending_updates: Vec<ValidatorUpdate>,
     /// Bond/unbond ops staged to ride along in the next produced block.
     pending_stake_ops: Vec<StakeOp>,
+    /// Equivocation evidence staged to ride along in the next produced block.
+    pending_slashing_evidence: Vec<SlashEvidence>,
     /// Each committed block, in height order — retained so the chain can be
     /// persisted (block log) alongside its certificates.
     blocks: Vec<Block>,
@@ -83,6 +85,7 @@ impl ChainDriver {
             seeds,
             pending_updates: Vec::new(),
             pending_stake_ops: Vec::new(),
+            pending_slashing_evidence: Vec::new(),
             blocks: Vec::new(),
             certs: Vec::new(),
         }
@@ -105,6 +108,13 @@ impl ChainDriver {
     /// change is certified by the *current* set and takes effect next height.
     pub fn stage_stake_op(&mut self, op: StakeOp) {
         self.pending_stake_ops.push(op);
+    }
+
+    /// Stage equivocation evidence to be carried by the next block. The offender
+    /// is slashed and removed on apply — verified against the *current* set, with
+    /// removal taking effect next height (same discipline as staking/updates).
+    pub fn stage_slashing_evidence(&mut self, ev: SlashEvidence) {
+        self.pending_slashing_evidence.push(ev);
     }
 
     pub fn height(&self) -> u64 {
@@ -147,10 +157,14 @@ impl ChainDriver {
         silent: &BTreeSet<u64>,
     ) -> Result<Option<Commit>, DriverError> {
         // build the next block from the pool; if the pool yields nothing but a
-        // validator change or a stake op is staged, produce an empty-tx block.
+        // validator change, a stake op, or slashing evidence is staged, produce
+        // an empty-tx block.
         let mut candidate = match self.mempool.build_block(&self.chain, timestamp_days) {
             Some(b) => b,
-            None if !self.pending_updates.is_empty() || !self.pending_stake_ops.is_empty() => {
+            None if !self.pending_updates.is_empty()
+                || !self.pending_stake_ops.is_empty()
+                || !self.pending_slashing_evidence.is_empty() =>
+            {
                 Block {
                     height: self.chain.state.height + 1,
                     prev_hash: self.chain.head,
@@ -158,12 +172,14 @@ impl ChainDriver {
                     txs: Vec::new(),
                     validator_updates: Vec::new(),
                     stake_ops: Vec::new(),
+                    slashing_evidence: Vec::new(),
                 }
             }
             None => return Ok(None),
         };
         candidate.validator_updates = self.pending_updates.clone();
         candidate.stake_ops = self.pending_stake_ops.clone();
+        candidate.slashing_evidence = self.pending_slashing_evidence.clone();
         let height = candidate.height;
 
         // consensus over this height uses the set ACTIVE for it — the on-chain
@@ -190,6 +206,7 @@ impl ChainDriver {
         self.apply(&candidate)?;
         self.pending_updates.clear();
         self.pending_stake_ops.clear();
+        self.pending_slashing_evidence.clear();
         self.blocks.push(candidate);
         self.certs.push(commit.clone());
         Ok(Some(commit))
@@ -223,7 +240,7 @@ impl ChainDriver {
 mod tests {
     use super::*;
     use crate::validator::{Validator, ValidatorSet, ValidatorUpdate};
-    use crate::{BondKind, Genesis, Review, DIM, MICRO};
+    use crate::{BondKind, Genesis, Review, SlashEvidence, Vote, VoteType, DIM, MICRO};
     use zhixing_engine::DeltaKParams;
 
     fn seed(id: u64) -> [u8; 32] {
@@ -327,6 +344,40 @@ mod tests {
         assert_eq!(d.height(), 2);
         assert_eq!(d.certificates().len(), 2);
         assert!(d.chain.state.supply_conserved());
+    }
+
+    #[test]
+    fn slashes_an_equivocating_validator_through_the_certified_chain() {
+        // seeds must include the bonding account so its validator can vote once active
+        let ids = [1u64, 2, 3, 21, 22, 23, 24];
+        let seeds: BTreeMap<u64, [u8; 32]> = ids.iter().map(|&id| (id, seed(id))).collect();
+        let mut d = ChainDriver::new(genesis(), seeds, 4);
+
+        // account 1 self-bonds -> becomes an active validator effective height 2
+        let op = StakeOp { account: 1, kind: BondKind::Bond, amount: 5 * MICRO, signature: [0u8; 64] }
+            .signed(&kp(1));
+        d.stage_stake_op(op);
+        d.produce(1.0, &BTreeSet::new()).unwrap().expect("a stake-only block is produced");
+        assert_eq!(d.chain.state.validators.get(1).map(|v| v.power), Some(5 * MICRO));
+
+        // it double-signs at height 2 — stage the cryptographic proof and finalize
+        // a (certified) block carrying it; the offender is slashed and removed.
+        let ev = SlashEvidence {
+            vote_a: Vote::signed(1, 2, 0, [1u8; 32], VoteType::Precommit, &kp(1)),
+            vote_b: Vote::signed(1, 2, 0, [2u8; 32], VoteType::Precommit, &kp(1)),
+        };
+        d.stage_slashing_evidence(ev);
+        d.produce(2.0, &BTreeSet::new()).unwrap().expect("a slashing block is produced");
+        assert_eq!(d.height(), 2);
+        assert_eq!(d.certificates().len(), 2);
+        assert_eq!(d.chain.state.treasury, 5 * MICRO, "bonded stake seized to treasury");
+        assert_eq!(d.chain.state.bonded, 0);
+        assert!(d.chain.state.validators.get(1).is_none(), "offender removed from the set");
+        assert!(d.chain.state.supply_conserved());
+
+        // the certified chain replays and re-verifies finality to the same state
+        let chain = Chain::replay_verified(genesis(), d.blocks(), d.certificates()).unwrap();
+        assert_eq!(chain.state.state_root(), d.chain.state.state_root());
     }
 
     #[test]

@@ -6,7 +6,7 @@
 
 use crate::consensus::{Commit, Vote, VoteType};
 use crate::validator::ValidatorUpdate;
-use crate::{Block, BondKind, Embedding, Review, StakeOp, SubmissionTx};
+use crate::{Block, BondKind, Embedding, Review, SlashEvidence, StakeOp, SubmissionTx};
 use zhixing_engine::DIM;
 
 #[derive(Debug)]
@@ -53,6 +53,10 @@ pub fn encode_block(b: &Block) -> Vec<u8> {
     e.u64(b.stake_ops.len() as u64);
     for op in &b.stake_ops {
         enc_stakeop(&mut e, op, true);
+    }
+    e.u64(b.slashing_evidence.len() as u64);
+    for ev in &b.slashing_evidence {
+        enc_evidence(&mut e, ev);
     }
     e.0
 }
@@ -139,6 +143,70 @@ fn enc_stakeop(e: &mut Enc, op: &StakeOp, include_sig: bool) {
     }
 }
 
+// --- votes & equivocation evidence -------------------------------------------
+
+/// Encode one vote (validator, height, round, block_hash, vote_type, signature)
+/// with the canonical layout shared by commit certificates and slashing
+/// evidence. Always includes the signature (a vote's signature IS the artifact).
+fn enc_vote(e: &mut Enc, v: &Vote) {
+    e.u64(v.validator);
+    e.u64(v.height);
+    e.u32(v.round);
+    e.raw(&v.block_hash);
+    e.u32(v.vote_type.tag() as u32);
+    e.raw(&v.signature);
+}
+
+/// Decode one vote from the cursor (inverse of [`enc_vote`]).
+fn dec_vote(d: &mut Dec) -> Result<Vote, CodecError> {
+    let validator = d.u64()?;
+    let height = d.u64()?;
+    let round = d.u32()?;
+    let mut block_hash = [0u8; 32];
+    block_hash.copy_from_slice(d.take(32)?);
+    let tag = d.u32()?;
+    let vote_type = VoteType::from_tag(tag as u8).ok_or(CodecError::BadEnum(tag))?;
+    let mut signature = [0u8; 64];
+    signature.copy_from_slice(d.take(64)?);
+    Ok(Vote {
+        validator,
+        height,
+        round,
+        block_hash,
+        vote_type,
+        signature,
+    })
+}
+
+/// Canonical bytes of one [`SlashEvidence`] (two conflicting votes), used inside
+/// blocks and for a standalone round-trip. Trailing bytes are an error on decode.
+pub fn encode_evidence(ev: &SlashEvidence) -> Vec<u8> {
+    let mut e = Enc(Vec::new());
+    enc_evidence(&mut e, ev);
+    e.0
+}
+
+/// Decode exactly one [`SlashEvidence`] (inverse of [`encode_evidence`]).
+pub fn decode_evidence(buf: &[u8]) -> Result<SlashEvidence, CodecError> {
+    let mut d = Dec { buf, pos: 0 };
+    let ev = dec_evidence(&mut d)?;
+    if d.pos != d.buf.len() {
+        return Err(CodecError::TrailingBytes);
+    }
+    Ok(ev)
+}
+
+fn enc_evidence(e: &mut Enc, ev: &SlashEvidence) {
+    enc_vote(e, &ev.vote_a);
+    enc_vote(e, &ev.vote_b);
+}
+
+fn dec_evidence(d: &mut Dec) -> Result<SlashEvidence, CodecError> {
+    let vote_a = dec_vote(d)?;
+    let vote_b = dec_vote(d)?;
+    Ok(SlashEvidence { vote_a, vote_b })
+}
+
 // --- commit certificates -----------------------------------------------------
 
 /// Canonical bytes of a finality certificate ([`Commit`]) — used to persist
@@ -151,12 +219,7 @@ pub fn encode_commit(c: &Commit) -> Vec<u8> {
     e.raw(&c.block_hash);
     e.u64(c.precommits.len() as u64);
     for v in &c.precommits {
-        e.u64(v.validator);
-        e.u64(v.height);
-        e.u32(v.round);
-        e.raw(&v.block_hash);
-        e.u32(v.vote_type.tag() as u32);
-        e.raw(&v.signature);
+        enc_vote(&mut e, v);
     }
     e.0
 }
@@ -170,24 +233,7 @@ pub fn decode_commit(buf: &[u8]) -> Result<Commit, CodecError> {
     let n = d.count()?;
     let mut precommits = Vec::with_capacity(n as usize);
     for _ in 0..n {
-        let validator = d.u64()?;
-        let v_height = d.u64()?;
-        let v_round = d.u32()?;
-        let mut v_hash = [0u8; 32];
-        v_hash.copy_from_slice(d.take(32)?);
-        let tag = d.u32()?;
-        let vote_type =
-            VoteType::from_tag(tag as u8).ok_or(CodecError::BadEnum(tag))?;
-        let mut signature = [0u8; 64];
-        signature.copy_from_slice(d.take(64)?);
-        precommits.push(Vote {
-            validator,
-            height: v_height,
-            round: v_round,
-            block_hash: v_hash,
-            vote_type,
-            signature,
-        });
+        precommits.push(dec_vote(&mut d)?);
     }
     if d.pos != d.buf.len() {
         return Err(CodecError::TrailingBytes);
@@ -251,6 +297,11 @@ pub fn decode_block(buf: &[u8]) -> Result<Block, CodecError> {
     for _ in 0..n_ops {
         stake_ops.push(dec_stakeop(&mut d)?);
     }
+    let n_ev = d.count()?;
+    let mut slashing_evidence = Vec::with_capacity(n_ev as usize);
+    for _ in 0..n_ev {
+        slashing_evidence.push(dec_evidence(&mut d)?);
+    }
     if d.pos != d.buf.len() {
         return Err(CodecError::TrailingBytes);
     }
@@ -261,6 +312,7 @@ pub fn decode_block(buf: &[u8]) -> Result<Block, CodecError> {
         txs,
         validator_updates,
         stake_ops,
+        slashing_evidence,
     })
 }
 
@@ -359,6 +411,29 @@ mod tests {
     use super::*;
     use crate::MICRO;
 
+    /// A conflicting-precommit pair for validator `v` at (h, r) — dummy
+    /// signatures (the codec does not verify them; that is the chain's job).
+    fn sample_evidence(v: u64) -> SlashEvidence {
+        SlashEvidence {
+            vote_a: Vote {
+                validator: v,
+                height: 9,
+                round: 1,
+                block_hash: [1u8; 32],
+                vote_type: VoteType::Precommit,
+                signature: [3u8; 64],
+            },
+            vote_b: Vote {
+                validator: v,
+                height: 9,
+                round: 1,
+                block_hash: [2u8; 32],
+                vote_type: VoteType::Precommit,
+                signature: [4u8; 64],
+            },
+        }
+    }
+
     fn sample_block() -> Block {
         let mut emb = [0.0f32; DIM];
         emb[3] = 1.0;
@@ -388,6 +463,7 @@ mod tests {
                 StakeOp { account: 1, kind: BondKind::Bond, amount: 5 * MICRO, signature: [7u8; 64] },
                 StakeOp { account: 2, kind: BondKind::Unbond, amount: 2 * MICRO, signature: [8u8; 64] },
             ],
+            slashing_evidence: vec![sample_evidence(22)],
         }
     }
 
@@ -452,6 +528,40 @@ mod tests {
         let back2 = decode_block(&encode_block(&plain)).unwrap();
         assert!(back2.stake_ops.is_empty());
         assert_ne!(back.hash(), back2.hash()); // stake ops are covered by the hash
+    }
+
+    #[test]
+    fn evidence_round_trip() {
+        let ev = sample_evidence(21);
+        let bytes = encode_evidence(&ev);
+        let back = decode_evidence(&bytes).unwrap();
+        assert_eq!(encode_evidence(&back), bytes);
+        assert_eq!(back.vote_a.validator, 21);
+        assert_eq!(back.vote_a.block_hash, [1u8; 32]);
+        assert_eq!(back.vote_b.block_hash, [2u8; 32]);
+        assert!(back.is_well_formed());
+        // trailing bytes are rejected
+        let mut extra = bytes.clone();
+        extra.push(0);
+        assert!(matches!(decode_evidence(&extra), Err(CodecError::TrailingBytes)));
+    }
+
+    #[test]
+    fn slashing_evidence_round_trip_in_a_block() {
+        let b = sample_block();
+        let back = decode_block(&encode_block(&b)).unwrap();
+        assert_eq!(back.slashing_evidence.len(), 1);
+        assert_eq!(back.slashing_evidence[0].vote_a.validator, 22);
+        assert_ne!(
+            back.slashing_evidence[0].vote_a.block_hash,
+            back.slashing_evidence[0].vote_b.block_hash
+        );
+        // a block with no evidence still round-trips, with a distinct hash
+        let mut plain = sample_block();
+        plain.slashing_evidence.clear();
+        let back2 = decode_block(&encode_block(&plain)).unwrap();
+        assert!(back2.slashing_evidence.is_empty());
+        assert_ne!(back.hash(), back2.hash()); // evidence is covered by the hash
     }
 
     #[test]

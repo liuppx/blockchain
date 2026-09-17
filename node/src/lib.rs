@@ -39,6 +39,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use zhixing_engine::{compute_delta_k, CognitiveGraph, DeltaKParams, GraphNode, Submission, DIM};
 
+pub use consensus::{Vote, VoteType};
 pub use crypto::{Keypair, PubKey, Sig};
 pub use hash::{hex, sha256};
 use validator::{Validator, ValidatorSet, ValidatorUpdate};
@@ -152,6 +153,36 @@ impl StakeOp {
     }
 }
 
+/// Cryptographic proof of validator equivocation: two conflicting precommit
+/// votes from the same validator at the same `(height, round)` but for
+/// *different* block hashes, each carrying a valid ed25519 signature by the
+/// offender's pubkey. Together they show the validator double-signed (a BFT
+/// safety violation). Submitters submit `SlashEvidence` in a block; the chain
+/// applies it on receipt (moving bonded stake and any still-maturing unbonding
+/// entry to the treasury, and removing the offender at the next height).
+#[derive(Clone, Debug)]
+pub struct SlashEvidence {
+    pub vote_a: Vote,
+    pub vote_b: Vote,
+}
+
+impl SlashEvidence {
+    /// Structural sanity: same validator, height, round, both precommit, two
+    /// distinct block hashes. Does *not* check signatures — the chain does that
+    /// with the offender's pubkey when applying the evidence, so this remains a
+    /// pure-data constructor usable in tests.
+    pub fn is_well_formed(&self) -> bool {
+        let a = &self.vote_a;
+        let b = &self.vote_b;
+        a.validator == b.validator
+            && a.height == b.height
+            && a.round == b.round
+            && a.vote_type == VoteType::Precommit
+            && b.vote_type == VoteType::Precommit
+            && a.block_hash != b.block_hash
+    }
+}
+
 /// A block: an ordered batch of submissions applied atomically.
 #[derive(Clone, Debug)]
 pub struct Block {
@@ -169,6 +200,16 @@ pub struct Block {
     /// *next* height (the same discipline as `validator_updates`). Empty in the
     /// common case.
     pub stake_ops: Vec<StakeOp>,
+    /// On-chain equivocation evidence — pairs of conflicting precommit votes
+    /// from the same validator at the same (height, round). Applied after the
+    /// staking ops; an offender's bonded stake (and any still-maturing unbonding
+    /// entry) is moved to the treasury, and the offender is removed from the
+    /// active validator set at the *next* height (same cross-height rule as
+    /// `stake_ops`). Empty in the honest case; populated only by blocks
+    /// submitted in response to a caught double-sign. Evidence itself is part
+    /// of the block hash, but its *effects* — reduced bonds, grown treasury —
+    /// are what fold into `state_root`, so honest chains see no root change.
+    pub slashing_evidence: Vec<SlashEvidence>,
 }
 
 impl Block {
@@ -284,6 +325,10 @@ pub enum ChainError {
     ZeroStake(u64),
     /// An unbond of more than the account currently has bonded.
     InsufficientBond { account: u64, need: u64, have: u64 },
+    /// Slashing evidence is malformed, against a non-validator, or carries an
+    /// invalid signature. The block is rejected; the offending validator id is
+    /// returned for diagnostics.
+    BadEquivocationEvidence(u64),
 }
 
 impl std::fmt::Display for ChainError {
@@ -311,6 +356,10 @@ impl std::fmt::Display for ChainError {
             ChainError::InsufficientBond { account, need, have } => write!(
                 f,
                 "account {account} cannot unbond {need} (has {have} bonded)"
+            ),
+            ChainError::BadEquivocationEvidence(v) => write!(
+                f,
+                "equivocation evidence against validator {v} is malformed, stale, or not signable by that validator"
             ),
         }
     }
@@ -375,6 +424,10 @@ pub struct BlockReceipt {
     pub bonded: u64,
     pub unbonded: u64,
     pub released: u64,
+    /// micro-$COG moved into the treasury by `slashing_evidence` this block
+    /// (sum of bond + any still-maturing unbonding entry, for the offender).
+    /// Distinct from `slashed`, which tracks submission-bad-score burns.
+    pub slashed_to_treasury: u64,
     pub txs: Vec<TxReceipt>,
 }
 
@@ -433,6 +486,7 @@ impl ChainState {
             txs: Vec::new(),
             validator_updates: Vec::new(),
             stake_ops: Vec::new(),
+            slashing_evidence: Vec::new(),
         }
         .hash();
         (state, gh)
@@ -503,6 +557,20 @@ impl ChainState {
             touched.insert(op.account);
         }
 
+        // on-chain equivocation evidence: pair of conflicting precommits from
+        // the same validator at the same (height, round). Slash the offender's
+        // bonded stake (and any still-maturing unbonding entry) into the
+        // treasury, and queue the offender for power-zero removal at the next
+        // height by inserting into `touched` — the same discipline as stake
+        // ops (validation fully precedes mutation, so a bad evidence rolls
+        // the whole block back).
+        let mut slashed_to_treasury_total = 0u64;
+        for ev in &block.slashing_evidence {
+            let moved = self.apply_evidence(ev)?;
+            slashed_to_treasury_total += moved;
+            touched.insert(ev.vote_a.validator);
+        }
+
         // on-chain validator-set transition: explicit updates PLUS the changes
         // implied by this block's staking ops (power == bonded stake). Both take
         // effect from the NEXT height — this block was certified by the set in
@@ -535,6 +603,7 @@ impl ChainState {
             bonded: bonded_total,
             unbonded: unbonded_total,
             released,
+            slashed_to_treasury: slashed_to_treasury_total,
             txs: receipts,
         })
     }
@@ -591,6 +660,72 @@ impl ChainState {
             }
         }
         Ok(())
+    }
+
+    /// Apply one equivocation evidence: validate the pair of conflicting
+    /// precommits against the offender's *active-validator* pubkey, then move
+    /// the offender's bonded stake (and any still-maturing unbonding entry)
+    /// into the treasury. Returns the amount routed to the treasury. The
+    /// offender's removal from the validator set at the next height is done by
+    /// the caller's derived-`ValidatorUpdate` step (power 0 == removal). All
+    /// checks precede any mutation, so bad evidence rolls the whole block back.
+    fn apply_evidence(&mut self, ev: &SlashEvidence) -> Result<u64, ChainError> {
+        // 1. structural sanity — same validator, height, round, both precommit,
+        //    two different block hashes.
+        if !ev.is_well_formed() {
+            return Err(ChainError::BadEquivocationEvidence(ev.vote_a.validator));
+        }
+        let id = ev.vote_a.validator;
+        // 2. the offender must be an active validator (we need their pubkey to
+        //    verify the signatures, and only active validators carry stake to
+        //    slash). Evidence against anyone else (not in the set, or already
+        //    removed) is rejected — same discipline as a malformed stake op.
+        let val = self
+            .validators
+            .get(id)
+            .ok_or(ChainError::BadEquivocationEvidence(id))?;
+        let pubkey = val.pubkey;
+        // 3. both vote signatures must verify against that pubkey — without
+        //    this, anyone could forge a "double-sign" against an innocent id.
+        let sig_a = consensus::vote_signing_bytes(
+            ev.vote_a.validator,
+            ev.vote_a.height,
+            ev.vote_a.round,
+            &ev.vote_a.block_hash,
+            ev.vote_a.vote_type,
+        );
+        let sig_b = consensus::vote_signing_bytes(
+            ev.vote_b.validator,
+            ev.vote_b.height,
+            ev.vote_b.round,
+            &ev.vote_b.block_hash,
+            ev.vote_b.vote_type,
+        );
+        if !crypto::verify(&pubkey, &sig_a, &ev.vote_a.signature)
+            || !crypto::verify(&pubkey, &sig_b, &ev.vote_b.signature)
+        {
+            return Err(ChainError::BadEquivocationEvidence(id));
+        }
+        // 4. slash — bond pool first, then any still-maturing unbonding entry
+        //    (still slashable until its `mature_height`; this is the whole
+        //    reason M17 has an unbonding window). All moved to the treasury, so
+        //    supply stays conserved.
+        let mut moved = 0u64;
+        if let Some(amt) = self.bonds.remove(&id) {
+            self.bonded -= amt;
+            moved += amt;
+        }
+        let mut still = Vec::with_capacity(self.unbonding.len());
+        for e in std::mem::take(&mut self.unbonding) {
+            if e.account == id {
+                moved += e.amount;
+            } else {
+                still.push(e);
+            }
+        }
+        self.unbonding = still;
+        self.treasury += moved;
+        Ok(moved)
     }
 
     /// Static validity checks that do NOT depend on ΔK or mutate state: reviews
@@ -985,6 +1120,7 @@ mod tests {
             txs,
             validator_updates: Vec::new(),
             stake_ops: Vec::new(),
+            slashing_evidence: Vec::new(),
         }
     }
 
@@ -1351,6 +1487,127 @@ mod tests {
         assert!(chain.state.supply_conserved());
     }
 
+    // ---- on-chain equivocation evidence + slashing (M18) ----
+
+    /// Two conflicting precommits from `offender` at (`height`, `round`), each
+    /// correctly signed by that validator's own key — valid double-sign evidence.
+    fn evidence(offender: u64, height: u64, round: u32) -> SlashEvidence {
+        SlashEvidence {
+            vote_a: Vote::signed(offender, height, round, [1u8; 32], VoteType::Precommit, &kp(offender)),
+            vote_b: Vote::signed(offender, height, round, [2u8; 32], VoteType::Precommit, &kp(offender)),
+        }
+    }
+
+    /// A block carrying slashing evidence (no txs, no stake ops).
+    fn evidence_block(chain: &Chain, height: u64, ev: Vec<SlashEvidence>) -> Block {
+        let mut b = block(chain, height, vec![]);
+        b.slashing_evidence = ev;
+        b
+    }
+
+    #[test]
+    fn slashing_burns_bonded_stake_to_treasury_and_removes_validator() {
+        let mut chain = Chain::new(base_genesis());
+        let start = chain.state.supply;
+        // account 1 self-bonds and becomes a validator effective height 2
+        chain.commit(&stake_block(&chain, 1, 1, BondKind::Bond, 5 * MICRO)).unwrap();
+        assert_eq!(chain.state.validators.get(1).map(|v| v.power), Some(5 * MICRO));
+
+        // at height 2 the validator is active — submit proof it double-signed
+        let r = chain.commit(&evidence_block(&chain, 2, vec![evidence(1, 2, 0)])).unwrap();
+        assert_eq!(r.slashed_to_treasury, 5 * MICRO);
+        assert_eq!(chain.state.treasury, 5 * MICRO, "bonded stake seized to treasury");
+        assert_eq!(chain.state.bonded, 0);
+        assert!(!chain.state.bonds.contains_key(&1));
+        assert!(chain.state.validators.get(1).is_none(), "offender removed from the set");
+        assert_eq!(chain.state.supply, start, "slash is supply-neutral");
+        assert!(chain.state.supply_conserved());
+    }
+
+    #[test]
+    fn slashing_also_seizes_a_maturing_unbonding_entry() {
+        let mut chain = Chain::new(base_genesis());
+        // bond 6, partially unbond 2 (leaving power 4 so the validator stays active),
+        // then slash: both the remaining bond and the still-maturing entry are seized.
+        chain.commit(&stake_block(&chain, 1, 1, BondKind::Bond, 6 * MICRO)).unwrap();
+        chain.commit(&stake_block(&chain, 2, 1, BondKind::Unbond, 2 * MICRO)).unwrap();
+        assert_eq!(chain.state.bonded, 4 * MICRO);
+        assert_eq!(chain.state.unbonding.len(), 1);
+        assert_eq!(chain.state.validators.get(1).map(|v| v.power), Some(4 * MICRO));
+
+        let r = chain.commit(&evidence_block(&chain, 3, vec![evidence(1, 3, 0)])).unwrap();
+        assert_eq!(r.slashed_to_treasury, 6 * MICRO, "bond + unbonding both seized");
+        assert_eq!(chain.state.treasury, 6 * MICRO);
+        assert_eq!(chain.state.bonded, 0);
+        assert!(chain.state.unbonding.is_empty(), "maturing entry seized too");
+        assert!(chain.state.validators.get(1).is_none());
+        assert!(chain.state.supply_conserved());
+    }
+
+    #[test]
+    fn slashing_a_genesis_validator_removes_it_without_moving_money() {
+        let mut chain = Chain::new(base_genesis());
+        // genesis validator 21 has power but no bonded stake — slashing removes it
+        // and moves nothing (still supply-neutral).
+        let r = chain.commit(&evidence_block(&chain, 1, vec![evidence(21, 1, 0)])).unwrap();
+        assert_eq!(r.slashed_to_treasury, 0);
+        assert_eq!(chain.state.treasury, 0);
+        assert!(chain.state.validators.get(21).is_none());
+        assert_eq!(chain.state.validators.len(), 2, "22 and 23 remain");
+        assert!(chain.state.supply_conserved());
+    }
+
+    #[test]
+    fn malformed_evidence_is_rejected_and_rolls_back() {
+        let mut chain = Chain::new(base_genesis());
+        // both votes name the same block hash -> not a conflict -> malformed
+        let ev = SlashEvidence {
+            vote_a: Vote::signed(21, 1, 0, [1u8; 32], VoteType::Precommit, &kp(21)),
+            vote_b: Vote::signed(21, 1, 0, [1u8; 32], VoteType::Precommit, &kp(21)),
+        };
+        let b = evidence_block(&chain, 1, vec![ev]);
+        assert!(matches!(chain.commit(&b), Err(ChainError::BadEquivocationEvidence(21))));
+        assert_eq!(chain.state.height, 0, "rejected block rolls fully back");
+        assert_eq!(chain.state.validators.len(), 3);
+    }
+
+    #[test]
+    fn evidence_against_a_non_validator_is_rejected() {
+        let mut chain = Chain::new(base_genesis());
+        // account 1 never bonded -> not in the validator set -> cannot be slashed
+        let b = evidence_block(&chain, 1, vec![evidence(1, 1, 0)]);
+        assert!(matches!(chain.commit(&b), Err(ChainError::BadEquivocationEvidence(1))));
+        assert_eq!(chain.state.height, 0);
+    }
+
+    #[test]
+    fn forged_evidence_signature_is_rejected() {
+        let mut chain = Chain::new(base_genesis());
+        // conflicting votes attributed to validator 21 but signed by account 1's key
+        let ev = SlashEvidence {
+            vote_a: Vote::signed(21, 1, 0, [1u8; 32], VoteType::Precommit, &kp(1)),
+            vote_b: Vote::signed(21, 1, 0, [2u8; 32], VoteType::Precommit, &kp(1)),
+        };
+        let b = evidence_block(&chain, 1, vec![ev]);
+        assert!(matches!(chain.commit(&b), Err(ChainError::BadEquivocationEvidence(21))));
+        assert_eq!(chain.state.height, 0);
+    }
+
+    #[test]
+    fn slashing_cannot_empty_the_validator_set() {
+        let mut chain = Chain::new(base_genesis());
+        // proof against every genesis validator in one block -> would empty the
+        // set -> rejected, chain untouched.
+        let b = evidence_block(
+            &chain,
+            1,
+            vec![evidence(21, 1, 0), evidence(22, 1, 0), evidence(23, 1, 0)],
+        );
+        assert!(matches!(chain.commit(&b), Err(ChainError::EmptyValidatorSet)));
+        assert_eq!(chain.state.height, 0);
+        assert_eq!(chain.state.validators.len(), 3);
+    }
+
     #[test]
     fn persisted_log_replays_to_identical_state() {
         use crate::store::BlockLog;
@@ -1378,6 +1635,7 @@ mod tests {
             txs: vec![novel_tx(2, 2, 2, 2.0)],
             validator_updates: Vec::new(),
             stake_ops: Vec::new(),
+            slashing_evidence: Vec::new(),
         };
         live.commit(&b2).unwrap();
         log.append(&b2).unwrap();

@@ -633,7 +633,7 @@ mod tests {
     }
 
     fn block(height: u64) -> Block {
-        Block { height, prev_hash: [9u8; 32], timestamp_days: height as f32, txs: Vec::new(), validator_updates: Vec::new(), stake_ops: Vec::new() }
+        Block { height, prev_hash: [9u8; 32], timestamp_days: height as f32, txs: Vec::new(), validator_updates: Vec::new(), stake_ops: Vec::new(), slashing_evidence: Vec::new() }
     }
 
     #[test]

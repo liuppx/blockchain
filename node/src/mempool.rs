@@ -89,6 +89,7 @@ impl Mempool {
             txs: included,
             validator_updates: Vec::new(),
             stake_ops: Vec::new(),
+            slashing_evidence: Vec::new(),
         })
     }
 

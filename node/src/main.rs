@@ -6,6 +6,7 @@
 //!   cargo run --release --bin node -- bft              # BFT commit certificate over a block
 //!   cargo run --release --bin node -- gossip           # gossip + anti-entropy sync (in-proc + loopback TCP)
 //!   cargo run --release --bin node -- staking          # bond/unbond: stake-bound validator power + unbonding
+//!   cargo run --release --bin node -- slashing         # slash an equivocating validator's bonded stake to the treasury
 //!   cargo run --release --bin node -- run  --dir DIR   # persistent chain (block log)
 //!   cargo run --release --bin node -- status --dir DIR # replay log, print state
 //!   cargo run --release --bin node -- certs  --dir DIR # persist certified chain, re-verify finality
@@ -29,7 +30,10 @@ use zhixing_node::net::{read_msg, write_msg, GossipMsg, GossipNode, Network};
 use zhixing_node::round::Sim;
 use zhixing_node::store::{BlockLog, CertLog};
 use zhixing_node::validator::{Validator, ValidatorSet, ValidatorUpdate};
-use zhixing_node::{hex, Block, BondKind, Chain, Genesis, Keypair, Review, StakeOp, SubmissionTx, MICRO};
+use zhixing_node::{
+    hex, Block, BondKind, Chain, Genesis, Keypair, Review, SlashEvidence, StakeOp, SubmissionTx,
+    Vote, VoteType, MICRO,
+};
 
 type Emb = [f32; DIM];
 
@@ -135,6 +139,7 @@ fn demo_blocks(chain: &Chain) -> Vec<Block> {
         ],
         validator_updates: Vec::new(),
         stake_ops: Vec::new(),
+        slashing_evidence: Vec::new(),
     };
     // block 2 prev_hash is block 1's hash
     let b2 = Block {
@@ -147,6 +152,7 @@ fn demo_blocks(chain: &Chain) -> Vec<Block> {
         ],
         validator_updates: Vec::new(),
         stake_ops: Vec::new(),
+        slashing_evidence: Vec::new(),
     };
     vec![b1, b2]
 }
@@ -163,6 +169,7 @@ fn main() {
         "chain" => cmd_chain(),
         "validators" => cmd_validators(),
         "staking" => cmd_staking(),
+        "slashing" => cmd_slashing(),
         "gossip" => cmd_gossip(),
         "run" => cmd_run(dir_arg(&args)),
         "status" => cmd_status(dir_arg(&args)),
@@ -198,6 +205,7 @@ fn usage() {
     eprintln!("  node chain              grow a BFT-certified chain height by height (mempool -> consensus -> commit)");
     eprintln!("  node validators         grow a chain across on-chain validator-set changes (add/remove)");
     eprintln!("  node staking            bond stake to gain validator power; unbond through a delayed withdrawal");
+    eprintln!("  node slashing           slash an equivocating validator's bonded stake to the treasury");
     eprintln!("  node gossip             gossip + anti-entropy sync: fresh nodes catch up to a certified chain (in-proc + TCP)");
     eprintln!("  node run    --dir DIR   persistent chain (seeds demo blocks once, then replays)");
     eprintln!("  node status --dir DIR   replay the block log and print state");
@@ -661,6 +669,92 @@ fn produce_stakereport(d: &mut ChainDriver, day: f32) {
     if after != before {
         println!("      -> validator set for the next height is now {after:?}");
     }
+}
+
+/// Demonstrate on-chain equivocation slashing (M18): a validator self-bonds,
+/// then double-signs at a height. The cryptographic proof (two conflicting
+/// precommits) is submitted on-chain; the chain seizes the offender's bonded
+/// stake into the treasury (supply-neutral) and removes it from the validator
+/// set at the next height. The whole certified chain then replays and re-verifies
+/// finality to the same state root.
+fn cmd_slashing() {
+    // signing-key seeds: genesis validators 21..=24 PLUS accounts 1..=3, so a
+    // freshly-bonded account can sign consensus votes once its power is active.
+    let seeds: BTreeMap<u64, [u8; 32]> = [1u64, 2, 3, 21, 22, 23, 24]
+        .iter()
+        .map(|&id| {
+            let mut s = [0u8; 32];
+            s[..8].copy_from_slice(&id.to_le_bytes());
+            (id, s)
+        })
+        .collect();
+    let mut d = ChainDriver::new(demo_genesis(), seeds, 1);
+
+    let supply0 = d.chain.state.supply;
+    let ids0: Vec<u64> = d.chain.state.validators.validators().iter().map(|v| v.id).collect();
+    println!(
+        "genesis validator set {ids0:?}; treasury {} $COG, bonded pool {} $COG\n",
+        cog(d.chain.state.treasury),
+        cog(d.chain.state.bonded),
+    );
+
+    // height 1: account #1 bonds 6 $COG and becomes an active validator with
+    // power == its bond, effective from height 2 (certified by the genesis set).
+    println!("  height 1: account #1 BONDs 6 $COG  (becomes a validator next height)");
+    d.stage_stake_op(
+        StakeOp { account: 1, kind: BondKind::Bond, amount: 6 * MICRO, signature: [0u8; 64] }
+            .signed(&kp(1)),
+    );
+    produce_stakereport(&mut d, 1.0);
+
+    // height 2: validator #1 equivocates — it precommits TWO different block
+    // hashes at the same (height, round). Each vote is validly signed by #1's
+    // key, so together they are un-forgeable proof of a double-sign. (In a live
+    // network these are gathered from two conflicting commits via
+    // `consensus::detect_equivocation`.)
+    let bad_a = Vote::signed(1, 2, 0, [0xAAu8; 32], VoteType::Precommit, &kp(1));
+    let bad_b = Vote::signed(1, 2, 0, [0xBBu8; 32], VoteType::Precommit, &kp(1));
+    let evidence = SlashEvidence { vote_a: bad_a, vote_b: bad_b };
+    println!(
+        "\n  height 2: validator #1 DOUBLE-SIGNs (precommits {} and {} at h2/r0)",
+        short(&[0xAAu8; 32]),
+        short(&[0xBBu8; 32]),
+    );
+    println!("    -> submitting the proof on-chain; power {} $COG at stake", cog(6 * MICRO));
+
+    d.stage_slashing_evidence(evidence);
+    let commit = d
+        .produce(2.0, &BTreeSet::new())
+        .unwrap_or_else(|e| fail_msg("produce slashing block", &e))
+        .expect("a slashing block is produced");
+
+    println!(
+        "    height 2 certified (commit binds {}); offender slashed",
+        short(&commit.block_hash)
+    );
+    println!(
+        "    treasury {} $COG (+{} seized), bonded pool {} $COG, validator #1 present: {}",
+        cog(d.chain.state.treasury),
+        cog(d.chain.state.treasury),
+        cog(d.chain.state.bonded),
+        d.chain.state.validators.get(1).is_some(),
+    );
+    let ids_after: Vec<u64> = d.chain.state.validators.validators().iter().map(|v| v.id).collect();
+    println!("    validator set for the next height is now {ids_after:?}");
+    println!(
+        "\n  slash is supply-neutral (bonded -> treasury): supply {} unchanged: {}",
+        cog(d.chain.state.supply),
+        d.chain.state.supply == supply0 && d.chain.state.supply_conserved(),
+    );
+
+    // replay the whole certified chain, re-verifying finality height by height.
+    let chain = Chain::replay_verified(demo_genesis(), d.blocks(), d.certificates())
+        .unwrap_or_else(|e| fail_msg("verify finality across slashing", &e));
+    println!(
+        "\nreplay re-verified finality across the slash ✓  head {}",
+        short(&chain.head)
+    );
+    debug_assert_eq!(chain.state.state_root(), d.chain.state.state_root());
 }
 
 /// Demonstrate the P2P network layer: fresh/lagging nodes converge to a
