@@ -43,6 +43,11 @@ impl Mempool {
         self.pending.is_empty()
     }
 
+    /// Whether a transaction with this content hash is currently pending.
+    pub fn contains(&self, hash: &Hash) -> bool {
+        self.pending.contains_key(hash)
+    }
+
     /// Admit a transaction after static validation against `chain`'s current
     /// state (signature, known account/reviewers, well-formed reviews, stake
     /// covered). Returns the tx hash on success. Duplicates (same content hash)

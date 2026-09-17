@@ -69,6 +69,17 @@ pub fn encode_tx(t: &SubmissionTx) -> Vec<u8> {
     e.0
 }
 
+/// Decode exactly one signed transaction (the inverse of [`encode_tx`]). Used by
+/// the gossip layer to carry a pending tx on the wire; trailing bytes are an error.
+pub fn decode_tx(buf: &[u8]) -> Result<SubmissionTx, CodecError> {
+    let mut d = Dec { buf, pos: 0 };
+    let tx = dec_tx(&mut d)?;
+    if d.pos != d.buf.len() {
+        return Err(CodecError::TrailingBytes);
+    }
+    Ok(tx)
+}
+
 fn enc_tx(e: &mut Enc, t: &SubmissionTx, include_sig: bool) {
     e.u64(t.author);
     e.emb(&t.embedding);
@@ -183,34 +194,7 @@ pub fn decode_block(buf: &[u8]) -> Result<Block, CodecError> {
     let n_txs = d.count()?;
     let mut txs = Vec::with_capacity(n_txs as usize);
     for _ in 0..n_txs {
-        let author = d.u64()?;
-        let embedding = d.emb()?;
-        let domain = d.u32()?;
-        let stake = d.u64()?;
-        let n_rev = d.count()?;
-        let mut reviews = Vec::with_capacity(n_rev as usize);
-        for _ in 0..n_rev {
-            reviews.push(Review {
-                reviewer: d.u64()?,
-                score: d.f32()?,
-            });
-        }
-        let repl_success = d.u32()?;
-        let repl_total = d.u32()?;
-        let ts = d.f32()?;
-        let mut signature = [0u8; 64];
-        signature.copy_from_slice(d.take(64)?);
-        txs.push(SubmissionTx {
-            author,
-            embedding,
-            domain,
-            stake,
-            reviews,
-            repl_success,
-            repl_total,
-            timestamp_days: ts,
-            signature,
-        });
+        txs.push(dec_tx(&mut d)?);
     }
     let n_upd = d.count()?;
     let mut validator_updates = Vec::with_capacity(n_upd as usize);
@@ -236,6 +220,39 @@ pub fn decode_block(buf: &[u8]) -> Result<Block, CodecError> {
 struct Dec<'a> {
     buf: &'a [u8],
     pos: usize,
+}
+
+/// Decode one signed transaction from the cursor (shared by [`decode_block`] and
+/// [`decode_tx`]).
+fn dec_tx(d: &mut Dec) -> Result<SubmissionTx, CodecError> {
+    let author = d.u64()?;
+    let embedding = d.emb()?;
+    let domain = d.u32()?;
+    let stake = d.u64()?;
+    let n_rev = d.count()?;
+    let mut reviews = Vec::with_capacity(n_rev as usize);
+    for _ in 0..n_rev {
+        reviews.push(Review {
+            reviewer: d.u64()?,
+            score: d.f32()?,
+        });
+    }
+    let repl_success = d.u32()?;
+    let repl_total = d.u32()?;
+    let ts = d.f32()?;
+    let mut signature = [0u8; 64];
+    signature.copy_from_slice(d.take(64)?);
+    Ok(SubmissionTx {
+        author,
+        embedding,
+        domain,
+        stake,
+        reviews,
+        repl_success,
+        repl_total,
+        timestamp_days: ts,
+        signature,
+    })
 }
 
 impl<'a> Dec<'a> {
@@ -330,6 +347,20 @@ mod tests {
         let back2 = decode_block(&encode_block(&plain)).unwrap();
         assert!(back2.validator_updates.is_empty());
         assert_ne!(back.hash(), back2.hash()); // updates are covered by the hash
+    }
+
+    #[test]
+    fn tx_round_trip() {
+        let b = sample_block();
+        let tx = &b.txs[0];
+        let bytes = encode_tx(tx);
+        let back = decode_tx(&bytes).unwrap();
+        assert_eq!(back.hash(), tx.hash());
+        assert_eq!(encode_tx(&back), bytes);
+        // trailing bytes are rejected
+        let mut extra = bytes.clone();
+        extra.push(0);
+        assert!(matches!(decode_tx(&extra), Err(CodecError::TrailingBytes)));
     }
 
     #[test]

@@ -30,6 +30,7 @@ pub mod driver;
 pub mod hash;
 pub mod mempool;
 pub mod merkle;
+pub mod net;
 pub mod round;
 pub mod store;
 pub mod validator;

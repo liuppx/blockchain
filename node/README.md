@@ -2,7 +2,7 @@
 
 对应白皮书 [`docs/WHITEPAPER.md`](../docs/WHITEPAPER.md) §5「PoK 共识」与 §7「技术架构」。
 
-这是把 ΔK 引擎（[`engine/`](../engine/)）与经济仿真（[`sim/`](../sim/)）背后的规则，落成一个**可运行、确定性的 PoK 共识状态机**——真正"跑链"的最小内核：区块、交易、账户、状态转移、铸造/罚没、链上声誉、ed25519 签名交易、追加式持久化、确定性 mempool 出块、Merkle 认证状态与轻客户端证明、BFT 最终性证书与验证人集、驱动活性的 BFT 轮次状态机（超时 / 锁定 / 换轮）、逐高度生长的**BFT 认证链**（mempool → 共识 → 提交，每块附可验证证书）、**证书落盘 + 重放即最终性复验**（`blocks.log` + `certs.log`，重放时逐高度复验 > 2/3 证书，恢复的是*最终性*而非仅状态）、**链上/动态验证人集**（区块携带验证人增删/改权，由变更前的集合认证、下一高度生效，重放随之逐高度跟随演进），以及内容寻址的区块哈希链与状态根。
+这是把 ΔK 引擎（[`engine/`](../engine/)）与经济仿真（[`sim/`](../sim/)）背后的规则，落成一个**可运行、确定性的 PoK 共识状态机**——真正"跑链"的最小内核：区块、交易、账户、状态转移、铸造/罚没、链上声誉、ed25519 签名交易、追加式持久化、确定性 mempool 出块、Merkle 认证状态与轻客户端证明、BFT 最终性证书与验证人集、驱动活性的 BFT 轮次状态机（超时 / 锁定 / 换轮）、逐高度生长的**BFT 认证链**（mempool → 共识 → 提交，每块附可验证证书）、**证书落盘 + 重放即最终性复验**（`blocks.log` + `certs.log`，重放时逐高度复验 > 2/3 证书，恢复的是*最终性*而非仅状态）、**链上/动态验证人集**（区块携带验证人增删/改权，由变更前的集合认证、下一高度生效，重放随之逐高度跟随演进）、**P2P gossip 与反熵状态同步**（交易 epidemic 泛洪 + 认证块拉取追赶，逐块对链上验证人集复验证书，含真实 loopback TCP 传输），以及内容寻址的区块哈希链与状态根。
 
 > **共识的前提是确定性**：给定相同的创世与相同的区块序列，每个诚实节点算出**逐字节相同**的状态（`state_root` 一致）。本 crate 就是那个状态转移函数 `apply_block`，其 ΔK 由 `zhixing_engine::compute_delta_k` 计算——与白皮书 B.2.3、Python 仿真是**同一份契约**。
 
@@ -17,10 +17,11 @@ cargo run --release --bin node -- bft              # BFT：4 验证人对区块�
 cargo run --release --bin node -- live             # BFT 活性：轮次状态机驱动出块（含提议人宕机换轮）
 cargo run --release --bin node -- chain            # BFT 认证链：mempool → 共识 → 提交，逐高度生长
 cargo run --release --bin node -- validators       # 链上验证人集：逐高度增删验证人，重放随之跟随
+cargo run --release --bin node -- gossip           # P2P：反熵同步（新节点追赶认证链）+ 交易 epidemic 泛洪 + 真实 TCP
 cargo run --release --bin node -- certs  --dir DIR # 证书落盘：产出认证链→落盘 blocks/certs→重放复验最终性
 cargo run --release --bin node -- run  --dir DIR   # 持久化链：首次落盘演示块，之后重放
 cargo run --release --bin node -- status --dir DIR # 重放区块日志并打印状态
-cargo test --release                               # 80 项单元测试（见下）
+cargo test --release                               # 90 项单元测试（见下）
 ```
 
 演示链展示：新颖提交铸造 $COG、跨域桥接拿到 novelty+bonus（ΔK>1）、近重复/低质提交被**罚没入 treasury**、供应守恒、评审声誉按链上结果升降。
@@ -138,6 +139,19 @@ cargo run --release --bin node -- certs --dir "$D"   # 再次：重载两份日�
 # 末尾 tamper 演示：丢一份证书 -> 纯状态重放仍成功，最终性重放拒绝
 ```
 
+## P2P 网络与反熵状态同步（Milestone 15）
+
+到 M14 为止，节点的各部件都跑在**同一进程**里：`round::Sim` 用进程内总线把验证人接起来定稿一个区块，驱动器独自把链生长起来。那条总线始终只是**P2P 层的占位**。M15 补上真正的网络层（`net.rs`）：它在**不同节点之间**传播两样真正跨网的东西——**待处理交易**（共识前）与**认证块**（区块 + 其最终性证书，共识后），并让一个新节点或落后节点从对等方**追赶**到认证链头。高度内的投票 gossip 仍留在 `round`（那是验证人内部的事）；跨网传播的是已最终化、可自证的结果。
+
+- **两条都"零信任"**：
+  - **反熵同步**——节点用 `Status` 广播自己的高度；落后的一方拉取缺失的认证块（`GetBlocks → Blocks`），且每块**仅当**其证书是「该高度生效验证人集」下真正的 > 2/3 法定人数、并恰好绑定该块时才应用（与 `Chain::replay_verified` 同一道校验）。**伪造或掉包的证书会让同步停在缺口处**，而非污染状态。
+  - **交易 epidemic gossip**——新颖交易准入 mempool 后转发给对等方；一个内容哈希 `seen` 集合让重复投递变成 no-op，于是泛洪一次即终止。
+- **确定性内核 + 真实传输分层**：`Network` 是固定顺序、进程内的投递总线（gossip 版的 `round::Sim`），让测试断言 N 个节点**收敛**到逐字节相同的 head/`state_root`；`GossipNode::on_message` 是不做任何 I/O 的**纯状态机**，返回"要发给谁"的消息，因此在进程内总线和真实 socket 上跑得一模一样。socket 传输（`read_msg`/`write_msg`）只是同一套 wire 消息之上薄薄的「`u32` 长度前缀 + 1 字节 tag + 载荷」分帧——正确性活在确定性协议里，不在线缆上。
+
+```bash
+cargo run --release --bin node -- gossip   # 新节点反熵追赶认证链 → 收敛；交易注入一处泛洪到全网；三从节点经真实 TCP 向种子拉链
+```
+
 ## 链上/动态验证人集（Milestone 16）
 
 到 M14 为止，验证人集是**网络常量**：由调用方传入、永不改变，`replay_verified` 拿同一份集合复验每个高度。真实链上验证人会加入、退出、改变权重——M16 让验证人集成为**链上共识状态**，可通过区块携带的变更逐高度演进。
@@ -168,6 +182,7 @@ cargo run --release --bin node -- validators   # 4 验证人起步 → 加入 #2
 | **认证链** | 驱动器逐高度串起 mempool→共识→提交，每块附复验过的 > 2/3 证书；低于 1/3 宕机仍生长，达 1/3 则安全停摆；两台驱动器逐字节一致（M13） |
 | **最终性持久化** | `Commit` 证书与区块同格式落盘（`certs.log`）；`replay_verified` 逐高度复验证书绑定+法定人数，恢复最终性而非仅状态；丢/换/伪造证书均被拒（M14） |
 | **动态验证人集** | 验证人集是折入 `state_root` 的链上状态；区块携带增删/改权，由变更前的集合认证、下一高度生效；驱动与重放对称跟随交接，用错误创世集合重放被拒（M16） |
+| **P2P 网络** | gossip 传播交易（epidemic 泛洪 + 内容哈希去重）与认证块（反熵拉取追赶）；每块对链上验证人集复验 > 2/3 证书才应用，伪造/掉包证书停在缺口；确定性 `Network` 保证收敛，纯状态机同时跑进程内与真实 TCP（M15） |
 | **依赖策略** | 引擎零依赖（可嵌入/WASM）；节点作为应用引入审计过的 `ed25519-dalek` 做签名，绝不自实现密码学 |
 
 ## 测试覆盖
@@ -255,6 +270,18 @@ a_block_cannot_empty_the_validator_set        清空验证人集的区块 → �
 validator_updates_round_trip_in_a_block       区块携带验证人变更编解码往返稳定
 grows_across_an_on_chain_validator_change     链跨越链上验证人交接生长、重放跟随
 replay_under_a_different_genesis_validator_set_is_rejected  用错误创世验证人集重放被拒
+# 编解码（codec.rs）— tx wire
+tx_round_trip                                 单交易 wire 编解码往返 + 拒绝尾部字节
+# P2P 网络（net.rs）
+wire_round_trips_every_message                四类 gossip 消息 wire 编解码往返稳定
+framed_stream_round_trip                      长度前缀分帧 write_msg/read_msg 往返
+decode_rejects_trailing_bytes                 gossip 解码拒绝尾部多余字节
+fresh_node_syncs_the_whole_certified_chain    新节点反熵同步整条认证链、state_root 一致
+sync_rejects_a_forged_certificate             伪造/不足额证书被拒，链停在缺口不被污染
+tx_gossip_reaches_every_node                  一处注入的交易 epidemic 泛洪到全网 mempool
+a_duplicate_tx_does_not_re_flood              已见过的交易不再转发（泛洪终止）
+nodes_at_mixed_heights_all_converge           混合高度的节点全部追赶到同一 head
+gossip_is_deterministic                       同输入 → 同收敛 head
 ```
 
 ## 文件
@@ -268,11 +295,12 @@ replay_under_a_different_genesis_validator_set_is_rejected  用错误创世验�
 | `src/consensus.rs` | BFT 投票/最终性证书：`Vote`/`Commit`/`verify`、`commit_block`、`detect_equivocation` + 测试 |
 | `src/round.rs` | BFT 轮次状态机（Tendermint `upon` 规则、超时/锁定/换轮）+ 进程内网络模拟器 `Sim` + 测试 |
 | `src/driver.rs` | BFT 认证链驱动 `ChainDriver`：逐高度 mempool→共识→提交 + 证书保留 + 故障注入 + 链上验证人变更（`stage_validator_update`）+ 测试 |
+| `src/net.rs` | P2P gossip 与反熵同步：`GossipMsg`/`GossipNode`（纯状态机，认证块 `apply_certified` 复验证书、交易 epidemic 泛洪去重）+ 确定性 `Network` 收敛总线 + `encode_gossip`/`read_msg`/`write_msg`（真实 socket 分帧）+ 测试 |
 | `src/crypto.rs` | ed25519 身份：`Keypair`/`verify`（封装 `ed25519-dalek`）+ 测试 |
-| `src/codec.rs` | 区块的规范二进制编解码（哈希与落盘共用，含 `validator_updates`）+ `tx_signing_bytes`/`encode_tx`（签名/tx 哈希字节）+ `encode_commit`/`decode_commit`（证书落盘）+ 测试 |
+| `src/codec.rs` | 区块的规范二进制编解码（哈希与落盘共用，含 `validator_updates`）+ `tx_signing_bytes`/`encode_tx`/`decode_tx`（签名/tx 哈希/gossip wire 字节）+ `encode_commit`/`decode_commit`（证书落盘）+ 测试 |
 | `src/store.rs` | 追加式日志（长度前缀记录、残缺尾检测）：`BlockLog`（区块）+ `CertLog`（证书）+ 测试 |
 | `src/hash.rs` | 纯 std SHA-256（FIPS 180-4，含已知向量测试）——离线零依赖 |
-| `src/main.rs` | 节点 CLI：`demo` / `build` / `prove` / `bft` / `live` / `chain` / `validators` / `certs` / `run` / `status`（含确定性演示密钥） |
+| `src/main.rs` | 节点 CLI：`demo` / `build` / `prove` / `bft` / `live` / `chain` / `validators` / `gossip` / `certs` / `run` / `status`（含确定性演示密钥） |
 
 ## 局限与后续（离生产还差什么）
 
@@ -284,11 +312,11 @@ replay_under_a_different_genesis_validator_set_is_rejected  用错误创世验�
 - **~~BFT 活性（轮次状态机）~~**：✅ 已完成（M12，propose/prevote/precommit + 超时 + 锁定 + 换轮 + 进程内模拟器）。
 - **~~认证链驱动~~**：✅ 已完成（M13，逐高度 mempool→共识→提交，每块附复验证书，故障下的活性/安全行为）。
 - **~~证书落盘 + 重放复验最终性~~**：✅ 已完成（M14，`certs.log` + `replay_verified` 逐高度复验 > 2/3 证书）。后续：多提议人异构 mempool、拜占庭对抗测试（等价/延迟/审查）。
-- **P2P 网络**：交易/区块/投票的 gossip、状态同步（当前 `round::Sim` 在进程内模拟消息总线）。
+- **~~P2P 网络~~**：✅ 已完成（M15，交易/认证块 gossip + 反熵状态同步 + 真实 TCP 传输；`round::Sim` 仍在进程内模拟高度内投票总线）。后续：Kademlia/节点发现、连接管理与背压、投票 gossip 上真实网络、Sybil/Eclipse 抗性。
 - **~~动态验证人集~~**：✅ 已完成（M16，链上增删验证人/改权、跨高度切换、`state_root` 折入验证人集、重放逐高度跟随交接）。后续：质押绑定权重、解绑期与退出队列、验证人集变更的轻客户端跟随协议。
 - **~~持久化~~**：✅ 已完成（M7，追加式区块日志 + 重放；M14 加证书日志）。后续可换 RocksDB、加 per-record 校验和与 segment 轮转。
 - **~~Merkle 化状态树~~**：✅ 已完成（M10，二叉 Merkle 树 + 账户包含证明）。后续：非成员证明、增量更新的 Merkle-Patricia trie、把 graph/头字段也纳入根。
 - **手写 SHA-256** 仅为离线零依赖演示，**生产必须换审计实现**（`sha2`）。
 - **kNN 暴力扫描**：随图谱增长需换 HNSW/IVF（见 engine 局限）。
 
-这些构成后续里程碑（~~M7 持久化~~ ✅、~~M8 签名~~ ✅、~~M9 mempool 出块~~ ✅、~~M10 Merkle 认证状态~~ ✅、~~M11 BFT 最终性内核~~ ✅、~~M12 BFT 轮次状态机/活性~~ ✅、~~M13 认证链驱动~~ ✅、~~M14 证书落盘 + 重放复验~~ ✅、M15 P2P + gossip、~~M16 动态验证人集~~ ✅……），每步仍遵循"可运行、可测试、契约一致"。
+这些构成后续里程碑（~~M7 持久化~~ ✅、~~M8 签名~~ ✅、~~M9 mempool 出块~~ ✅、~~M10 Merkle 认证状态~~ ✅、~~M11 BFT 最终性内核~~ ✅、~~M12 BFT 轮次状态机/活性~~ ✅、~~M13 认证链驱动~~ ✅、~~M14 证书落盘 + 重放复验~~ ✅、~~M15 P2P + gossip~~ ✅、~~M16 动态验证人集~~ ✅……），每步仍遵循"可运行、可测试、契约一致"。

@@ -4,6 +4,7 @@
 //!   cargo run --release --bin node -- build            # mempool builds a block
 //!   cargo run --release --bin node -- prove            # light-client Merkle proof
 //!   cargo run --release --bin node -- bft              # BFT commit certificate over a block
+//!   cargo run --release --bin node -- gossip           # gossip + anti-entropy sync (in-proc + loopback TCP)
 //!   cargo run --release --bin node -- run  --dir DIR   # persistent chain (block log)
 //!   cargo run --release --bin node -- status --dir DIR # replay log, print state
 //!   cargo run --release --bin node -- certs  --dir DIR # persist certified chain, re-verify finality
@@ -13,13 +14,17 @@
 //! byte-identical state (same state_root) — the point of the persistence layer.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::net::{TcpListener, TcpStream};
 use std::process::exit;
+use std::sync::mpsc;
+use std::thread;
 
 use zhixing_engine::{DeltaKParams, DIM};
 use zhixing_node::consensus::{commit_block, detect_equivocation};
 use zhixing_node::driver::ChainDriver;
 use zhixing_node::mempool::Mempool;
 use zhixing_node::merkle;
+use zhixing_node::net::{read_msg, write_msg, GossipMsg, GossipNode, Network};
 use zhixing_node::round::Sim;
 use zhixing_node::store::{BlockLog, CertLog};
 use zhixing_node::validator::{Validator, ValidatorSet, ValidatorUpdate};
@@ -154,6 +159,7 @@ fn main() {
         "live" => cmd_live(),
         "chain" => cmd_chain(),
         "validators" => cmd_validators(),
+        "gossip" => cmd_gossip(),
         "run" => cmd_run(dir_arg(&args)),
         "status" => cmd_status(dir_arg(&args)),
         "certs" => cmd_certs(dir_arg(&args)),
@@ -187,6 +193,7 @@ fn usage() {
     eprintln!("  node live               drive the BFT round FSM to a commit (incl. a dead proposer)");
     eprintln!("  node chain              grow a BFT-certified chain height by height (mempool -> consensus -> commit)");
     eprintln!("  node validators         grow a chain across on-chain validator-set changes (add/remove)");
+    eprintln!("  node gossip             gossip + anti-entropy sync: fresh nodes catch up to a certified chain (in-proc + TCP)");
     eprintln!("  node run    --dir DIR   persistent chain (seeds demo blocks once, then replays)");
     eprintln!("  node status --dir DIR   replay the block log and print state");
     eprintln!("  node certs  --dir DIR   persist a certified chain (blocks+certs) and re-verify finality on reload");
@@ -545,6 +552,117 @@ fn produce_vreport(d: &mut ChainDriver, day: f32) {
             d.chain.state.validators.quorum()
         );
     }
+}
+
+/// Demonstrate the P2P network layer: fresh/lagging nodes converge to a
+/// certified chain by anti-entropy sync, and a transaction floods to every node
+/// by epidemic gossip — first over the deterministic in-process bus, then over
+/// real loopback TCP sockets (every certificate re-verified on arrival).
+fn cmd_gossip() {
+    // a real certified chain to disseminate (produced exactly as `certs` does)
+    let (_, seeds) = demo_validators();
+    let mut d = ChainDriver::new(demo_genesis(), seeds, 1);
+    for t in [
+        tx(1, unit(1), 1, reviews(&[(10, 0.9), (11, 0.85), (12, 0.9)]), (3, 3), 1.0),
+        tx(2, unit(2), 2, reviews(&[(10, 0.88), (11, 0.9), (12, 0.86)]), (3, 3), 1.0),
+        tx(3, blend(1, 2), 3, reviews(&[(10, 0.9), (11, 0.9), (12, 0.85)]), (3, 3), 1.0),
+    ] {
+        d.submit(t).unwrap();
+    }
+    d.produce_until_drained(1.0, 16).unwrap_or_else(|e| fail_msg("produce chain", &e));
+    let blocks = d.blocks().to_vec();
+    let certs = d.certificates().to_vec();
+    println!(
+        "seed produced a certified chain: height {} · head {}\n",
+        blocks.len(),
+        short(&d.head())
+    );
+
+    // --- in-process gossip: node 1 seeded, nodes 2..4 fresh, all connected ----
+    let ids = [1u64, 2, 3, 4];
+    let mut seed_node = GossipNode::new(1, demo_genesis(), 16, ids);
+    assert!(seed_node.load_certified(&blocks, &certs));
+    let others: Vec<GossipNode> =
+        [2u64, 3, 4].iter().map(|&id| GossipNode::new(id, demo_genesis(), 16, ids)).collect();
+    let mut net = Network::new(std::iter::once(seed_node).chain(others).collect());
+
+    println!("in-process anti-entropy sync (node 1 seeded, nodes 2–4 fresh):");
+    net.announce_all();
+    let delivered = net.run();
+    for id in ids {
+        let n = net.node(id);
+        println!("  node {id}  height {}  head {}", n.height(), short(&n.head()));
+    }
+    println!(
+        "  -> converged={} after {delivered} messages; state_root {}\n",
+        net.converged(),
+        short(&net.node(4).chain.state.state_root())
+    );
+
+    // epidemic tx gossip: inject one tx at node 3, watch it reach every mempool
+    let t = tx(1, unit(5), 5, reviews(&[(10, 0.8), (11, 0.78), (12, 0.82)]), (3, 3), 4.0);
+    let h = t.hash();
+    net.submit(3, t);
+    net.run();
+    let reached: Vec<u64> = ids.iter().copied().filter(|&id| net.node(id).mempool.contains(&h)).collect();
+    println!("epidemic tx gossip: tx {} injected at node 3", short(&h));
+    println!("  -> present in mempools of nodes {reached:?}\n");
+
+    // --- real loopback TCP: three followers pull the chain over sockets --------
+    println!("loopback TCP sync (three followers pull from a seed over sockets):");
+    let n_followers = 3usize;
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap_or_else(|e| fail("bind seed", e));
+    let addr = listener.local_addr().unwrap();
+
+    // seed server: serve `n_followers` connections, each a GetBlocks -> Blocks
+    let (sblocks, scerts) = (blocks.clone(), certs.clone());
+    let server = thread::spawn(move || {
+        let mut seed = GossipNode::new(1, demo_genesis(), 16, [1u64]);
+        assert!(seed.load_certified(&sblocks, &scerts));
+        for _ in 0..n_followers {
+            let (mut stream, _) = listener.accept().expect("accept");
+            if let Ok(GossipMsg::GetBlocks { from }) = read_msg(&mut stream) {
+                // reuse the real protocol to build the response
+                for (_, msg) in seed.on_message(0, GossipMsg::GetBlocks { from }) {
+                    write_msg(&mut stream, &msg).expect("serve blocks");
+                }
+            }
+        }
+    });
+
+    // followers: each dials the seed, requests from height 1, verifies + applies
+    let (tx_done, rx_done) = mpsc::channel();
+    for id in 2u64..2 + n_followers as u64 {
+        let tx_done = tx_done.clone();
+        thread::spawn(move || {
+            let mut node = GossipNode::new(id, demo_genesis(), 16, [1u64]);
+            let mut stream = TcpStream::connect(addr).expect("dial seed");
+            write_msg(&mut stream, &GossipMsg::GetBlocks { from: 1 }).expect("request");
+            if let Ok(GossipMsg::Blocks(batch)) = read_msg(&mut stream) {
+                for (b, c) in batch {
+                    node.apply_certified(b, c); // re-verifies each cert on arrival
+                }
+            }
+            tx_done.send((id, node.height(), node.head())).expect("report");
+        });
+    }
+    drop(tx_done);
+    server.join().expect("seed server");
+
+    let mut results: Vec<(u64, u64, String)> =
+        rx_done.iter().map(|(id, h, head)| (id, h, short(&head))).collect();
+    results.sort();
+    let expected = short(&d.head());
+    for (id, h, head) in &results {
+        let ok = if *head == expected { "✓" } else { "✗" };
+        println!("  follower {id}  synced to height {h}  head {head}  {ok}");
+    }
+    let all_ok = results.iter().all(|(_, h, head)| *h == blocks.len() as u64 && *head == expected);
+    println!(
+        "  -> {} follower(s) synced to the certified head over TCP, every certificate re-verified: {}",
+        results.len(),
+        all_ok
+    );
 }
 
 fn cmd_run(dir: String) {    let path = format!("{dir}/blocks.log");
