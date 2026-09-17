@@ -13,10 +13,26 @@
 //! This yields a deterministic, stake-proportional, drift-free rotation that
 //! every node computes identically.
 
+use std::collections::BTreeMap;
+
 use crate::PubKey;
 
 #[derive(Clone, Debug)]
 pub struct Validator {
+    pub id: u64,
+    pub pubkey: PubKey,
+    pub power: u64,
+}
+
+/// An on-chain change to the validator set, carried in a [`crate::Block`] and
+/// applied *after* that block's transactions. `power == 0` removes the validator
+/// (a no-op if absent); `power > 0` inserts a new validator or updates an
+/// existing one's power (and rotates in the given pubkey). Changes take effect
+/// from the *next* height — the block carrying an update is still certified by
+/// the set in force before it (see [`crate::ChainState::apply_block`] and
+/// [`crate::Chain::replay_verified`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ValidatorUpdate {
     pub id: u64,
     pub pubkey: PubKey,
     pub power: u64,
@@ -55,6 +71,26 @@ impl ValidatorSet {
 
     pub fn total_power(&self) -> u64 {
         self.validators.iter().map(|v| v.power).sum()
+    }
+
+    /// Apply on-chain [`ValidatorUpdate`]s in order, returning the evolved set.
+    /// `power == 0` removes `id` (no-op if absent); `power > 0` upserts
+    /// `(id, pubkey, power)`. The result is re-sorted by id (via [`Self::new`]),
+    /// so it stays canonical regardless of the update order.
+    pub fn apply_updates(&self, updates: &[ValidatorUpdate]) -> ValidatorSet {
+        let mut by_id: BTreeMap<u64, Validator> =
+            self.validators.iter().map(|v| (v.id, v.clone())).collect();
+        for u in updates {
+            if u.power == 0 {
+                by_id.remove(&u.id);
+            } else {
+                by_id.insert(
+                    u.id,
+                    Validator { id: u.id, pubkey: u.pubkey, power: u.power },
+                );
+            }
+        }
+        ValidatorSet::new(by_id.into_values().collect())
     }
 
     /// Minimum voting power for a decision: strictly more than 2/3 of total,
@@ -170,5 +206,42 @@ mod tests {
         assert_ne!(vs.proposer_for_round(h, 0), vs.proposer_for_round(h, 1));
         // round 0 is exactly the height-only proposer (back-compat)
         assert_eq!(vs.proposer_for_round(h, 0), vs.proposer_for(h));
+    }
+
+    fn upd(id: u64, power: u64) -> ValidatorUpdate {
+        ValidatorUpdate { id, pubkey: kp(id).public(), power }
+    }
+
+    #[test]
+    fn apply_updates_adds_removes_and_reweights() {
+        let vs = vset(&[(1, 1), (2, 1), (3, 1)]);
+        // add #4, drop #2, reweight #1 to power 5
+        let next = vs.apply_updates(&[upd(4, 1), upd(2, 0), upd(1, 5)]);
+        let ids: Vec<u64> = next.validators().iter().map(|v| v.id).collect();
+        assert_eq!(ids, vec![1, 3, 4]); // sorted, #2 gone, #4 in
+        assert_eq!(next.get(1).unwrap().power, 5); // reweighted
+        assert_eq!(next.total_power(), 5 + 1 + 1);
+        // original set is untouched (updates return a new set)
+        assert_eq!(vs.len(), 3);
+        assert_eq!(vs.get(1).unwrap().power, 1);
+    }
+
+    #[test]
+    fn apply_updates_removing_absent_is_a_noop() {
+        let vs = vset(&[(1, 1), (2, 1)]);
+        let next = vs.apply_updates(&[upd(99, 0)]);
+        let ids: Vec<u64> = next.validators().iter().map(|v| v.id).collect();
+        assert_eq!(ids, vec![1, 2]);
+    }
+
+    #[test]
+    fn apply_updates_result_is_order_independent() {
+        let vs = vset(&[(1, 1), (2, 1), (3, 1)]);
+        let a = vs.apply_updates(&[upd(4, 2), upd(5, 3)]);
+        let b = vs.apply_updates(&[upd(5, 3), upd(4, 2)]);
+        let ia: Vec<u64> = a.validators().iter().map(|v| v.id).collect();
+        let ib: Vec<u64> = b.validators().iter().map(|v| v.id).collect();
+        assert_eq!(ia, ib);
+        assert_eq!(a.total_power(), b.total_power());
     }
 }

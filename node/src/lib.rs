@@ -40,6 +40,7 @@ use zhixing_engine::{compute_delta_k, CognitiveGraph, DeltaKParams, GraphNode, S
 
 pub use crypto::{Keypair, PubKey, Sig};
 pub use hash::{hex, sha256};
+use validator::{Validator, ValidatorSet, ValidatorUpdate};
 
 /// 1 $COG == 1_000_000 micro-$COG. All balances are integer micro-$COG.
 pub const MICRO: u64 = 1_000_000;
@@ -98,6 +99,10 @@ pub struct Block {
     /// Wall-clock of the block in days; becomes `now_days` for ΔK freshness.
     pub timestamp_days: f32,
     pub txs: Vec<SubmissionTx>,
+    /// On-chain validator-set changes carried by this block. Applied after the
+    /// transactions and taking effect from the *next* height (this block is
+    /// still certified by the set in force before it). Empty in the common case.
+    pub validator_updates: Vec<ValidatorUpdate>,
 }
 
 impl Block {
@@ -156,6 +161,10 @@ pub struct ChainState {
     pub treasury: u64, // slashed stake pool (redistributed, not burned)
     pub height: u64,
     pub now_days: f32,
+    /// The active validator set — part of consensus state, evolved on-chain by
+    /// each block's [`Block::validator_updates`]. Holds the set that certifies
+    /// the *next* height (at genesis, the set that certifies height 1).
+    pub validators: ValidatorSet,
 }
 
 /// Genesis configuration.
@@ -167,6 +176,9 @@ pub struct Genesis {
     pub base_emission_micro: u64,
     pub slash_bps: u32,
     pub timestamp_days: f32,
+    /// The initial validator set (id, pubkey, voting power). Consensus over
+    /// height 1 uses exactly this set; later heights evolve it on-chain.
+    pub validators: Vec<(u64, PubKey, u64)>,
 }
 
 #[derive(Clone, Debug)]
@@ -179,6 +191,9 @@ pub enum ChainError {
     BadScore { reviewer: u64, score: f32 },
     EmptyReviews(u64),
     BadSignature(u64),
+    /// A block's validator updates would leave the set empty — consensus would
+    /// become impossible, so the block is rejected.
+    EmptyValidatorSet,
 }
 
 impl std::fmt::Display for ChainError {
@@ -199,6 +214,9 @@ impl std::fmt::Display for ChainError {
             }
             ChainError::EmptyReviews(a) => write!(f, "submission by {a} has no reviews"),
             ChainError::BadSignature(a) => write!(f, "invalid signature for account {a}"),
+            ChainError::EmptyValidatorSet => {
+                write!(f, "validator updates would empty the validator set")
+            }
         }
     }
 }
@@ -285,6 +303,12 @@ impl ChainState {
                 domain: dom,
             });
         }
+        let validators = ValidatorSet::new(
+            g.validators
+                .into_iter()
+                .map(|(id, pubkey, power)| Validator { id, pubkey, power })
+                .collect(),
+        );
         let state = ChainState {
             accounts,
             reviewers,
@@ -296,13 +320,15 @@ impl ChainState {
             treasury: 0,
             height: 0,
             now_days: g.timestamp_days,
+            validators,
         };
-        // genesis "block" hash: height 0, zero prev, no txs
+        // genesis "block" hash: height 0, zero prev, no txs, no validator updates
         let gh = Block {
             height: 0,
             prev_hash: [0u8; 32],
             timestamp_days: g.timestamp_days,
             txs: Vec::new(),
+            validator_updates: Vec::new(),
         }
         .hash();
         (state, gh)
@@ -335,6 +361,19 @@ impl ChainState {
                 n_reject += 1;
             }
             receipts.push(r);
+        }
+
+        // on-chain validator-set transition: the updates in this block take
+        // effect from the NEXT height (this block was certified by the set in
+        // force before it). Guard against emptying the set, which would make
+        // future consensus impossible. Applied on a trial clone via
+        // `Chain::commit`, so a rejection here rolls the whole block back.
+        if !block.validator_updates.is_empty() {
+            let next = self.validators.apply_updates(&block.validator_updates);
+            if next.is_empty() {
+                return Err(ChainError::EmptyValidatorSet);
+            }
+            self.validators = next;
         }
 
         self.height = block.height;
@@ -504,6 +543,15 @@ impl ChainState {
             e.emb(&n.embedding);
             e.u32(n.domain);
         }
+        // validator set is consensus state: fold it into the root so a divergent
+        // set (e.g. a missed on-chain update) yields a different state_root.
+        let vs = self.validators.validators();
+        e.u64(vs.len() as u64);
+        for v in vs {
+            e.u64(v.id);
+            e.raw(&v.pubkey);
+            e.u64(v.power);
+        }
         sha256(&e.0)
     }
 
@@ -602,21 +650,24 @@ impl Chain {
     }
 
     /// Replay `blocks` *and re-verify finality*: for each height the accompanying
-    /// certificate in `certs` must be a valid > 2/3 quorum (`Commit::verify`
-    /// against `vset`) that binds exactly this block (matching height and hash),
-    /// before the block is applied. Where [`Self::replay`] recovers deterministic
-    /// *state*, this recovers *finality* — a restarted node (or a following light
-    /// client) re-establishes that every block was finalized by a super-majority,
-    /// not merely that it re-derives the same bytes. A dropped, swapped, or forged
+    /// certificate in `certs` must be a valid > 2/3 quorum (`Commit::verify`)
+    /// that binds exactly this block (matching height and hash), before the block
+    /// is applied. Where [`Self::replay`] recovers deterministic *state*, this
+    /// recovers *finality* — a restarted node (or a following light client)
+    /// re-establishes that every block was finalized by a super-majority, not
+    /// merely that it re-derives the same bytes. A dropped, swapped, or forged
     /// certificate is rejected here even though the block itself is well-formed.
     ///
-    /// The validator set is supplied by the caller (a network constant here;
-    /// on-chain/dynamic validator sets are a later milestone).
+    /// The validator set is **not** a caller-supplied constant: it is consensus
+    /// state that lives in the chain and evolves on-chain. Each block's
+    /// certificate is checked against the set *active for that height* — the set
+    /// in force before the block is applied — and applying the block may itself
+    /// change the set for the next height (see [`Block::validator_updates`]). So
+    /// replay follows validator handoffs exactly as the live chain produced them.
     pub fn replay_verified(
         genesis: Genesis,
         blocks: &[Block],
         certs: &[consensus::Commit],
-        vset: &validator::ValidatorSet,
     ) -> Result<Self, ReplayError> {
         if blocks.len() != certs.len() {
             return Err(ReplayError::CountMismatch {
@@ -630,8 +681,10 @@ impl Chain {
             if c.height != b.height || c.block_hash != b.hash() {
                 return Err(ReplayError::CertificateMismatch { height: b.height });
             }
-            // ...and be a real super-majority under the validator set
-            c.verify(vset).map_err(ReplayError::Consensus)?;
+            // ...and be a real super-majority under the set active for this
+            // height (before committing, which may change it for the next one)
+            c.verify(&chain.state.validators)
+                .map_err(ReplayError::Consensus)?;
             chain.commit(b).map_err(ReplayError::Chain)?;
         }
         Ok(chain)
@@ -670,6 +723,11 @@ mod tests {
             base_emission_micro: 8 * MICRO,
             slash_bps: 10_000,
             timestamp_days: 0.0,
+            validators: vec![
+                (21, kp(21).public(), 1),
+                (22, kp(22).public(), 1),
+                (23, kp(23).public(), 1),
+            ],
         }
     }
 
@@ -702,6 +760,7 @@ mod tests {
             prev_hash: chain.head,
             timestamp_days: height as f32,
             txs,
+            validator_updates: Vec::new(),
         }
     }
 
@@ -885,6 +944,74 @@ mod tests {
         assert!(chain.state.account_proof(999).is_none());
     }
 
+    fn vupd(id: u64, power: u64) -> ValidatorUpdate {
+        ValidatorUpdate { id, pubkey: kp(id).public(), power }
+    }
+
+    #[test]
+    fn genesis_seeds_the_validator_set_as_state() {
+        let chain = Chain::new(base_genesis());
+        let ids: Vec<u64> = chain
+            .state
+            .validators
+            .validators()
+            .iter()
+            .map(|v| v.id)
+            .collect();
+        assert_eq!(ids, vec![21, 22, 23]);
+        assert_eq!(chain.state.validators.total_power(), 3);
+    }
+
+    #[test]
+    fn a_validator_update_takes_effect_next_height() {
+        let mut chain = Chain::new(base_genesis());
+        // a block that admits validator #24 (alongside a normal submission)
+        let mut b = block(&chain, 1, vec![novel_tx(1, 1, 1, 1.0)]);
+        b.validator_updates = vec![vupd(24, 1)];
+        chain.commit(&b).unwrap();
+        let ids: Vec<u64> = chain
+            .state
+            .validators
+            .validators()
+            .iter()
+            .map(|v| v.id)
+            .collect();
+        assert_eq!(ids, vec![21, 22, 23, 24], "set grew after the block committed");
+        assert_eq!(chain.state.validators.total_power(), 4);
+    }
+
+    #[test]
+    fn state_root_covers_the_validator_set() {
+        // two chains identical except for an on-chain validator change must have
+        // different state roots — the set is consensus state, not metadata.
+        let mut plain = Chain::new(base_genesis());
+        let mut changed = Chain::new(base_genesis());
+        let b_plain = block(&plain, 1, vec![novel_tx(1, 1, 1, 1.0)]);
+        let mut b_changed = block(&changed, 1, vec![novel_tx(1, 1, 1, 1.0)]);
+        b_changed.validator_updates = vec![vupd(24, 1)];
+        plain.commit(&b_plain).unwrap();
+        changed.commit(&b_changed).unwrap();
+        assert_ne!(
+            plain.state.state_root(),
+            changed.state.state_root(),
+            "a validator handoff moves the state root"
+        );
+    }
+
+    #[test]
+    fn a_block_cannot_empty_the_validator_set() {
+        let mut chain = Chain::new(base_genesis());
+        // remove every genesis validator in one block -> rejected, chain untouched
+        let mut b = block(&chain, 1, vec![novel_tx(1, 1, 1, 1.0)]);
+        b.validator_updates = vec![vupd(21, 0), vupd(22, 0), vupd(23, 0)];
+        assert!(matches!(
+            chain.commit(&b),
+            Err(ChainError::EmptyValidatorSet)
+        ));
+        assert_eq!(chain.state.height, 0, "rejected block rolls fully back");
+        assert_eq!(chain.state.validators.len(), 3);
+    }
+
     #[test]
     fn persisted_log_replays_to_identical_state() {
         use crate::store::BlockLog;
@@ -910,6 +1037,7 @@ mod tests {
             prev_hash: live.head,
             timestamp_days: 2.0,
             txs: vec![novel_tx(2, 2, 2, 2.0)],
+            validator_updates: Vec::new(),
         };
         live.commit(&b2).unwrap();
         log.append(&b2).unwrap();

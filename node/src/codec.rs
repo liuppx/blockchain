@@ -5,6 +5,7 @@
 //! were persisted. Big-endian, length-prefixed, no external serialization crate.
 
 use crate::consensus::{Commit, Vote, VoteType};
+use crate::validator::ValidatorUpdate;
 use crate::{Block, Embedding, Review, SubmissionTx};
 use zhixing_engine::DIM;
 
@@ -42,6 +43,12 @@ pub fn encode_block(b: &Block) -> Vec<u8> {
     e.u64(b.txs.len() as u64);
     for t in &b.txs {
         enc_tx(&mut e, t, true);
+    }
+    e.u64(b.validator_updates.len() as u64);
+    for u in &b.validator_updates {
+        e.u64(u.id);
+        e.raw(&u.pubkey);
+        e.u64(u.power);
     }
     e.0
 }
@@ -205,6 +212,15 @@ pub fn decode_block(buf: &[u8]) -> Result<Block, CodecError> {
             signature,
         });
     }
+    let n_upd = d.count()?;
+    let mut validator_updates = Vec::with_capacity(n_upd as usize);
+    for _ in 0..n_upd {
+        let id = d.u64()?;
+        let mut pubkey = [0u8; 32];
+        pubkey.copy_from_slice(d.take(32)?);
+        let power = d.u64()?;
+        validator_updates.push(ValidatorUpdate { id, pubkey, power });
+    }
     if d.pos != d.buf.len() {
         return Err(CodecError::TrailingBytes);
     }
@@ -213,6 +229,7 @@ pub fn decode_block(buf: &[u8]) -> Result<Block, CodecError> {
         prev_hash,
         timestamp_days,
         txs,
+        validator_updates,
     })
 }
 
@@ -282,6 +299,10 @@ mod tests {
                 timestamp_days: 3.0,
                 signature: [9u8; 64],
             }],
+            validator_updates: vec![
+                ValidatorUpdate { id: 25, pubkey: [5u8; 32], power: 3 },
+                ValidatorUpdate { id: 21, pubkey: [0u8; 32], power: 0 },
+            ],
         }
     }
 
@@ -292,6 +313,23 @@ mod tests {
         let back = decode_block(&bytes).unwrap();
         assert_eq!(encode_block(&back), bytes);
         assert_eq!(back.hash(), b.hash());
+    }
+
+    #[test]
+    fn validator_updates_round_trip_in_a_block() {
+        let b = sample_block();
+        let back = decode_block(&encode_block(&b)).unwrap();
+        assert_eq!(back.validator_updates.len(), 2);
+        assert_eq!(back.validator_updates[0].id, 25);
+        assert_eq!(back.validator_updates[0].power, 3);
+        assert_eq!(back.validator_updates[1].id, 21);
+        assert_eq!(back.validator_updates[1].power, 0); // removal encoded as power 0
+        // a block with no updates still round-trips (empty length prefix)
+        let mut plain = sample_block();
+        plain.validator_updates.clear();
+        let back2 = decode_block(&encode_block(&plain)).unwrap();
+        assert!(back2.validator_updates.is_empty());
+        assert_ne!(back.hash(), back2.hash()); // updates are covered by the hash
     }
 
     #[test]

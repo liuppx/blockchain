@@ -22,7 +22,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use crate::consensus::Commit;
 use crate::mempool::Mempool;
 use crate::round::Sim;
-use crate::validator::ValidatorSet;
+use crate::validator::ValidatorUpdate;
 use crate::{Block, Chain, ChainError, Genesis, Hash, Keypair, SubmissionTx};
 
 #[derive(Debug)]
@@ -59,10 +59,13 @@ impl std::error::Error for DriverError {}
 pub struct ChainDriver {
     pub chain: Chain,
     pub mempool: Mempool,
-    vset: ValidatorSet,
     /// Validator signing-key seeds. Keypairs are not clonable, so the driver
-    /// holds seeds and rebuilds the keypair map for each height's `Sim`.
+    /// holds seeds and rebuilds the keypair map for each height's `Sim`. This is
+    /// a *superset* of the active validators (which live in chain state and
+    /// change on-chain) so keys are on hand for validators admitted later.
     seeds: BTreeMap<u64, [u8; 32]>,
+    /// Validator-set changes staged to ride along in the next produced block.
+    pending_updates: Vec<ValidatorUpdate>,
     /// Each committed block, in height order — retained so the chain can be
     /// persisted (block log) alongside its certificates.
     blocks: Vec<Block>,
@@ -71,17 +74,12 @@ pub struct ChainDriver {
 }
 
 impl ChainDriver {
-    pub fn new(
-        genesis: Genesis,
-        vset: ValidatorSet,
-        seeds: BTreeMap<u64, [u8; 32]>,
-        max_txs: usize,
-    ) -> Self {
+    pub fn new(genesis: Genesis, seeds: BTreeMap<u64, [u8; 32]>, max_txs: usize) -> Self {
         ChainDriver {
             chain: Chain::new(genesis),
             mempool: Mempool::new(max_txs),
-            vset,
             seeds,
+            pending_updates: Vec::new(),
             blocks: Vec::new(),
             certs: Vec::new(),
         }
@@ -90,6 +88,13 @@ impl ChainDriver {
     /// Admit a transaction to the mempool (static validation against current state).
     pub fn submit(&mut self, tx: SubmissionTx) -> Result<Hash, ChainError> {
         self.mempool.insert(&self.chain, tx)
+    }
+
+    /// Stage an on-chain validator-set change to be carried by the next block
+    /// [`Self::produce`] finalizes. The change is certified by the *current*
+    /// validator set and takes effect from the following height.
+    pub fn stage_validator_update(&mut self, update: ValidatorUpdate) {
+        self.pending_updates.push(update);
     }
 
     pub fn height(&self) -> u64 {
@@ -131,14 +136,29 @@ impl ChainDriver {
         timestamp_days: f32,
         silent: &BTreeSet<u64>,
     ) -> Result<Option<Commit>, DriverError> {
-        let candidate = match self.mempool.build_block(&self.chain, timestamp_days) {
+        // build the next block from the pool; if the pool yields nothing but a
+        // validator change is staged, produce a validator-only (empty-tx) block.
+        let mut candidate = match self.mempool.build_block(&self.chain, timestamp_days) {
             Some(b) => b,
+            None if !self.pending_updates.is_empty() => Block {
+                height: self.chain.state.height + 1,
+                prev_hash: self.chain.head,
+                timestamp_days,
+                txs: Vec::new(),
+                validator_updates: Vec::new(),
+            },
             None => return Ok(None),
         };
+        candidate.validator_updates = self.pending_updates.clone();
         let height = candidate.height;
 
+        // consensus over this height uses the set ACTIVE for it — the on-chain
+        // set in force before this block applies. Updates the block carries only
+        // take effect next height, so the new set never votes on its own arrival.
+        let active = self.chain.state.validators.clone();
+
         // drive BFT consensus over the candidate on the in-process bus
-        let mut sim = Sim::new(self.vset.clone(), self.keys(), height, candidate.clone(), silent);
+        let mut sim = Sim::new(active.clone(), self.keys(), height, candidate.clone(), silent);
         let decisions = sim.run();
 
         // every honest validator decides the same block; take any certificate
@@ -148,12 +168,13 @@ impl ChainDriver {
         };
 
         // trust nothing we did not verify: the certificate must be a real >2/3
-        // quorum, and it must certify exactly the block we are about to commit
-        if commit.verify(&self.vset).is_err() || commit.block_hash != candidate.hash() {
+        // quorum of the active set, and certify exactly the block we will commit
+        if commit.verify(&active).is_err() || commit.block_hash != candidate.hash() {
             return Err(DriverError::BadCertificate { height });
         }
 
         self.apply(&candidate)?;
+        self.pending_updates.clear();
         self.blocks.push(candidate);
         self.certs.push(commit.clone());
         Ok(Some(commit))
@@ -186,7 +207,7 @@ impl ChainDriver {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::validator::Validator;
+    use crate::validator::{Validator, ValidatorSet, ValidatorUpdate};
     use crate::{Genesis, Review, DIM, MICRO};
     use zhixing_engine::DeltaKParams;
 
@@ -219,6 +240,10 @@ mod tests {
             base_emission_micro: 8 * MICRO,
             slash_bps: 10_000,
             timestamp_days: 0.0,
+            validators: [21u64, 22, 23, 24]
+                .iter()
+                .map(|&id| (id, kp(id).public(), 1))
+                .collect(),
         }
     }
 
@@ -254,8 +279,8 @@ mod tests {
 
     /// One driver, one block per height (max_txs = 1), fed three submissions.
     fn seeded_driver() -> ChainDriver {
-        let (vset, seeds) = validators();
-        let mut d = ChainDriver::new(genesis(), vset, seeds, 1);
+        let (_vset, seeds) = validators();
+        let mut d = ChainDriver::new(genesis(), seeds, 1);
         d.submit(tx(1, 1, 1)).unwrap();
         d.submit(tx(2, 2, 2)).unwrap();
         d.submit(tx(3, 3, 3)).unwrap();
@@ -350,27 +375,25 @@ mod tests {
 
     #[test]
     fn persisted_certified_chain_reverifies_finality() {
-        let (vset, _) = validators();
         let mut d = seeded_driver();
         d.produce_until_drained(1.0, 10).unwrap();
 
         // replay the retained (blocks, certs) re-verifying every height's quorum
         let replayed =
-            Chain::replay_verified(genesis(), d.blocks(), d.certificates(), &vset).unwrap();
+            Chain::replay_verified(genesis(), d.blocks(), d.certificates()).unwrap();
         assert_eq!(replayed.head, d.head());
         assert_eq!(replayed.state.state_root(), d.chain.state.state_root());
     }
 
     #[test]
     fn replay_rejects_a_forged_certificate() {
-        let (vset, _) = validators();
         let mut d = seeded_driver();
         d.produce_until_drained(1.0, 10).unwrap();
 
         // tamper: point the first certificate at a different block hash
         let mut certs = d.certificates().to_vec();
         certs[0].block_hash = [0xabu8; 32];
-        let r = Chain::replay_verified(genesis(), d.blocks(), &certs, &vset);
+        let r = Chain::replay_verified(genesis(), d.blocks(), &certs);
         assert!(matches!(
             r,
             Err(crate::ReplayError::CertificateMismatch { height: 1 })
@@ -379,26 +402,77 @@ mod tests {
 
     #[test]
     fn replay_rejects_a_dropped_certificate() {
-        let (vset, _) = validators();
         let mut d = seeded_driver();
         d.produce_until_drained(1.0, 10).unwrap();
 
         // a certificate goes missing -> counts no longer line up
         let certs = &d.certificates()[..d.certificates().len() - 1];
-        let r = Chain::replay_verified(genesis(), d.blocks(), certs, &vset);
+        let r = Chain::replay_verified(genesis(), d.blocks(), certs);
         assert!(matches!(r, Err(crate::ReplayError::CountMismatch { .. })));
     }
 
     #[test]
     fn replay_rejects_a_certificate_below_quorum() {
-        let (vset, _) = validators();
         let mut d = seeded_driver();
         d.produce_until_drained(1.0, 10).unwrap();
 
         // strip the first cert down to a single precommit -> not > 2/3 power
         let mut certs = d.certificates().to_vec();
         certs[0].precommits.truncate(1);
-        let r = Chain::replay_verified(genesis(), d.blocks(), &certs, &vset);
+        let r = Chain::replay_verified(genesis(), d.blocks(), &certs);
+        assert!(matches!(r, Err(crate::ReplayError::Consensus(_))));
+    }
+
+    #[test]
+    fn grows_across_an_on_chain_validator_change() {
+        // seeds are a superset (21..=25); the genesis set is only 21..=24
+        let seeds: BTreeMap<u64, [u8; 32]> = (21u64..=25).map(|id| (id, seed(id))).collect();
+        let mut d = ChainDriver::new(genesis(), seeds, 1);
+        d.submit(tx(1, 1, 1)).unwrap();
+        d.submit(tx(2, 2, 2)).unwrap();
+        d.submit(tx(3, 3, 3)).unwrap();
+
+        // height 1 under the genesis set of four
+        d.produce(1.0, &BTreeSet::new()).unwrap().unwrap();
+        assert_eq!(d.chain.state.validators.len(), 4);
+
+        // admit validator #25; the change rides in the height-2 block but is
+        // certified by the PRE-change set (the newcomer never votes on its arrival)
+        let before2 = d.chain.state.validators.clone();
+        d.stage_validator_update(ValidatorUpdate { id: 25, pubkey: kp(25).public(), power: 1 });
+        let c2 = d.produce(2.0, &BTreeSet::new()).unwrap().unwrap();
+        assert!(c2.verify(&before2).is_ok(), "certified by the old set");
+        assert_eq!(before2.len(), 4);
+        assert_eq!(d.chain.state.validators.len(), 5, "set grew for the next height");
+
+        // height 3 is now certified by the NEW set of five
+        let before3 = d.chain.state.validators.clone();
+        let c3 = d.produce(3.0, &BTreeSet::new()).unwrap().unwrap();
+        assert_eq!(before3.len(), 5);
+        assert!(c3.verify(&before3).is_ok());
+
+        // replay follows the handoff exactly: each height re-verified against the
+        // set that was active for it, ending on the evolved five-validator set
+        let replayed = Chain::replay_verified(genesis(), d.blocks(), d.certificates()).unwrap();
+        assert_eq!(replayed.head, d.head());
+        assert_eq!(replayed.state.validators.len(), 5);
+        assert_eq!(replayed.state.state_root(), d.chain.state.state_root());
+    }
+
+    #[test]
+    fn replay_under_a_different_genesis_validator_set_is_rejected() {
+        let mut d = seeded_driver();
+        d.produce_until_drained(1.0, 10).unwrap();
+
+        // the validator set is genesis-anchored consensus state: replay against a
+        // genesis naming different validators cannot re-verify the real quorum.
+        let mut g = genesis();
+        g.validators = vec![
+            (90, kp(90).public(), 1),
+            (91, kp(91).public(), 1),
+            (92, kp(92).public(), 1),
+        ];
+        let r = Chain::replay_verified(g, d.blocks(), d.certificates());
         assert!(matches!(r, Err(crate::ReplayError::Consensus(_))));
     }
 }

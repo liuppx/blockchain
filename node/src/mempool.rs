@@ -82,6 +82,7 @@ impl Mempool {
             prev_hash: chain.head,
             timestamp_days,
             txs: included,
+            validator_updates: Vec::new(),
         })
     }
 
@@ -125,6 +126,11 @@ mod tests {
             base_emission_micro: 8 * MICRO,
             slash_bps: 10_000,
             timestamp_days: 0.0,
+            validators: vec![
+                (21, kp(21).public(), 1),
+                (22, kp(22).public(), 1),
+                (23, kp(23).public(), 1),
+            ],
         }
     }
 

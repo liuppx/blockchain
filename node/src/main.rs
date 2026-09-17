@@ -22,7 +22,7 @@ use zhixing_node::mempool::Mempool;
 use zhixing_node::merkle;
 use zhixing_node::round::Sim;
 use zhixing_node::store::{BlockLog, CertLog};
-use zhixing_node::validator::{Validator, ValidatorSet};
+use zhixing_node::validator::{Validator, ValidatorSet, ValidatorUpdate};
 use zhixing_node::{hex, Block, Chain, Genesis, Keypair, Review, SubmissionTx, MICRO};
 
 type Emb = [f32; DIM];
@@ -75,6 +75,7 @@ fn tx(author: u64, emb: Emb, domain: u32, revs: Vec<Review>, repl: (u32, u32), d
 /// The fixed genesis of this reference network (a network constant: both writers
 /// and replayers must reconstruct it identically).
 fn demo_genesis() -> Genesis {
+    let (vset, _) = demo_validators();
     Genesis {
         accounts: vec![
             (1, 30 * MICRO, kp(1).public()),
@@ -87,6 +88,11 @@ fn demo_genesis() -> Genesis {
         base_emission_micro: 8 * MICRO,
         slash_bps: 10_000,
         timestamp_days: 0.0,
+        validators: vset
+            .validators()
+            .iter()
+            .map(|v| (v.id, v.pubkey, v.power))
+            .collect(),
     }
 }
 
@@ -121,6 +127,7 @@ fn demo_blocks(chain: &Chain) -> Vec<Block> {
             tx(1, unit(1), 1, reviews(&[(10, 0.9), (11, 0.85), (12, 0.9)]), (3, 3), 1.0),
             tx(2, unit(2), 2, reviews(&[(10, 0.88), (11, 0.9), (12, 0.86)]), (3, 3), 1.0),
         ],
+        validator_updates: Vec::new(),
     };
     // block 2 prev_hash is block 1's hash
     let b2 = Block {
@@ -131,6 +138,7 @@ fn demo_blocks(chain: &Chain) -> Vec<Block> {
             tx(3, blend(1, 2), 3, reviews(&[(10, 0.9), (11, 0.9), (12, 0.85)]), (3, 3), 2.0),
             tx(1, unit(0), 0, reviews(&[(10, 0.7), (11, 0.6), (12, 0.65)]), (0, 3), 2.0),
         ],
+        validator_updates: Vec::new(),
     };
     vec![b1, b2]
 }
@@ -145,6 +153,7 @@ fn main() {
         "bft" => cmd_bft(),
         "live" => cmd_live(),
         "chain" => cmd_chain(),
+        "validators" => cmd_validators(),
         "run" => cmd_run(dir_arg(&args)),
         "status" => cmd_status(dir_arg(&args)),
         "certs" => cmd_certs(dir_arg(&args)),
@@ -177,6 +186,7 @@ fn usage() {
     eprintln!("  node bft                4 validators certify a block; show fault tolerance + equivocation");
     eprintln!("  node live               drive the BFT round FSM to a commit (incl. a dead proposer)");
     eprintln!("  node chain              grow a BFT-certified chain height by height (mempool -> consensus -> commit)");
+    eprintln!("  node validators         grow a chain across on-chain validator-set changes (add/remove)");
     eprintln!("  node run    --dir DIR   persistent chain (seeds demo blocks once, then replays)");
     eprintln!("  node status --dir DIR   replay the block log and print state");
     eprintln!("  node certs  --dir DIR   persist a certified chain (blocks+certs) and re-verify finality on reload");
@@ -393,7 +403,7 @@ fn cmd_chain() {
         .collect();
 
     // one block per height so the chain visibly grows tx by tx
-    let mut d = ChainDriver::new(demo_genesis(), vset.clone(), seeds, 1);
+    let mut d = ChainDriver::new(demo_genesis(), seeds, 1);
     for t in [
         tx(1, unit(1), 1, reviews(&[(10, 0.9), (11, 0.85), (12, 0.9)]), (3, 3), 1.0),
         tx(2, unit(2), 2, reviews(&[(10, 0.88), (11, 0.9), (12, 0.86)]), (3, 3), 1.0),
@@ -449,6 +459,94 @@ fn cmd_chain() {
     println!("\nfinal head {} · height {} · {} certificates", short(&d.head()), d.height(), d.certificates().len());
 }
 
+/// Demonstrate a validator handoff on a live, BFT-certified chain: grow a few
+/// heights under the genesis set, then admit and later remove a validator via
+/// on-chain [`ValidatorUpdate`]s. Each change is certified by the set in force
+/// *before* it and takes effect from the next height; a final replay re-verifies
+/// finality following the very same handoffs.
+fn cmd_validators() {
+    // signing-key seeds are a superset (21..=25); the genesis set is 21..=24
+    let seeds: BTreeMap<u64, [u8; 32]> = (21u64..=25)
+        .map(|id| {
+            let mut s = [0u8; 32];
+            s[..8].copy_from_slice(&id.to_le_bytes());
+            (id, s)
+        })
+        .collect();
+    let mut d = ChainDriver::new(demo_genesis(), seeds, 1);
+    for t in [
+        tx(1, unit(1), 1, reviews(&[(10, 0.9), (11, 0.85), (12, 0.9)]), (3, 3), 1.0),
+        tx(2, unit(2), 2, reviews(&[(10, 0.88), (11, 0.9), (12, 0.86)]), (3, 3), 1.0),
+        tx(3, blend(1, 2), 3, reviews(&[(10, 0.9), (11, 0.9), (12, 0.85)]), (3, 3), 1.0),
+        tx(1, unit(4), 4, reviews(&[(10, 0.8), (11, 0.78), (12, 0.82)]), (3, 3), 1.0),
+    ] {
+        d.submit(t).unwrap();
+    }
+
+    let ids0: Vec<u64> = d.chain.state.validators.validators().iter().map(|v| v.id).collect();
+    println!(
+        "genesis validator set {ids0:?}  quorum {} (> 2/3)\n",
+        d.chain.state.validators.quorum()
+    );
+
+    // height 1: a plain block under the genesis set of four
+    produce_vreport(&mut d, 1.0);
+
+    // admit validator #25: the change rides in the height-2 block but is
+    // certified by the PRE-change set — the newcomer never votes on its arrival.
+    println!("  staged: ADD validator #25 (takes effect next height)");
+    d.stage_validator_update(ValidatorUpdate { id: 25, pubkey: kp(25).public(), power: 1 });
+    produce_vreport(&mut d, 2.0);
+
+    // remove validator #21, certified by the five-validator set now in force
+    println!("  staged: REMOVE validator #21");
+    d.stage_validator_update(ValidatorUpdate { id: 21, pubkey: kp(21).public(), power: 0 });
+    produce_vreport(&mut d, 3.0);
+
+    // one more plain height under the evolved set
+    produce_vreport(&mut d, 4.0);
+
+    // replay the whole certified chain, re-verifying finality height by height —
+    // following the very same validator handoffs the live chain produced.
+    let chain = Chain::replay_verified(demo_genesis(), d.blocks(), d.certificates())
+        .unwrap_or_else(|e| fail_msg("verify finality across handoffs", &e));
+    let final_ids: Vec<u64> = chain.state.validators.validators().iter().map(|v| v.id).collect();
+    println!(
+        "\nreplay re-verified finality across every handoff ✓  final set {final_ids:?}  head {}",
+        short(&chain.head)
+    );
+    debug_assert_eq!(chain.state.state_root(), d.chain.state.state_root());
+}
+
+/// Produce one height (all validators honest) and report which set certified it
+/// and, if the set changed, what it becomes for the next height.
+fn produce_vreport(d: &mut ChainDriver, day: f32) {
+    let before = d.chain.state.validators.clone();
+    let commit = d
+        .produce(day, &BTreeSet::new())
+        .unwrap_or_else(|e| fail_msg("produce height", &e))
+        .expect("a block to produce");
+    let power = commit.verify(&before).unwrap();
+    let ids_before: Vec<u64> = before.validators().iter().map(|v| v.id).collect();
+    println!(
+        "  height {}  certified by {:?}  (power {}/{}, quorum {})",
+        commit.height,
+        ids_before,
+        power,
+        before.total_power(),
+        before.quorum()
+    );
+    let ids_after: Vec<u64> = d.chain.state.validators.validators().iter().map(|v| v.id).collect();
+    if ids_after != ids_before {
+        println!(
+            "    -> validator set for height {} is now {:?}  (quorum {})",
+            commit.height + 1,
+            ids_after,
+            d.chain.state.validators.quorum()
+        );
+    }
+}
+
 fn cmd_run(dir: String) {    let path = format!("{dir}/blocks.log");
     let log = BlockLog::open(&path).unwrap_or_else(|e| fail("open log", e));
     let blocks = log.read_all().unwrap_or_else(|e| fail("read log", e));
@@ -499,7 +597,7 @@ fn cmd_certs(dir: String) {
     let existing = blog.read_all().unwrap_or_else(|e| fail("read block log", e));
     if existing.is_empty() {
         println!("empty logs at {dir} — producing a BFT-certified chain\n");
-        let mut d = ChainDriver::new(demo_genesis(), vset.clone(), seeds, 1);
+        let mut d = ChainDriver::new(demo_genesis(), seeds, 1);
         for t in [
             tx(1, unit(1), 1, reviews(&[(10, 0.9), (11, 0.85), (12, 0.9)]), (3, 3), 1.0),
             tx(2, unit(2), 2, reviews(&[(10, 0.88), (11, 0.9), (12, 0.86)]), (3, 3), 1.0),
@@ -525,7 +623,7 @@ fn cmd_certs(dir: String) {
     // reload both logs and replay re-verifying finality at every height
     let blocks = blog.read_all().unwrap_or_else(|e| fail("read block log", e));
     let certs = clog.read_all().unwrap_or_else(|e| fail("read cert log", e));
-    let chain = Chain::replay_verified(demo_genesis(), &blocks, &certs, &vset)
+    let chain = Chain::replay_verified(demo_genesis(), &blocks, &certs)
         .unwrap_or_else(|e| fail_msg("verify finality on replay", &e));
     println!(
         "reloaded {} block(s) + {} certificate(s); FINALITY re-verified height by height:",
@@ -550,7 +648,7 @@ fn cmd_certs(dir: String) {
     if !certs.is_empty() {
         let dropped = &certs[..certs.len() - 1];
         let state_ok = Chain::replay(demo_genesis(), &blocks).is_ok();
-        let finality = Chain::replay_verified(demo_genesis(), &blocks, dropped, &vset);
+        let finality = Chain::replay_verified(demo_genesis(), &blocks, dropped);
         println!("\ntamper check — drop the last certificate:");
         println!("  state-only replay still succeeds: {state_ok}");
         match finality {

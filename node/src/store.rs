@@ -173,6 +173,7 @@ mod tests {
                 timestamp_days: height as f32,
                 signature: [7u8; 64],
             }],
+            validator_updates: Vec::new(),
         }
     }
 

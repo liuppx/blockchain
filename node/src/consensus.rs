@@ -274,6 +274,7 @@ mod tests {
             prev_hash: [tag; 32],
             timestamp_days: height as f32,
             txs: Vec::new(),
+            validator_updates: Vec::new(),
         }
     }
 
