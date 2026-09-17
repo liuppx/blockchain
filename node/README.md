@@ -1,8 +1,8 @@
-# ZhixingGraph 参考节点（Rust · Milestone 6–16）
+# ZhixingGraph 参考节点（Rust · Milestone 6–17）
 
 对应白皮书 [`docs/WHITEPAPER.md`](../docs/WHITEPAPER.md) §5「PoK 共识」与 §7「技术架构」。
 
-这是把 ΔK 引擎（[`engine/`](../engine/)）与经济仿真（[`sim/`](../sim/)）背后的规则，落成一个**可运行、确定性的 PoK 共识状态机**——真正"跑链"的最小内核：区块、交易、账户、状态转移、铸造/罚没、链上声誉、ed25519 签名交易、追加式持久化、确定性 mempool 出块、Merkle 认证状态与轻客户端证明、BFT 最终性证书与验证人集、驱动活性的 BFT 轮次状态机（超时 / 锁定 / 换轮）、逐高度生长的**BFT 认证链**（mempool → 共识 → 提交，每块附可验证证书）、**证书落盘 + 重放即最终性复验**（`blocks.log` + `certs.log`，重放时逐高度复验 > 2/3 证书，恢复的是*最终性*而非仅状态）、**链上/动态验证人集**（区块携带验证人增删/改权，由变更前的集合认证、下一高度生效，重放随之逐高度跟随演进）、**P2P gossip 与反熵状态同步**（交易 epidemic 泛洪 + 认证块拉取追赶，逐块对链上验证人集复验证书，含真实 loopback TCP 传输），以及内容寻址的区块哈希链与状态根。
+这是把 ΔK 引擎（[`engine/`](../engine/)）与经济仿真（[`sim/`](../sim/)）背后的规则，落成一个**可运行、确定性的 PoK 共识状态机**——真正"跑链"的最小内核：区块、交易、账户、状态转移、铸造/罚没、链上声誉、ed25519 签名交易、追加式持久化、确定性 mempool 出块、Merkle 认证状态与轻客户端证明、BFT 最终性证书与验证人集、驱动活性的 BFT 轮次状态机（超时 / 锁定 / 换轮）、逐高度生长的**BFT 认证链**（mempool → 共识 → 提交，每块附可验证证书）、**证书落盘 + 重放即最终性复验**（`blocks.log` + `certs.log`，重放时逐高度复验 > 2/3 证书，恢复的是*最终性*而非仅状态）、**链上/动态验证人集**（区块携带验证人增删/改权，由变更前的集合认证、下一高度生效，重放随之逐高度跟随演进）、**P2P gossip 与反熵状态同步**（交易 epidemic 泛洪 + 认证块拉取追赶，逐块对链上验证人集复验证书，含真实 loopback TCP 传输）、**质押绑定的验证人权重与解绑期**（账户自绑定 $COG → 成为验证人、权重 == 绑定量；解绑经时间锁提款队列，资金留在池中仍可罚没直至到期返还），以及内容寻址的区块哈希链与状态根。
 
 > **共识的前提是确定性**：给定相同的创世与相同的区块序列，每个诚实节点算出**逐字节相同**的状态（`state_root` 一致）。本 crate 就是那个状态转移函数 `apply_block`，其 ΔK 由 `zhixing_engine::compute_delta_k` 计算——与白皮书 B.2.3、Python 仿真是**同一份契约**。
 
@@ -18,10 +18,11 @@ cargo run --release --bin node -- live             # BFT 活性：轮次状态�
 cargo run --release --bin node -- chain            # BFT 认证链：mempool → 共识 → 提交，逐高度生长
 cargo run --release --bin node -- validators       # 链上验证人集：逐高度增删验证人，重放随之跟随
 cargo run --release --bin node -- gossip           # P2P：反熵同步（新节点追赶认证链）+ 交易 epidemic 泛洪 + 真实 TCP
+cargo run --release --bin node -- staking          # 质押：绑定 $COG 获得验证人权重；解绑经时间锁提款到期返还
 cargo run --release --bin node -- certs  --dir DIR # 证书落盘：产出认证链→落盘 blocks/certs→重放复验最终性
 cargo run --release --bin node -- run  --dir DIR   # 持久化链：首次落盘演示块，之后重放
 cargo run --release --bin node -- status --dir DIR # 重放区块日志并打印状态
-cargo test --release                               # 90 项单元测试（见下）
+cargo test --release                               # 101 项单元测试（见下）
 ```
 
 演示链展示：新颖提交铸造 $COG、跨域桥接拿到 novelty+bonus（ΔK>1）、近重复/低质提交被**罚没入 treasury**、供应守恒、评审声誉按链上结果升降。
@@ -32,8 +33,8 @@ cargo test --release                               # 90 项单元测试（见下
 
 ```bash
 D=$(mktemp -d)
-cargo run --release --bin node -- run    --dir "$D"   # state_root=c78e18a6…b7027b
-cargo run --release --bin node -- status --dir "$D"   # state_root=c78e18a6…b7027b（从磁盘重建，一致）
+cargo run --release --bin node -- run    --dir "$D"   # state_root=1a2ec34c…9935b0
+cargo run --release --bin node -- status --dir "$D"   # state_root=1a2ec34c…9935b0（从磁盘重建，一致）
 ```
 
 - **同一份编码**用于区块哈希与磁盘记录（`codec`），所以区块哈希覆盖的正是落盘的字节。
@@ -165,6 +166,19 @@ cargo run --release --bin node -- gossip   # 新节点反熵追赶认证链 → 
 cargo run --release --bin node -- validators   # 4 验证人起步 → 加入 #25（旧集合认证）→ 删除 #21 → 重放逐高度跟随交接
 ```
 
+## 质押绑定的验证人权重与解绑期（Milestone 17）
+
+到 M16 为止，验证人的**权重是链上参数**：可增删/改权，但那只是被写入的数字，与任何经济抵押无关。真实 PoS 里权重必须**由质押背书**——想要更大投票权，就得锁定更多本金作为可罚没的担保。M17 把二者绑定：账户**自绑定（self-bond）** $COG，其**账户 id 即成为验证人 id**，验证人权重 == 绑定的 micro-$COG（恒等映射，精确无舍入）。
+
+- **绑定即赋权**：`StakeOp{account, Bond, amount}`（作者签名）把 `amount` 从账户余额移入**绑定池**（`bonded`），并按 M16 的纪律派生一条验证人变更——**由变更前的集合认证、下一高度生效**，新绑定者绝不为自己的加入投票。权重严格等于该账户的当前绑定量（`bonds[id]`）。
+- **解绑经时间锁**：`Unbond` 立即撤下权重（下一高度移出验证人集），但资金**不立刻退还**——进入解绑队列 `{account, amount, mature_height = H + UNBONDING_PERIOD}`（`UNBONDING_PERIOD = 3`）。在到期前资金**仍留在系统内、仍可被罚没**（这正是 M18 按证据罚没的安全前提），到期高度应用时才返还账户余额。
+- **供应守恒扩展**：不变量升级为 `Σ余额 + treasury + bonded + Σ解绑中金额 == supply`，全程有测试守护（绑定/解绑/到期返还的完整生命周期）。
+- **折入状态根、块级携带**：`bonded`/`bonds`/`unbonding` 三者均折入 `state_root`（故绑定改变状态根，`merkle_root` 不含绑定、保持不变）；bond/unbond 作为**块级 `stake_ops`**（类比 `validator_updates`）由区块携带、经 BFT 认证链定稿，本里程碑暂不走 mempool/gossip。**创世验证人仍是自举集**（不占绑定池），保持模型干净。
+
+```bash
+cargo run --release --bin node -- staking   # #1 绑定 6 $COG → 权重激活（旧集合认证）→ 解绑 → 时间锁 → 到期返还；供应全程守恒；重放复验最终性
+```
+
 ## 设计要点
 
 | 主题 | 做法 |
@@ -183,6 +197,7 @@ cargo run --release --bin node -- validators   # 4 验证人起步 → 加入 #2
 | **最终性持久化** | `Commit` 证书与区块同格式落盘（`certs.log`）；`replay_verified` 逐高度复验证书绑定+法定人数，恢复最终性而非仅状态；丢/换/伪造证书均被拒（M14） |
 | **动态验证人集** | 验证人集是折入 `state_root` 的链上状态；区块携带增删/改权，由变更前的集合认证、下一高度生效；驱动与重放对称跟随交接，用错误创世集合重放被拒（M16） |
 | **P2P 网络** | gossip 传播交易（epidemic 泛洪 + 内容哈希去重）与认证块（反熵拉取追赶）；每块对链上验证人集复验 > 2/3 证书才应用，伪造/掉包证书停在缺口；确定性 `Network` 保证收敛，纯状态机同时跑进程内与真实 TCP（M15） |
+| **质押绑定权重** | 账户自绑定 $COG → 验证人权重 == 绑定量（恒等映射）；解绑经 `UNBONDING_PERIOD` 时间锁提款队列，资金留池仍可罚没直至到期返还；`bonded`/`bonds`/`unbonding` 折入 `state_root`，块级 `stake_ops` 经 BFT 认证；供应守恒含绑定与解绑中金额（M17） |
 | **依赖策略** | 引擎零依赖（可嵌入/WASM）；节点作为应用引入审计过的 `ed25519-dalek` 做签名，绝不自实现密码学 |
 
 ## 测试覆盖
@@ -282,25 +297,37 @@ tx_gossip_reaches_every_node                  一处注入的交易 epidemic 泛
 a_duplicate_tx_does_not_re_flood              已见过的交易不再转发（泛洪终止）
 nodes_at_mixed_heights_all_converge           混合高度的节点全部追赶到同一 head
 gossip_is_deterministic                       同输入 → 同收敛 head
+# 质押绑定权重与解绑（lib.rs + codec.rs + driver.rs）
+bonding_makes_an_account_a_validator_next_height   绑定 → 账户成为验证人、权重 == 绑定量、下一高度生效
+unbond_schedules_a_delayed_withdrawal_that_matures 解绑 → 撤权 + 时间锁提款，到期返还余额
+bond_beyond_balance_is_rejected               绑定超余额 → 拒绝、整块回滚
+unbond_beyond_bond_is_rejected                解绑超绑定量 → 拒绝
+forged_stakeop_is_rejected                    他人密钥签的 stake op → BadSignature
+zero_amount_stakeop_is_rejected               绑定/解绑 0 → 拒绝
+state_root_covers_bonded_stake                绑定折入 state_root（改绑定 → 根变）
+a_full_bond_unbond_cycle_conserves_supply     绑定/解绑全程供应守恒
+stakeop_round_trip                            stake op wire 编解码往返 + 拒绝尾部字节
+stake_ops_round_trip_in_a_block               区块携带 stake_ops 编解码往返稳定、纳入哈希
+bonds_stake_and_activates_a_validator_through_the_certified_chain  经 BFT 认证链绑定 → 新权重认证下一高度
 ```
 
 ## 文件
 
 | 文件 | 作用 |
 |---|---|
-| `src/lib.rs` | 状态机核心：`Block`/`SubmissionTx`/`Account`/`ChainState`/`Chain`、`apply_block`（含验证人集跨高度切换）、`replay`/`replay_verified`（重放即最终性复验，随验证人集演进）、验签、`state_root`（含验证人集）/`merkle_root`/`account_proof`、供应守恒不变量 + 测试 |
+| `src/lib.rs` | 状态机核心：`Block`/`SubmissionTx`/`StakeOp`/`Account`/`ChainState`/`Chain`、`apply_block`（含验证人集跨高度切换、stake_ops 应用与解绑到期返还）、`apply_stake_op`、`replay`/`replay_verified`、验签、`state_root`（含验证人集 + 绑定/解绑状态）/`merkle_root`/`account_proof`、供应守恒不变量（含 bonded + 解绑中）+ 测试 |
 | `src/mempool.rs` | 确定性 mempool 与出块：内容寻址排序 + 试算式 `build_block` + 测试 |
 | `src/merkle.rs` | 二叉 Merkle 树：域分隔叶/节点、奇数提升、包含证明 `Proof`/`verify` + 测试 |
 | `src/validator.rs` | 验证人集与确定性提议人（Tendermint 优先级累加器）、链上变更 `ValidatorUpdate`/`apply_updates` + 测试 |
 | `src/consensus.rs` | BFT 投票/最终性证书：`Vote`/`Commit`/`verify`、`commit_block`、`detect_equivocation` + 测试 |
 | `src/round.rs` | BFT 轮次状态机（Tendermint `upon` 规则、超时/锁定/换轮）+ 进程内网络模拟器 `Sim` + 测试 |
-| `src/driver.rs` | BFT 认证链驱动 `ChainDriver`：逐高度 mempool→共识→提交 + 证书保留 + 故障注入 + 链上验证人变更（`stage_validator_update`）+ 测试 |
+| `src/driver.rs` | BFT 认证链驱动 `ChainDriver`：逐高度 mempool→共识→提交 + 证书保留 + 故障注入 + 链上验证人变更（`stage_validator_update`）+ 质押变更（`stage_stake_op`）+ 测试 |
 | `src/net.rs` | P2P gossip 与反熵同步：`GossipMsg`/`GossipNode`（纯状态机，认证块 `apply_certified` 复验证书、交易 epidemic 泛洪去重）+ 确定性 `Network` 收敛总线 + `encode_gossip`/`read_msg`/`write_msg`（真实 socket 分帧）+ 测试 |
 | `src/crypto.rs` | ed25519 身份：`Keypair`/`verify`（封装 `ed25519-dalek`）+ 测试 |
-| `src/codec.rs` | 区块的规范二进制编解码（哈希与落盘共用，含 `validator_updates`）+ `tx_signing_bytes`/`encode_tx`/`decode_tx`（签名/tx 哈希/gossip wire 字节）+ `encode_commit`/`decode_commit`（证书落盘）+ 测试 |
+| `src/codec.rs` | 区块的规范二进制编解码（哈希与落盘共用，含 `validator_updates` 与 `stake_ops`）+ `tx_signing_bytes`/`encode_tx`/`decode_tx`（签名/tx 哈希/gossip wire 字节）+ `stakeop_signing_bytes`/`encode_stakeop`/`decode_stakeop`（bond/unbond 签名与哈希）+ `encode_commit`/`decode_commit`（证书落盘）+ 测试 |
 | `src/store.rs` | 追加式日志（长度前缀记录、残缺尾检测）：`BlockLog`（区块）+ `CertLog`（证书）+ 测试 |
 | `src/hash.rs` | 纯 std SHA-256（FIPS 180-4，含已知向量测试）——离线零依赖 |
-| `src/main.rs` | 节点 CLI：`demo` / `build` / `prove` / `bft` / `live` / `chain` / `validators` / `gossip` / `certs` / `run` / `status`（含确定性演示密钥） |
+| `src/main.rs` | 节点 CLI：`demo` / `build` / `prove` / `bft` / `live` / `chain` / `validators` / `gossip` / `staking` / `certs` / `run` / `status`（含确定性演示密钥） |
 
 ## 局限与后续（离生产还差什么）
 
@@ -313,10 +340,11 @@ gossip_is_deterministic                       同输入 → 同收敛 head
 - **~~认证链驱动~~**：✅ 已完成（M13，逐高度 mempool→共识→提交，每块附复验证书，故障下的活性/安全行为）。
 - **~~证书落盘 + 重放复验最终性~~**：✅ 已完成（M14，`certs.log` + `replay_verified` 逐高度复验 > 2/3 证书）。后续：多提议人异构 mempool、拜占庭对抗测试（等价/延迟/审查）。
 - **~~P2P 网络~~**：✅ 已完成（M15，交易/认证块 gossip + 反熵状态同步 + 真实 TCP 传输；`round::Sim` 仍在进程内模拟高度内投票总线）。后续：Kademlia/节点发现、连接管理与背压、投票 gossip 上真实网络、Sybil/Eclipse 抗性。
-- **~~动态验证人集~~**：✅ 已完成（M16，链上增删验证人/改权、跨高度切换、`state_root` 折入验证人集、重放逐高度跟随交接）。后续：质押绑定权重、解绑期与退出队列、验证人集变更的轻客户端跟随协议。
+- **~~动态验证人集~~**：✅ 已完成（M16，链上增删验证人/改权、跨高度切换、`state_root` 折入验证人集、重放逐高度跟随交接）。
+- **~~质押绑定权重 + 解绑期~~**：✅ 已完成（M17，账户自绑定 $COG → 权重 == 绑定量、解绑经时间锁提款队列、供应守恒含 bonded/解绑中）。后续：**按证据罚没绑定质押入 treasury（M18）**、验证人集变更的轻客户端跟随协议、佣金/委托质押（delegation）、绑定/解绑走 mempool 与 gossip。
 - **~~持久化~~**：✅ 已完成（M7，追加式区块日志 + 重放；M14 加证书日志）。后续可换 RocksDB、加 per-record 校验和与 segment 轮转。
 - **~~Merkle 化状态树~~**：✅ 已完成（M10，二叉 Merkle 树 + 账户包含证明）。后续：非成员证明、增量更新的 Merkle-Patricia trie、把 graph/头字段也纳入根。
 - **手写 SHA-256** 仅为离线零依赖演示，**生产必须换审计实现**（`sha2`）。
 - **kNN 暴力扫描**：随图谱增长需换 HNSW/IVF（见 engine 局限）。
 
-这些构成后续里程碑（~~M7 持久化~~ ✅、~~M8 签名~~ ✅、~~M9 mempool 出块~~ ✅、~~M10 Merkle 认证状态~~ ✅、~~M11 BFT 最终性内核~~ ✅、~~M12 BFT 轮次状态机/活性~~ ✅、~~M13 认证链驱动~~ ✅、~~M14 证书落盘 + 重放复验~~ ✅、~~M15 P2P + gossip~~ ✅、~~M16 动态验证人集~~ ✅……），每步仍遵循"可运行、可测试、契约一致"。
+这些构成后续里程碑（~~M7 持久化~~ ✅、~~M8 签名~~ ✅、~~M9 mempool 出块~~ ✅、~~M10 Merkle 认证状态~~ ✅、~~M11 BFT 最终性内核~~ ✅、~~M12 BFT 轮次状态机/活性~~ ✅、~~M13 认证链驱动~~ ✅、~~M14 证书落盘 + 重放复验~~ ✅、~~M15 P2P + gossip~~ ✅、~~M16 动态验证人集~~ ✅、~~M17 质押绑定权重 + 解绑期~~ ✅、M18 按证据罚没绑定质押……），每步仍遵循"可运行、可测试、契约一致"。

@@ -275,6 +275,7 @@ mod tests {
             timestamp_days: height as f32,
             txs: Vec::new(),
             validator_updates: Vec::new(),
+            stake_ops: Vec::new(),
         }
     }
 

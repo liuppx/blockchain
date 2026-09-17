@@ -174,6 +174,7 @@ mod tests {
                 signature: [7u8; 64],
             }],
             validator_updates: Vec::new(),
+            stake_ops: Vec::new(),
         }
     }
 

@@ -23,7 +23,7 @@ use crate::consensus::Commit;
 use crate::mempool::Mempool;
 use crate::round::Sim;
 use crate::validator::ValidatorUpdate;
-use crate::{Block, Chain, ChainError, Genesis, Hash, Keypair, SubmissionTx};
+use crate::{Block, Chain, ChainError, Genesis, Hash, Keypair, StakeOp, SubmissionTx};
 
 #[derive(Debug)]
 pub enum DriverError {
@@ -66,6 +66,8 @@ pub struct ChainDriver {
     seeds: BTreeMap<u64, [u8; 32]>,
     /// Validator-set changes staged to ride along in the next produced block.
     pending_updates: Vec<ValidatorUpdate>,
+    /// Bond/unbond ops staged to ride along in the next produced block.
+    pending_stake_ops: Vec<StakeOp>,
     /// Each committed block, in height order — retained so the chain can be
     /// persisted (block log) alongside its certificates.
     blocks: Vec<Block>,
@@ -80,6 +82,7 @@ impl ChainDriver {
             mempool: Mempool::new(max_txs),
             seeds,
             pending_updates: Vec::new(),
+            pending_stake_ops: Vec::new(),
             blocks: Vec::new(),
             certs: Vec::new(),
         }
@@ -95,6 +98,13 @@ impl ChainDriver {
     /// validator set and takes effect from the following height.
     pub fn stage_validator_update(&mut self, update: ValidatorUpdate) {
         self.pending_updates.push(update);
+    }
+
+    /// Stage a signed bond/unbond op to be carried by the next block
+    /// [`Self::produce`] finalizes. Like validator updates, the implied power
+    /// change is certified by the *current* set and takes effect next height.
+    pub fn stage_stake_op(&mut self, op: StakeOp) {
+        self.pending_stake_ops.push(op);
     }
 
     pub fn height(&self) -> u64 {
@@ -137,19 +147,23 @@ impl ChainDriver {
         silent: &BTreeSet<u64>,
     ) -> Result<Option<Commit>, DriverError> {
         // build the next block from the pool; if the pool yields nothing but a
-        // validator change is staged, produce a validator-only (empty-tx) block.
+        // validator change or a stake op is staged, produce an empty-tx block.
         let mut candidate = match self.mempool.build_block(&self.chain, timestamp_days) {
             Some(b) => b,
-            None if !self.pending_updates.is_empty() => Block {
-                height: self.chain.state.height + 1,
-                prev_hash: self.chain.head,
-                timestamp_days,
-                txs: Vec::new(),
-                validator_updates: Vec::new(),
-            },
+            None if !self.pending_updates.is_empty() || !self.pending_stake_ops.is_empty() => {
+                Block {
+                    height: self.chain.state.height + 1,
+                    prev_hash: self.chain.head,
+                    timestamp_days,
+                    txs: Vec::new(),
+                    validator_updates: Vec::new(),
+                    stake_ops: Vec::new(),
+                }
+            }
             None => return Ok(None),
         };
         candidate.validator_updates = self.pending_updates.clone();
+        candidate.stake_ops = self.pending_stake_ops.clone();
         let height = candidate.height;
 
         // consensus over this height uses the set ACTIVE for it — the on-chain
@@ -175,6 +189,7 @@ impl ChainDriver {
 
         self.apply(&candidate)?;
         self.pending_updates.clear();
+        self.pending_stake_ops.clear();
         self.blocks.push(candidate);
         self.certs.push(commit.clone());
         Ok(Some(commit))
@@ -208,7 +223,7 @@ impl ChainDriver {
 mod tests {
     use super::*;
     use crate::validator::{Validator, ValidatorSet, ValidatorUpdate};
-    use crate::{Genesis, Review, DIM, MICRO};
+    use crate::{BondKind, Genesis, Review, DIM, MICRO};
     use zhixing_engine::DeltaKParams;
 
     fn seed(id: u64) -> [u8; 32] {
@@ -285,6 +300,33 @@ mod tests {
         d.submit(tx(2, 2, 2)).unwrap();
         d.submit(tx(3, 3, 3)).unwrap();
         d
+    }
+
+    #[test]
+    fn bonds_stake_and_activates_a_validator_through_the_certified_chain() {
+        // seeds must include the bonding account so its validator can vote once active
+        let ids = [1u64, 2, 3, 21, 22, 23, 24];
+        let seeds: BTreeMap<u64, [u8; 32]> = ids.iter().map(|&id| (id, seed(id))).collect();
+        let mut d = ChainDriver::new(genesis(), seeds, 4);
+        let bal0 = d.chain.state.accounts[&1].balance;
+
+        // stage a bond by account 1 and finalize a (certified) block carrying it
+        let op = StakeOp { account: 1, kind: BondKind::Bond, amount: 5 * MICRO, signature: [0u8; 64] }
+            .signed(&kp(1));
+        d.stage_stake_op(op);
+        d.produce(1.0, &BTreeSet::new()).unwrap().expect("a stake-only block is produced");
+        assert_eq!(d.height(), 1);
+        assert_eq!(d.chain.state.bonded, 5 * MICRO);
+        assert_eq!(d.chain.state.accounts[&1].balance, bal0 - 5 * MICRO);
+        // account 1 is now an active validator with power == its bond (certified by the old set)
+        assert_eq!(d.chain.state.validators.get(1).map(|v| v.power), Some(5 * MICRO));
+
+        // the grown set (now including #1) certifies the next height
+        d.submit(tx(2, 2, 2)).unwrap();
+        d.produce(2.0, &BTreeSet::new()).unwrap().expect("next height commits under the grown set");
+        assert_eq!(d.height(), 2);
+        assert_eq!(d.certificates().len(), 2);
+        assert!(d.chain.state.supply_conserved());
     }
 
     #[test]

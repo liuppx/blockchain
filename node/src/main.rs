@@ -5,6 +5,7 @@
 //!   cargo run --release --bin node -- prove            # light-client Merkle proof
 //!   cargo run --release --bin node -- bft              # BFT commit certificate over a block
 //!   cargo run --release --bin node -- gossip           # gossip + anti-entropy sync (in-proc + loopback TCP)
+//!   cargo run --release --bin node -- staking          # bond/unbond: stake-bound validator power + unbonding
 //!   cargo run --release --bin node -- run  --dir DIR   # persistent chain (block log)
 //!   cargo run --release --bin node -- status --dir DIR # replay log, print state
 //!   cargo run --release --bin node -- certs  --dir DIR # persist certified chain, re-verify finality
@@ -28,7 +29,7 @@ use zhixing_node::net::{read_msg, write_msg, GossipMsg, GossipNode, Network};
 use zhixing_node::round::Sim;
 use zhixing_node::store::{BlockLog, CertLog};
 use zhixing_node::validator::{Validator, ValidatorSet, ValidatorUpdate};
-use zhixing_node::{hex, Block, Chain, Genesis, Keypair, Review, SubmissionTx, MICRO};
+use zhixing_node::{hex, Block, BondKind, Chain, Genesis, Keypair, Review, StakeOp, SubmissionTx, MICRO};
 
 type Emb = [f32; DIM];
 
@@ -133,6 +134,7 @@ fn demo_blocks(chain: &Chain) -> Vec<Block> {
             tx(2, unit(2), 2, reviews(&[(10, 0.88), (11, 0.9), (12, 0.86)]), (3, 3), 1.0),
         ],
         validator_updates: Vec::new(),
+        stake_ops: Vec::new(),
     };
     // block 2 prev_hash is block 1's hash
     let b2 = Block {
@@ -144,6 +146,7 @@ fn demo_blocks(chain: &Chain) -> Vec<Block> {
             tx(1, unit(0), 0, reviews(&[(10, 0.7), (11, 0.6), (12, 0.65)]), (0, 3), 2.0),
         ],
         validator_updates: Vec::new(),
+        stake_ops: Vec::new(),
     };
     vec![b1, b2]
 }
@@ -159,6 +162,7 @@ fn main() {
         "live" => cmd_live(),
         "chain" => cmd_chain(),
         "validators" => cmd_validators(),
+        "staking" => cmd_staking(),
         "gossip" => cmd_gossip(),
         "run" => cmd_run(dir_arg(&args)),
         "status" => cmd_status(dir_arg(&args)),
@@ -193,6 +197,7 @@ fn usage() {
     eprintln!("  node live               drive the BFT round FSM to a commit (incl. a dead proposer)");
     eprintln!("  node chain              grow a BFT-certified chain height by height (mempool -> consensus -> commit)");
     eprintln!("  node validators         grow a chain across on-chain validator-set changes (add/remove)");
+    eprintln!("  node staking            bond stake to gain validator power; unbond through a delayed withdrawal");
     eprintln!("  node gossip             gossip + anti-entropy sync: fresh nodes catch up to a certified chain (in-proc + TCP)");
     eprintln!("  node run    --dir DIR   persistent chain (seeds demo blocks once, then replays)");
     eprintln!("  node status --dir DIR   replay the block log and print state");
@@ -551,6 +556,110 @@ fn produce_vreport(d: &mut ChainDriver, day: f32) {
             ids_after,
             d.chain.state.validators.quorum()
         );
+    }
+}
+
+/// Demonstrate staking-bound validator power: an account bonds $COG to become a
+/// validator whose power equals its bonded stake, then unbonds through a
+/// time-locked withdrawal (funds stay in the pool — still part of supply, still
+/// slashable — until maturity, then return to the balance). Everything rides a
+/// BFT-certified chain and is re-verified on replay.
+fn cmd_staking() {
+    use zhixing_node::UNBONDING_PERIOD;
+
+    // signing-key seeds: genesis validators 21..=24 PLUS accounts 1..=3, so a
+    // freshly-bonded account can sign consensus votes once its power is active.
+    let seeds: BTreeMap<u64, [u8; 32]> = [1u64, 2, 3, 21, 22, 23, 24]
+        .iter()
+        .map(|&id| {
+            let mut s = [0u8; 32];
+            s[..8].copy_from_slice(&id.to_le_bytes());
+            (id, s)
+        })
+        .collect();
+    let mut d = ChainDriver::new(demo_genesis(), seeds, 1);
+
+    let ids0: Vec<u64> = d.chain.state.validators.validators().iter().map(|v| v.id).collect();
+    println!(
+        "genesis validator set {ids0:?} (equal power); account #1 balance {} $COG, bonded pool {} $COG\n",
+        cog(d.chain.state.accounts[&1].balance),
+        cog(d.chain.state.bonded),
+    );
+
+    // height 1: account #1 bonds 6 $COG. The op rides a block certified by the
+    // GENESIS set — the newcomer never votes on its own arrival. power == bond.
+    println!("  height 1: account #1 BONDs 6 $COG  (power activates next height)");
+    d.stage_stake_op(
+        StakeOp { account: 1, kind: BondKind::Bond, amount: 6 * MICRO, signature: [0u8; 64] }
+            .signed(&kp(1)),
+    );
+    produce_stakereport(&mut d, 1.0);
+
+    // height 2: #1 is now an active validator with power == its bond. It unbonds,
+    // scheduling a delayed withdrawal that matures UNBONDING_PERIOD heights later.
+    println!("\n  height 2: account #1 UNBONDs 6 $COG  (power removed next height; funds time-locked)");
+    d.stage_stake_op(
+        StakeOp { account: 1, kind: BondKind::Unbond, amount: 6 * MICRO, signature: [0u8; 64] }
+            .signed(&kp(1)),
+    );
+    produce_stakereport(&mut d, 2.0);
+    let mature = 2 + UNBONDING_PERIOD;
+    println!(
+        "    scheduled withdrawal of 6 $COG matures at height {mature}; account #1 balance still {} $COG (locked in pool)",
+        cog(d.chain.state.accounts[&1].balance),
+    );
+
+    // advance plain heights until the withdrawal matures; the released funds
+    // return to the balance when the maturing height is applied.
+    let mut day = 3.0;
+    for h in 3..=mature {
+        d.submit(tx(
+            2,
+            unit(h as usize + 1),
+            h as u32 + 10,
+            reviews(&[(10, 0.9), (11, 0.85), (12, 0.9)]),
+            (3, 3),
+            day,
+        ))
+        .unwrap();
+        produce_stakereport(&mut d, day);
+        day += 1.0;
+    }
+    println!(
+        "\n  height {mature} applied: account #1 balance {} $COG, bonded pool {} $COG, unbonding queue {} entries",
+        cog(d.chain.state.accounts[&1].balance),
+        cog(d.chain.state.bonded),
+        d.chain.state.unbonding.len(),
+    );
+    println!("  supply conserved throughout: {}", d.chain.state.supply_conserved());
+
+    // replay the whole certified chain, re-verifying finality height by height.
+    let chain = Chain::replay_verified(demo_genesis(), d.blocks(), d.certificates())
+        .unwrap_or_else(|e| fail_msg("verify finality across staking", &e));
+    println!(
+        "\nreplay re-verified finality across the staking lifecycle ✓  head {}",
+        short(&chain.head)
+    );
+    debug_assert_eq!(chain.state.state_root(), d.chain.state.state_root());
+}
+
+/// Produce one height (all validators honest) and report the set that certified
+/// it, the bonded pool, and account #1's live validator power (== its bond).
+fn produce_stakereport(d: &mut ChainDriver, day: f32) {
+    let before: Vec<u64> = d.chain.state.validators.validators().iter().map(|v| v.id).collect();
+    d.produce(day, &BTreeSet::new())
+        .unwrap_or_else(|e| fail_msg("produce height", &e))
+        .expect("a block to produce");
+    let after: Vec<u64> = d.chain.state.validators.validators().iter().map(|v| v.id).collect();
+    println!(
+        "    height {} certified by {:?}; bonded pool {} $COG; account #1 power {} $COG",
+        d.height(),
+        before,
+        cog(d.chain.state.bonded),
+        cog(d.chain.state.validators.get(1).map(|v| v.power).unwrap_or(0)),
+    );
+    if after != before {
+        println!("      -> validator set for the next height is now {after:?}");
     }
 }
 

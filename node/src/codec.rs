@@ -6,7 +6,7 @@
 
 use crate::consensus::{Commit, Vote, VoteType};
 use crate::validator::ValidatorUpdate;
-use crate::{Block, Embedding, Review, SubmissionTx};
+use crate::{Block, BondKind, Embedding, Review, StakeOp, SubmissionTx};
 use zhixing_engine::DIM;
 
 #[derive(Debug)]
@@ -49,6 +49,10 @@ pub fn encode_block(b: &Block) -> Vec<u8> {
         e.u64(u.id);
         e.raw(&u.pubkey);
         e.u64(u.power);
+    }
+    e.u64(b.stake_ops.len() as u64);
+    for op in &b.stake_ops {
+        enc_stakeop(&mut e, op, true);
     }
     e.0
 }
@@ -95,6 +99,43 @@ fn enc_tx(e: &mut Enc, t: &SubmissionTx, include_sig: bool) {
     e.f32(t.timestamp_days);
     if include_sig {
         e.raw(&t.signature);
+    }
+}
+
+// --- stake operations (bond / unbond) ----------------------------------------
+
+/// The exact bytes an account signs to authorize a bond/unbond: all fields
+/// EXCEPT the signature. Verifying `signature` over these authenticates the op.
+pub fn stakeop_signing_bytes(op: &StakeOp) -> Vec<u8> {
+    let mut e = Enc(Vec::new());
+    enc_stakeop(&mut e, op, false);
+    e.0
+}
+
+/// Canonical bytes of a full (signed) stake op, used for its content-addressed hash.
+pub fn encode_stakeop(op: &StakeOp) -> Vec<u8> {
+    let mut e = Enc(Vec::new());
+    enc_stakeop(&mut e, op, true);
+    e.0
+}
+
+/// Decode exactly one signed stake op (the inverse of [`encode_stakeop`]);
+/// trailing bytes are an error.
+pub fn decode_stakeop(buf: &[u8]) -> Result<StakeOp, CodecError> {
+    let mut d = Dec { buf, pos: 0 };
+    let op = dec_stakeop(&mut d)?;
+    if d.pos != d.buf.len() {
+        return Err(CodecError::TrailingBytes);
+    }
+    Ok(op)
+}
+
+fn enc_stakeop(e: &mut Enc, op: &StakeOp, include_sig: bool) {
+    e.u64(op.account);
+    e.u32(op.kind.tag() as u32);
+    e.u64(op.amount);
+    if include_sig {
+        e.raw(&op.signature);
     }
 }
 
@@ -205,6 +246,11 @@ pub fn decode_block(buf: &[u8]) -> Result<Block, CodecError> {
         let power = d.u64()?;
         validator_updates.push(ValidatorUpdate { id, pubkey, power });
     }
+    let n_ops = d.count()?;
+    let mut stake_ops = Vec::with_capacity(n_ops as usize);
+    for _ in 0..n_ops {
+        stake_ops.push(dec_stakeop(&mut d)?);
+    }
     if d.pos != d.buf.len() {
         return Err(CodecError::TrailingBytes);
     }
@@ -214,6 +260,7 @@ pub fn decode_block(buf: &[u8]) -> Result<Block, CodecError> {
         timestamp_days,
         txs,
         validator_updates,
+        stake_ops,
     })
 }
 
@@ -251,6 +298,23 @@ fn dec_tx(d: &mut Dec) -> Result<SubmissionTx, CodecError> {
         repl_success,
         repl_total,
         timestamp_days: ts,
+        signature,
+    })
+}
+
+/// Decode one signed stake op from the cursor (shared by [`decode_block`] and
+/// [`decode_stakeop`]).
+fn dec_stakeop(d: &mut Dec) -> Result<StakeOp, CodecError> {
+    let account = d.u64()?;
+    let tag = d.u32()?;
+    let kind = BondKind::from_tag(tag as u8).ok_or(CodecError::BadEnum(tag))?;
+    let amount = d.u64()?;
+    let mut signature = [0u8; 64];
+    signature.copy_from_slice(d.take(64)?);
+    Ok(StakeOp {
+        account,
+        kind,
+        amount,
         signature,
     })
 }
@@ -320,6 +384,10 @@ mod tests {
                 ValidatorUpdate { id: 25, pubkey: [5u8; 32], power: 3 },
                 ValidatorUpdate { id: 21, pubkey: [0u8; 32], power: 0 },
             ],
+            stake_ops: vec![
+                StakeOp { account: 1, kind: BondKind::Bond, amount: 5 * MICRO, signature: [7u8; 64] },
+                StakeOp { account: 2, kind: BondKind::Unbond, amount: 2 * MICRO, signature: [8u8; 64] },
+            ],
         }
     }
 
@@ -347,6 +415,43 @@ mod tests {
         let back2 = decode_block(&encode_block(&plain)).unwrap();
         assert!(back2.validator_updates.is_empty());
         assert_ne!(back.hash(), back2.hash()); // updates are covered by the hash
+    }
+
+    #[test]
+    fn stakeop_round_trip() {
+        let op = StakeOp {
+            account: 3,
+            kind: BondKind::Unbond,
+            amount: 4 * MICRO,
+            signature: [6u8; 64],
+        };
+        let bytes = encode_stakeop(&op);
+        let back = decode_stakeop(&bytes).unwrap();
+        assert_eq!(encode_stakeop(&back), bytes);
+        assert_eq!(back.hash(), op.hash());
+        // signing bytes exclude the signature
+        assert!(stakeop_signing_bytes(&op).len() < bytes.len());
+        // trailing bytes are rejected
+        let mut extra = bytes.clone();
+        extra.push(0);
+        assert!(matches!(decode_stakeop(&extra), Err(CodecError::TrailingBytes)));
+    }
+
+    #[test]
+    fn stake_ops_round_trip_in_a_block() {
+        let b = sample_block();
+        let back = decode_block(&encode_block(&b)).unwrap();
+        assert_eq!(back.stake_ops.len(), 2);
+        assert_eq!(back.stake_ops[0].account, 1);
+        assert_eq!(back.stake_ops[0].kind, BondKind::Bond);
+        assert_eq!(back.stake_ops[0].amount, 5 * MICRO);
+        assert_eq!(back.stake_ops[1].kind, BondKind::Unbond);
+        // a block with no stake ops still round-trips, with a distinct hash
+        let mut plain = sample_block();
+        plain.stake_ops.clear();
+        let back2 = decode_block(&encode_block(&plain)).unwrap();
+        assert!(back2.stake_ops.is_empty());
+        assert_ne!(back.hash(), back2.hash()); // stake ops are covered by the hash
     }
 
     #[test]

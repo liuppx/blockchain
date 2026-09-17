@@ -88,6 +88,7 @@ impl Mempool {
             timestamp_days,
             txs: included,
             validator_updates: Vec::new(),
+            stake_ops: Vec::new(),
         })
     }
 

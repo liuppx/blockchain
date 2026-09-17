@@ -35,7 +35,7 @@ pub mod round;
 pub mod store;
 pub mod validator;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use zhixing_engine::{compute_delta_k, CognitiveGraph, DeltaKParams, GraphNode, Submission, DIM};
 
@@ -92,6 +92,66 @@ impl SubmissionTx {
     }
 }
 
+/// Number of heights a withdrawal stays locked in the unbonding queue after an
+/// [`StakeOp`] unbond. During this window the funds have left the validator's
+/// voting power but not yet returned to the account balance — the delay is what
+/// keeps an exiting validator's stake reachable by slashing (a later milestone).
+pub const UNBONDING_PERIOD: u64 = 3;
+
+/// Bond adds to a validator's stake (and voting power); Unbond schedules a
+/// delayed withdrawal of it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BondKind {
+    Bond,
+    Unbond,
+}
+
+impl BondKind {
+    pub fn tag(self) -> u8 {
+        match self {
+            BondKind::Bond => 0,
+            BondKind::Unbond => 1,
+        }
+    }
+    pub fn from_tag(t: u8) -> Option<BondKind> {
+        match t {
+            0 => Some(BondKind::Bond),
+            1 => Some(BondKind::Unbond),
+            _ => None,
+        }
+    }
+}
+
+/// A self-bond staking operation: account `account` bonds or unbonds `amount`
+/// micro-$COG toward the validator whose id **is** `account`. Bonding moves the
+/// funds from the account balance into the bonded pool and gives the validator
+/// that much voting power (effective next height, like any validator-set change);
+/// unbonding removes the power and parks the funds in the unbonding queue for
+/// [`UNBONDING_PERIOD`] heights before they return to the balance. Ties consensus
+/// weight to economic skin-in-the-game (whitepaper B.2.3 / §5): power is bonded
+/// $COG, not an out-of-band constant.
+#[derive(Clone, Debug)]
+pub struct StakeOp {
+    pub account: u64,
+    pub kind: BondKind,
+    pub amount: u64,
+    /// ed25519 signature by `account`'s key over [`codec::stakeop_signing_bytes`].
+    pub signature: Sig,
+}
+
+impl StakeOp {
+    /// Sign this op's canonical fields with `kp` (the account's key).
+    pub fn signed(mut self, kp: &Keypair) -> Self {
+        self.signature = kp.sign(&codec::stakeop_signing_bytes(&self));
+        self
+    }
+
+    /// Content-addressed hash over the full signed encoding.
+    pub fn hash(&self) -> Hash {
+        sha256(&codec::encode_stakeop(self))
+    }
+}
+
 /// A block: an ordered batch of submissions applied atomically.
 #[derive(Clone, Debug)]
 pub struct Block {
@@ -104,6 +164,11 @@ pub struct Block {
     /// transactions and taking effect from the *next* height (this block is
     /// still certified by the set in force before it). Empty in the common case.
     pub validator_updates: Vec<ValidatorUpdate>,
+    /// Bond/unbond staking operations carried by this block. Applied after the
+    /// submissions; the validator-power changes they imply take effect from the
+    /// *next* height (the same discipline as `validator_updates`). Empty in the
+    /// common case.
+    pub stake_ops: Vec<StakeOp>,
 }
 
 impl Block {
@@ -115,6 +180,17 @@ impl Block {
 }
 
 // --- State -------------------------------------------------------------------
+
+/// A withdrawal in flight: `amount` micro-$COG unbonded by `account`, returning
+/// to its balance once the chain reaches `mature_height`. Until then the funds
+/// are neither in a balance nor in the validator's power — they sit here, still
+/// part of `supply` (and, in a later milestone, still slashable).
+#[derive(Clone, Debug)]
+pub struct UnbondingEntry {
+    pub account: u64,
+    pub amount: u64,
+    pub mature_height: u64,
+}
 
 #[derive(Clone, Debug, Default)]
 pub struct Account {
@@ -160,6 +236,15 @@ pub struct ChainState {
     pub slash_bps: u32,
     pub supply: u64,   // total $COG in existence (micro)
     pub treasury: u64, // slashed stake pool (redistributed, not burned)
+    /// Total micro-$COG bonded as validator stake (backs voting power). Equals
+    /// the sum of [`Self::bonds`]. Held out of balances but part of `supply`.
+    pub bonded: u64,
+    /// Currently bonded micro-$COG per validator id (== that validator's voting
+    /// power, applied to the set from the next height). The source of truth for
+    /// stake-derived power; a validator drops out when its bond reaches zero.
+    pub bonds: BTreeMap<u64, u64>,
+    /// Withdrawals in the unbonding delay window, awaiting return to balances.
+    pub unbonding: Vec<UnbondingEntry>,
     pub height: u64,
     pub now_days: f32,
     /// The active validator set — part of consensus state, evolved on-chain by
@@ -195,6 +280,10 @@ pub enum ChainError {
     /// A block's validator updates would leave the set empty — consensus would
     /// become impossible, so the block is rejected.
     EmptyValidatorSet,
+    /// A bond/unbond op with a zero amount (never meaningful).
+    ZeroStake(u64),
+    /// An unbond of more than the account currently has bonded.
+    InsufficientBond { account: u64, need: u64, have: u64 },
 }
 
 impl std::fmt::Display for ChainError {
@@ -218,6 +307,11 @@ impl std::fmt::Display for ChainError {
             ChainError::EmptyValidatorSet => {
                 write!(f, "validator updates would empty the validator set")
             }
+            ChainError::ZeroStake(a) => write!(f, "account {a} bond/unbond amount is zero"),
+            ChainError::InsufficientBond { account, need, have } => write!(
+                f,
+                "account {account} cannot unbond {need} (has {have} bonded)"
+            ),
         }
     }
 }
@@ -276,6 +370,11 @@ pub struct BlockReceipt {
     pub slashed: u64,
     pub accepted: usize,
     pub rejected: usize,
+    /// micro-$COG newly bonded, newly unbonded, and returned from matured
+    /// unbonding this block (staking flow, for reporting).
+    pub bonded: u64,
+    pub unbonded: u64,
+    pub released: u64,
     pub txs: Vec<TxReceipt>,
 }
 
@@ -319,6 +418,9 @@ impl ChainState {
             slash_bps: g.slash_bps,
             supply,
             treasury: 0,
+            bonded: 0,
+            bonds: BTreeMap::new(),
+            unbonding: Vec::new(),
             height: 0,
             now_days: g.timestamp_days,
             validators,
@@ -330,6 +432,7 @@ impl ChainState {
             timestamp_days: g.timestamp_days,
             txs: Vec::new(),
             validator_updates: Vec::new(),
+            stake_ops: Vec::new(),
         }
         .hash();
         (state, gh)
@@ -345,6 +448,28 @@ impl ChainState {
             });
         }
         self.now_days = block.timestamp_days;
+        let new_height = block.height;
+
+        // release any unbonding withdrawals that mature at or before this height,
+        // returning the funds to the account balance (before this block's own
+        // unbonds are scheduled, so a same-block bond/unbond never matures early).
+        let mut released = 0u64;
+        let mut still_unbonding = Vec::with_capacity(self.unbonding.len());
+        for e in std::mem::take(&mut self.unbonding) {
+            if e.mature_height <= new_height {
+                if let Some(a) = self.accounts.get_mut(&e.account) {
+                    a.balance += e.amount;
+                } else {
+                    // account gone (cannot happen for a self-bond) — keep the
+                    // money in the system by routing it to the treasury.
+                    self.treasury += e.amount;
+                }
+                released += e.amount;
+            } else {
+                still_unbonding.push(e);
+            }
+        }
+        self.unbonding = still_unbonding;
 
         let mut receipts = Vec::with_capacity(block.txs.len());
         let mut minted_total = 0u64;
@@ -364,20 +489,42 @@ impl ChainState {
             receipts.push(r);
         }
 
-        // on-chain validator-set transition: the updates in this block take
-        // effect from the NEXT height (this block was certified by the set in
-        // force before it). Guard against emptying the set, which would make
-        // future consensus impossible. Applied on a trial clone via
-        // `Chain::commit`, so a rejection here rolls the whole block back.
-        if !block.validator_updates.is_empty() {
-            let next = self.validators.apply_updates(&block.validator_updates);
+        // staking operations: move funds between balance / bonded pool / unbonding
+        // queue, tracking which validators' power changed so we can evolve the set.
+        let mut bonded_total = 0u64;
+        let mut unbonded_total = 0u64;
+        let mut touched: BTreeSet<u64> = BTreeSet::new();
+        for op in &block.stake_ops {
+            match op.kind {
+                BondKind::Bond => bonded_total += op.amount,
+                BondKind::Unbond => unbonded_total += op.amount,
+            }
+            self.apply_stake_op(op, new_height)?;
+            touched.insert(op.account);
+        }
+
+        // on-chain validator-set transition: explicit updates PLUS the changes
+        // implied by this block's staking ops (power == bonded stake). Both take
+        // effect from the NEXT height — this block was certified by the set in
+        // force before it, so a newly-bonded validator never votes on its own
+        // arrival. Guard against emptying the set (future consensus impossible).
+        // Applied on a trial clone via `Chain::commit`, so any rejection here
+        // rolls the whole block back.
+        let mut updates = block.validator_updates.clone();
+        for id in touched {
+            let power = self.bonds.get(&id).copied().unwrap_or(0);
+            let pubkey = self.accounts.get(&id).map(|a| a.pubkey).unwrap_or_default();
+            updates.push(ValidatorUpdate { id, pubkey, power }); // power 0 == removal
+        }
+        if !updates.is_empty() {
+            let next = self.validators.apply_updates(&updates);
             if next.is_empty() {
                 return Err(ChainError::EmptyValidatorSet);
             }
             self.validators = next;
         }
 
-        self.height = block.height;
+        self.height = new_height;
         Ok(BlockReceipt {
             height: block.height,
             hash: block.hash(),
@@ -385,8 +532,65 @@ impl ChainState {
             slashed: slashed_total,
             accepted: n_accept,
             rejected: n_reject,
+            bonded: bonded_total,
+            unbonded: unbonded_total,
+            released,
             txs: receipts,
         })
+    }
+
+    /// Apply one bond/unbond op at `height` (the height of the block carrying it).
+    /// Bond escrows funds from the account balance into the bonded pool; unbond
+    /// removes them from the pool and schedules a delayed withdrawal. Never
+    /// partially mutates on error (all checks precede any mutation), so a failing
+    /// op rolls the whole block back cleanly.
+    fn apply_stake_op(&mut self, op: &StakeOp, height: u64) -> Result<(), ChainError> {
+        let acct = self
+            .accounts
+            .get(&op.account)
+            .ok_or(ChainError::UnknownAccount(op.account))?;
+        if !crypto::verify(&acct.pubkey, &codec::stakeop_signing_bytes(op), &op.signature) {
+            return Err(ChainError::BadSignature(op.account));
+        }
+        if op.amount == 0 {
+            return Err(ChainError::ZeroStake(op.account));
+        }
+        match op.kind {
+            BondKind::Bond => {
+                if acct.balance < op.amount {
+                    return Err(ChainError::InsufficientBalance {
+                        account: op.account,
+                        need: op.amount,
+                        have: acct.balance,
+                    });
+                }
+                self.accounts.get_mut(&op.account).unwrap().balance -= op.amount;
+                *self.bonds.entry(op.account).or_insert(0) += op.amount;
+                self.bonded += op.amount;
+            }
+            BondKind::Unbond => {
+                let cur = self.bonds.get(&op.account).copied().unwrap_or(0);
+                if cur < op.amount {
+                    return Err(ChainError::InsufficientBond {
+                        account: op.account,
+                        need: op.amount,
+                        have: cur,
+                    });
+                }
+                if cur == op.amount {
+                    self.bonds.remove(&op.account);
+                } else {
+                    self.bonds.insert(op.account, cur - op.amount);
+                }
+                self.bonded -= op.amount;
+                self.unbonding.push(UnbondingEntry {
+                    account: op.account,
+                    amount: op.amount,
+                    mature_height: height + UNBONDING_PERIOD,
+                });
+            }
+        }
+        Ok(())
     }
 
     /// Static validity checks that do NOT depend on ΔK or mutate state: reviews
@@ -553,6 +757,20 @@ impl ChainState {
             e.raw(&v.pubkey);
             e.u64(v.power);
         }
+        // staking state: the bonded pool, per-validator bonds, and the unbonding
+        // queue are all consensus state and must move the root.
+        e.u64(self.bonded);
+        e.u64(self.bonds.len() as u64);
+        for (id, amt) in &self.bonds {
+            e.u64(*id);
+            e.u64(*amt);
+        }
+        e.u64(self.unbonding.len() as u64);
+        for u in &self.unbonding {
+            e.u64(u.account);
+            e.u64(u.amount);
+            e.u64(u.mature_height);
+        }
         sha256(&e.0)
     }
 
@@ -594,12 +812,16 @@ impl ChainState {
         leaves
     }
 
-    /// Accounting invariant: every micro-$COG is either in an account balance or
-    /// in the treasury (stake escrow is always resolved within a tx). Should
-    /// hold after any sequence of blocks.
+    /// Accounting invariant: every micro-$COG is in an account balance, in the
+    /// treasury, in the bonded pool, or in the unbonding queue (stake escrow for a
+    /// submission is always resolved within a tx). Should hold after any sequence
+    /// of blocks.
     pub fn supply_conserved(&self) -> bool {
-        let held: u128 =
-            self.accounts.values().map(|a| a.balance as u128).sum::<u128>() + self.treasury as u128;
+        let unbonding: u128 = self.unbonding.iter().map(|u| u.amount as u128).sum();
+        let held: u128 = self.accounts.values().map(|a| a.balance as u128).sum::<u128>()
+            + self.treasury as u128
+            + self.bonded as u128
+            + unbonding;
         held == self.supply as u128
     }
 }
@@ -762,6 +984,7 @@ mod tests {
             timestamp_days: height as f32,
             txs,
             validator_updates: Vec::new(),
+            stake_ops: Vec::new(),
         }
     }
 
@@ -1013,6 +1236,121 @@ mod tests {
         assert_eq!(chain.state.validators.len(), 3);
     }
 
+    // ---- staking-bound validator power + unbonding (M17) ----
+
+    /// Build a block carrying a single signed bond/unbond op (no txs).
+    fn stake_block(chain: &Chain, height: u64, account: u64, kind: BondKind, amount: u64) -> Block {
+        let op = StakeOp { account, kind, amount, signature: [0u8; 64] }.signed(&kp(account));
+        let mut b = block(chain, height, vec![]);
+        b.stake_ops = vec![op];
+        b
+    }
+
+    #[test]
+    fn bonding_makes_an_account_a_validator_next_height() {
+        let mut chain = Chain::new(base_genesis());
+        let bal_before = chain.state.accounts[&1].balance;
+        let b = stake_block(&chain, 1, 1, BondKind::Bond, 5 * MICRO);
+        let r = chain.commit(&b).unwrap();
+        assert_eq!(r.bonded, 5 * MICRO);
+        // funds left the balance for the bonded pool (still part of supply)
+        assert_eq!(chain.state.accounts[&1].balance, bal_before - 5 * MICRO);
+        assert_eq!(chain.state.bonded, 5 * MICRO);
+        assert_eq!(chain.state.bonds.get(&1), Some(&(5 * MICRO)));
+        // account 1 is now a validator whose power == its bonded stake
+        assert_eq!(chain.state.validators.get(1).map(|v| v.power), Some(5 * MICRO));
+        assert!(chain.state.supply_conserved());
+    }
+
+    #[test]
+    fn unbond_schedules_a_delayed_withdrawal_that_matures() {
+        let mut chain = Chain::new(base_genesis());
+        chain.commit(&stake_block(&chain, 1, 1, BondKind::Bond, 5 * MICRO)).unwrap();
+        let bal_after_bond = chain.state.accounts[&1].balance;
+
+        // unbond at height 2: power drops immediately (next height), funds locked
+        let r = chain.commit(&stake_block(&chain, 2, 1, BondKind::Unbond, 5 * MICRO)).unwrap();
+        assert_eq!(r.unbonded, 5 * MICRO);
+        assert_eq!(chain.state.bonded, 0);
+        assert!(chain.state.validators.get(1).is_none(), "validator removed at power 0");
+        assert_eq!(chain.state.accounts[&1].balance, bal_after_bond, "funds still locked");
+        assert_eq!(chain.state.unbonding.len(), 1);
+        assert_eq!(chain.state.unbonding[0].mature_height, 2 + UNBONDING_PERIOD);
+        assert!(chain.state.supply_conserved());
+
+        // advance empty blocks until the withdrawal matures
+        while chain.state.height < 2 + UNBONDING_PERIOD {
+            let h = chain.state.height + 1;
+            let b = block(&chain, h, vec![]);
+            chain.commit(&b).unwrap();
+        }
+        assert!(chain.state.unbonding.is_empty(), "matured out of the queue");
+        assert_eq!(chain.state.accounts[&1].balance, bal_after_bond + 5 * MICRO, "funds returned");
+        assert!(chain.state.supply_conserved());
+    }
+
+    #[test]
+    fn bond_beyond_balance_is_rejected() {
+        let mut chain = Chain::new(base_genesis());
+        let b = stake_block(&chain, 1, 1, BondKind::Bond, 1000 * MICRO);
+        assert!(matches!(chain.commit(&b), Err(ChainError::InsufficientBalance { .. })));
+        assert_eq!(chain.state.height, 0, "rejected block rolls fully back");
+        assert!(chain.state.bonds.is_empty());
+        assert_eq!(chain.state.bonded, 0);
+    }
+
+    #[test]
+    fn unbond_beyond_bond_is_rejected() {
+        let mut chain = Chain::new(base_genesis());
+        let b = stake_block(&chain, 1, 1, BondKind::Unbond, MICRO);
+        assert!(matches!(chain.commit(&b), Err(ChainError::InsufficientBond { .. })));
+        assert_eq!(chain.state.height, 0);
+    }
+
+    #[test]
+    fn forged_stakeop_is_rejected() {
+        let mut chain = Chain::new(base_genesis());
+        // account 1's bond signed by account 2's key
+        let op = StakeOp { account: 1, kind: BondKind::Bond, amount: MICRO, signature: [0u8; 64] }
+            .signed(&kp(2));
+        let mut b = block(&chain, 1, vec![]);
+        b.stake_ops = vec![op];
+        assert!(matches!(chain.commit(&b), Err(ChainError::BadSignature(1))));
+        assert_eq!(chain.state.height, 0);
+    }
+
+    #[test]
+    fn zero_amount_stakeop_is_rejected() {
+        let mut chain = Chain::new(base_genesis());
+        let b = stake_block(&chain, 1, 1, BondKind::Bond, 0);
+        assert!(matches!(chain.commit(&b), Err(ChainError::ZeroStake(1))));
+    }
+
+    #[test]
+    fn state_root_covers_bonded_stake() {
+        let mut plain = Chain::new(base_genesis());
+        let mut bonded = Chain::new(base_genesis());
+        plain.commit(&block(&plain, 1, vec![novel_tx(1, 1, 1, 1.0)])).unwrap();
+        let mut b = block(&bonded, 1, vec![novel_tx(1, 1, 1, 1.0)]);
+        b.stake_ops = vec![StakeOp { account: 2, kind: BondKind::Bond, amount: 3 * MICRO, signature: [0u8; 64] }.signed(&kp(2))];
+        bonded.commit(&b).unwrap();
+        assert_ne!(plain.state.state_root(), bonded.state.state_root());
+    }
+
+    #[test]
+    fn a_full_bond_unbond_cycle_conserves_supply() {
+        let mut chain = Chain::new(base_genesis());
+        let start = chain.state.supply;
+        chain.commit(&stake_block(&chain, 1, 1, BondKind::Bond, 7 * MICRO)).unwrap();
+        assert!(chain.state.supply_conserved());
+        chain.commit(&stake_block(&chain, 2, 1, BondKind::Unbond, 4 * MICRO)).unwrap();
+        assert!(chain.state.supply_conserved());
+        // still bonded 3, unbonding 4, balance rest — supply unchanged throughout
+        assert_eq!(chain.state.bonded, 3 * MICRO);
+        assert_eq!(chain.state.supply, start);
+        assert!(chain.state.supply_conserved());
+    }
+
     #[test]
     fn persisted_log_replays_to_identical_state() {
         use crate::store::BlockLog;
@@ -1039,6 +1377,7 @@ mod tests {
             timestamp_days: 2.0,
             txs: vec![novel_tx(2, 2, 2, 2.0)],
             validator_updates: Vec::new(),
+            stake_ops: Vec::new(),
         };
         live.commit(&b2).unwrap();
         log.append(&b2).unwrap();
