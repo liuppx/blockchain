@@ -181,6 +181,14 @@ impl SlashEvidence {
             && b.vote_type == VoteType::Precommit
             && a.block_hash != b.block_hash
     }
+
+    /// Content hash for gossip dedup. Canonical encoding includes both votes'
+    /// signatures, so two semantically identical pieces of evidence hash to
+    /// the same 32 bytes — a stable, collision-safe identity under
+    /// signing-key uniqueness.
+    pub fn hash(&self) -> Hash {
+        sha256(&codec::encode_evidence(self))
+    }
 }
 
 /// A block: an ordered batch of submissions applied atomically.

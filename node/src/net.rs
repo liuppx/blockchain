@@ -22,6 +22,13 @@
 //!   * **Epidemic tx gossip** — a novel transaction is admitted to the mempool
 //!     and forwarded to peers; a content-hash `seen` set makes re-delivery a
 //!     no-op, so the broadcast floods once and terminates.
+//!   * **Block-level op gossip** (M19) — equivocation evidence (`Evidence`)
+//!     and signed stake ops (`StakeOp`) flood into every node's pending pool
+//!     the same way; the next proposer drains the pool into `pending_*` on
+//!     its driver and the resulting block carries the op. This makes slashing
+//!     and bond/unbond **permissionlessly detectable** rather than only
+//!     proposer-detectable: any node that observes a double-sign can route
+//!     the proof into the next block, no matter who the proposer is.
 //!
 //! Determinism holds as everywhere else: [`Network`] is an in-process, fixed-order
 //! delivery bus that lets tests assert N nodes **converge** to a byte-identical
@@ -33,11 +40,12 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::io::{self, Read, Write};
 
 use crate::codec::{
-    decode_block, decode_commit, decode_tx, encode_block, encode_commit, encode_tx, CodecError,
+    decode_block, decode_commit, decode_evidence, decode_stakeop, decode_tx, encode_block,
+    encode_commit, encode_evidence, encode_stakeop, encode_tx, CodecError,
 };
 use crate::consensus::Commit;
 use crate::mempool::Mempool;
-use crate::{Block, Chain, Genesis, Hash, SubmissionTx};
+use crate::{Block, Chain, Genesis, Hash, SlashEvidence, StakeOp, SubmissionTx};
 
 /// Maximum certified blocks returned in a single [`GossipMsg::Blocks`] batch — a
 /// lagging peer that needs more re-requests from the new height.
@@ -55,6 +63,16 @@ pub enum GossipMsg {
     Blocks(Vec<(Block, Commit)>),
     /// Gossip one pending transaction.
     Tx(SubmissionTx),
+    /// Gossip one piece of equivocation evidence (M19) — once it floods into
+    /// every node's pending pool, the next proposer admits it into a slashing
+    /// block. Full cryptographic validation (signatures, offender is active)
+    /// happens in `chain.commit.apply_evidence`; this layer only dedups.
+    Evidence(SlashEvidence),
+    /// Gossip one signed bond/unbond op (M19) — same pattern as `Evidence`:
+    /// flood into every node's pending stake-op pool, the next proposer
+    /// admits it into a staking block. Full validation in
+    /// `chain.commit.apply_stake_op`.
+    StakeOp(StakeOp),
 }
 
 /// One peer: a chain, a mempool, the retained certified chain (blocks paired with
@@ -74,6 +92,15 @@ pub struct GossipNode {
     certs: Vec<Commit>,
     /// Content hashes of transactions already seen — makes gossip flooding idempotent.
     seen_tx: BTreeSet<Hash>,
+    /// Content hashes of equivocation evidence already seen — dedup for `Evidence`.
+    seen_evidence: BTreeSet<Hash>,
+    /// Content hashes of stake ops already seen — dedup for `StakeOp`.
+    seen_stake_op: BTreeSet<Hash>,
+    /// Evidence staged to be carried by the next block this node proposes
+    /// (drained by the driver via [`Self::take_pending_evidence`]).
+    pending_evidence: Vec<SlashEvidence>,
+    /// Stake ops staged to be carried by the next block this node proposes.
+    pending_stake_ops: Vec<StakeOp>,
     /// Known peer ids (iterated in sorted order for deterministic output).
     peers: BTreeSet<u64>,
 }
@@ -88,6 +115,10 @@ impl GossipNode {
             blocks: Vec::new(),
             certs: Vec::new(),
             seen_tx: BTreeSet::new(),
+            seen_evidence: BTreeSet::new(),
+            seen_stake_op: BTreeSet::new(),
+            pending_evidence: Vec::new(),
+            pending_stake_ops: Vec::new(),
             peers: peers.into_iter().filter(|&p| p != id).collect(),
         }
     }
@@ -106,6 +137,29 @@ impl GossipNode {
 
     pub fn certificates(&self) -> &[Commit] {
         &self.certs
+    }
+
+    /// Evidence staged for the next proposed block (read-only view).
+    pub fn pending_evidence(&self) -> &[SlashEvidence] {
+        &self.pending_evidence
+    }
+
+    /// Stake ops staged for the next proposed block (read-only view).
+    pub fn pending_stake_ops(&self) -> &[StakeOp] {
+        &self.pending_stake_ops
+    }
+
+    /// Drain staged evidence, transferring it to a block builder (e.g. a
+    /// `ChainDriver`'s `stage_slashing_evidence`). After this call the
+    /// gossip node's pending pool is empty, and the `seen_evidence` set
+    /// still suppresses re-flood if the same record loops back.
+    pub fn take_pending_evidence(&mut self) -> Vec<SlashEvidence> {
+        std::mem::take(&mut self.pending_evidence)
+    }
+
+    /// Drain staged stake ops, transferring them to a block builder.
+    pub fn take_pending_stake_ops(&mut self) -> Vec<StakeOp> {
+        std::mem::take(&mut self.pending_stake_ops)
     }
 
     /// Preload an already-certified chain (e.g. a seed node handing out history).
@@ -169,6 +223,33 @@ impl GossipNode {
         self.broadcast(GossipMsg::Tx(tx), None)
     }
 
+    /// Submit a locally-originated piece of equivocation evidence: stage it
+    /// for the next block this node proposes and return the gossip to flood
+    /// it to peers. Malformed evidence (fails `is_well_formed`) is silently
+    /// dropped — never staged, never forwarded.
+    pub fn submit_local_evidence(&mut self, ev: SlashEvidence) -> Vec<(u64, GossipMsg)> {
+        if !ev.is_well_formed() {
+            return Vec::new();
+        }
+        let h = ev.hash();
+        self.seen_evidence.insert(h);
+        self.pending_evidence.push(ev.clone());
+        self.broadcast(GossipMsg::Evidence(ev), None)
+    }
+
+    /// Submit a locally-originated stake op: stage it for the next block and
+    /// return the gossip to flood it to peers. Stake op "structural" shape
+    /// is just `{account, kind, amount, sig}` — there is nothing to validate
+    /// here; signature verification happens at apply time in
+    /// `chain.commit.apply_stake_op`, which rolls back the whole block on
+    /// any failure.
+    pub fn submit_local_stake_op(&mut self, op: StakeOp) -> Vec<(u64, GossipMsg)> {
+        let h = op.hash();
+        self.seen_stake_op.insert(h);
+        self.pending_stake_ops.push(op.clone());
+        self.broadcast(GossipMsg::StakeOp(op), None)
+    }
+
     /// The gossip a node emits to announce its current height (anti-entropy tick).
     pub fn announce(&self) -> Vec<(u64, GossipMsg)> {
         self.broadcast(GossipMsg::Status { height: self.height() }, None)
@@ -199,6 +280,8 @@ impl GossipNode {
             }
             GossipMsg::Blocks(batch) => self.on_blocks(from, batch),
             GossipMsg::Tx(tx) => self.on_tx(from, tx),
+            GossipMsg::Evidence(ev) => self.on_evidence(from, ev),
+            GossipMsg::StakeOp(op) => self.on_stake_op(from, op),
         }
     }
 
@@ -234,6 +317,27 @@ impl GossipNode {
             return Vec::new();
         }
         self.broadcast(GossipMsg::Tx(tx), Some(from))
+    }
+
+    fn on_evidence(&mut self, from: u64, ev: SlashEvidence) -> Vec<(u64, GossipMsg)> {
+        if !ev.is_well_formed() {
+            return Vec::new(); // silently drop structurally bad evidence
+        }
+        if !self.seen_evidence.insert(ev.hash()) {
+            return Vec::new(); // already flooded through us
+        }
+        // stage; full cryptographic validation lives in apply_evidence
+        self.pending_evidence.push(ev.clone());
+        self.broadcast(GossipMsg::Evidence(ev), Some(from))
+    }
+
+    fn on_stake_op(&mut self, from: u64, op: StakeOp) -> Vec<(u64, GossipMsg)> {
+        if !self.seen_stake_op.insert(op.hash()) {
+            return Vec::new(); // already flooded through us
+        }
+        // stage; signature verification lives in apply_stake_op
+        self.pending_stake_ops.push(op.clone());
+        self.broadcast(GossipMsg::StakeOp(op), Some(from))
     }
 
     /// Address `msg` to every peer, optionally excluding one (the sender), in
@@ -295,6 +399,19 @@ impl Network {
         self.enqueue(id, out);
     }
 
+    /// Submit a locally-originated piece of equivocation evidence at node `id`
+    /// and flood it.
+    pub fn submit_evidence(&mut self, id: u64, ev: SlashEvidence) {
+        let out = self.nodes.get_mut(&id).unwrap().submit_local_evidence(ev);
+        self.enqueue(id, out);
+    }
+
+    /// Submit a locally-originated stake op at node `id` and flood it.
+    pub fn submit_stake_op(&mut self, id: u64, op: StakeOp) {
+        let out = self.nodes.get_mut(&id).unwrap().submit_local_stake_op(op);
+        self.enqueue(id, out);
+    }
+
     /// Mutable access to a node (e.g. to preload a seed's certified chain).
     pub fn node_mut(&mut self, id: u64) -> &mut GossipNode {
         self.nodes.get_mut(&id).unwrap()
@@ -339,6 +456,8 @@ const TAG_STATUS: u8 = 0;
 const TAG_GET: u8 = 1;
 const TAG_BLOCKS: u8 = 2;
 const TAG_TX: u8 = 3;
+const TAG_EVIDENCE: u8 = 4;
+const TAG_STAKEOP: u8 = 5;
 
 /// Encode a gossip message: a 1-byte tag followed by its length-prefixed payload
 /// (reusing the block/commit/tx codecs). Self-describing, no external crate.
@@ -365,6 +484,14 @@ pub fn encode_gossip(m: &GossipMsg) -> Vec<u8> {
             out.push(TAG_TX);
             put_bytes(&mut out, &encode_tx(tx));
         }
+        GossipMsg::Evidence(ev) => {
+            out.push(TAG_EVIDENCE);
+            put_bytes(&mut out, &encode_evidence(ev));
+        }
+        GossipMsg::StakeOp(op) => {
+            out.push(TAG_STAKEOP);
+            put_bytes(&mut out, &encode_stakeop(op));
+        }
     }
     out
 }
@@ -389,6 +516,8 @@ pub fn decode_gossip(buf: &[u8]) -> Result<GossipMsg, CodecError> {
             GossipMsg::Blocks(batch)
         }
         TAG_TX => GossipMsg::Tx(decode_tx(take_bytes(&mut rest)?)?),
+        TAG_EVIDENCE => GossipMsg::Evidence(decode_evidence(take_bytes(&mut rest)?)?),
+        TAG_STAKEOP => GossipMsg::StakeOp(decode_stakeop(take_bytes(&mut rest)?)?),
         other => return Err(CodecError::BadEnum(other as u32)),
     };
     if !rest.is_empty() {
@@ -449,7 +578,7 @@ pub fn read_msg<R: Read>(r: &mut R) -> io::Result<GossipMsg> {
 mod tests {
     use super::*;
     use crate::driver::ChainDriver;
-    use crate::{Keypair, Review, SubmissionTx, DIM, MICRO};
+    use crate::{BondKind, Keypair, Review, SlashEvidence, SubmissionTx, Vote, VoteType, DIM, MICRO};
     use std::collections::BTreeMap;
     use zhixing_engine::DeltaKParams;
 
@@ -526,6 +655,8 @@ mod tests {
             GossipMsg::GetBlocks { from: 3 },
             GossipMsg::Blocks(batch),
             GossipMsg::Tx(tx(1, 1, 1)),
+            GossipMsg::Evidence(sample_evidence(1)),
+            GossipMsg::StakeOp(sample_bond(1, 5 * MICRO)),
         ];
         for m in &msgs {
             let bytes = encode_gossip(m);
@@ -672,5 +803,156 @@ mod tests {
             net.node(2).head()
         };
         assert_eq!(build(), build(), "same inputs -> same synced head");
+    }
+
+    // -- M19: block-level op gossip (evidence + stake_op) --------------------
+
+    /// A well-formed, properly-signed piece of equivocation evidence (M18-style).
+    /// Validator 1 double-signs precommits for two different block hashes at
+    /// (height=2, round=0). Both votes carry valid ed25519 signatures by kp(1).
+    fn sample_evidence(offender: u64) -> SlashEvidence {
+        SlashEvidence {
+            vote_a: Vote::signed(offender, 2, 0, [0xAAu8; 32], VoteType::Precommit, &kp(offender)),
+            vote_b: Vote::signed(offender, 2, 0, [0xBBu8; 32], VoteType::Precommit, &kp(offender)),
+        }
+    }
+
+    /// A signed bond op: account `a` bonds `amount` micro-$COG, signed by kp(a).
+    fn sample_bond(a: u64, amount: u64) -> crate::StakeOp {
+        crate::StakeOp {
+            account: a,
+            kind: BondKind::Bond,
+            amount,
+            signature: [0u8; 64],
+        }
+        .signed(&kp(a))
+    }
+
+    #[test]
+    fn evidence_gossip_reaches_every_node() {
+        // three fully-connected fresh nodes; an evidence injected at one floods to all
+        let ids = [1u64, 2, 3];
+        let nodes: Vec<GossipNode> =
+            ids.iter().map(|&id| GossipNode::new(id, genesis(), 16, ids.iter().copied())).collect();
+        let mut net = Network::new(nodes);
+
+        let ev = sample_evidence(1);
+        let h = ev.hash();
+        net.submit_evidence(1, ev.clone());
+        net.run();
+
+        for id in ids {
+            let pending = net.node(id).pending_evidence();
+            assert_eq!(pending.len(), 1, "node {id} staged one evidence");
+            assert_eq!(pending[0].hash(), h, "node {id} holds the same evidence");
+        }
+    }
+
+    #[test]
+    fn a_duplicate_evidence_does_not_re_flood() {
+        let ids = [1u64, 2];
+        let nodes: Vec<GossipNode> =
+            ids.iter().map(|&id| GossipNode::new(id, genesis(), 16, ids.iter().copied())).collect();
+        let mut net = Network::new(nodes);
+        let ev = sample_evidence(1);
+        net.submit_evidence(1, ev.clone());
+        net.run();
+        // re-injecting the same evidence to node 2 yields no new forwarding
+        let again = net
+            .nodes
+            .get_mut(&2)
+            .unwrap()
+            .on_message(1, GossipMsg::Evidence(ev));
+        assert!(again.is_empty(), "an already-seen evidence is not re-gossiped");
+    }
+
+    #[test]
+    fn a_malformed_evidence_is_silently_dropped() {
+        // vote_a and vote_b carry the same block_hash — fails is_well_formed
+        let bad = SlashEvidence {
+            vote_a: Vote::signed(1, 2, 0, [0xAAu8; 32], VoteType::Precommit, &kp(1)),
+            vote_b: Vote::signed(1, 2, 0, [0xAAu8; 32], VoteType::Precommit, &kp(1)),
+        };
+        assert!(!bad.is_well_formed());
+
+        let mut node = GossipNode::new(1, genesis(), 16, [1, 2]);
+        let out = node.submit_local_evidence(bad.clone());
+        assert!(out.is_empty(), "malformed evidence is not broadcast");
+        assert!(node.pending_evidence().is_empty(), "malformed evidence is not staged");
+
+        // receiving one from a peer is also dropped
+        let out2 = node.on_message(2, GossipMsg::Evidence(bad));
+        assert!(out2.is_empty());
+    }
+
+    #[test]
+    fn stake_op_gossip_reaches_every_node() {
+        let ids = [1u64, 2, 3];
+        let nodes: Vec<GossipNode> =
+            ids.iter().map(|&id| GossipNode::new(id, genesis(), 16, ids.iter().copied())).collect();
+        let mut net = Network::new(nodes);
+
+        let op = sample_bond(1, 5 * MICRO);
+        let h = op.hash();
+        net.submit_stake_op(1, op.clone());
+        net.run();
+
+        for id in ids {
+            let pending = net.node(id).pending_stake_ops();
+            assert_eq!(pending.len(), 1, "node {id} staged one stake op");
+            assert_eq!(pending[0].hash(), h);
+        }
+    }
+
+    /// End-to-end: gossip an evidence through the network to a node, drain
+    /// the gossip node's pending pool into a `ChainDriver`, then `produce`
+    /// — the resulting block carries the evidence and the offender is
+    /// slashed. This is the "any node can route a double-sign proof into
+    /// the next block" story, end to end.
+    #[test]
+    fn gossiped_evidence_lands_in_the_next_proposed_block() {
+        // seeds must include the bonding account so its validator can vote once
+        // active (same pattern as the M18 test in driver.rs).
+        let ids = [1u64, 2, 3, 21, 22, 23, 24];
+        let seeds: BTreeMap<u64, [u8; 32]> = ids.iter().map(|&id| (id, seed(id))).collect();
+        let mut driver = ChainDriver::new(genesis(), seeds, 4);
+
+        // h=1: account 1 self-bonds 6 $COG → becomes an active validator at h=2
+        let bond = sample_bond(1, 6 * MICRO);
+        driver.stage_stake_op(bond);
+        driver.produce(1.0, &BTreeSet::new()).unwrap().expect("stake-only block at h=1");
+        assert_eq!(
+            driver.chain.state.validators.get(1).map(|v| v.power),
+            Some(6 * MICRO),
+            "validator 1 is active at h=2 with power == bonded",
+        );
+
+        // a fresh gossip node receives the evidence over the wire and stages
+        // it into its pending pool — exactly what on_evidence does.
+        let mut g = GossipNode::new(1, genesis(), 16, [1]);
+        let ev = sample_evidence(1);
+        let _ = g.on_message(2, GossipMsg::Evidence(ev.clone()));
+
+        // the proposer (the same node, conceptually) drains the pending pool
+        // into the driver and produces — even with an empty mempool, the
+        // pending evidence admits a block.
+        for ev in g.take_pending_evidence() {
+            driver.stage_slashing_evidence(ev);
+        }
+        let commit = driver.produce(2.0, &BTreeSet::new()).unwrap();
+        assert!(commit.is_some(), "produce returned a finality certificate");
+
+        // the produced block carries the evidence
+        let block = driver.blocks().last().unwrap();
+        assert_eq!(block.slashing_evidence.len(), 1);
+        assert_eq!(block.slashing_evidence[0].hash(), ev.hash());
+        // ... and the offender was slashed
+        let state = &driver.chain.state;
+        assert!(state.validators.get(1).is_none(), "offender removed from validator set");
+        assert_eq!(state.bonded, 0, "bonded pool drained");
+        assert_eq!(state.treasury, 6 * MICRO, "treasury seized the stake");
+        // ... and replay re-verifies finality
+        Chain::replay_verified(genesis(), driver.blocks(), driver.certificates())
+            .expect("replay re-verifies finality");
     }
 }

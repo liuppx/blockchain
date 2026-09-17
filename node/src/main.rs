@@ -811,6 +811,35 @@ fn cmd_gossip() {
     println!("epidemic tx gossip: tx {} injected at node 3", short(&h));
     println!("  -> present in mempools of nodes {reached:?}\n");
 
+    // M19: equivocation-evidence gossip — any node that observes a double-sign
+    // floods the proof to every peer; the next proposer drains the pending
+    // pool into its driver and admits the evidence into a slashing block.
+    // The gossip layer is purely shape-based: well-formed evidence floods
+    // regardless. Full cryptographic validation (offender is active, both
+    // signatures verify) happens at apply_evidence in chain.commit; the unit
+    // test `gossiped_evidence_lands_in_the_next_proposed_block` exercises the
+    // end-to-end slash.
+    let offender = 1u64;
+    let ev = SlashEvidence {
+        vote_a: Vote::signed(offender, 2, 0, [0xAAu8; 32], VoteType::Precommit, &kp(offender)),
+        vote_b: Vote::signed(offender, 2, 0, [0xBBu8; 32], VoteType::Precommit, &kp(offender)),
+    };
+    let ev_hash = ev.hash();
+    net.submit_evidence(2, ev);
+    net.run();
+    let pending_evidence_nodes: Vec<u64> = ids
+        .iter()
+        .copied()
+        .filter(|&id| !net.node(id).pending_evidence().is_empty())
+        .collect();
+    println!(
+        "M19 block-level op gossip: evidence {} injected at node 2",
+        short(&ev_hash)
+    );
+    println!(
+        "  -> present in pending_evidence pools of nodes {pending_evidence_nodes:?} (flooded, deduped by content hash; full cryptographic validation happens at apply_evidence)\n"
+    );
+
     // --- real loopback TCP: three followers pull the chain over sockets --------
     println!("loopback TCP sync (three followers pull from a seed over sockets):");
     let n_followers = 3usize;
