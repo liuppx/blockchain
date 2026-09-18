@@ -17,7 +17,7 @@ use std::collections::BTreeMap;
 
 use crate::PubKey;
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct Validator {
     pub id: u64,
     pub pubkey: PubKey,

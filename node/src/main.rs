@@ -27,6 +27,7 @@ use std::thread;
 use zhixing_engine::{DeltaKParams, DIM};
 use zhixing_node::consensus::{commit_block, detect_equivocation, Commit};
 use zhixing_node::driver::ChainDriver;
+use zhixing_node::light::{ProofEntry, ValidatorTracker};
 use zhixing_node::mempool::Mempool;
 use zhixing_node::merkle;
 use zhixing_node::net::{read_msg, write_msg, GossipMsg, GossipNode, LightGossipNode, LightNetwork, Network};
@@ -35,7 +36,7 @@ use zhixing_node::store::{BlockLog, CertLog};
 use zhixing_node::validator::{Validator, ValidatorSet, ValidatorUpdate};
 use zhixing_node::{
     hex, Block, BondKind, Chain, Genesis, Keypair, Review, SlashEvidence, StakeOp, SubmissionTx,
-    ValidatorTracker, Vote, VoteType, MICRO,
+    Vote, VoteType, MICRO,
 };
 
 type Emb = [f32; DIM];
@@ -345,7 +346,9 @@ fn cmd_vprove() {
     let proof = next_set.proof(id).expect("membership proof exists");
     println!("light client is told: validator #{id} power={} $COG", cog(v.power));
     println!("proof: {} sibling hash(es) up to next_validators_root", proof.steps.len());
-    match ValidatorTracker::verify_membership(block, cert, &tracked, &v, &proof) {
+    let header = zhixing_node::codec::BlockHeader::from_block(block);
+    let entry = ProofEntry::Validator { id, validator: v.clone(), proof: proof.clone() };
+    match ValidatorTracker::verify_proof_against_header(&header, cert, &tracked, &entry) {
         Ok(()) => println!("verify membership against the cert-signed header -> true"),
         Err(e) => {
             eprintln!("membership proof unexpectedly failed: {e}");
@@ -356,7 +359,8 @@ fn cmd_vprove() {
     // negative case: a lie about the validator's power must fail.
     let mut forged = v.clone();
     forged.power += 1;
-    let bad = ValidatorTracker::verify_membership(block, cert, &tracked, &forged, &proof);
+    let forged_entry = ProofEntry::Validator { id, validator: forged, proof };
+    let bad = ValidatorTracker::verify_proof_against_header(&header, cert, &tracked, &forged_entry);
     println!("verify a forged (power+1) leaf -> {} (must be false)", bad.is_ok());
 }
 
@@ -1232,15 +1236,15 @@ fn cmd_lsync() {
     let id = 25u64;
     let v = next_set.get(id).expect("validator 25 active at the tip").clone();
     let proof = next_set.proof(id).expect("membership proof exists");
-    match ValidatorTracker::verify_membership_against_header(
+    let entry = ProofEntry::Validator { id, validator: v.clone(), proof: proof.clone() };
+    match ValidatorTracker::verify_proof_against_header(
         &lh.header,
         &lh.cert,
         active_for_cert,
-        &v,
-        &proof,
+        &entry,
     ) {
         Ok(()) => println!(
-            "  verify_membership (validator #{id}) against the latest cert-signed header -> true"
+            "  verify_proof_against_header (validator #{id}) against the latest cert-signed header -> true"
         ),
         Err(e) => {
             eprintln!("  membership proof unexpectedly failed: {e}");
@@ -1257,29 +1261,27 @@ fn cmd_lsync() {
     // Use the valid proof for validator 25 but claim it opens validator 99 —
     // merkle::verify rejects it, exercising the proof path.
     let bad_proof = next_set.proof(25).unwrap();
-    let wrong = ValidatorTracker::verify_membership_against_header(
+    let bad_entry = ProofEntry::Validator { id: 99, validator: bad_validator, proof: bad_proof };
+    let wrong = ValidatorTracker::verify_proof_against_header(
         &lh.header,
         &lh.cert,
         active_for_cert,
-        &bad_validator,
-        &bad_proof,
+        &bad_entry,
     );
     println!(
-        "  verify_membership against a forged next set -> {} (must be false)",
+        "  verify_proof_against_header against a forged next set -> {} (must be false)",
         wrong.is_ok()
     );
 }
 
-/// M23: a light wallet proves its own balance against a cert-signed header
-/// pulled over the M22 gossip bus — no replay, no tx bodies, no full peer
-/// trust. Mirrors the `lsync` demo but goes one step further: after the
-/// light peer reaches the full peer's height, it asks the full peer for an
-/// account inclusion proof, then runs `verify_account_membership_against_header`
-/// against the cert-signed `header.accounts_root`.
+/// M24: a light wallet proves its own balance, its reviewer reputation, AND a
+/// next-set validator membership — all three with one batched `GetProof` round
+/// trip and a single verifier, against the same cert-signed header pulled over
+/// the M22 gossip bus. No replay, no tx bodies, no full-peer trust.
 fn cmd_account() {
-    use zhixing_node::light::ValidatorTracker;
+    use zhixing_node::light::ProofKind;
 
-    println!("M23 — account-membership SPV for a wallet");
+    println!("M24 — batched SPV: account + reviewer + validator in one round-trip");
     println!();
 
     // 1. Build a real certified chain (same shape as cmd_lsync — a chain that
@@ -1332,45 +1334,103 @@ fn cmd_account() {
     let last_block = &blocks[last_idx];
     let last_cert = &certs[last_idx];
 
-    // 5. Light wallet asks full peer: GetAccountProof { id: 1 }. Full peer
-    //    replies with AccountProof from its current chain state.
+    // 5. Light wallet asks full peer: GetProof { items: [(Account, 1),
+    //    (Reviewer, 10), (Validator, 25)] }. One round-trip, three proofs.
     let mut full_node = net.take_full(1);
     let mut light_node = net.take_light(light_id);
-    let reply = full_node.on_message(light_id, GossipMsg::GetAccountProof { id: 1 });
-    assert_eq!(reply.len(), 1, "full peer must serve the account proof");
+    let reply = full_node.on_message(light_id, GossipMsg::GetProof {
+        items: vec![
+            (ProofKind::Account, 1),
+            (ProofKind::Reviewer, 10),
+            (ProofKind::Validator, 25),
+        ],
+    });
+    assert_eq!(reply.len(), 1, "full peer must serve the batched proofs");
     let (_dst, proof_msg) = reply.into_iter().next().unwrap();
     light_node.on_message(1, proof_msg);
 
-    // 6. Light wallet pulls the cached proof, computes the leaf locally, and
-    //    calls verify_account_membership_against_header against the latest
-    //    cert-signed header's `accounts_root` (the SPV primitive).
-    let (account, proof) = light_node
-        .take_account_proof(1)
-        .expect("proof cached for id 1");
+    // 6. Light wallet pulls the cached entries and verifies all three against
+    //    the same cert-signed header with the unified dispatcher. The
+    //    `ProofKind` inside each entry decides which root slot is checked:
+    //    Account + Reviewer -> header.accounts_root, Validator ->
+    //    header.next_validators_root.
+    //
+    //    `lt.validators()` is the active set for height `lt.height() + 1`
+    //    (i.e. the post-update set, since the light tracker just followed
+    //    height H and advanced to it). For verifying the cert at height H,
+    //    we need the active set FOR height H — the pre-update set, which
+    //    equals the genesis set when the chain's first block is the one
+    //    carrying the update. Use the genesis-tracker set explicitly.
     let header = zhixing_node::codec::BlockHeader::from_block(last_block);
-    let tracked = lt.validators().clone();
-    let verified = ValidatorTracker::verify_account_membership_against_header(
-        &header, last_cert, &tracked, 1, &account, &proof,
+    let tracked = ValidatorTracker::from_genesis(&demo_genesis()).validators().clone();
+
+    let account_entry = light_node
+        .take_proof(ProofKind::Account, 1)
+        .expect("account proof cached for id 1");
+    let reviewer_entry = light_node
+        .take_proof(ProofKind::Reviewer, 10)
+        .expect("reviewer proof cached for id 10");
+    let validator_entry = light_node
+        .take_proof(ProofKind::Validator, 25)
+        .expect("validator proof cached for id 25");
+
+    let account_ok = ValidatorTracker::verify_proof_against_header(
+        &header, last_cert, &tracked, &account_entry,
     );
+    let reviewer_ok = ValidatorTracker::verify_proof_against_header(
+        &header, last_cert, &tracked, &reviewer_entry,
+    );
+    let validator_ok = ValidatorTracker::verify_proof_against_header(
+        &header, last_cert, &tracked, &validator_entry,
+    );
+
+    let ProofEntry::Account { account, .. } = &account_entry else {
+        unreachable!("account entry shape");
+    };
+    let ProofEntry::Reviewer { reputation, .. } = &reviewer_entry else {
+        unreachable!("reviewer entry shape");
+    };
+    let ProofEntry::Validator { validator, .. } = &validator_entry else {
+        unreachable!("validator entry shape");
+    };
+
     println!("account #1 (post-apply state at height {}):", lt.height());
     println!("  balance       = {} COG", account.balance / MICRO);
     println!("  staked_total  = {} COG", account.staked_total / MICRO);
     println!("  earned_total  = {} COG", account.earned_total / MICRO);
     println!("  submissions   = {}", account.submissions);
     println!(
-        "  verify_account_membership_against_header -> {}",
-        verified.is_ok()
-    );
-
-    // 7. Negative: light wallet tampers with the proof's leaf (claims balance+1),
-    //    retry -> MembershipProofInvalid.
-    let mut bad_account = account.clone();
-    bad_account.balance += 1;
-    let bad = ValidatorTracker::verify_account_membership_against_header(
-        &header, last_cert, &tracked, 1, &bad_account, &proof,
+        "  verify_proof_against_header (Account)         -> {}",
+        account_ok.is_ok()
     );
     println!(
-        "  inflated balance (balance+1) -> {} (must be false: {})",
+        "  verify_proof_against_header (Reviewer #10)    -> {} (reputation = {})",
+        reviewer_ok.is_ok(),
+        reputation
+    );
+    println!(
+        "  verify_proof_against_header (Validator #25)   -> {} (power = {} COG)",
+        validator_ok.is_ok(),
+        validator.power / MICRO
+    );
+
+    // 7. Negative: light wallet tampers with the validator's leaf (claims power+1),
+    //    retry -> MembershipProofInvalid.
+    let ProofEntry::Validator { id: _id, validator: v_real, proof: p_real } = validator_entry else {
+        unreachable!()
+    };
+    let mut bad_validator = v_real.clone();
+    bad_validator.power += 1;
+    let forged_entry = ProofEntry::Validator {
+        id: 25,
+        validator: bad_validator,
+        proof: p_real,
+    };
+    let bad = ValidatorTracker::verify_proof_against_header(
+        &header, last_cert, &tracked, &forged_entry,
+    );
+    println!(
+        "  inflated validator power (power+1) -> {} (must be false: {})",
         bad.is_ok(),
         match bad.as_ref().err() {
             Some(e) => format!("{e}"),
@@ -1381,8 +1441,8 @@ fn cmd_account() {
     // 8. Negative: light wallet tampers with header.accounts_root.
     let mut bad_header = header.clone();
     bad_header.accounts_root = [0xAB; 32];
-    let bad_root = ValidatorTracker::verify_account_membership_against_header(
-        &bad_header, last_cert, &tracked, 1, &account, &proof,
+    let bad_root = ValidatorTracker::verify_proof_against_header(
+        &bad_header, last_cert, &tracked, &account_entry,
     );
     println!(
         "  tampered accounts_root -> {} (must be false: {})",
@@ -1397,11 +1457,11 @@ fn cmd_account() {
     //    accounts_root is the inclusion-proof tree for accounts + reviewers.
     println!();
     println!("dual-root contract:");
-    println!("  state_root    = {}  (full consensus-state digest)", short(&header.state_root));
-    println!("  accounts_root = {}  (Merkle root over accounts U reviewers)", short(&header.accounts_root));
-    println!("  the cert signs header.hash() which covers BOTH roots; the wallet");
-    println!("  trusts the cert-signing validator set for state_root and verifies");
-    println!("  account membership against accounts_root locally.");
+    println!("  state_root            = {}  (full consensus-state digest)", short(&header.state_root));
+    println!("  accounts_root         = {}  (Merkle root over accounts U reviewers)", short(&header.accounts_root));
+    println!("  next_validators_root  = {}  (Merkle root over next-set validators)", short(&header.next_validators_root));
+    println!("  the cert signs header.hash() which covers ALL THREE roots; the wallet");
+    println!("  verifies each ProofEntry locally against its kind's root slot.");
     net.put_full(full_node);
     net.put_light(light_node);
 }
@@ -1599,6 +1659,14 @@ fn fail_msg<E: std::fmt::Display>(ctx: &str, e: &E) -> ! {
 /// the certified `(blocks, certs)` vectors the driver produced.
 fn run_driver(max_heights: usize) -> (Vec<Block>, Vec<Commit>) {
     let mut driver = ChainDriver::new(demo_genesis(), demo_driver_seeds(), 4);
+    // M24: stage a brand-new validator (id 25) so the M24 batched proof demo
+    // can ask for an Account + Reviewer + Validator proof against the same
+    // post-block next-set, with all three leaves non-trivial.
+    driver.stage_validator_update(ValidatorUpdate {
+        id: 25,
+        pubkey: kp(25).public(),
+        power: 2 * MICRO,
+    });
     // Submit enough txs that the mempool actually produces blocks (otherwise
     // `produce_until_drained` returns 0 because no candidate is yielded).
     driver.submit(tx(1, unit(1), 1, reviews(&[(10, 0.9), (11, 0.85), (12, 0.9)]), (3, 3), 1.0)).expect("submit 1");

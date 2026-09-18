@@ -49,6 +49,81 @@ use crate::merkle;
 use crate::validator::{Validator, ValidatorSet, ValidatorUpdate};
 use crate::{Block, BondKind, Genesis, Hash, PubKey};
 
+/// M24: which O(log n) inclusion proof the wallet is asking for (or
+/// receiving) over the `GetProof` / `Proof` gossip pair. All three
+/// kinds ultimately verify against a cert-signed `BlockHeader` —
+/// [`ProofKind::Account`] and [`ProofKind::Reviewer`] against
+/// `header.accounts_root`, [`ProofKind::Validator`] against
+/// `header.next_validators_root`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum ProofKind {
+    Account = 0,
+    Reviewer = 1,
+    Validator = 2,
+}
+
+/// M24: typed leaf + proof for a single [`ProofKind`]. The wallet
+/// recomputes the canonical leaf via [`Self::leaf`] and runs
+/// `merkle::verify(root, merkle::leaf_hash(&leaf), &self.proof)`. The
+/// leaf the prover hands back is **not trusted** — see
+/// `verify_proof_against_header`.
+#[derive(Clone, Debug, PartialEq)]
+pub enum ProofEntry {
+    Account {
+        id: u64,
+        account: crate::Account,
+        proof: merkle::Proof,
+    },
+    Reviewer {
+        id: u64,
+        reputation: f32,
+        proof: merkle::Proof,
+    },
+    Validator {
+        id: u64,
+        validator: Validator,
+        proof: merkle::Proof,
+    },
+}
+
+impl ProofEntry {
+    pub fn kind(&self) -> ProofKind {
+        match self {
+            ProofEntry::Account { .. } => ProofKind::Account,
+            ProofEntry::Reviewer { .. } => ProofKind::Reviewer,
+            ProofEntry::Validator { .. } => ProofKind::Validator,
+        }
+    }
+
+    pub fn id(&self) -> u64 {
+        match self {
+            ProofEntry::Account { id, .. }
+            | ProofEntry::Reviewer { id, .. }
+            | ProofEntry::Validator { id, .. } => *id,
+        }
+    }
+
+    pub fn proof(&self) -> &merkle::Proof {
+        match self {
+            ProofEntry::Account { proof, .. }
+            | ProofEntry::Reviewer { proof, .. }
+            | ProofEntry::Validator { proof, .. } => proof,
+        }
+    }
+
+    /// Local recomputation of the leaf bytes the verifier will hash.
+    /// Mirrors the on-chain `merkle_leaves()` layout byte-for-byte.
+    pub fn leaf(&self) -> Vec<u8> {
+        match self {
+            ProofEntry::Account { id, account, .. } => account.merkle_leaf(*id),
+            ProofEntry::Reviewer { id, reputation, .. } => {
+                crate::Reviewer { id: *id, reputation: *reputation }.merkle_leaf()
+            }
+            ProofEntry::Validator { validator, .. } => validator.merkle_leaf(),
+        }
+    }
+}
+
 /// Follows the active validator set across a certified chain without full
 /// replay. Construct with [`Self::from_genesis`], then feed certified blocks in
 /// height order via [`Self::follow`] / [`Self::follow_all`].
@@ -366,109 +441,39 @@ impl ValidatorTracker {
         Ok(power)
     }
 
-    /// Verify that `validator` is a member of the set that certifies the height
-    /// *after* `block` — i.e. is committed by `block.next_validators_root` — given
-    /// an inclusion `proof` ([`ValidatorSet::proof`]). `block` must itself be
-    /// certified by `cert` under `tracked_set` (the set active for `block`'s
-    /// height), anchoring the commitment to a > 2/3 quorum. The SPV membership
-    /// primitive: prove one validator against a cert-signed header, no replay.
-    pub fn verify_membership(
-        block: &Block,
-        cert: &Commit,
-        tracked_set: &ValidatorSet,
-        validator: &Validator,
-        proof: &merkle::Proof,
-    ) -> Result<(), LightError> {
-        // the header must be finalized by a real quorum of the anchoring set ...
-        if cert.height != block.height || cert.block_hash != block.hash() {
-            return Err(LightError::CertificateMismatch { height: block.height });
-        }
-        cert.verify(tracked_set).map_err(LightError::Consensus)?;
-        // ... and the validator's leaf must open against its committed root.
-        let leaf = merkle::leaf_hash(&validator.merkle_leaf());
-        if !merkle::verify(&block.next_validators_root, &leaf, proof) {
-            return Err(LightError::MembershipProofInvalid { height: block.height });
-        }
-        Ok(())
-    }
-
-    /// M22 header-only variant of [`Self::verify_membership`]: same SPV contract,
-    /// but takes a [`crate::codec::BlockHeader`] instead of a full [`Block`] —
-    /// the proof and the cert are verified against the header alone, no bodies.
-    /// The cert's `block_hash` must equal `header.hash()`.
-    pub fn verify_membership_against_header(
-        header: &crate::codec::BlockHeader,
-        cert: &Commit,
-        tracked_set: &ValidatorSet,
-        validator: &Validator,
-        proof: &merkle::Proof,
-    ) -> Result<(), LightError> {
-        let hh = header.hash();
-        if cert.height != header.height || cert.block_hash != hh {
-            return Err(LightError::CertificateMismatch { height: header.height });
-        }
-        cert.verify(tracked_set).map_err(LightError::Consensus)?;
-        let leaf = merkle::leaf_hash(&validator.merkle_leaf());
-        if !merkle::verify(&header.next_validators_root, &leaf, proof) {
-            return Err(LightError::MembershipProofInvalid { height: header.height });
-        }
-        Ok(())
-    }
-
-    /// M23 SPV: prove that `account` is in the post-apply accounts tree
-    /// committed by `block.accounts_root`, against a cert-signed block. The
-    /// cert must bind `block.hash()` (which includes `accounts_root`); the
-    /// proof is the O(log n) Merkle inclusion proof against
-    /// [`crate::ChainState::account_proof`] — sourced out-of-band (see
-    /// `GossipMsg::GetAccountProof` / `GossipMsg::AccountProof`).
+    /// M24: the **only** SPV proof verifier. Replaces M22's
+    /// `verify_membership_against_header` (validator proof) and M23's
+    /// `verify_account_membership_against_header` (account proof), plus the
+    /// reviewer proof path that was never wired up.
     ///
-    /// **Tracking discipline** (mirrors `verify_membership`):
-    ///   1. The block is finalized by a real quorum of `tracked_set` (the set
-    ///      active for `block`'s height).
-    ///   2. The cert's `block_hash` equals `block.hash()`.
-    ///   3. `merkle::verify(&block.accounts_root, leaf, proof)` succeeds, where
-    ///      `leaf = leaf_hash(account.merkle_leaf(id))`. The leaf is computed
-    ///      from the supplied `account`, so the verifier doesn't have to trust
-    ///      the prover's claim about which leaf they handed over.
-    pub fn verify_account_membership(
-        block: &Block,
-        cert: &Commit,
-        tracked_set: &ValidatorSet,
-        account_id: u64,
-        account: &crate::Account,
-        proof: &merkle::Proof,
-    ) -> Result<(), LightError> {
-        if cert.height != block.height || cert.block_hash != block.hash() {
-            return Err(LightError::CertificateMismatch { height: block.height });
-        }
-        cert.verify(tracked_set).map_err(LightError::Consensus)?;
-        let leaf = merkle::leaf_hash(&account.merkle_leaf(account_id));
-        if !merkle::verify(&block.accounts_root, &leaf, proof) {
-            return Err(LightError::MembershipProofInvalid { height: block.height });
-        }
-        Ok(())
-    }
-
-    /// M23 header-only variant of [`Self::verify_account_membership`]: same SPV
-    /// contract, but takes a [`crate::codec::BlockHeader`] instead of a full
-    /// `Block` so the wallet proves its balance against the cert-signed header
-    /// alone, no tx bodies, no replay. The cert's `block_hash` must equal
-    /// `header.hash()`.
-    pub fn verify_account_membership_against_header(
+    /// Cert-signs `header.hash()`, computes the leaf locally from `entry`,
+    /// then runs `merkle::verify` against the right root slot for `entry`'s
+    /// [`ProofKind`]:
+    ///   * [`ProofKind::Account`]  → `header.accounts_root`
+    ///   * [`ProofKind::Reviewer`] → `header.accounts_root`
+    ///   * [`ProofKind::Validator`] → `header.next_validators_root`
+    ///
+    /// The prover does **not** get to claim a different leaf than it shipped
+    /// — the verifier recomputes `merkle::leaf_hash(&entry.leaf())` and
+    /// checks it against the proof's path. Returns `MembershipProofInvalid`
+    /// if the leaf-hash / root don't match.
+    pub fn verify_proof_against_header(
         header: &crate::codec::BlockHeader,
         cert: &Commit,
         tracked_set: &ValidatorSet,
-        account_id: u64,
-        account: &crate::Account,
-        proof: &merkle::Proof,
+        entry: &ProofEntry,
     ) -> Result<(), LightError> {
         let hh = header.hash();
         if cert.height != header.height || cert.block_hash != hh {
             return Err(LightError::CertificateMismatch { height: header.height });
         }
         cert.verify(tracked_set).map_err(LightError::Consensus)?;
-        let leaf = merkle::leaf_hash(&account.merkle_leaf(account_id));
-        if !merkle::verify(&header.accounts_root, &leaf, proof) {
+        let leaf = merkle::leaf_hash(&entry.leaf());
+        let root = match entry {
+            ProofEntry::Account { .. } | ProofEntry::Reviewer { .. } => &header.accounts_root,
+            ProofEntry::Validator { .. } => &header.next_validators_root,
+        };
+        if !merkle::verify(root, &leaf, entry.proof()) {
             return Err(LightError::MembershipProofInvalid { height: header.height });
         }
         Ok(())
@@ -857,7 +862,7 @@ mod tests {
     }
 
     #[test]
-    fn verify_membership_proves_and_rejects_forgery() {
+    fn verify_proof_against_header_accepts_validator_membership() {
         let mut d = driver(base_genesis());
         d.stage_validator_update(ValidatorUpdate { id: 24, pubkey: kp(24).public(), power: 5 });
         d.produce(1.0, &no_silence()).unwrap().expect("block");
@@ -869,18 +874,35 @@ mod tests {
 
         let v = next_set.get(24).unwrap().clone();
         let proof = next_set.proof(24).unwrap();
-        ValidatorTracker::verify_membership(block, cert, &tracked, &v, &proof)
-            .expect("genuine membership verifies");
+        let header = crate::codec::BlockHeader::from_block(block);
+        let entry = ProofEntry::Validator { id: 24, validator: v.clone(), proof };
+        ValidatorTracker::verify_proof_against_header(&header, cert, &tracked, &entry)
+            .expect("genuine validator membership verifies");
+    }
 
-        // forge the power -> proof no longer opens to the committed root.
+    #[test]
+    fn verify_proof_against_header_rejects_a_tampered_validator_leaf() {
+        let mut d = driver(base_genesis());
+        d.stage_validator_update(ValidatorUpdate { id: 24, pubkey: kp(24).public(), power: 5 });
+        d.produce(1.0, &no_silence()).unwrap().expect("block");
+
+        let block = &d.blocks()[0];
+        let cert = &d.certificates()[0];
+        let next_set = d.chain.state.validators.clone();
+        let tracked = ValidatorTracker::from_genesis(&base_genesis()).validators().clone();
+
+        let v = next_set.get(24).unwrap().clone();
+        let proof = next_set.proof(24).unwrap();
         let mut forged = v.clone();
         forged.power += 1;
-        let err = ValidatorTracker::verify_membership(block, cert, &tracked, &forged, &proof)
+        let header = crate::codec::BlockHeader::from_block(block);
+        let entry = ProofEntry::Validator { id: 24, validator: forged, proof };
+        let err = ValidatorTracker::verify_proof_against_header(&header, cert, &tracked, &entry)
             .unwrap_err();
         assert!(matches!(err, LightError::MembershipProofInvalid { .. }), "got {err}");
     }
 
-    // --- M23: account-membership SPV ---------------------------------------
+    // --- M23/M24: account + reviewer SPV via the unified verifier ------------
 
     /// Build a tiny certified chain of length 1 carrying an account-affecting
     /// tx (so the accounts tree actually mutates between genesis and h1) and
@@ -900,44 +922,34 @@ mod tests {
     }
 
     #[test]
-    fn verify_account_membership_header_only_works_against_a_cert_signed_header() {
+    fn verify_proof_against_header_accepts_account_membership() {
         let (block, cert, account, proof) = one_block_with_proof();
         let tracked = ValidatorTracker::from_genesis(&base_genesis()).validators().clone();
-        // Full-block variant.
-        ValidatorTracker::verify_account_membership(&block, &cert, &tracked, 1, &account, &proof)
-            .expect("full-block account membership verifies");
-        // Header-only variant — no bodies needed.
         let header = crate::codec::BlockHeader::from_block(&block);
-        ValidatorTracker::verify_account_membership_against_header(
-            &header, &cert, &tracked, 1, &account, &proof,
-        )
-        .expect("header-only account membership verifies");
+        let entry = ProofEntry::Account { id: 1, account, proof };
+        ValidatorTracker::verify_proof_against_header(&header, &cert, &tracked, &entry)
+            .expect("header-only account membership verifies");
         // And `state_root_against_header` accepts the same cert-signed header.
         ValidatorTracker::verify_state_root_against_header(&header, &cert, &tracked)
             .expect("state_root accepts the cert-signed header");
     }
 
     #[test]
-    fn verify_account_membership_rejects_an_inflated_balance() {
+    fn verify_proof_against_header_rejects_an_inflated_balance() {
         let (block, cert, mut account, proof) = one_block_with_proof();
         // The verifier computes the leaf from the supplied `account`, so a
         // tampered balance makes the recomputed leaf mismatch the proof's path.
         account.balance += 1;
         let tracked = ValidatorTracker::from_genesis(&base_genesis()).validators().clone();
-        let err = ValidatorTracker::verify_account_membership(&block, &cert, &tracked, 1, &account, &proof)
-            .unwrap_err();
-        assert!(matches!(err, LightError::MembershipProofInvalid { .. }), "got {err}");
-        // Same against the header-only variant.
         let header = crate::codec::BlockHeader::from_block(&block);
-        let err = ValidatorTracker::verify_account_membership_against_header(
-            &header, &cert, &tracked, 1, &account, &proof,
-        )
-        .unwrap_err();
+        let entry = ProofEntry::Account { id: 1, account, proof };
+        let err = ValidatorTracker::verify_proof_against_header(&header, &cert, &tracked, &entry)
+            .unwrap_err();
         assert!(matches!(err, LightError::MembershipProofInvalid { .. }), "got {err}");
     }
 
     #[test]
-    fn verify_account_membership_rejects_tampered_accounts_root() {
+    fn verify_proof_against_header_rejects_tampered_accounts_root() {
         let (block, cert, account, proof) = one_block_with_proof();
         let tracked = ValidatorTracker::from_genesis(&base_genesis()).validators().clone();
         // Mutate accounts_root in the header (cert-signed field!) — the proof
@@ -946,10 +958,9 @@ mod tests {
         // FIRST rejection is CertificateMismatch. Either failure is sound.
         let mut bad_header = crate::codec::BlockHeader::from_block(&block);
         bad_header.accounts_root = [0xAB; 32];
-        let err = ValidatorTracker::verify_account_membership_against_header(
-            &bad_header, &cert, &tracked, 1, &account, &proof,
-        )
-        .unwrap_err();
+        let entry = ProofEntry::Account { id: 1, account, proof };
+        let err = ValidatorTracker::verify_proof_against_header(&bad_header, &cert, &tracked, &entry)
+            .unwrap_err();
         assert!(
             matches!(err, LightError::CertificateMismatch { .. } | LightError::MembershipProofInvalid { .. }),
             "got {err}"
@@ -957,29 +968,27 @@ mod tests {
     }
 
     #[test]
-    fn verify_account_membership_rejects_a_wrong_certificate() {
+    fn verify_proof_against_header_rejects_a_wrong_certificate() {
         let (block, cert, account, proof) = one_block_with_proof();
         let tracked = ValidatorTracker::from_genesis(&base_genesis()).validators().clone();
-        // A cert for a different height doesn't bind this block.
+        let header = crate::codec::BlockHeader::from_block(&block);
+        let entry = ProofEntry::Account { id: 1, account, proof };
+        // A cert for a different height doesn't bind this header.
         let mut wrong_height = cert.clone();
         wrong_height.height = block.height + 1;
-        let err = ValidatorTracker::verify_account_membership(
-            &block, &wrong_height, &tracked, 1, &account, &proof,
-        )
-        .unwrap_err();
+        let err = ValidatorTracker::verify_proof_against_header(&header, &wrong_height, &tracked, &entry)
+            .unwrap_err();
         assert!(matches!(err, LightError::CertificateMismatch { .. }), "got {err}");
         // And a cert from a totally different chain (wrong block_hash) is rejected.
         let mut wrong_hash = cert.clone();
         wrong_hash.block_hash = [0xCC; 32];
-        let err = ValidatorTracker::verify_account_membership(
-            &block, &wrong_hash, &tracked, 1, &account, &proof,
-        )
-        .unwrap_err();
+        let err = ValidatorTracker::verify_proof_against_header(&header, &wrong_hash, &tracked, &entry)
+            .unwrap_err();
         assert!(matches!(err, LightError::CertificateMismatch { .. }), "got {err}");
     }
 
     #[test]
-    fn verify_account_membership_rejects_unknown_id_against_a_cert_signed_header() {
+    fn verify_proof_against_header_rejects_unknown_account_id_against_a_cert_signed_header() {
         // An account that doesn't exist on-chain still has a "leaf preimage" the
         // prover could hand us, but the Merkle tree at the cert-signed height
         // doesn't contain it — so the locally-computed leaf won't verify against
@@ -987,14 +996,44 @@ mod tests {
         let (block, cert, _real_account, _proof) = one_block_with_proof();
         let tracked = ValidatorTracker::from_genesis(&base_genesis()).validators().clone();
         let header = crate::codec::BlockHeader::from_block(&block);
-        // Make up a fake account for id 999 and the empty proof from the real
-        // chain — they obviously don't cohere.
         let fake_account = crate::Account::default();
         let empty_proof = merkle::Proof { steps: Vec::new() };
-        let err = ValidatorTracker::verify_account_membership_against_header(
-            &header, &cert, &tracked, 999, &fake_account, &empty_proof,
-        )
-        .unwrap_err();
+        let entry = ProofEntry::Account { id: 999, account: fake_account, proof: empty_proof };
+        let err = ValidatorTracker::verify_proof_against_header(&header, &cert, &tracked, &entry)
+            .unwrap_err();
+        assert!(matches!(err, LightError::MembershipProofInvalid { .. }), "got {err}");
+    }
+
+    #[test]
+    fn verify_proof_against_header_accepts_reviewer_membership() {
+        // Build a chain where reviewer #10 exists, pull a proof for them, verify.
+        let mut d = driver(base_genesis());
+        d.submit(novel_tx(1, 1, 1, 1.0)).unwrap(); // reviewers 10..13 review it
+        d.produce(1.0, &no_silence()).unwrap().expect("block");
+        let block = d.blocks()[0].clone();
+        let cert = d.certificates()[0].clone();
+        let reputation = d.chain.state.reviewers.get(&10).copied().expect("reviewer 10");
+        let proof = d.chain.state.reviewer_proof(10).expect("reviewer proof");
+        let header = crate::codec::BlockHeader::from_block(&block);
+        let entry = ProofEntry::Reviewer { id: 10, reputation, proof };
+        let tracked = ValidatorTracker::from_genesis(&base_genesis()).validators().clone();
+        ValidatorTracker::verify_proof_against_header(&header, &cert, &tracked, &entry)
+            .expect("reviewer proof verifies against accounts_root");
+    }
+
+    #[test]
+    fn verify_proof_against_header_rejects_tampered_reputation() {
+        let mut d = driver(base_genesis());
+        d.submit(novel_tx(1, 1, 1, 1.0)).unwrap();
+        d.produce(1.0, &no_silence()).unwrap().expect("block");
+        let block = d.blocks()[0].clone();
+        let cert = d.certificates()[0].clone();
+        let proof = d.chain.state.reviewer_proof(10).expect("reviewer proof");
+        let header = crate::codec::BlockHeader::from_block(&block);
+        let entry = ProofEntry::Reviewer { id: 10, reputation: 999.0, proof };
+        let tracked = ValidatorTracker::from_genesis(&base_genesis()).validators().clone();
+        let err = ValidatorTracker::verify_proof_against_header(&header, &cert, &tracked, &entry)
+            .unwrap_err();
         assert!(matches!(err, LightError::MembershipProofInvalid { .. }), "got {err}");
     }
 }

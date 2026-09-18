@@ -1,8 +1,8 @@
-# ZhixingGraph 参考节点（Rust · Milestone 6–23）
+# ZhixingGraph 参考节点（Rust · Milestone 6–24）
 
 对应白皮书 [`docs/WHITEPAPER.md`](../docs/WHITEPAPER.md) §5「PoK 共识」与 §7「技术架构」。
 
-这是把 ΔK 引擎（[`engine/`](../engine/)）与经济仿真（[`sim/`](../sim/)）背后的规则，落成一个**可运行、确定性的 PoK 共识状态机**——真正"跑链"的最小内核：区块、交易、账户、状态转移、铸造/罚没、链上声誉、ed25519 签名交易、追加式持久化、确定性 mempool 出块、Merkle 认证状态与轻客户端证明、BFT 最终性证书与验证人集、驱动活性的 BFT 轮次状态机（超时 / 锁定 / 换轮）、逐高度生长的**BFT 认证链**（mempool → 共识 → 提交，每块附可验证证书）、**证书落盘 + 重放即最终性复验**（`blocks.log` + `certs.log`，重放时逐高度复验 > 2/3 证书，恢复的是*最终性*而非仅状态）、**链上/动态验证人集**（区块携带验证人增删/改权，由变更前的集合认证、下一高度生效，重放随之逐高度跟随演进）、**P2P gossip 与反熵状态同步**（交易 epidemic 泛洪 + 认证块拉取追赶，逐块对链上验证人集复验证书，含真实 loopback TCP 传输）、**质押绑定的验证人权重与解绑期**（账户自绑定 $COG → 成为验证人、权重 == 绑定量；解绑经时间锁提款队列，资金留在池中仍可罚没直至到期返还）、**按证据罚没等价双签**（把冲突预提交的密码学证据搬上链，罚没作恶验证人的绑定质押与解绑中金额入 treasury、下一高度移出验证人集，供应守恒）、**P2P 传播证据与质押变更**（`SlashEvidence`/`StakeOp` 经 gossip 进入每个节点的待打包池，下一区块由出块方带出——作恶可归责、质押可远程触发，不再仅靠出块人已持有），**验证人集变更的轻客户端跟随协议**（只凭创世信任根，逐高度对当前集合复验最终性证书、再复刻该块引起的验证人集迁移——不执行任何交易、不追踪账户余额，即得到与全量重放逐字节一致的活跃验证人集），**验证人集 Merkle 承诺入区块头**（把"下一高度生效的验证人集"的 Merkle 根 `next_validators_root` 折进区块头、纳入证书所签的 `block_hash`——轻客户端遂能**免复刻迁移**地凭一份证书验证整套下一验证人集`follow_committed`，或用 O(log n) 包含证明对 cert 签名的头**证明单个验证人**`verify_membership`，即 SPV 原语；M20 的 `follow` 也逐高度对该承诺根交叉校验）、**头部的轻同步传输**（`BlockHeader` 携每份体的 SHA-256 承诺，`Block::hash` 现哈希头投影使 `header.hash() == block.hash()` 恒成立；新 `CertifiedHeader` + `GossipMsg::GetHeaders/Headers` 把 SPV 原语搬上 gossip 总线；新 `LightGossipNode` 只保留头 + 一个 `ValidatorTracker`，从不解码任何交易体——M21 的 `follow_committed`/`verify_membership` 经 `follow_header` / `verify_membership_against_header` 迁移至只对头形式），**钱包的账户-成员 SPV**（`BlockHeader` 再携 `state_root` 完整共识状态 digest + `accounts_root` accounts/reviewers 二叉 Merkle 根两条承诺根，新 `GossipMsg::GetAccountProof/AccountProof` 让钱包从对端要单账户包含证明，新 SPV `verify_account_membership_against_header` 在本地重算 leaf 并对头里的根验证——钱包证明自己的余额**只下头、不下体、零重放**；`Chain::commit` 把两条根走 trial 路径盖到 `block` 上，`apply_block_inner` 多两条强制度 `StateRootMismatch` / `AccountsRootMismatch`，与 M21 同形同序），以及内容寻址的区块哈希链与状态根。
+这是把 ΔK 引擎（[`engine/`](../engine/)）与经济仿真（[`sim/`](../sim/)）背后的规则，落成一个**可运行、确定性的 PoK 共识状态机**——真正"跑链"的最小内核：区块、交易、账户、状态转移、铸造/罚没、链上声誉、ed25519 签名交易、追加式持久化、确定性 mempool 出块、Merkle 认证状态与轻客户端证明、BFT 最终性证书与验证人集、驱动活性的 BFT 轮次状态机（超时 / 锁定 / 换轮）、逐高度生长的**BFT 认证链**（mempool → 共识 → 提交，每块附可验证证书）、**证书落盘 + 重放即最终性复验**（`blocks.log` + `certs.log`，重放时逐高度复验 > 2/3 证书，恢复的是*最终性*而非仅状态）、**链上/动态验证人集**（区块携带验证人增删/改权，由变更前的集合认证、下一高度生效，重放随之逐高度跟随演进）、**P2P gossip 与反熵状态同步**（交易 epidemic 泛洪 + 认证块拉取追赶，逐块对链上验证人集复验证书，含真实 loopback TCP 传输）、**质押绑定的验证人权重与解绑期**（账户自绑定 $COG → 成为验证人、权重 == 绑定量；解绑经时间锁提款队列，资金留在池中仍可罚没直至到期返还）、**按证据罚没等价双签**（把冲突预提交的密码学证据搬上链，罚没作恶验证人的绑定质押与解绑中金额入 treasury、下一高度移出验证人集，供应守恒）、**P2P 传播证据与质押变更**（`SlashEvidence`/`StakeOp` 经 gossip 进入每个节点的待打包池，下一区块由出块方带出——作恶可归责、质押可远程触发，不再仅靠出块人已持有），**验证人集变更的轻客户端跟随协议**（只凭创世信任根，逐高度对当前集合复验最终性证书、再复刻该块引起的验证人集迁移——不执行任何交易、不追踪账户余额，即得到与全量重放逐字节一致的活跃验证人集），**验证人集 Merkle 承诺入区块头**（把"下一高度生效的验证人集"的 Merkle 根 `next_validators_root` 折进区块头、纳入证书所签的 `block_hash`——轻客户端遂能**免复刻迁移**地凭一份证书验证整套下一验证人集`follow_committed`，或用 O(log n) 包含证明对 cert 签名的头**证明单个验证人**`verify_membership`，即 SPV 原语；M20 的 `follow` 也逐高度对该承诺根交叉校验）、**头部的轻同步传输**（`BlockHeader` 携每份体的 SHA-256 承诺，`Block::hash` 现哈希头投影使 `header.hash() == block.hash()` 恒成立；新 `CertifiedHeader` + `GossipMsg::GetHeaders/Headers` 把 SPV 原语搬上 gossip 总线；新 `LightGossipNode` 只保留头 + 一个 `ValidatorTracker`，从不解码任何交易体——M21 的 `follow_committed`/`verify_membership` 经 `follow_header` / `verify_membership_against_header` 迁移至只对头形式），**钱包的账户-成员 SPV**（`BlockHeader` 再携 `state_root` 完整共识状态 digest + `accounts_root` accounts/reviewers 二叉 Merkle 根两条承诺根，新 SPV `verify_account_membership_against_header` 在本地重算 leaf 并对头里的根验证——钱包证明自己的余额**只下头、不下体、零重放**；`Chain::commit` 把两条根走 trial 路径盖到 `block` 上，`apply_block_inner` 多两条强制度 `StateRootMismatch` / `AccountsRootMismatch`，与 M21 同形同序），**M24：批量化、类型化的统一 SPV 原语**——把 M23 单账户单 trick 的 `GetAccountProof/AccountProof` 传输**完全替换**为**一对**通用 `GossipMsg::GetProof { items }` / `Proof { items }`（wire tags 8/9 复用给新对），承载任意混合 `[(Account|Reviewer|Validator, id), ...]` 列表，**单次往返上限 `MAX_PROOF_BATCH = 32`**；新 `Reviewer::merkle_leaf()` + `ChainState::reviewer_proof(id)` 闭合审阅人包含证明的路径（审阅人叶一直就在 `accounts_root` 二叉树里，只是没有 typed producer）；新 typed `ProofEntry` 枚举（Account/Reviewer/Validator 三变体）携带 typed leaf + proof，wallet 端 M22/M23 的 `verify_membership_against_header` / `verify_account_membership_against_header` **全部删除**，只剩**一个** `ValidatorTracker::verify_proof_against_header(header, cert, tracked_set, entry)` 调度器，按 `entry.kind()` 选根——Account/Reviewer 对 `accounts_root`，Validator 对 `next_validators_root`，本地重算 leaf、零信任 prover；以及内容寻址的区块哈希链与状态根。
 
 > **共识的前提是确定性**：给定相同的创世与相同的区块序列，每个诚实节点算出**逐字节相同**的状态（`state_root` 一致）。本 crate 就是那个状态转移函数 `apply_block`，其 ΔK 由 `zhixing_engine::compute_delta_k` 计算——与白皮书 B.2.3、Python 仿真是**同一份契约**。
 
@@ -25,7 +25,7 @@ cargo run --release --bin node -- slashing         # 罚没：验证人双签 �
 cargo run --release --bin node -- certs  --dir DIR # 证书落盘：产出认证链→落盘 blocks/certs→重放复验最终性
 cargo run --release --bin node -- run  --dir DIR   # 持久化链：首次落盘演示块，之后重放
 cargo run --release --bin node -- status --dir DIR # 重放区块日志并打印状态
-cargo test --release                               # 158 项单元测试（见下）
+cargo test --release                               # 167 项单元测试（见下）
 ```
 
 演示链展示：新颖提交铸造 $COG、跨域桥接拿到 novelty+bonus（ΔK>1）、近重复/低质提交被**罚没入 treasury**、供应守恒、评审声誉按链上结果升降。
@@ -74,7 +74,7 @@ cargo run --release --bin node -- build   # 乱序投递 3 笔 -> 构造器按 t
 
 ## 认证状态与轻客户端证明（Milestone 10）
 
-`state_root` 之外，节点再对 accounts/reviewers 状态维护一棵**二叉 Merkle 树**（`merkle_root`）。它把"整块状态摘要"升级成**可逐叶打开**的认证结构：轻客户端只持有 `merkle_root`，拿到某个账户的内容 + 一条**包含证明**（`account_proof`）即可验证该账户真属于此状态——无需全量状态。
+`state_root` 之外，节点再对 accounts/reviewers 状态维护一棵**二叉 Merkle 树**（`merkle_root`）。它把"整块状态摘要"升级成**可逐叶打开**的认证结构：轻客户端只持有 `merkle_root`，拿到某个账户的内容 + 一条**包含证明**（`account_proof`（**M24** 新增 `reviewer_proof(id)` 闭合审阅人路径；`ChainState::merkle_leaves` 改调 `Reviewer::merkle_leaf()`））即可验证该账户真属于此状态——无需全量状态。
 
 - **域分隔**：叶 `sha256(0x00‖data)`、内部节点 `sha256(0x01‖left‖right)`，杜绝把叶当内部节点的第二原象攻击。
 - **奇数节点提升而非复制**：末尾落单节点原样上提（避免 CT 式"自我复制"陷阱），证明在该层不记录兄弟。
@@ -157,6 +157,21 @@ M22 给钱包带来了头部传输，但钱包真正想要的"**我的余额是�
 
 ```bash
 cargo run --release --bin node -- account   # 光端凭 cert-signed header 证明自己的余额：true；改大 → false；改根 → false
+```
+
+## 批量化、类型化的统一 SPV 原语（Milestone 24）
+
+M23 给钱包一条 `GetAccountProof` / `AccountProof` 单账户单 trick 的传输，但它是一次性"为了 M23 demo 而存在"的形状——`accounts_root` 二叉树里**审阅人叶一直就在**（M10 的 `merkle_leaves` 后半段），只是没有 typed producer；下一集合验证人又有 `ValidatorSet::proof` 可用，但走的是另一条 SPV 路径。三种 O(log n) 包含证明、三种不同传输故事——不该如此。M24 把它们压成**一对**通用 wire + **一个** SPV 验证器：
+
+- **完全替换 M23 的 `GetAccountProof` / `AccountProof` 对**：新 `GossipMsg::GetProof { items: Vec<(ProofKind, u64)> }` / `GossipMsg::Proof { items: Vec<Option<ProofEntry>> }`（wire tags 8/9 复用给新对）。`items` 可任意混合 `[Account|Reviewer|Validator]` × id，单次往返上限 `MAX_PROOF_BATCH = 32`，超 cap 是 codec-level 错。全节点在 `GossipNode::on_message` 现取现发（`account_proof` / `reviewer_proof` / `ValidatorSet::proof`），未知 key 返 `None`。
+- **新 typed `ProofEntry` 枚举**：三变体 `Account { id, account, proof }` / `Reviewer { id, reputation, proof }` / `Validator { id, validator, proof }`，每变体都带 typed leaf + proof。Wallet 端 M22/M23 的 `verify_membership_against_header` / `verify_account_membership_against_header` **全部删除**——wallet 端**唯一**的 SPV 验证器是 `ValidatorTracker::verify_proof_against_header(header, cert, tracked_set, entry)`：先验 cert 签的就是 `header.hash()`、再用 cert 复验签名的 > 2/3 法定人数、然后**本地重算** `leaf = merkle::leaf_hash(&entry.leaf())`、最后按 `entry.kind()` 选根——Account/Reviewer 对 `header.accounts_root`，Validator 对 `header.next_validators_root`，跑 `merkle::verify`。叶是 prover 给的，但 verifier 不信——它从 typed entry **自己重算** leaf。
+- **闭合审阅人路径**：新 `Reviewer::merkle_leaf()`（`u64 id ‖ f32 reputation`，12 字节，`ChainState::merkle_leaves` 后半段调用它，与既有内联字节逐字节相同）+ 新 `ChainState::reviewer_proof(id) -> Option<merkle::Proof>`（审阅人 index = `n_accounts + rindex`，与 `merkle_leaves` 布局一致）。
+- **光端缓存**：`LightGossipNode::take_proof(kind, id) -> Option<ProofEntry>`，键是 `(ProofKind, u64)`，复用一个 `BTreeMap` 缓存三类证明。
+- **判别码**：`ProofKind` 1 字节 tag（`0=Account`/`1=Reviewer`/`2=Validator`），`ProofEntry` 用固定 leaf 字节长度（Account=88、Reviewer=12、Validator=48）从 `Vec<u8>` 中切出 leaf 与 proof，编码稳定无歧义。
+- **`cmd_account` 演示三证明批量**：单次 `GetProof { items: [(Account,1), (Reviewer,1), (Validator,25)] }` 拿回三 typed entries，对**同一 cert-signed header** 调 `verify_proof_against_header` 三遍——账户余额、审阅人声誉、验证人集合成员全部 ✓；再把 validator 的 power 改 1 → `MembershipProofInvalid`（prover 不能谎报 leaf）。
+
+```bash
+cargo run --release --bin node -- account   # 三证明批量化：账户余额 + 审阅人声誉 + 验证人集合成员，单 GetProof 往返、本地重算 leaf、对 cert-signed 头验证
 ```
 
 ## P2P 网络与反熵状态同步（Milestone 15）
@@ -266,7 +281,7 @@ M21 的 SPV 原语 (`follow_committed` / `verify_membership`) 仍以**完整 `(B
 
 ```bash
 cargo run --release --bin node -- lsync    # 一台全节点 (id=1) + 一台光节点 (id=2) 共总线：光节点起步 0、只发 Status -> 只拉头 + next_set -> 跟上至 height N（0 笔交易入眼），附线缆字节节省与 verify_membership
-cargo run --release --bin node -- account  # 钱包的账户-成员 SPV：凭 cert-signed 头证明自己余额，不下体、不重放
+cargo run --release --bin node -- account  # 钱包 SPV 三证明批量化：账户余额 + 审阅人声誉 + 验证人集合成员，单次 GetProof 往返、本地重算 leaf、对 cert-signed 头验证
 ```
 
 ## 设计要点
@@ -293,6 +308,7 @@ cargo run --release --bin node -- account  # 钱包的账户-成员 SPV：凭 ce
 | **轻客户端跟随验证人集** | `ValidatorTracker::from_genesis` 只信创世；`follow` 每高度用当前集合复验证书、再复刻 `apply_block` 的集合迁移（`validator_updates` + 由 `stake_ops`/`slashing_evidence` 派生的权重），镜像 `bonds` 映射 + 从 `Genesis.accounts` 播种的不可变公钥表；因输入全在 `block_hash`（证书所签）内，结果与 `replay_verified` 逐字节一致却 0 执行交易；复用 `GossipMsg::Blocks` 传输（M20） |
 | **验证人集 Merkle 承诺入头** | `Block.next_validators_root` = 对 post-apply 下一集合的 Merkle 根（`Validator::merkle_leaf` 与 `state_root` 三元组同字节），落在证书所签的 `block_hash` 内；出块方 `Chain::seal`（trial 克隆导出根）、`apply_block` 提交强制根匹配否则 `ValidatorRootMismatch`；轻客户端 `follow_committed` 免复刻迁移地比对整套集合根，`verify_membership` 用 O(log n) 包含证明对 cert 签名头证明单个验证人（SPV 原语），`follow` 亦逐高度交叉校验；迁移从不读该字段故无循环（M21） |
 | **钱包 SPV 账户证明（双根承诺）** | `BlockHeader` 再携 `state_root`（`ChainState::state_root()` 完整共识状态 digest，证书签 = 钱包信任根）与 `accounts_root`（accounts ∪ reviewers 二叉 Merkle 根，供 O(log n) 包含证明）；`Chain::commit` 走 trial 路径把两根盖到 `block` 上，`apply_block_inner` 多两条强制度 `StateRootMismatch` / `AccountsRootMismatch`；新 SPV `verify_account_membership_against_header` 在本地重算 `leaf = leaf_hash(account.merkle_leaf(id))` 并对 `header.accounts_root` 验证——钱包证明自己余额只下头、不下体、零重放（M23） |
+| **M24 批量化、类型化 SPV 原语** | `GossipMsg::GetProof { items }` / `Proof { items }` 一对承载任意混合 `[(Account|Reviewer|Validator, id), ...]` 列表（`MAX_PROOF_BATCH = 32`），wire tags 8/9 完全替换 M23 的 `GetAccountProof/AccountProof`；新 `ProofEntry` typed 枚举 + `Reviewer::merkle_leaf()` + `ChainState::reviewer_proof(id)` 闭合审阅人路径；wallet 端**唯一** SPV 验证器 `ValidatorTracker::verify_proof_against_header(header, cert, tracked_set, entry)` 按 `entry.kind()` 选根（Account/Reviewer → `accounts_root`，Validator → `next_validators_root`），本地重算 leaf、零信任 prover；M22/M23 的 kind-specific 验证器全部删除 |
 | **依赖策略** | 引擎零依赖（可嵌入/WASM）；节点作为应用引入审计过的 `ed25519-dalek` 做签名，绝不自实现密码学 |
 
 ## 测试覆盖
@@ -454,6 +470,18 @@ full_node_serves_an_account_proof_in_response_to_get_account_proof  全节点 Ge
 light_node_proves_account_balance_against_cert_signed_header  光端经 gossip 取证明 → 本地验 → Ok
 light_node_rejects_an_inflated_account_proof  改账户 → 验失败
 account_proof_request_for_unknown_id_yields_a_rejecting_proof  未知 id → 默认账户 + 空证明 → 验失败
+# M24 泛化批量化证明请求总线（lib.rs + codec.rs + light.rs + net.rs）
+proof_kind_round_trip                        ProofKind 三变体编码往返稳定
+batch_getproof_and_proof_round_trip          GetProof/Proof 两端编码携带 Account/Reviewer/Validator 混合列表、含 None 槽
+reviewer_proof_round_trip                    ChainState::reviewer_proof(id) 对 accounts_root 验证通过；改 reputation → 失败；未知 id → None
+reviewer_proof_index_lies_after_all_accounts reviewer_proof 的 index 在所有 account_proof 的 index 之后
+verify_proof_against_header_accepts_account_reviewer_and_validator_in_one_call  三变体 ProofEntry 各自 verify_proof_against_header 对同一 cert-signed 头成立
+verify_proof_against_header_rejects_a_tampered_validator_leaf  改 validator.power → MembershipProofInvalid
+verify_proof_against_header_rejects_tampered_reputation  改 reputation → MembershipProofInvalid
+full_node_serves_a_batch_of_proofs_in_response_to_get_proof  三类证明批量化往返
+full_node_serves_a_reviewer_proof_for_a_reviewer_id_not_in_accounts  非账户 id 的审阅人也能取到合法 proof
+get_proof_with_too_many_items_is_a_codec_error  33 项超出 MAX_PROOF_BATCH → decode 拒绝
+proof_request_for_unknown_id_yields_none_in_the_response  未知 id → 服务端 None、客户端缺槽
 ```
 
 ## 文件
@@ -467,8 +495,8 @@ account_proof_request_for_unknown_id_yields_a_rejecting_proof  未知 id → 默
 | `src/consensus.rs` | BFT 投票/最终性证书：`Vote`/`Commit`/`verify`、`commit_block`、`detect_equivocation` + 测试 |
 | `src/round.rs` | BFT 轮次状态机（Tendermint `upon` 规则、超时/锁定/换轮）+ 进程内网络模拟器 `Sim` + 测试 |
 | `src/driver.rs` | BFT 认证链驱动 `ChainDriver`：逐高度 mempool→共识→提交 + 证书保留 + 故障注入 + 链上验证人变更（`stage_validator_update`）+ 质押变更（`stage_stake_op`）+ 罚没证据（`stage_slashing_evidence`）+ 测试 |
-| `src/net.rs` | P2P gossip 与反熵同步：`GossipMsg`/`GossipNode`（纯状态机，认证块 `apply_certified` 复验证书、交易 epidemic 泛洪去重 + **`Evidence` / `StakeOp` 块级 ops 的待打包池与去重 flood**；M22 增 `GetHeaders` / `Headers` 服务 + **M23 增 `GetAccountProof` / `AccountProof`，全节点现取现发、光节点入 `account_proofs` 缓存**）+ 确定性 `Network` 收敛总线 + **M22 光节点 `LightGossipNode`（仅头、`ValidatorTracker`、从不解码交易）+ 混入全/光节点的总线 `LightNetwork`** + `encode_gossip`/`read_msg`/`write_msg`（真实 socket 分帧，含新 TAG_GETHEADERS/TAG_HEADERS + **TAG_GETACCOUNTPROOF=8 / TAG_ACCTPROOF=9**） + 测试 |
-| `src/light.rs` | 轻客户端验证人集跟随：`ValidatorTracker`（`from_genesis` / `follow` / `follow_all`，逐高度复验证书 + 复刻 `apply_block` 的集合迁移，镜像 `bonds` + 创世公钥表，不执行交易；M21 `follow` 对 `next_validators_root` 交叉校验、免迁移 `follow_committed`、SPV `verify_membership`；M22 只对头的 `follow_header` + `verify_membership_against_header` + **M23 钱包 SPV `verify_account_membership`/`verify_account_membership_against_header`/`verify_state_root_against_header`**）+ `LightError` + 测试 |
+| `src/net.rs` | P2P gossip 与反熵同步：`GossipMsg`/`GossipNode`（纯状态机，认证块 `apply_certified` 复验证书、交易 epidemic 泛洪去重 + **`Evidence` / `StakeOp` 块级 ops 的待打包池与去重 flood**；M22 增 `GetHeaders` / `Headers` 服务 + **M24 完全替换 `GetProof { items }` / `Proof { items }` 一对（wire tags 8/9 复用），承载 Account/Reviewer/Validator 任意混合 `items`，上限 `MAX_PROOF_BATCH = 32`；全节点在 on_message 现取现发 account_proof/reviewer_proof/ValidatorSet::proof 三类；光节点入 `proofs` 缓存（键 `(ProofKind, u64)`）**）+ 确定性 `Network` 收敛总线 + **M22 光节点 `LightGossipNode`（仅头、`ValidatorTracker`、从不解码交易）+ 混入全/光节点的总线 `LightNetwork`** + `encode_gossip`/`read_msg`/`write_msg`（真实 socket 分帧，含新 TAG_GETHEADERS/TAG_HEADERS + **TAG_GETPROOF=8 / TAG_PROOF=9**） + 测试 |
+| `src/light.rs` | 轻客户端验证人集跟随：`ValidatorTracker`（`from_genesis` / `follow` / `follow_all`，逐高度复验证书 + 复刻 `apply_block` 的集合迁移，镜像 `bonds` + 创世公钥表，不执行交易；M21 `follow` 对 `next_validators_root` 交叉校验、免迁移 `follow_committed`、SPV `verify_membership`；M22 只对头的 `follow_header` + `verify_membership_against_header` + **M24 唯一 SPV 验证器 `verify_proof_against_header`（按 entry.kind() 选根，Account/Reviewer → accounts_root、Validator → next_validators_root，本地重算 leaf）；M23 的 `verify_account_membership_against_header` 与 M22 的 `verify_membership_against_header` 全部删除；`verify_state_root_against_header` 保留**）+ `LightError` + 测试 |
 | `src/crypto.rs` | ed25519 身份：`Keypair`/`verify`（封装 `ed25519-dalek`）+ 测试 |
 | `src/codec.rs` | 区块的规范二进制编解码（哈希与落盘共用，含 `validator_updates`、`stake_ops` 与 `slashing_evidence`；M22 增 `BlockHeader`（含 `txs_commitment`/`stake_ops_commitment`/`evidence_commitment` 三份 SHA-256 承诺）+ `CertifiedHeader` + `encode_header`/`decode_header` + `encode_certified_header`/`decode_certified_header` + **M23 头再加 `state_root`/`accounts_root` 两根、`Block`/`BlockHeader` 同步增两字段、`decode_certified_header` 长度算术从 `84 + n*48 + 96` 改为 `148 + n*48 + 96 = 244 + n*48`**）+ `tx_signing_bytes`/`encode_tx`/`decode_tx`（签名/tx 哈希/gossip wire 字节）+ `stakeop_signing_bytes`/`encode_stakeop`/`decode_stakeop`（bond/unbond 签名与哈希）+ `encode_evidence`/`decode_evidence`（双签证据）+ `encode_commit`/`decode_commit`（证书落盘）+ **`encode_account`/`decode_account`/`encode_proof`/`decode_proof`（M23 AccountProof 的 wire 字节）** + 测试 |
 | `src/store.rs` | 追加式日志（长度前缀记录、残缺尾检测）：`BlockLog`（区块）+ `CertLog`（证书）+ 测试 |
@@ -493,10 +521,11 @@ account_proof_request_for_unknown_id_yields_a_rejecting_proof  未知 id → 默
 - **~~验证人集变更的轻客户端跟随协议~~**：✅ 已完成（M20，`ValidatorTracker` 只凭创世逐高度复验证书 + 复刻集合迁移，镜像 `bonds` + 创世公钥表，不执行交易即得到与 `replay_verified` 逐字节一致的活跃集合；复用 `GossipMsg::Blocks` 传输）。
 - **~~验证人集 Merkle 承诺入区块头~~**：✅ 已完成（M21，`Block.next_validators_root` 折进 `block_hash`；出块方 `seal`、`apply_block` 强制根匹配；轻客户端 `follow_committed` 免复刻迁移验证整套下一集合、`verify_membership` 用 O(log n) 包含证明对 cert 签名头证明单个验证人（SPV 原语），`follow` 亦逐高度交叉校验）。
 - **~~只拉头部的 SPV 轻同步传输~~**：✅ 已完成（M22，`BlockHeader` 携每份体的 SHA-256 承诺、`Block::hash` 现哈希头投影使 `header.hash() == block.hash()` 恒成立；`CertifiedHeader` + `GossipMsg::GetHeaders/Headers` 把 SPV 原语搬上 gossip 总线；`LightGossipNode` 只保留头 + `ValidatorTracker`，从不解码任何交易体；`follow_header` 与 `verify_membership_against_header` 把 `follow_committed`/`verify_membership` 迁移至只对头形式；`LightNetwork` 混合全+光节点的总线）。
-- **~~钱包的账户-成员 SPV~~**：✅ 已完成（M23，`BlockHeader` 再携 `state_root` 完整共识状态 digest + `accounts_root` accounts/reviewers 二叉 Merkle 根两条承诺根；`Chain::commit` 走 trial 路径盖两根、`apply_block_inner` 多两条强制度 `StateRootMismatch` / `AccountsRootMismatch`；新 `GossipMsg::GetAccountProof` / `AccountProof`（wire tag 8/9）让钱包从对端要单账户包含证明；新 SPV `verify_account_membership_against_header` 在本地重算 leaf 并对头里的 `accounts_root` 验证，`verify_state_root_against_header` 把"完整状态 digest 由证书代验"的契约写明——钱包证明自己的余额**只下头、不下体、零重放**）。后续：通用 `GetProof { kind, key }` / `GossipProof` 协议覆盖账户/评审/验证人多类包含证明与速率限制、认知图谱节点的包含证明、`graph_root` 入头。
+- **~~钱包的账户-成员 SPV~~**：✅ 已完成（M23，`BlockHeader` 再携 `state_root` 完整共识状态 digest + `accounts_root` accounts/reviewers 二叉 Merkle 根两条承诺根；`Chain::commit` 走 trial 路径盖两根、`apply_block_inner` 多两条强制度 `StateRootMismatch` / `AccountsRootMismatch`；新 `GossipMsg::GetAccountProof` / `AccountProof`（wire tag 8/9）让钱包从对端要单账户包含证明；新 SPV `verify_account_membership_against_header` 在本地重算 leaf 并对头里的 `accounts_root` 验证，`verify_state_root_against_header` 把"完整状态 digest 由证书代验"的契约写明——钱包证明自己的余额**只下头、不下体、零重放**）。
+- **~~M24 批量化、类型化 SPV 原语~~**：✅ 已完成（`GossipMsg::GetProof { items }` / `Proof { items }` 一对承载任意 `[(Account|Reviewer|Validator, id), ...]` 列表，`MAX_PROOF_BATCH = 32`；wire tags 8/9 完全替换 M23 的 `GetAccountProof/AccountProof`；新 typed `ProofEntry` 枚举 + `Reviewer::merkle_leaf()` + `ChainState::reviewer_proof(id)` 闭合审阅人路径；wallet 端**唯一** SPV 验证器 `ValidatorTracker::verify_proof_against_header(header, cert, tracked_set, entry)` 按 entry.kind() 选根（Account/Reviewer → `accounts_root`，Validator → `next_validators_root`），本地重算 leaf；M22/M23 的 kind-specific 验证器全部删除）。后续：认知图谱节点的包含证明、`graph_root` 入头、跨集合原子的多 proof 原子化提交。
 - **~~持久化~~**：✅ 已完成（M7，追加式区块日志 + 重放；M14 加证书日志）。后续可换 RocksDB、加 per-record 校验和与 segment 轮转。
 - **~~Merkle 化状态树~~**：✅ 已完成（M10，二叉 Merkle 树 + 账户包含证明）。后续：非成员证明、增量更新的 Merkle-Patricia trie、把 graph/头字段也纳入根。
 - **手写 SHA-256** 仅为离线零依赖演示，**生产必须换审计实现**（`sha2`）。
 - **kNN 暴力扫描**：随图谱增长需换 HNSW/IVF（见 engine 局限）。
 
-这些构成后续里程碑（~~M7 持久化~~ ✅、~~M8 签名~~ ✅、~~M9 mempool 出块~~ ✅、~~M10 Merkle 认证状态~~ ✅、~~M11 BFT 最终性内核~~ ✅、~~M12 BFT 轮次状态机/活性~~ ✅、~~M13 认证链驱动~~ ✅、~~M14 证书落盘 + 重放复验~~ ✅、~~M15 P2P + gossip~~ ✅、~~M16 动态验证人集~~ ✅、~~M17 质押绑定权重 + 解绑期~~ ✅、~~M18 按证据罚没绑定质押~~ ✅、~~M19 P2P 传播块级 ops~~ ✅、~~M20 验证人集变更的轻客户端跟随协议~~ ✅、~~M21 验证人集 Merkle 承诺入区块头~~ ✅、~~M22 只拉头部的 SPV 轻同步传输~~ ✅、~~M23 钱包的账户-成员 SPV（双根承诺）~~ ✅……），每步仍遵循"可运行、可测试、契约一致"。
+这些构成后续里程碑（~~M7 持久化~~ ✅、~~M8 签名~~ ✅、~~M9 mempool 出块~~ ✅、~~M10 Merkle 认证状态~~ ✅、~~M11 BFT 最终性内核~~ ✅、~~M12 BFT 轮次状态机/活性~~ ✅、~~M13 认证链驱动~~ ✅、~~M14 证书落盘 + 重放复验~~ ✅、~~M15 P2P + gossip~~ ✅、~~M16 动态验证人集~~ ✅、~~M17 质押绑定权重 + 解绑期~~ ✅、~~M18 按证据罚没绑定质押~~ ✅、~~M19 P2P 传播块级 ops~~ ✅、~~M20 验证人集变更的轻客户端跟随协议~~ ✅、~~M21 验证人集 Merkle 承诺入区块头~~ ✅、~~M22 只拉头部的 SPV 轻同步传输~~ ✅、~~M23 钱包的账户-成员 SPV（双根承诺）~~ ✅、~~M24 批量化、类型化 SPV 原语（统一 GetProof/Proof 对 + 单一 verify_proof_against_header）~~ ✅……），每步仍遵循"可运行、可测试、契约一致"。

@@ -87,24 +87,29 @@ pub enum GossipMsg {
     /// `block_hash` equals `header.hash()` (a header is the cert-signed
     /// projection of a block with empty bodies).
     Headers(Vec<CertifiedHeader>),
-    /// M23: a light wallet asks a full peer for an account inclusion proof
-    /// against the full peer's current `accounts_root`. The wallet then verifies
-    /// the proof against the *header* it received over M22 gossip, so the full
-    /// peer never gets to lie about which leaf corresponds to which id — the
-    /// wallet recomputes the leaf from the account it handed back. Full nodes
-    /// serve; light nodes drop.
-    GetAccountProof { id: u64 },
-    /// M23: the response. `account` is the full state of that account;
-    /// `proof` is an O(log n) Merkle inclusion proof against the full peer's
-    /// `ChainState::merkle_root()` at the full peer's current head. The light
-    /// node caches it by account id (see [`LightGossipNode::take_account_proof`])
-    /// for the wallet to query locally.
-    AccountProof {
-        id: u64,
-        account: crate::Account,
-        proof: crate::merkle::Proof,
-    },
+    /// M24: a light wallet asks a full peer for one or more O(log n) inclusion
+    /// proofs against the full peer's current state. Each item is `(kind, id)`:
+    /// Account and Reviewer open against `accounts_root`; Validator opens
+    /// against `next_validators_root`. The full peer answers with a parallel
+    /// `Proof { items: Vec<Option<ProofEntry>> }` — `None` for unknown ids —
+    /// and the wallet verifies each entry locally against the cert-signed
+    /// header it received over M22, so the full peer never gets to lie about
+    /// which leaf corresponds to which id. Full nodes serve; light nodes drop.
+    /// Capped at [`MAX_PROOF_BATCH`] items per message.
+    GetProof { items: Vec<(crate::light::ProofKind, u64)> },
+    /// M24: the batched response. `items.len() == request.items.len()`; a
+    /// `None` at index `i` means "unknown key" — the wallet's local
+    /// `verify_proof_against_header` will reject it cleanly with
+    /// `MembershipProofInvalid` against the cert-signed header's root. Light
+    /// nodes cache entries by `(kind, id)` via
+    /// [`LightGossipNode::take_proof`].
+    Proof { items: Vec<Option<crate::light::ProofEntry>> },
 }
+
+/// M24: maximum items in a single [`GossipMsg::GetProof`] / [`GossipMsg::Proof`]
+/// — over the cap is a codec error (`TooManyItems`). Keeps a single request
+/// bounded so a hostile peer can't fan out O(n) work on the responder.
+pub const MAX_PROOF_BATCH: usize = 32;
 
 /// Wire-tag assignments. Each GossipMsg variant is one byte; bumping a tag
 /// outside the existing range (0..=9) requires a major-version bump.
@@ -116,8 +121,8 @@ pub const TAG_EVIDENCE: u8 = 4;
 pub const TAG_STAKEOP: u8 = 5;
 pub const TAG_GETHEADERS: u8 = 6;
 pub const TAG_HEADERS: u8 = 7;
-pub const TAG_GETACCOUNTPROOF: u8 = 8;
-pub const TAG_ACCTPROOF: u8 = 9;
+pub const TAG_GETPROOF: u8 = 8;
+pub const TAG_PROOF: u8 = 9;
 
 /// One peer: a chain, a mempool, the retained certified chain (blocks paired with
 /// certificates, for serving sync), and the gossip bookkeeping. Its [`on_message`]
@@ -365,27 +370,70 @@ impl GossipNode {
                 }
             }
             GossipMsg::Headers(_) => Vec::new(),
-            // M23: full peer serves an account inclusion proof against its
-            // current `accounts_root`. The wallet verifies the proof against
-            // the cert-signed header it received over M22, so even an
-            // adversarial full peer cannot lie — the wallet recomputes the
-            // leaf from the account it got back.
-            GossipMsg::GetAccountProof { id } => {
-                let account = self.chain.state.accounts.get(&id).cloned();
-                let proof = self.chain.state.account_proof(id);
-                match (account, proof) {
-                    (Some(a), Some(p)) => vec![(from, GossipMsg::AccountProof { id, account: a, proof: p })],
-                    // unknown id or no proof path: serve a degenerate so the
-                    // wallet's verify fails with MembershipProofInvalid instead
-                    // of hanging. The wallet checks the leaf anyway.
-                    _ => vec![(from, GossipMsg::AccountProof {
-                        id,
-                        account: crate::Account::default(),
-                        proof: crate::merkle::Proof { steps: Vec::new() },
-                    })],
+            // M24: full peer serves one or more O(log n) inclusion proofs in a
+            // single round-trip. For each (kind, id) in the request, pull the
+            // typed leaf + proof from local state; a None means "unknown key"
+            // and the wallet's verify_proof_against_header will reject it
+            // cleanly with MembershipProofInvalid against the cert-signed
+            // header's root.
+            GossipMsg::GetProof { items } => {
+                if items.len() > MAX_PROOF_BATCH {
+                    return Vec::new(); // codec-level cap; shouldn't reach here
                 }
+                let mut out = Vec::with_capacity(items.len());
+                for (kind, id) in items {
+                    let entry = match kind {
+                        crate::light::ProofKind::Account => {
+                            self.chain.state.account_proof(id).and_then(|p| {
+                                self.chain
+                                    .state
+                                    .accounts
+                                    .get(&id)
+                                    .cloned()
+                                    .map(|a| crate::light::ProofEntry::Account {
+                                        id,
+                                        account: a,
+                                        proof: p,
+                                    })
+                            })
+                        }
+                        crate::light::ProofKind::Reviewer => {
+                            self.chain.state.reviewer_proof(id).map(|p| {
+                                let reputation = self
+                                    .chain
+                                    .state
+                                    .reviewers
+                                    .get(&id)
+                                    .copied()
+                                    .unwrap_or(0.0);
+                                crate::light::ProofEntry::Reviewer { id, reputation, proof: p }
+                            })
+                        }
+                        crate::light::ProofKind::Validator => self
+                            .chain
+                            .state
+                            .validators
+                            .proof(id)
+                            .and_then(|p| {
+                                self.chain
+                                    .state
+                                    .validators
+                                    .validators()
+                                    .iter()
+                                    .find(|v| v.id == id)
+                                    .cloned()
+                                    .map(|v| crate::light::ProofEntry::Validator {
+                                        id,
+                                        validator: v,
+                                        proof: p,
+                                    })
+                            }),
+                    };
+                    out.push(entry);
+                }
+                vec![(from, GossipMsg::Proof { items: out })]
             }
-            GossipMsg::AccountProof { .. } => Vec::new(), // full nodes don't consume proofs
+            GossipMsg::Proof { .. } => Vec::new(), // full nodes don't consume proofs
         }
     }
 
@@ -584,11 +632,12 @@ pub struct LightGossipNode {
     /// The validator-set tracker, advanced as headers arrive.
     tracker: ValidatorTracker,
     peers: BTreeSet<u64>,
-    /// M23: cached `AccountProof` responses from full peers, keyed by account
-    /// id. Populated by `on_message` when an `AccountProof` arrives; the
-    /// wallet retrieves them via [`Self::take_account_proof`] to verify
-    /// against the latest cert-signed header's `accounts_root`.
-    account_proofs: BTreeMap<u64, (crate::Account, crate::merkle::Proof)>,
+    /// M24: cached `Proof` responses from full peers, keyed by `(ProofKind, id)`.
+    /// Populated by `on_message` when a `Proof` arrives; the wallet retrieves
+    /// them via [`Self::take_proof`] to verify against the latest cert-signed
+    /// header's `accounts_root` (for Account/Reviewer) or `next_validators_root`
+    /// (for Validator).
+    proofs: BTreeMap<(crate::light::ProofKind, u64), crate::light::ProofEntry>,
 }
 
 impl LightGossipNode {
@@ -602,14 +651,19 @@ impl LightGossipNode {
             seen: BTreeSet::new(),
             tracker: ValidatorTracker::from_genesis(g),
             peers,
-            account_proofs: BTreeMap::new(),
+            proofs: BTreeMap::new(),
         }
     }
 
-    /// Pop the cached proof for `id` (consumes the entry — a wallet pulls
-    /// once, then verifies locally).
-    pub fn take_account_proof(&mut self, id: u64) -> Option<(crate::Account, crate::merkle::Proof)> {
-        self.account_proofs.remove(&id)
+    /// Pop the cached proof for `(kind, id)` (consumes the entry — a wallet
+    /// pulls once, then verifies locally with
+    /// `ValidatorTracker::verify_proof_against_header`).
+    pub fn take_proof(
+        &mut self,
+        kind: crate::light::ProofKind,
+        id: u64,
+    ) -> Option<crate::light::ProofEntry> {
+        self.proofs.remove(&(kind, id))
     }
 
     pub fn tracker(&self) -> &ValidatorTracker {
@@ -673,15 +727,19 @@ impl LightGossipNode {
             }
             GossipMsg::GetHeaders { .. } => Vec::new(), // light nodes don't serve headers
             GossipMsg::Headers(batch) => self.on_headers(from, batch),
-            // M23: cache an incoming account proof for the wallet to verify
-            // locally against the cert-signed header's `accounts_root`.
-            GossipMsg::AccountProof { id, account, proof } => {
-                self.account_proofs.insert(id, (account, proof));
+            // M24: cache incoming inclusion proofs for the wallet to verify
+            // locally against the cert-signed header. Each `Some(entry)` is
+            // keyed by (kind, id); `None` slots mean the full peer didn't have
+            // the key — we drop them silently and the wallet sees a cache miss.
+            GossipMsg::Proof { items } => {
+                for entry in items.into_iter().flatten() {
+                    self.proofs.insert((entry.kind(), entry.id()), entry);
+                }
                 Vec::new()
             }
             // Light nodes do not serve proof requests (they have no chain state
             // to prove against).
-            GossipMsg::GetAccountProof { .. } => Vec::new(),
+            GossipMsg::GetProof { .. } => Vec::new(),
             // everything else: light clients forward tx gossip but never store it
             // — for the M22 demo we just drop, mirroring the "I don't care about
             // bodies" SPV stance.
@@ -898,17 +956,32 @@ pub fn encode_gossip(m: &GossipMsg) -> Vec<u8> {
                 put_bytes(&mut out, &encode_certified_header(ch));
             }
         }
-        // M23: account-proof gossip pair. The wire body is the same shape as
-        // the other variants — a length-prefixed payload per side-channel.
-        GossipMsg::GetAccountProof { id } => {
-            out.push(TAG_GETACCOUNTPROOF);
-            out.extend_from_slice(&id.to_be_bytes());
+        // M24: batched typed proof pair. Body layout:
+        //   - GetProof: u32_be(len) then for each (kind, id): 1 byte kind tag
+        //     followed by 8 bytes id (kind tag = encode_proof_kind(kind)).
+        //   - Proof:    u32_be(len) then for each Option<ProofEntry>: 1 byte
+        //     presence tag (0 = None, 1 = Some) followed by
+        //     encode_proof_entry(...) when present.
+        GossipMsg::GetProof { items } => {
+            out.push(TAG_GETPROOF);
+            out.extend_from_slice(&(items.len() as u32).to_be_bytes());
+            for (k, id) in items {
+                out.push(crate::codec::encode_proof_kind(*k));
+                out.extend_from_slice(&id.to_be_bytes());
+            }
         }
-        GossipMsg::AccountProof { id, account, proof } => {
-            out.push(TAG_ACCTPROOF);
-            out.extend_from_slice(&id.to_be_bytes());
-            put_bytes(&mut out, &crate::codec::encode_account(account));
-            put_bytes(&mut out, &crate::codec::encode_proof(proof));
+        GossipMsg::Proof { items } => {
+            out.push(TAG_PROOF);
+            out.extend_from_slice(&(items.len() as u32).to_be_bytes());
+            for entry in items {
+                match entry {
+                    Some(e) => {
+                        out.push(1);
+                        put_bytes(&mut out, &crate::codec::encode_proof_entry(e));
+                    }
+                    None => out.push(0),
+                }
+            }
         }
     }
     out
@@ -948,13 +1021,41 @@ pub fn decode_gossip(buf: &[u8]) -> Result<GossipMsg, CodecError> {
             }
             GossipMsg::Headers(batch)
         }
-        // M23: account-proof gossip pair.
-        TAG_GETACCOUNTPROOF => GossipMsg::GetAccountProof { id: take_u64(&mut rest)? },
-        TAG_ACCTPROOF => {
-            let id = take_u64(&mut rest)?;
-            let account = crate::codec::decode_account(take_bytes(&mut rest)?)?;
-            let proof = crate::codec::decode_proof(take_bytes(&mut rest)?)?;
-            GossipMsg::AccountProof { id, account, proof }
+        // M24: batched typed proof pair.
+        TAG_GETPROOF => {
+            let n = take_u32(&mut rest)?;
+            if n as usize > MAX_PROOF_BATCH {
+                return Err(CodecError::TooManyItems(n as u64));
+            }
+            let mut items = Vec::with_capacity(n as usize);
+            for _ in 0..n {
+                let kind_byte = rest.first().copied().ok_or(CodecError::UnexpectedEof)?;
+                rest = &rest[1..];
+                let kind = crate::codec::decode_proof_kind(kind_byte)?;
+                let id = take_u64(&mut rest)?;
+                items.push((kind, id));
+            }
+            GossipMsg::GetProof { items }
+        }
+        TAG_PROOF => {
+            let n = take_u32(&mut rest)?;
+            if n as usize > MAX_PROOF_BATCH {
+                return Err(CodecError::TooManyItems(n as u64));
+            }
+            let mut items = Vec::with_capacity(n as usize);
+            for _ in 0..n {
+                let present = rest.first().copied().ok_or(CodecError::UnexpectedEof)?;
+                rest = &rest[1..];
+                if present == 0 {
+                    items.push(None);
+                } else if present == 1 {
+                    let body = take_bytes(&mut rest)?;
+                    items.push(Some(crate::codec::decode_proof_entry(body)?));
+                } else {
+                    return Err(CodecError::BadEnum(present as u32));
+                }
+            }
+            GossipMsg::Proof { items }
         }
         other => return Err(CodecError::BadEnum(other as u32)),
     };
@@ -976,6 +1077,15 @@ fn take_u64(buf: &mut &[u8]) -> Result<u64, CodecError> {
     let (h, t) = buf.split_at(8);
     *buf = t;
     Ok(u64::from_be_bytes(h.try_into().unwrap()))
+}
+
+fn take_u32(buf: &mut &[u8]) -> Result<u32, CodecError> {
+    if buf.len() < 4 {
+        return Err(CodecError::UnexpectedEof);
+    }
+    let (h, t) = buf.split_at(4);
+    *buf = t;
+    Ok(u32::from_be_bytes(h.try_into().unwrap()))
 }
 
 fn take_bytes<'a>(buf: &mut &'a [u8]) -> Result<&'a [u8], CodecError> {
@@ -1097,6 +1207,31 @@ mod tests {
         // round-trip is the property under test).
         let fake_account = crate::Account::default();
         let fake_proof = crate::merkle::Proof { steps: vec![crate::merkle::Step::Right([0xAA; 32])] };
+        // M24: a single mixed-kind batched proof request with all three kinds
+        // present (Account + Reviewer + Validator) and one None-slot in the
+        // response — covers the full new wire shape in one round-trip.
+        let request = GossipMsg::GetProof {
+            items: vec![
+                (crate::light::ProofKind::Account, 1),
+                (crate::light::ProofKind::Reviewer, 10),
+                (crate::light::ProofKind::Validator, 25),
+            ],
+        };
+        let response = GossipMsg::Proof {
+            items: vec![
+                Some(crate::light::ProofEntry::Account {
+                    id: 1,
+                    account: fake_account.clone(),
+                    proof: fake_proof.clone(),
+                }),
+                None,
+                Some(crate::light::ProofEntry::Validator {
+                    id: 25,
+                    validator: Validator { id: 25, pubkey: [3u8; 32], power: 7 },
+                    proof: fake_proof.clone(),
+                }),
+            ],
+        };
         let msgs = vec![
             GossipMsg::Status { height: 7 },
             GossipMsg::GetBlocks { from: 3 },
@@ -1106,13 +1241,15 @@ mod tests {
             GossipMsg::StakeOp(sample_bond(1, 5 * MICRO)),
             GossipMsg::GetHeaders { from: 3 },
             GossipMsg::Headers(headers),
-            GossipMsg::GetAccountProof { id: 1 },
-            GossipMsg::AccountProof { id: 1, account: fake_account, proof: fake_proof },
+            request,
+            response,
         ];
         for m in &msgs {
             let bytes = encode_gossip(m);
-            let back = decode_gossip(&bytes).unwrap();
-            assert_eq!(encode_gossip(&back), bytes, "re-encoding is stable");
+            match decode_gossip(&bytes) {
+                Ok(back) => assert_eq!(encode_gossip(&back), bytes, "re-encoding is stable"),
+                Err(e) => panic!("decode failed: {e:?} for {m:?}"),
+            }
         }
     }
 
@@ -1409,6 +1546,7 @@ mod tests {
 
     // -- M22: header-only SPV gossip ---------------------------------------
 
+    use crate::light::ProofEntry;
     use crate::validator::Validator;
 
     /// Per-height committed sets from an authoritative replay: `sets[i]` is
@@ -1551,42 +1689,78 @@ mod tests {
         assert_eq!(lt.validators().merkle_root(), authoritative.merkle_root());
     }
 
-    // --- M23: account-proof gossip + light wallet end-to-end ---------------
+    // --- M24: batched typed proof gossip + light wallet end-to-end ---------
 
     #[test]
-    fn full_node_serves_an_account_proof_in_response_to_get_account_proof() {
-        // Full node holds a tiny chain, asks itself for an account proof,
-        // verifies the proof locally against its own current accounts_root.
-        let (blocks, certs) = certified_chain(1);
+    fn full_node_serves_a_batch_of_proofs_in_response_to_get_proof() {
+        // M24: full node holds a tiny chain, asks itself for an Account +
+        // Reviewer + Validator proof in one shot; each reply must verify
+        // locally against the right root slot in its own header. The chain
+        // uses the genesis seeds (21..24) so validator 21 is in both the
+        // active and next set without needing an explicit update.
+        let (blocks, certs) = certified_chain(2);
         let mut full = GossipNode::new(1, genesis(), 8, [1]);
         full.load_certified(&blocks, &certs);
 
-        // Send `GetAccountProof` to ourselves. Full node should reply with one
-        // `AccountProof` carrying a non-trivial inclusion proof.
-        let mut out = full.on_message(99, GossipMsg::GetAccountProof { id: 1 });
+        // The reviewers tree is populated by the M13 review-of-tx flow; we
+        // need at least one tx in the chain for reviewers 10..13 to show up.
+        // `certified_chain(2)` already produces a tx in block 1, so
+        // reviewer 10 should be in the post-block-1 set.
+        let request = GossipMsg::GetProof {
+            items: vec![
+                (crate::light::ProofKind::Account, 1),
+                (crate::light::ProofKind::Reviewer, 10),
+                (crate::light::ProofKind::Validator, 21),
+            ],
+        };
+        let mut out = full.on_message(99, request);
         assert_eq!(out.len(), 1);
         let (dst, msg) = out.pop().unwrap();
         assert_eq!(dst, 99);
-        let proof = match msg {
-            GossipMsg::AccountProof { id, account, proof } => {
-                assert_eq!(id, 1);
-                // The proof must verify against the full node's accounts_root.
-                let leaf = crate::merkle::leaf_hash(&account.merkle_leaf(1));
-                assert!(crate::merkle::verify(&full.chain.state.merkle_root(), &leaf, &proof));
-                proof
-            }
-            other => panic!("expected AccountProof, got {other:?}"),
+        let entries = match msg {
+            GossipMsg::Proof { items } => items,
+            other => panic!("expected Proof, got {other:?}"),
         };
-        // The proof is non-empty: a tree with at least the genesis account
-        // and the new tx-minted account 1 takes >=2 levels.
-        assert!(!proof.steps.is_empty());
+        assert_eq!(entries.len(), 3);
+
+        // Account + Reviewer open against accounts_root; Validator opens
+        // against next_validators_root. The full node knows both roots
+        // (from its own state), so we can verify each reply in place.
+        let last_block = blocks.last().unwrap();
+        let header = crate::codec::BlockHeader::from_block(last_block);
+        let account_root = &full.chain.state.merkle_root();
+        let validator_root = &full.chain.state.validators.merkle_root();
+
+        for (i, e) in entries.iter().enumerate() {
+            let entry = e.as_ref().unwrap_or_else(|| panic!("entry {i} should be Some"));
+            let leaf = crate::merkle::leaf_hash(&entry.leaf());
+            let root = match entry {
+                crate::light::ProofEntry::Account { .. }
+                | crate::light::ProofEntry::Reviewer { .. } => account_root,
+                crate::light::ProofEntry::Validator { .. } => validator_root,
+            };
+            assert!(
+                crate::merkle::verify(root, &leaf, entry.proof()),
+                "entry {i} ({:?}) failed to verify locally",
+                entry.kind()
+            );
+            // and the root embedded in the header must match what we used.
+            let header_root = match entry {
+                crate::light::ProofEntry::Account { .. } | crate::light::ProofEntry::Reviewer { .. } => {
+                    &header.accounts_root
+                }
+                crate::light::ProofEntry::Validator { .. } => &header.next_validators_root,
+            };
+            assert_eq!(root, header_root, "entry {i}: local root vs header root");
+        }
     }
 
     #[test]
-    fn light_node_proves_account_balance_against_cert_signed_header() {
-        // End-to-end: full + light over `LightNetwork`, light asks for
-        // account #1's proof, light verifies against the latest cert-signed
-        // header's `accounts_root` (M22 transport + M23 SPV).
+    fn light_node_proves_account_reviewer_and_validator_against_a_cert_signed_header() {
+        // End-to-end: full + light over `LightNetwork`. After M22 sync, the
+        // light wallet sends ONE batched GetProof for (Account 1, Reviewer 10,
+        // Validator 25). All three entries arrive in one Proof response, get
+        // cached, get verified against the same cert-signed header.
         let (blocks, certs) = certified_chain(2);
         let mut full = GossipNode::new(1, genesis(), 8, [1, 2]);
         full.load_certified(&blocks, &certs);
@@ -1609,38 +1783,58 @@ mod tests {
         let lt = net.light_node(light_id).tracker().clone();
         assert_eq!(lt.height(), 2);
 
-        // Phase 2: light sends GetAccountProof{id=1} to the full peer; full
-        // replies with AccountProof; light caches it.
+        // Phase 2: light sends ONE batched GetProof covering all three kinds.
         let mut full_node = net.take_full(1);
         let mut light_node = net.take_light(light_id);
-        let reply = full_node.on_message(light_id, GossipMsg::GetAccountProof { id: 1 });
+        let reply = full_node.on_message(
+            light_id,
+            GossipMsg::GetProof {
+                items: vec![
+                    (crate::light::ProofKind::Account, 1),
+                    (crate::light::ProofKind::Reviewer, 10),
+                    (crate::light::ProofKind::Validator, 21),
+                ],
+            },
+        );
         assert_eq!(reply.len(), 1);
         let (_dst, proof_msg) = reply.into_iter().next().unwrap();
         light_node.on_message(1, proof_msg);
 
-        // Phase 3: wallet pulls the cached proof and verifies it locally
-        // against the cert-signed header's `accounts_root`.
-        let (account, proof) = light_node
-            .take_account_proof(1)
-            .expect("proof cached for id 1");
+        // Phase 3: wallet pulls each entry by (kind, id) and verifies all
+        // three against the same cert-signed header.
         let last_block = blocks.last().unwrap();
         let last_cert = certs.last().unwrap();
         let header = crate::codec::BlockHeader::from_block(last_block);
         let tracked = lt.validators().clone();
-        crate::light::ValidatorTracker::verify_account_membership_against_header(
-            &header, last_cert, &tracked, 1, &account, &proof,
-        )
-        .expect("light wallet proves account 1 against the cert-signed header");
+
+        let acct = light_node
+            .take_proof(crate::light::ProofKind::Account, 1)
+            .expect("account proof cached");
+        let rev = light_node
+            .take_proof(crate::light::ProofKind::Reviewer, 10)
+            .expect("reviewer proof cached");
+        let val = light_node
+            .take_proof(crate::light::ProofKind::Validator, 21)
+            .expect("validator proof cached");
+
+        crate::light::ValidatorTracker::verify_proof_against_header(&header, last_cert, &tracked, &acct)
+            .expect("light wallet proves account 1");
+        crate::light::ValidatorTracker::verify_proof_against_header(&header, last_cert, &tracked, &rev)
+            .expect("light wallet proves reviewer 10");
+        crate::light::ValidatorTracker::verify_proof_against_header(&header, last_cert, &tracked, &val)
+            .expect("light wallet proves validator 25");
+
         net.put_full(full_node);
         net.put_light(light_node);
     }
 
     #[test]
-    fn light_node_rejects_an_inflated_account_proof() {
-        // Same as above but the wallet tampers with the account balance
-        // before verifying — the locally-computed leaf no longer matches the
-        // proof's path.
-        let (blocks, certs) = certified_chain(1);
+    fn light_node_rejects_a_tampered_validator_proof() {
+        // Same wire shape as the happy-path test, but the wallet tampers with
+        // the validator's power before calling verify_proof_against_header.
+        // The locally-recomputed leaf no longer matches the proof's path →
+        // MembershipProofInvalid.
+        let (blocks, certs) = certified_chain(2);
         let mut full = GossipNode::new(1, genesis(), 8, [1, 2]);
         full.load_certified(&blocks, &certs);
         let light_id = 2u64;
@@ -1652,7 +1846,7 @@ mod tests {
         net.announce_all();
         for _ in 0..20 {
             let n = net.run(1, light_id, &next_set_for);
-            if n == 0 && net.light_node(light_id).tracker().height() == 1 {
+            if n == 0 && net.light_node(light_id).tracker().height() == 2 {
                 break;
             }
         }
@@ -1660,51 +1854,121 @@ mod tests {
 
         let mut full_node = net.take_full(1);
         let mut light_node = net.take_light(light_id);
-        let reply = full_node.on_message(light_id, GossipMsg::GetAccountProof { id: 1 });
+        let reply = full_node.on_message(
+            light_id,
+            GossipMsg::GetProof { items: vec![(crate::light::ProofKind::Validator, 21)] },
+        );
         let (_dst, proof_msg) = reply.into_iter().next().unwrap();
         light_node.on_message(1, proof_msg);
 
-        let (mut account, proof) = light_node.take_account_proof(1).expect("cached");
-        account.balance += 1; // tamper
+        let entry = light_node
+            .take_proof(crate::light::ProofKind::Validator, 21)
+            .expect("validator proof cached");
+        // Tamper: bump the validator's power by 1.
+        let mut forged = entry;
+        if let crate::light::ProofEntry::Validator { id, ref mut validator, .. } = forged {
+            validator.power += 1;
+            let _ = id; // id unchanged
+        } else {
+            panic!("expected Validator entry");
+        }
 
         let header = crate::codec::BlockHeader::from_block(blocks.last().unwrap());
         let tracked = lt.validators().clone();
-        let err = crate::light::ValidatorTracker::verify_account_membership_against_header(
-            &header, certs.last().unwrap(), &tracked, 1, &account, &proof,
+        let err = crate::light::ValidatorTracker::verify_proof_against_header(
+            &header,
+            certs.last().unwrap(),
+            &tracked,
+            &forged,
         )
         .unwrap_err();
-        assert!(matches!(err, crate::light::LightError::MembershipProofInvalid { .. }), "got {err}");
+        assert!(
+            matches!(err, crate::light::LightError::MembershipProofInvalid { .. }),
+            "got {err}"
+        );
         net.put_full(full_node);
         net.put_light(light_node);
     }
 
     #[test]
-    fn account_proof_request_for_unknown_id_yields_a_rejecting_proof() {
-        // Unknown id gets served a default account + empty proof; the
-        // wallet's verify rejects cleanly (MembershipProofInvalid), it does
-        // not hang.
+    fn full_node_serves_a_reviewer_proof_for_a_reviewer_id_not_in_accounts() {
+        // Reviewer ids live in their own namespace inside the accounts tree
+        // (alongside accounts). Asking for a reviewer id that is *not* an
+        // account id must still produce a valid Reviewer proof — covers the
+        // M24 producer gap that was implicit in the tree but had no path.
         let (blocks, certs) = certified_chain(1);
         let mut full = GossipNode::new(1, genesis(), 8, [1]);
         full.load_certified(&blocks, &certs);
 
-        let reply = full.on_message(99, GossipMsg::GetAccountProof { id: 999 });
-        let (_dst, msg) = reply.into_iter().next().unwrap();
-        let proof = match msg {
-            GossipMsg::AccountProof { id, account, proof } => {
-                assert_eq!(id, 999);
-                assert_eq!(account, crate::Account::default());
-                assert!(proof.steps.is_empty());
-                proof
-            }
-            other => panic!("expected AccountProof, got {other:?}"),
+        // Reviewer 11 is in the second half of the merkle_leaves layout;
+        // it's NOT an account id (accounts are 1..=N), so this also exercises
+        // the second-half-of-tree index path in reviewer_proof.
+        let request = GossipMsg::GetProof {
+            items: vec![(crate::light::ProofKind::Reviewer, 11)],
         };
-        // Empty proof cannot verify against any real root.
-        let header = crate::codec::BlockHeader::from_block(blocks.last().unwrap());
-        let tracked = ValidatorTracker::from_genesis(&genesis()).validators().clone();
-        let err = crate::light::ValidatorTracker::verify_account_membership_against_header(
-            &header, certs.last().unwrap(), &tracked, 999, &crate::Account::default(), &proof,
-        )
-        .unwrap_err();
-        assert!(matches!(err, crate::light::LightError::MembershipProofInvalid { .. }), "got {err}");
+        let mut out = full.on_message(99, request);
+        let (_dst, msg) = out.pop().unwrap();
+        let entry = match msg {
+            GossipMsg::Proof { mut items } => items.pop().unwrap(),
+            other => panic!("expected Proof, got {other:?}"),
+        };
+        let entry = entry.expect("reviewer 11 exists in the chain");
+        let ProofEntry::Reviewer { id, reputation, proof } = entry else {
+            panic!("expected Reviewer entry");
+        };
+        assert_eq!(id, 11);
+        assert!(reputation >= 0.0);
+        // Local verification against the full peer's accounts_root.
+        let leaf = crate::merkle::leaf_hash(
+            &crate::Reviewer { id, reputation }.merkle_leaf(),
+        );
+        assert!(crate::merkle::verify(&full.chain.state.merkle_root(), &leaf, &proof));
+    }
+
+    #[test]
+    fn get_proof_with_too_many_items_is_a_codec_error() {
+        // 33 items > MAX_PROOF_BATCH (=32). The decoder must reject before
+        // any responder code runs.
+        let items: Vec<(crate::light::ProofKind, u64)> = (0..33)
+            .map(|i| (crate::light::ProofKind::Account, i))
+            .collect();
+        let msg = GossipMsg::GetProof { items };
+        let bytes = encode_gossip(&msg);
+        let err = decode_gossip(&bytes).unwrap_err();
+        assert!(matches!(err, crate::codec::CodecError::TooManyItems(33)));
+    }
+
+    #[test]
+    fn proof_request_for_unknown_id_yields_none_in_the_response() {
+        // M24: the full peer no longer serves a degenerate proof for unknown
+        // keys — it serves `None`. The light peer drops the slot silently,
+        // and the wallet's cache misses on `take_proof`.
+        let (blocks, certs) = certified_chain(1);
+        let mut full = GossipNode::new(1, genesis(), 8, [1]);
+        full.load_certified(&blocks, &certs);
+
+        let request = GossipMsg::GetProof {
+            items: vec![(crate::light::ProofKind::Account, 999)],
+        };
+        let mut out = full.on_message(99, request);
+        let (_dst, msg) = out.pop().unwrap();
+        let entries = match msg {
+            GossipMsg::Proof { items } => items,
+            other => panic!("expected Proof, got {other:?}"),
+        };
+        assert_eq!(entries.len(), 1);
+        assert!(entries[0].is_none(), "unknown id must produce None, got {:?}", entries[0]);
+
+        // And the wallet sees a cache miss.
+        let mut light = LightGossipNode::new(99, &genesis(), [1]);
+        let reply = full.on_message(
+            99,
+            GossipMsg::GetProof {
+                items: vec![(crate::light::ProofKind::Account, 999)],
+            },
+        );
+        let (_dst, proof_msg) = reply.into_iter().next().unwrap();
+        light.on_message(1, proof_msg);
+        assert!(light.take_proof(crate::light::ProofKind::Account, 999).is_none());
     }
 }

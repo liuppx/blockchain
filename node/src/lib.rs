@@ -311,6 +311,27 @@ impl Account {
     }
 }
 
+/// M24: a reviewer's reputation state. M23 already includes reviewers
+/// in the `accounts_root` Merkle tree (`ChainState::merkle_root`),
+/// but there was no typed producer for a reviewer-inclusion proof.
+/// `merkle_leaf()` is the canonical preimage `merkle::leaf_hash` consumes
+/// — byte-identical to the inline encoding previously living in
+/// `ChainState::merkle_leaves`.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Reviewer {
+    pub id: u64,
+    pub reputation: f32,
+}
+
+impl Reviewer {
+    pub fn merkle_leaf(&self) -> Vec<u8> {
+        let mut e = codec::Enc(Vec::new());
+        e.u64(self.id);
+        e.f32(self.reputation);
+        e.0
+    }
+}
+
 /// The full replicated state. Cloneable so blocks can be applied on a trial copy
 /// and rolled back atomically if any tx is invalid.
 #[derive(Clone)]
@@ -1084,12 +1105,20 @@ impl ChainState {
             leaves.push(merkle::leaf_hash(&a.merkle_leaf(*id)));
         }
         for (id, rep) in &self.reviewers {
-            let mut e = codec::Enc(Vec::new());
-            e.u64(*id);
-            e.f32(*rep);
-            leaves.push(merkle::leaf_hash(&e.0));
+            leaves.push(merkle::leaf_hash(&Reviewer { id: *id, reputation: *rep }.merkle_leaf()));
         }
         leaves
+    }
+
+    /// M24: inclusion proof for a reviewer against [`Self::merkle_root`].
+    /// Reviewers occupy the second half of the `merkle_leaves` layout
+    /// (accounts first, then reviewers, both in `BTreeMap` order).
+    /// `None` if `reviewer_id` is unknown.
+    pub fn reviewer_proof(&self, reviewer_id: u64) -> Option<merkle::Proof> {
+        let n_accounts = self.accounts.len();
+        let rids: Vec<u64> = self.reviewers.keys().copied().collect();
+        let rindex = rids.iter().position(|&k| k == reviewer_id)?;
+        merkle::MerkleTree::from_leaf_hashes(self.merkle_leaves()).proof(n_accounts + rindex)
     }
 
     /// Accounting invariant: every micro-$COG is in an account balance, in the
@@ -2008,5 +2037,72 @@ mod tests {
         let err = chain.commit(&mut b).unwrap_err();
         assert!(matches!(err, ChainError::AccountsRootMismatch { height: 1 }), "got {err:?}");
         assert_eq!(chain.state.height, 0, "rejected block rolls fully back");
+    }
+
+    // --- M24: reviewer proof producer ------------------------------------
+
+    fn one_block_chain() -> Chain {
+        let mut chain = Chain::new(base_genesis());
+        let b = block(&chain, 1, vec![novel_tx(1, 1, 1, 1.0)]);
+        chain.commit(&mut b.clone()).unwrap();
+        chain
+    }
+
+    #[test]
+    fn reviewer_proof_round_trip() {
+        // For each reviewer in the post-block state, the producer's proof
+        // verifies against `ChainState::merkle_root()` when fed the canonical
+        // leaf. Tampering reputation breaks it; an unknown id returns None.
+        let chain = one_block_chain();
+        for (&rid, &rep) in chain.state.reviewers.iter() {
+            let proof = chain.state.reviewer_proof(rid).expect("proof exists");
+            let leaf = merkle::leaf_hash(&Reviewer { id: rid, reputation: rep }.merkle_leaf());
+            assert!(
+                merkle::verify(&chain.state.merkle_root(), &leaf, &proof),
+                "reviewer {rid} proof does not verify"
+            );
+            // tamper with reputation: the leaf changes, verification must fail.
+            let bad_leaf = merkle::leaf_hash(&Reviewer { id: rid, reputation: rep + 0.1 }.merkle_leaf());
+            assert!(!merkle::verify(&chain.state.merkle_root(), &bad_leaf, &proof));
+        }
+        assert!(chain.state.reviewer_proof(9_999).is_none());
+    }
+
+    #[test]
+    fn reviewer_proof_index_lies_after_all_accounts() {
+        // Reviewer leaves live in the second half of `merkle_leaves()`
+        // (accounts first, then reviewers, both in BTreeMap order). Account
+        // proofs thus have indices < reviewer proof indices. We verify the
+        // same property by recomputing both indices from the producer's
+        // helper (n_accounts + rindex for reviewer; the first slot for
+        // accounts 1..N), then confirming both proofs open against the
+        // shared `merkle_root()`.
+        let chain = one_block_chain();
+        let leaves = chain.state.merkle_leaves();
+        assert_eq!(
+            leaves.len(),
+            chain.state.accounts.len() + chain.state.reviewers.len(),
+            "leaves must include both accounts and reviewers"
+        );
+        // First leaf is the smallest account id (account 1); the last leaf is
+        // the largest reviewer id.
+        let first_account_leaf = merkle::leaf_hash(
+            &chain.state.accounts.get(&1).unwrap().merkle_leaf(1),
+        );
+        let last_reviewer_leaf = merkle::leaf_hash(
+            &Reviewer {
+                id: 12,
+                reputation: chain.state.reviewers[&12],
+            }
+            .merkle_leaf(),
+        );
+        let pos_first = leaves.iter().position(|h| *h == first_account_leaf).expect("account 1 leaf");
+        let pos_last = leaves.iter().position(|h| *h == last_reviewer_leaf).expect("reviewer 12 leaf");
+        assert!(pos_first < pos_last, "account index {pos_first} should be < reviewer index {pos_last}");
+        // And both proofs verify against the shared root.
+        let acct_proof = chain.state.account_proof(1).expect("account 1 proof");
+        let rev_proof = chain.state.reviewer_proof(12).expect("reviewer 12 proof");
+        assert!(merkle::verify(&chain.state.merkle_root(), &first_account_leaf, &acct_proof));
+        assert!(merkle::verify(&chain.state.merkle_root(), &last_reviewer_leaf, &rev_proof));
     }
 }

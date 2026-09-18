@@ -5,9 +5,12 @@
 //! were persisted. Big-endian, length-prefixed, no external serialization crate.
 
 use crate::consensus::{Commit, Vote, VoteType};
+use crate::light::{ProofEntry, ProofKind};
 use crate::merkle::{Proof, Step};
-use crate::validator::ValidatorUpdate;
-use crate::{Account, Block, BondKind, Embedding, Review, SlashEvidence, StakeOp, SubmissionTx};
+use crate::validator::{Validator, ValidatorUpdate};
+use crate::{
+    Account, Block, BondKind, Embedding, Review, Reviewer, SlashEvidence, StakeOp, SubmissionTx,
+};
 use zhixing_engine::DIM;
 
 #[derive(Debug)]
@@ -591,6 +594,167 @@ pub fn decode_proof(buf: &[u8]) -> Result<Proof, CodecError> {
     Ok(Proof { steps })
 }
 
+// --- M24: typed ProofKind / Validator / Reviewer / ProofEntry wire codecs ----
+//
+// The M24 wire pair `GetProof { items }` / `Proof { items }` carries a typed
+// `(kind, id)` request and a typed `ProofEntry` response. The body layout for
+// one entry:
+//   - 1 byte kind tag (0 = Account, 1 = Reviewer, 2 = Validator)
+//   - 8 byte id (u64 BE; ignored for Validator but kept fixed-width)
+//   - leaf bytes (canonical preimage the verifier hashes)
+//   - length-prefixed Proof bytes
+//
+// `encode_proof_entry` re-uses the `Account::merkle_leaf(id)` /
+// `Reviewer::merkle_leaf(id)` / `Validator::merkle_leaf()` paths so the wire
+// layout is byte-identical to what the verifier recomputes locally — no
+// separate canonicalization, no drift.
+
+/// M24: wire tag for one [`ProofKind`]. The numeric value matches the
+/// encoding order in [`ProofKind`] (Account=0, Reviewer=1, Validator=2) so
+/// adding a new kind means appending — never renumbering.
+pub fn encode_proof_kind(k: ProofKind) -> u8 {
+    match k {
+        ProofKind::Account => 0,
+        ProofKind::Reviewer => 1,
+        ProofKind::Validator => 2,
+    }
+}
+
+/// M24: inverse of [`encode_proof_kind`].
+pub fn decode_proof_kind(b: u8) -> Result<ProofKind, CodecError> {
+    match b {
+        0 => Ok(ProofKind::Account),
+        1 => Ok(ProofKind::Reviewer),
+        2 => Ok(ProofKind::Validator),
+        other => Err(CodecError::BadEnum(other as u32)),
+    }
+}
+
+/// M24: canonical bytes of one [`Validator`] for the M24 `Proof` response.
+/// Byte-identical to [`Validator::merkle_leaf`] so the verifier can recompute
+/// the leaf locally and reject a prover that swaps one for the other.
+pub fn encode_validator(v: &Validator) -> Vec<u8> {
+    v.merkle_leaf()
+}
+
+/// M24: inverse of [`encode_validator`].
+pub fn decode_validator(buf: &[u8]) -> Result<Validator, CodecError> {
+    let mut d = Dec { buf, pos: 0 };
+    let id = d.u64()?;
+    let mut pubkey = [0u8; 32];
+    pubkey.copy_from_slice(d.take(32)?);
+    let power = d.u64()?;
+    if d.pos != d.buf.len() {
+        return Err(CodecError::TrailingBytes);
+    }
+    Ok(Validator { id, pubkey, power })
+}
+
+/// M24: canonical bytes of one [`Reviewer`] (id ‖ reputation) for the M24
+/// `Proof` response. Same shape as [`Reviewer::merkle_leaf`].
+pub fn encode_reviewer(id: u64, reputation: f32) -> Vec<u8> {
+    Reviewer { id, reputation }.merkle_leaf()
+}
+
+/// M24: inverse of [`encode_reviewer`].
+pub fn decode_reviewer(buf: &[u8]) -> Result<(u64, f32), CodecError> {
+    let mut d = Dec { buf, pos: 0 };
+    let id = d.u64()?;
+    let reputation = d.f32()?;
+    if d.pos != d.buf.len() {
+        return Err(CodecError::TrailingBytes);
+    }
+    Ok((id, reputation))
+}
+
+/// M24: canonical bytes of one [`ProofEntry`]. Carries the typed leaf
+/// (so the verifier recomputes the same bytes locally and rejects a prover
+/// that swaps the leaf) plus the inclusion proof. The leaf already encodes
+/// the kind-specific id (e.g. `Account::merkle_leaf(id)` writes id first),
+/// so we don't repeat it on the wire.
+pub fn encode_proof_entry(e: &ProofEntry) -> Vec<u8> {
+    let mut out = Vec::new();
+    out.push(encode_proof_kind(e.kind()));
+    out.extend_from_slice(&e.leaf());
+    out.extend_from_slice(&encode_proof(e.proof()));
+    out
+}
+
+/// M24: inverse of [`encode_proof_entry`]. Wire layout per entry is
+/// `kind(1) || leaf_bytes || encode_proof(proof)` — the leaf bytes ARE
+/// `T::merkle_leaf(...)` (id-prefixed, kind-specific length), and we
+/// reconstruct the typed object by parsing that layout directly. We
+/// re-derive the leaf byte length from the kind tag (the three kinds have
+/// distinct fixed sizes), then split.
+pub fn decode_proof_entry(buf: &[u8]) -> Result<ProofEntry, CodecError> {
+    let mut d = Dec { buf, pos: 0 };
+    let kind = decode_proof_kind(d.u8()?)?;
+    // Each kind has a fixed leaf byte length because all the inner fields
+    // are fixed-width (u64 / f32 / [u8;32]). Keeping a single match here
+    // means the wire doesn't need an explicit leaf-length prefix — saving
+    // 4 bytes per entry.
+    let leaf_byte_len = match kind {
+        // Account: u64 id ‖ raw pubkey ‖ 6 × u64 (balance, staked, earned,
+        // slashed, submissions, accepted) = 8 + 32 + 48 = 88.
+        ProofKind::Account => 88,
+        // Reviewer: u64 id ‖ f32 reputation = 8 + 4 = 12.
+        ProofKind::Reviewer => 12,
+        // Validator: u64 id ‖ raw pubkey ‖ u64 power = 8 + 32 + 8 = 48.
+        ProofKind::Validator => 48,
+    };
+    if buf.len() < 1 + leaf_byte_len {
+        return Err(CodecError::UnexpectedEof);
+    }
+    let leaf_buf = &buf[1..1 + leaf_byte_len];
+    let proof = decode_proof(&buf[1 + leaf_byte_len..])?;
+    let entry = match kind {
+        ProofKind::Account => {
+            let mut d2 = Dec { buf: leaf_buf, pos: 0 };
+            let id = d2.u64()?;
+            let mut pubkey = [0u8; 32];
+            pubkey.copy_from_slice(d2.take(32)?);
+            let balance = d2.u64()?;
+            let staked_total = d2.u64()?;
+            let earned_total = d2.u64()?;
+            let slashed_total = d2.u64()?;
+            let submissions = d2.u64()?;
+            let accepted = d2.u64()?;
+            ProofEntry::Account {
+                id,
+                account: Account {
+                    pubkey,
+                    balance,
+                    staked_total,
+                    earned_total,
+                    slashed_total,
+                    submissions,
+                    accepted,
+                },
+                proof,
+            }
+        }
+        ProofKind::Reviewer => {
+            let mut d2 = Dec { buf: leaf_buf, pos: 0 };
+            let id = d2.u64()?;
+            let reputation = d2.f32()?;
+            ProofEntry::Reviewer { id, reputation, proof }
+        }
+        ProofKind::Validator => {
+            let mut d2 = Dec { buf: leaf_buf, pos: 0 };
+            let id = d2.u64()?;
+            let mut pubkey = [0u8; 32];
+            pubkey.copy_from_slice(d2.take(32)?);
+            let power = d2.u64()?;
+            ProofEntry::Validator {
+                id,
+                validator: Validator { id, pubkey, power },
+                proof,
+            }
+        }
+    };
+    Ok(entry)
+}
+
 pub(crate) struct Enc(pub Vec<u8>);
 
 impl Enc {
@@ -741,6 +905,9 @@ impl<'a> Dec<'a> {
     fn u32(&mut self) -> Result<u32, CodecError> {
         Ok(u32::from_be_bytes(self.take(4)?.try_into().unwrap()))
     }
+    fn u8(&mut self) -> Result<u8, CodecError> {
+        Ok(u8::from_be_bytes(self.take(1)?.try_into().unwrap()))
+    }
     fn u64(&mut self) -> Result<u64, CodecError> {
         Ok(u64::from_be_bytes(self.take(8)?.try_into().unwrap()))
     }
@@ -767,6 +934,7 @@ impl<'a> Dec<'a> {
 mod tests {
     use super::*;
     use crate::MICRO;
+    use crate::net::{decode_gossip, encode_gossip, GossipMsg};
 
     /// A conflicting-precommit pair for validator `v` at (h, r) — dummy
     /// signatures (the codec does not verify them; that is the chain's job).
@@ -1078,5 +1246,72 @@ mod tests {
         let mut bytes = encode_header(&h);
         bytes.push(0);
         assert!(matches!(decode_header(&bytes), Err(CodecError::TrailingBytes)));
+    }
+
+    // --- M24: typed proof wire codecs ---------------------------------------
+
+    #[test]
+    fn proof_kind_round_trip() {
+        use crate::light::ProofKind;
+        for k in [ProofKind::Account, ProofKind::Reviewer, ProofKind::Validator] {
+            assert_eq!(decode_proof_kind(encode_proof_kind(k)).unwrap(), k);
+        }
+        assert!(matches!(decode_proof_kind(7), Err(CodecError::BadEnum(7))));
+    }
+
+    #[test]
+    fn batch_getproof_and_proof_round_trip() {
+        use crate::light::{ProofEntry, ProofKind};
+        // Build a `GetProof` covering all three kinds, encode -> decode, and
+        // assert the request survives the wire byte-for-byte.
+        let request_items: Vec<(ProofKind, u64)> = vec![
+            (ProofKind::Account, 1),
+            (ProofKind::Reviewer, 10),
+            (ProofKind::Validator, 25),
+        ];
+        let req_bytes = encode_gossip(&GossipMsg::GetProof { items: request_items.clone() });
+        let req_back: GossipMsg = decode_gossip(&req_bytes).unwrap();
+        let req_items_back = match &req_back {
+            GossipMsg::GetProof { items } => items.clone(),
+            other => panic!("expected GetProof, got {other:?}"),
+        };
+        assert_eq!(req_items_back, request_items);
+        assert_eq!(encode_gossip(&req_back), req_bytes, "GetProof must be self-stable");
+
+        // Build a `Proof` covering all three kinds plus a None slot.
+        let account = Account {
+            pubkey: [0xA1; 32],
+            balance: 42 * MICRO,
+            staked_total: 5 * MICRO,
+            earned_total: 7 * MICRO,
+            slashed_total: 0,
+            submissions: 4,
+            accepted: 3,
+        };
+        let validator = Validator {
+            id: 25,
+            pubkey: [0xB2; 32],
+            power: 11,
+        };
+        let fake_proof = Proof {
+            steps: vec![Step::Right([0xCC; 32])],
+        };
+        let resp_items: Vec<Option<ProofEntry>> = vec![
+            Some(ProofEntry::Account { id: 1, account: account.clone(), proof: fake_proof.clone() }),
+            None,
+            Some(ProofEntry::Reviewer { id: 10, reputation: 0.91, proof: fake_proof.clone() }),
+            Some(ProofEntry::Validator { id: 25, validator: validator.clone(), proof: fake_proof.clone() }),
+        ];
+        let resp_bytes = encode_gossip(&GossipMsg::Proof { items: resp_items.clone() });
+        let resp_back: GossipMsg = decode_gossip(&resp_bytes).unwrap();
+        let resp_items_back = match &resp_back {
+            GossipMsg::Proof { items } => items.clone(),
+            other => panic!("expected Proof, got {other:?}"),
+        };
+        assert_eq!(resp_items_back.len(), resp_items.len());
+        for (i, (a, b)) in resp_items_back.iter().zip(resp_items.iter()).enumerate() {
+            assert_eq!(a, b, "entry {i} mismatch after round-trip");
+        }
+        assert_eq!(encode_gossip(&resp_back), resp_bytes, "Proof must be self-stable");
     }
 }
