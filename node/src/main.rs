@@ -194,6 +194,7 @@ fn main() {
         "light" => cmd_light(),
         "lsync" => cmd_lsync(),
         "account" => cmd_account(),
+        "graph" => cmd_graph(),
         "run" => cmd_run(dir_arg(&args)),
         "status" => cmd_status(dir_arg(&args)),
         "certs" => cmd_certs(dir_arg(&args)),
@@ -234,6 +235,7 @@ fn usage() {
     eprintln!("  node light              light client: follow the validator set across heights without full replay");
     eprintln!("  node lsync              header-only SPV sync over the gossip bus: a light peer reaches the full node's height with zero tx bodies");
     eprintln!("  node account            account-membership SPV for a wallet: prove your own balance against a cert-signed header, no replay, no tx bodies");
+    eprintln!("  node graph              cognitive-graph inclusion proof: prove a graph node against a cert-signed header's accounts_root, no graph download");
     eprintln!("  node run    --dir DIR   persistent chain (seeds demo blocks once, then replays)");
     eprintln!("  node status --dir DIR   replay the block log and print state");
     eprintln!("  node certs  --dir DIR   persist a certified chain (blocks+certs) and re-verify finality on reload");
@@ -1462,6 +1464,167 @@ fn cmd_account() {
     println!("  next_validators_root  = {}  (Merkle root over next-set validators)", short(&header.next_validators_root));
     println!("  the cert signs header.hash() which covers ALL THREE roots; the wallet");
     println!("  verifies each ProofEntry locally against its kind's root slot.");
+    net.put_full(full_node);
+    net.put_light(light_node);
+}
+
+/// M25 demo: light wallet proves a single cognitive-graph node (kernel of
+/// a concept) against a cert-signed header via the unified GetProof bus —
+/// no replay, no graph download, no tx bodies. The graph node lives in the
+/// same `accounts_root` tree as accounts and reviewers; the wallet
+/// recomputes the leaf locally from the typed `ProofEntry::GraphNode`.
+fn cmd_graph() {
+    use zhixing_node::light::ProofKind;
+
+    println!("M25 — cognitive-graph inclusion proof against a cert-signed header");
+    println!();
+
+    // Build a real certified chain. `run_driver(1)` produces block 1, which
+    // includes an accepted submission, so `state.graph` has at least one
+    // freshly minted node (in addition to any genesis seed nodes).
+    let (blocks, certs) = run_driver(1);
+
+    // Wrap in GossipNode (full) + LightGossipNode (light) over LightNetwork.
+    let mut full = GossipNode::new(1, demo_genesis(), 8, [1, 2]);
+    full.load_certified(&blocks, &certs);
+    let light_id = 2u64;
+    let light = LightGossipNode::new(light_id, &demo_genesis(), [1, 2]);
+    let mut net = LightNetwork::new(vec![full], vec![light]);
+
+    // Side-channel next_set_for so the M22 sync runs through apply_header.
+    let sets = committed_sets(&demo_genesis(), &blocks);
+    let next_set_for = |h: u64| sets.get((h - 1) as usize).cloned();
+
+    net.announce_all();
+    for _ in 0..20 {
+        let n = net.run(1, light_id, &next_set_for);
+        if n == 0 && net.light_node(light_id).tracker().height() == 1 {
+            break;
+        }
+        if n == 0 {
+            break;
+        }
+    }
+    let lt = net.light_node(light_id).tracker().clone();
+    println!(
+        "M22 sync: light at height {}, head {}",
+        lt.height(),
+        short(&lt.head())
+    );
+    println!();
+
+    // The chain state must have at least one graph node (genesis seeds or
+    // accepted submissions). Pick the first one — guaranteed.
+    let last_idx = (lt.height() as usize).saturating_sub(1);
+    let last_block = &blocks[last_idx];
+    let last_cert = &certs[last_idx];
+    let n_graph = net.full_node(1).chain.state.graph.nodes.len();
+    if n_graph == 0 {
+        eprintln!("graph is empty — demo chain must seed at least one node");
+        return;
+    }
+    let idx = 0usize;
+    let expected_node = net.full_node(1).chain.state.graph.nodes[idx].clone();
+    println!("graph node to prove:");
+    println!("  node_id   = {}", expected_node.node_id);
+    println!("  domain    = {}", expected_node.domain);
+    println!(
+        "  embedding = [{:.2}, {:.2}, {:.2}, {:.2}, {:.2}, {:.2}, {:.2}, {:.2}]",
+        expected_node.embedding[0], expected_node.embedding[1],
+        expected_node.embedding[2], expected_node.embedding[3],
+        expected_node.embedding[4], expected_node.embedding[5],
+        expected_node.embedding[6], expected_node.embedding[7],
+    );
+
+    // Send a single batched GetProof: account #1 + graph node (idx 0).
+    let mut full_node = net.take_full(1);
+    let mut light_node = net.take_light(light_id);
+    let reply = full_node.on_message(
+        light_id,
+        GossipMsg::GetProof {
+            items: vec![
+                (ProofKind::Account, 1),
+                (ProofKind::GraphNode, idx as u64),
+            ],
+        },
+    );
+    assert_eq!(reply.len(), 1, "full peer must serve the batched proofs");
+    let (_dst, proof_msg) = reply.into_iter().next().unwrap();
+    light_node.on_message(1, proof_msg);
+
+    let header = zhixing_node::codec::BlockHeader::from_block(last_block);
+    let tracked = ValidatorTracker::from_genesis(&demo_genesis()).validators().clone();
+
+    let account_entry = light_node
+        .take_proof(ProofKind::Account, 1)
+        .expect("account proof cached");
+    let graph_entry = light_node
+        .take_proof(ProofKind::GraphNode, expected_node.node_id)
+        .expect("graph node proof cached");
+
+    let account_ok = ValidatorTracker::verify_proof_against_header(
+        &header, last_cert, &tracked, &account_entry,
+    );
+    let graph_ok = ValidatorTracker::verify_proof_against_header(
+        &header, last_cert, &tracked, &graph_entry,
+    );
+
+    let ProofEntry::Account { account, .. } = &account_entry else {
+        unreachable!("account entry shape");
+    };
+    let ProofEntry::GraphNode { graph_node, .. } = &graph_entry else {
+        unreachable!("graph entry shape");
+    };
+
+    println!();
+    println!("verify_proof_against_header (Account #1, balance = {} COG) -> {}",
+        account.balance / MICRO, account_ok.is_ok());
+    println!(
+        "verify_proof_against_header (GraphNode #{}, domain = {}) -> {}",
+        graph_node.node_id, graph_node.domain, graph_ok.is_ok()
+    );
+
+    // Negative: tamper with the graph node's embedding -> verifier recomputes
+    // the leaf locally and rejects the proof with MembershipProofInvalid.
+    let ProofEntry::GraphNode { node_id: nid, graph_node: real_node, proof: p } = graph_entry.clone() else {
+        unreachable!()
+    };
+    let mut bad_node = real_node.clone();
+    bad_node.embedding[0] += 1.0;
+    let forged_entry = ProofEntry::GraphNode {
+        node_id: nid,
+        graph_node: bad_node,
+        proof: p.clone(),
+    };
+    let bad = ValidatorTracker::verify_proof_against_header(
+        &header, last_cert, &tracked, &forged_entry,
+    );
+    println!();
+    println!(
+        "tampered embedding[0] -> {} (must be false: {})",
+        bad.is_ok(),
+        match bad.as_ref().err() {
+            Some(e) => format!("{e}"),
+            None => String::from("ok (UNEXPECTED)"),
+        }
+    );
+
+    // Negative: tamper with header.accounts_root — root is cert-signed, so
+    // the cert no longer matches `header.hash()` -> CertificateMismatch.
+    let mut bad_header = header.clone();
+    bad_header.accounts_root = [0xAB; 32];
+    let bad_root = ValidatorTracker::verify_proof_against_header(
+        &bad_header, last_cert, &tracked, &graph_entry,
+    );
+    println!(
+        "tampered accounts_root -> {} (must be false: {})",
+        bad_root.is_ok(),
+        match bad_root.as_ref().err() {
+            Some(e) => format!("{e}"),
+            None => String::from("ok (UNEXPECTED)"),
+        }
+    );
+
     net.put_full(full_node);
     net.put_light(light_node);
 }

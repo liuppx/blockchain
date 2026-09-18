@@ -38,12 +38,17 @@ pub mod validator;
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use zhixing_engine::{compute_delta_k, CognitiveGraph, DeltaKParams, GraphNode, Submission, DIM};
+use zhixing_engine::{compute_delta_k, CognitiveGraph, DeltaKParams, Submission, DIM};
 
 pub use consensus::{Vote, VoteType};
 pub use crypto::{Keypair, PubKey, Sig};
 pub use hash::{hex, sha256};
 pub use light::{LightError, ValidatorTracker};
+// M25: re-export the engine module so `crate::engine::GraphNode` works from
+// codec.rs / light.rs without a direct engine dependency in those modules.
+pub mod engine {
+    pub use zhixing_engine::*;
+}
 use validator::{Validator, ValidatorSet, ValidatorUpdate};
 
 /// 1 $COG == 1_000_000 micro-$COG. All balances are integer micro-$COG.
@@ -567,10 +572,7 @@ impl ChainState {
         let reviewers: BTreeMap<u64, f32> = g.reviewers.into_iter().collect();
         let mut graph = CognitiveGraph::new();
         for (emb, dom) in g.seed_nodes {
-            graph.add(GraphNode {
-                embedding: emb,
-                domain: dom,
-            });
+            graph.add(emb, dom);
         }
         let validators = ValidatorSet::new(
             g.validators
@@ -973,10 +975,7 @@ impl ChainState {
                 acct.accepted += 1;
             }
             self.supply += reward;
-            self.graph.add(GraphNode {
-                embedding: tx.embedding,
-                domain: tx.domain,
-            });
+            self.graph.add(tx.embedding, tx.domain);
             self.reward_reviewers(&tx.reviews, true);
             minted = reward;
             slashed = 0;
@@ -1097,15 +1096,25 @@ impl ChainState {
         merkle::MerkleTree::from_leaf_hashes(self.merkle_leaves()).proof(index)
     }
 
-    /// Internal: collect each accounts/reviewers entry as a domain-separated
-    /// leaf hash, in canonical BTreeMap order.
+    /// Internal: collect each accounts/reviewers/graph-nodes entry as a
+    /// domain-separated leaf hash, in canonical order: accounts (BTreeMap
+    /// order), reviewers (BTreeMap order), graph nodes (insertion order).
+    /// The resulting Merkle root is `accounts_root`, which now commits
+    /// to all three sets in one 32-byte slot (M25 extended it from the
+    /// M24 accounts∪reviewers coverage).
     fn merkle_leaves(&self) -> Vec<Hash> {
-        let mut leaves = Vec::with_capacity(self.accounts.len() + self.reviewers.len());
+        let n_graph = self.graph.nodes.len();
+        let mut leaves = Vec::with_capacity(
+            self.accounts.len() + self.reviewers.len() + n_graph,
+        );
         for (id, a) in &self.accounts {
             leaves.push(merkle::leaf_hash(&a.merkle_leaf(*id)));
         }
         for (id, rep) in &self.reviewers {
             leaves.push(merkle::leaf_hash(&Reviewer { id: *id, reputation: *rep }.merkle_leaf()));
+        }
+        for n in &self.graph.nodes {
+            leaves.push(merkle::leaf_hash(&n.merkle_leaf()));
         }
         leaves
     }
@@ -1119,6 +1128,17 @@ impl ChainState {
         let rids: Vec<u64> = self.reviewers.keys().copied().collect();
         let rindex = rids.iter().position(|&k| k == reviewer_id)?;
         merkle::MerkleTree::from_leaf_hashes(self.merkle_leaves()).proof(n_accounts + rindex)
+    }
+
+    /// M25: inclusion proof for the graph node at insertion index `idx`,
+    /// against [`Self::merkle_root`]. Graph nodes occupy the third slice
+    /// of `merkle_leaves` (after accounts and reviewers), in insertion
+    /// order — so the proof path is `n_accounts + n_reviewers + idx`.
+    /// `None` if `idx >= self.graph.nodes.len()`.
+    pub fn graph_node_proof(&self, idx: usize) -> Option<merkle::Proof> {
+        if idx >= self.graph.nodes.len() { return None; }
+        let offset = self.accounts.len() + self.reviewers.len();
+        merkle::MerkleTree::from_leaf_hashes(self.merkle_leaves()).proof(offset + idx)
     }
 
     /// Accounting invariant: every micro-$COG is in an account balance, in the
@@ -2081,8 +2101,10 @@ mod tests {
         let leaves = chain.state.merkle_leaves();
         assert_eq!(
             leaves.len(),
-            chain.state.accounts.len() + chain.state.reviewers.len(),
-            "leaves must include both accounts and reviewers"
+            chain.state.accounts.len()
+                + chain.state.reviewers.len()
+                + chain.state.graph.nodes.len(),
+            "leaves must include accounts, reviewers, AND graph nodes (M25)"
         );
         // First leaf is the smallest account id (account 1); the last leaf is
         // the largest reviewer id.
@@ -2104,5 +2126,72 @@ mod tests {
         let rev_proof = chain.state.reviewer_proof(12).expect("reviewer 12 proof");
         assert!(merkle::verify(&chain.state.merkle_root(), &first_account_leaf, &acct_proof));
         assert!(merkle::verify(&chain.state.merkle_root(), &last_reviewer_leaf, &rev_proof));
+    }
+
+    /// M25: every graph node in a multi-block chain has an inclusion proof
+    /// that verifies against `merkle_root()`. Tamper any leaf byte (here:
+    /// first embedding float) and the proof must fail. Out-of-range index
+    /// returns `None`.
+    #[test]
+    fn graph_node_proof_round_trip() {
+        let chain = one_block_chain();
+        let n = chain.state.graph.nodes.len();
+        assert!(n > 0, "demo genesis must seed at least one graph node");
+        let root = chain.state.merkle_root();
+        for idx in 0..n {
+            let node = chain.state.graph.nodes[idx].clone();
+            let leaf = merkle::leaf_hash(&node.merkle_leaf());
+            let proof = chain
+                .state
+                .graph_node_proof(idx)
+                .expect("graph_node_proof must return Some for in-range idx");
+            assert!(
+                merkle::verify(&root, &leaf, &proof),
+                "graph node #{idx} (id={}) proof should verify",
+                node.node_id
+            );
+            // Tamper: bump the first embedding float. The proof should fail.
+            let mut bad = node.clone();
+            bad.embedding[0] += 1.0;
+            let bad_leaf = merkle::leaf_hash(&bad.merkle_leaf());
+            assert!(
+                !merkle::verify(&root, &bad_leaf, &proof),
+                "tampered graph node #{idx} proof must NOT verify"
+            );
+        }
+        // Out of range -> None.
+        assert!(chain.state.graph_node_proof(n).is_none());
+        assert!(chain.state.graph_node_proof(n + 1).is_none());
+    }
+
+    /// M25: graph leaves occupy the third slice of `merkle_leaves()` —
+    /// AFTER all accounts and reviewers. So `graph_node_proof(idx)`'s
+    /// internal index must equal `n_accounts + n_reviewers + idx`. We
+    /// verify by finding the graph-node leaf's position in `merkle_leaves()`
+    /// and asserting it's strictly past every account and reviewer leaf.
+    #[test]
+    fn merkle_leaves_include_graph_nodes_after_accounts_and_reviewers() {
+        let chain = one_block_chain();
+        let leaves = chain.state.merkle_leaves();
+        let n_acct = chain.state.accounts.len();
+        let n_rev = chain.state.reviewers.len();
+        let n_graph = chain.state.graph.nodes.len();
+        assert_eq!(leaves.len(), n_acct + n_rev + n_graph);
+
+        // Spot-check the first graph node's position is past every account/reviewer leaf.
+        let g_leaf = merkle::leaf_hash(&chain.state.graph.nodes[0].merkle_leaf());
+        let g_pos = leaves
+            .iter()
+            .position(|h| *h == g_leaf)
+            .expect("graph node leaf must appear in merkle_leaves()");
+        assert!(
+            g_pos >= n_acct + n_rev,
+            "graph node position {g_pos} must lie after accounts+reviewers ({})",
+            n_acct + n_rev
+        );
+
+        // And the producer's proof is a Merkle verify against the same root.
+        let proof = chain.state.graph_node_proof(0).expect("graph_node_proof(0)");
+        assert!(merkle::verify(&chain.state.merkle_root(), &g_leaf, &proof));
     }
 }

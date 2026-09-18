@@ -50,16 +50,20 @@ use crate::validator::{Validator, ValidatorSet, ValidatorUpdate};
 use crate::{Block, BondKind, Genesis, Hash, PubKey};
 
 /// M24: which O(log n) inclusion proof the wallet is asking for (or
-/// receiving) over the `GetProof` / `Proof` gossip pair. All three
-/// kinds ultimately verify against a cert-signed `BlockHeader` —
-/// [`ProofKind::Account`] and [`ProofKind::Reviewer`] against
-/// `header.accounts_root`, [`ProofKind::Validator`] against
-/// `header.next_validators_root`.
+/// receiving) over the `GetProof` / `Proof` gossip pair. All kinds
+/// ultimately verify against a cert-signed `BlockHeader` —
+/// [`ProofKind::Account`], [`ProofKind::Reviewer`], and
+/// [`ProofKind::GraphNode`] against `header.accounts_root`,
+/// [`ProofKind::Validator`] against `header.next_validators_root`.
+/// `GraphNode` (M25) joins the same tree as Account/Reviewer — graph
+/// leaves occupy the third slice of [`crate::ChainState::merkle_leaves`]
+/// (insertion order) so one root slot certifies all three.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum ProofKind {
     Account = 0,
     Reviewer = 1,
     Validator = 2,
+    GraphNode = 3,
 }
 
 /// M24: typed leaf + proof for a single [`ProofKind`]. The wallet
@@ -84,6 +88,15 @@ pub enum ProofEntry {
         validator: Validator,
         proof: merkle::Proof,
     },
+    /// M25: a single cognitive-graph node (kernel of concept) plus its
+    /// `accounts_root` Merkle proof. `node_id` is the monotonic id
+    /// assigned at insertion by `engine::CognitiveGraph::add`; it's the
+    /// stable external identity for this node across the chain.
+    GraphNode {
+        node_id: u64,
+        graph_node: crate::engine::GraphNode,
+        proof: merkle::Proof,
+    },
 }
 
 impl ProofEntry {
@@ -92,6 +105,7 @@ impl ProofEntry {
             ProofEntry::Account { .. } => ProofKind::Account,
             ProofEntry::Reviewer { .. } => ProofKind::Reviewer,
             ProofEntry::Validator { .. } => ProofKind::Validator,
+            ProofEntry::GraphNode { .. } => ProofKind::GraphNode,
         }
     }
 
@@ -100,6 +114,7 @@ impl ProofEntry {
             ProofEntry::Account { id, .. }
             | ProofEntry::Reviewer { id, .. }
             | ProofEntry::Validator { id, .. } => *id,
+            ProofEntry::GraphNode { node_id, .. } => *node_id,
         }
     }
 
@@ -108,6 +123,7 @@ impl ProofEntry {
             ProofEntry::Account { proof, .. }
             | ProofEntry::Reviewer { proof, .. }
             | ProofEntry::Validator { proof, .. } => proof,
+            ProofEntry::GraphNode { proof, .. } => proof,
         }
     }
 
@@ -120,6 +136,7 @@ impl ProofEntry {
                 crate::Reviewer { id: *id, reputation: *reputation }.merkle_leaf()
             }
             ProofEntry::Validator { validator, .. } => validator.merkle_leaf(),
+            ProofEntry::GraphNode { graph_node, .. } => graph_node.merkle_leaf(),
         }
     }
 }
@@ -443,14 +460,17 @@ impl ValidatorTracker {
 
     /// M24: the **only** SPV proof verifier. Replaces M22's
     /// `verify_membership_against_header` (validator proof) and M23's
-    /// `verify_account_membership_against_header` (account proof), plus the
-    /// reviewer proof path that was never wired up.
+    /// `verify_account_membership_against_header` (account proof), the
+    /// reviewer proof path that was never wired up, and (M25) the
+    /// graph-node proof path.
     ///
     /// Cert-signs `header.hash()`, computes the leaf locally from `entry`,
     /// then runs `merkle::verify` against the right root slot for `entry`'s
     /// [`ProofKind`]:
-    ///   * [`ProofKind::Account`]  → `header.accounts_root`
-    ///   * [`ProofKind::Reviewer`] → `header.accounts_root`
+    ///   * [`ProofKind::Account`]   → `header.accounts_root`
+    ///   * [`ProofKind::Reviewer`]  → `header.accounts_root`
+    ///   * [`ProofKind::GraphNode`] → `header.accounts_root` (M25 — graph
+    ///     leaves share the accounts_root tree)
     ///   * [`ProofKind::Validator`] → `header.next_validators_root`
     ///
     /// The prover does **not** get to claim a different leaf than it shipped
@@ -470,7 +490,9 @@ impl ValidatorTracker {
         cert.verify(tracked_set).map_err(LightError::Consensus)?;
         let leaf = merkle::leaf_hash(&entry.leaf());
         let root = match entry {
-            ProofEntry::Account { .. } | ProofEntry::Reviewer { .. } => &header.accounts_root,
+            ProofEntry::Account { .. }
+            | ProofEntry::Reviewer { .. }
+            | ProofEntry::GraphNode { .. } => &header.accounts_root,
             ProofEntry::Validator { .. } => &header.next_validators_root,
         };
         if !merkle::verify(root, &leaf, entry.proof()) {
@@ -1031,6 +1053,55 @@ mod tests {
         let proof = d.chain.state.reviewer_proof(10).expect("reviewer proof");
         let header = crate::codec::BlockHeader::from_block(&block);
         let entry = ProofEntry::Reviewer { id: 10, reputation: 999.0, proof };
+        let tracked = ValidatorTracker::from_genesis(&base_genesis()).validators().clone();
+        let err = ValidatorTracker::verify_proof_against_header(&header, &cert, &tracked, &entry)
+            .unwrap_err();
+        assert!(matches!(err, LightError::MembershipProofInvalid { .. }), "got {err}");
+    }
+
+    /// M25: produce a 1-block certified chain that includes at least one
+    /// accepted submission (so `state.graph` is non-empty), build a
+    /// `ProofEntry::GraphNode`, and confirm
+    /// `verify_proof_against_header` accepts it against the cert-signed
+    /// header's `accounts_root`.
+    #[test]
+    fn verify_proof_against_header_accepts_a_graph_node_proof() {
+        let mut d = driver(base_genesis());
+        d.submit(novel_tx(1, 1, 1, 1.0)).unwrap();
+        d.produce(1.0, &no_silence()).unwrap().expect("block");
+        let block = d.blocks()[0].clone();
+        let cert = d.certificates()[0].clone();
+        // The chain state has at least the demo-genesis seed node(s) plus any
+        // nodes added by the accepted submission. After `produce` block 1 the
+        // graph is non-empty, so node id 0 is safe to request.
+        assert!(!d.chain.state.graph.nodes.is_empty(), "graph must be non-empty");
+        let idx = 0;
+        let node = d.chain.state.graph.nodes[idx].clone();
+        let proof = d.chain.state.graph_node_proof(idx).expect("graph_node_proof(0)");
+        let header = crate::codec::BlockHeader::from_block(&block);
+        let entry = ProofEntry::GraphNode { node_id: node.node_id, graph_node: node.clone(), proof };
+        let tracked = ValidatorTracker::from_genesis(&base_genesis()).validators().clone();
+        ValidatorTracker::verify_proof_against_header(&header, &cert, &tracked, &entry)
+            .expect("graph-node proof must verify");
+    }
+
+    /// M25: tamper the embedding field in a `ProofEntry::GraphNode` — the
+    /// verifier recomputes the leaf locally and rejects the proof with
+    /// `MembershipProofInvalid` (prover-supplied leaf is not trusted).
+    #[test]
+    fn verify_proof_against_header_rejects_a_tampered_graph_node_embedding() {
+        let mut d = driver(base_genesis());
+        d.submit(novel_tx(1, 1, 1, 1.0)).unwrap();
+        d.produce(1.0, &no_silence()).unwrap().expect("block");
+        let block = d.blocks()[0].clone();
+        let cert = d.certificates()[0].clone();
+        let idx = 0;
+        let mut node = d.chain.state.graph.nodes[idx].clone();
+        let proof = d.chain.state.graph_node_proof(idx).expect("graph_node_proof(0)");
+        // Tamper: bump the first embedding float.
+        node.embedding[0] += 1.0;
+        let header = crate::codec::BlockHeader::from_block(&block);
+        let entry = ProofEntry::GraphNode { node_id: node.node_id, graph_node: node, proof };
         let tracked = ValidatorTracker::from_genesis(&base_genesis()).validators().clone();
         let err = ValidatorTracker::verify_proof_against_header(&header, &cert, &tracked, &entry)
             .unwrap_err();

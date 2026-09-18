@@ -610,13 +610,14 @@ pub fn decode_proof(buf: &[u8]) -> Result<Proof, CodecError> {
 // separate canonicalization, no drift.
 
 /// M24: wire tag for one [`ProofKind`]. The numeric value matches the
-/// encoding order in [`ProofKind`] (Account=0, Reviewer=1, Validator=2) so
-/// adding a new kind means appending — never renumbering.
+/// encoding order in [`ProofKind`] (Account=0, Reviewer=1, Validator=2,
+/// GraphNode=3) so adding a new kind means appending — never renumbering.
 pub fn encode_proof_kind(k: ProofKind) -> u8 {
     match k {
         ProofKind::Account => 0,
         ProofKind::Reviewer => 1,
         ProofKind::Validator => 2,
+        ProofKind::GraphNode => 3,
     }
 }
 
@@ -626,6 +627,7 @@ pub fn decode_proof_kind(b: u8) -> Result<ProofKind, CodecError> {
         0 => Ok(ProofKind::Account),
         1 => Ok(ProofKind::Reviewer),
         2 => Ok(ProofKind::Validator),
+        3 => Ok(ProofKind::GraphNode),
         other => Err(CodecError::BadEnum(other as u32)),
     }
 }
@@ -667,6 +669,28 @@ pub fn decode_reviewer(buf: &[u8]) -> Result<(u64, f32), CodecError> {
     Ok((id, reputation))
 }
 
+/// M25: canonical bytes of one [`crate::engine::GraphNode`] for the M25
+/// `Proof` response. Same layout as [`crate::engine::GraphNode::merkle_leaf`]
+/// (node_id ‖ 8×f32 embedding ‖ u32 domain).
+pub fn encode_graph_node(n: &crate::engine::GraphNode) -> Vec<u8> {
+    n.merkle_leaf()
+}
+
+/// M25: inverse of [`encode_graph_node`].
+pub fn decode_graph_node(buf: &[u8]) -> Result<crate::engine::GraphNode, CodecError> {
+    let mut d = Dec { buf, pos: 0 };
+    let node_id = d.u64()?;
+    let mut embedding = [0.0f32; crate::engine::DIM];
+    for slot in embedding.iter_mut() {
+        *slot = d.f32()?;
+    }
+    let domain = d.u32()?;
+    if d.pos != d.buf.len() {
+        return Err(CodecError::TrailingBytes);
+    }
+    Ok(crate::engine::GraphNode { node_id, embedding, domain })
+}
+
 /// M24: canonical bytes of one [`ProofEntry`]. Carries the typed leaf
 /// (so the verifier recomputes the same bytes locally and rejects a prover
 /// that swaps the leaf) plus the inclusion proof. The leaf already encodes
@@ -701,6 +725,9 @@ pub fn decode_proof_entry(buf: &[u8]) -> Result<ProofEntry, CodecError> {
         ProofKind::Reviewer => 12,
         // Validator: u64 id ‖ raw pubkey ‖ u64 power = 8 + 32 + 8 = 48.
         ProofKind::Validator => 48,
+        // M25: GraphNode: u64 node_id ‖ 8×f32 embedding ‖ u32 domain
+        // = 8 + 32 + 4 = 44.
+        ProofKind::GraphNode => 44,
     };
     if buf.len() < 1 + leaf_byte_len {
         return Err(CodecError::UnexpectedEof);
@@ -750,6 +777,10 @@ pub fn decode_proof_entry(buf: &[u8]) -> Result<ProofEntry, CodecError> {
                 validator: Validator { id, pubkey, power },
                 proof,
             }
+        }
+        ProofKind::GraphNode => {
+            let graph_node = decode_graph_node(leaf_buf)?;
+            ProofEntry::GraphNode { node_id: graph_node.node_id, graph_node, proof }
         }
     };
     Ok(entry)
@@ -1253,7 +1284,12 @@ mod tests {
     #[test]
     fn proof_kind_round_trip() {
         use crate::light::ProofKind;
-        for k in [ProofKind::Account, ProofKind::Reviewer, ProofKind::Validator] {
+        for k in [
+            ProofKind::Account,
+            ProofKind::Reviewer,
+            ProofKind::Validator,
+            ProofKind::GraphNode,
+        ] {
             assert_eq!(decode_proof_kind(encode_proof_kind(k)).unwrap(), k);
         }
         assert!(matches!(decode_proof_kind(7), Err(CodecError::BadEnum(7))));
@@ -1261,13 +1297,15 @@ mod tests {
 
     #[test]
     fn batch_getproof_and_proof_round_trip() {
+        use crate::engine::GraphNode;
         use crate::light::{ProofEntry, ProofKind};
-        // Build a `GetProof` covering all three kinds, encode -> decode, and
-        // assert the request survives the wire byte-for-byte.
+        // Build a `GetProof` covering all FOUR kinds (M25 added GraphNode),
+        // encode -> decode, and confirm the request survives the wire.
         let request_items: Vec<(ProofKind, u64)> = vec![
             (ProofKind::Account, 1),
             (ProofKind::Reviewer, 10),
             (ProofKind::Validator, 25),
+            (ProofKind::GraphNode, 0),
         ];
         let req_bytes = encode_gossip(&GossipMsg::GetProof { items: request_items.clone() });
         let req_back: GossipMsg = decode_gossip(&req_bytes).unwrap();
@@ -1278,7 +1316,7 @@ mod tests {
         assert_eq!(req_items_back, request_items);
         assert_eq!(encode_gossip(&req_back), req_bytes, "GetProof must be self-stable");
 
-        // Build a `Proof` covering all three kinds plus a None slot.
+        // Build a `Proof` covering all four kinds plus a None slot.
         let account = Account {
             pubkey: [0xA1; 32],
             balance: 42 * MICRO,
@@ -1293,6 +1331,13 @@ mod tests {
             pubkey: [0xB2; 32],
             power: 11,
         };
+        let graph_node = GraphNode {
+            node_id: 7,
+            embedding: [
+                0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8,
+            ],
+            domain: 42,
+        };
         let fake_proof = Proof {
             steps: vec![Step::Right([0xCC; 32])],
         };
@@ -1301,6 +1346,7 @@ mod tests {
             None,
             Some(ProofEntry::Reviewer { id: 10, reputation: 0.91, proof: fake_proof.clone() }),
             Some(ProofEntry::Validator { id: 25, validator: validator.clone(), proof: fake_proof.clone() }),
+            Some(ProofEntry::GraphNode { node_id: 7, graph_node: graph_node.clone(), proof: fake_proof.clone() }),
         ];
         let resp_bytes = encode_gossip(&GossipMsg::Proof { items: resp_items.clone() });
         let resp_back: GossipMsg = decode_gossip(&resp_bytes).unwrap();
@@ -1313,5 +1359,32 @@ mod tests {
             assert_eq!(a, b, "entry {i} mismatch after round-trip");
         }
         assert_eq!(encode_gossip(&resp_back), resp_bytes, "Proof must be self-stable");
+    }
+
+    /// M25: encode/decode a standalone `ProofEntry::GraphNode` and confirm
+    /// the wire shape — 1-byte kind tag (3) + 44-byte leaf
+    /// (node_id ‖ 8×f32 embedding ‖ u32 domain) + `encode_proof` bytes.
+    #[test]
+    fn graph_node_proof_entry_round_trip() {
+        use crate::engine::GraphNode;
+        use crate::light::ProofEntry;
+        let n = GraphNode {
+            node_id: 17,
+            embedding: [0.10, 0.20, 0.30, 0.40, 0.50, 0.60, 0.70, 0.80],
+            domain: 9,
+        };
+        let proof = Proof {
+            steps: vec![
+                Step::Left([0x11; 32]),
+                Step::Right([0x22; 32]),
+            ],
+        };
+        let entry = ProofEntry::GraphNode { node_id: 17, graph_node: n.clone(), proof: proof.clone() };
+        let bytes = encode_proof_entry(&entry);
+        // kind tag = 3, then 44-byte leaf, then proof bytes.
+        assert_eq!(bytes[0], 3);
+        assert_eq!(&bytes[1..45], n.merkle_leaf().as_slice());
+        let back = decode_proof_entry(&bytes).expect("decode must succeed");
+        assert_eq!(back, entry);
     }
 }

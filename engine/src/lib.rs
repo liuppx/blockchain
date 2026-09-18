@@ -50,10 +50,50 @@ pub struct Submission {
     pub timestamp_days: f32,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct GraphNode {
+    /// M25: monotonic id assigned at insertion (0, 1, 2, ...). Stable for
+    /// inclusion proofs and external references — distinct from the
+    /// node's position in `CognitiveGraph::nodes`, which is the same
+    /// value, but the id is what the chain commits to in the per-node
+    /// leaf preimage.
+    pub node_id: u64,
     pub embedding: Embedding,
     pub domain: u32,
+}
+
+impl GraphNode {
+    /// M25: canonical leaf preimage for inclusion proofs. Mirrors the
+    /// per-node layout used by `ChainState::state_root` for graph nodes,
+    /// but prepends `node_id` so the leaf identifies a specific node
+    /// independent of position. Total width: 8 + 32 + 4 = 44 bytes.
+    pub fn merkle_leaf(&self) -> Vec<u8> {
+        let mut e = Enc(Vec::new());
+        e.u64(self.node_id);
+        e.emb(&self.embedding);
+        e.u32(self.domain);
+        e.0
+    }
+}
+
+/// Minimal endian-aware encoder so the engine can produce a leaf
+/// preimage without depending on any external crate. Mirrors
+/// `node::codec::Enc` semantics byte-for-byte.
+struct Enc(Vec<u8>);
+
+impl Enc {
+    fn u64(&mut self, v: u64) {
+        self.0.extend_from_slice(&v.to_be_bytes());
+    }
+    fn u32(&mut self, v: u32) {
+        self.0.extend_from_slice(&v.to_be_bytes());
+    }
+    fn f32(&mut self, v: f32) {
+        self.0.extend_from_slice(&v.to_be_bytes());
+    }
+    fn emb(&mut self, e: &Embedding) {
+        for &x in e { self.f32(x); }
+    }
 }
 
 /// Minimal cognitive graph with same-domain kNN and a cross-domain bridge probe.
@@ -72,9 +112,14 @@ impl CognitiveGraph {
         CognitiveGraph { nodes: Vec::with_capacity(cap) }
     }
 
+    /// Append a node to the graph and return its monotonic `node_id`.
+    /// The id equals the insertion index; both are stable for the
+    /// lifetime of the graph.
     #[inline]
-    pub fn add(&mut self, node: GraphNode) {
-        self.nodes.push(node);
+    pub fn add(&mut self, embedding: Embedding, domain: u32) -> u64 {
+        let id = self.nodes.len() as u64;
+        self.nodes.push(GraphNode { node_id: id, embedding, domain });
+        id
     }
 
     pub fn len(&self) -> usize {
@@ -83,6 +128,12 @@ impl CognitiveGraph {
 
     pub fn is_empty(&self) -> bool {
         self.nodes.is_empty()
+    }
+
+    /// M25: index → node_id reverse lookup. Returns `None` if `idx` is
+    /// out of range. Equivalent to `nodes[idx].node_id` but bounds-checked.
+    pub fn id_at(&self, idx: usize) -> Option<u64> {
+        self.nodes.get(idx).map(|n| n.node_id)
     }
 
     /// Max cosine similarity to any same-domain node, plus whether the domain has
@@ -269,11 +320,36 @@ mod tests {
     #[test]
     fn near_duplicate_gets_zero() {
         let mut g = CognitiveGraph::new();
-        g.add(GraphNode { embedding: unit(1.0), domain: 0 });
+        g.add(unit(1.0), 0);
         let sub = Submission { embedding: unit(1.0), domain: 0, timestamp_days: 0.0 };
         let reviews = vec![(1.0, 0.9); 5];
         let dk = compute_delta_k(&sub, &g, &reviews, (3, 3), &DeltaKParams::default(), 0.0);
         assert_eq!(dk, 0.0); // cos_sim == 1 > tau_dup -> novelty 0 -> gated to 0
+    }
+
+    #[test]
+    fn add_assigns_monotonic_node_ids() {
+        let mut g = CognitiveGraph::new();
+        assert_eq!(g.add(unit(1.0), 0), 0);
+        assert_eq!(g.add(unit(0.5), 1), 1);
+        assert_eq!(g.add(unit(0.0), 0), 2);
+        assert_eq!(g.id_at(0), Some(0));
+        assert_eq!(g.id_at(2), Some(2));
+        assert_eq!(g.id_at(3), None);
+    }
+
+    #[test]
+    fn merkle_leaf_is_stable_and_id_prefixed() {
+        let n = GraphNode { node_id: 7, embedding: unit(1.0), domain: 3 };
+        let leaf = n.merkle_leaf();
+        assert_eq!(leaf.len(), 8 + 32 + 4); // 44 bytes
+        // id is at the front in BE
+        assert_eq!(&leaf[0..8], &7u64.to_be_bytes());
+        // embedding follows: 8 × f32, first one is 1.0
+        let e0 = f32::from_be_bytes(leaf[8..12].try_into().unwrap());
+        assert!((e0 - 1.0).abs() < 1e-6);
+        // domain is the trailing u32 in BE
+        assert_eq!(&leaf[40..44], &3u32.to_be_bytes());
     }
 
     #[test]
@@ -330,7 +406,7 @@ mod python {
 
         fn add(&mut self, embedding: Vec<f32>, domain: u32) -> PyResult<()> {
             let emb = to_embedding(&embedding)?;
-            self.graph.add(GraphNode { embedding: emb, domain });
+            let _id = self.graph.add(emb, domain);
             Ok(())
         }
 

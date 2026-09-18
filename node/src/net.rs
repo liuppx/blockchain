@@ -428,6 +428,27 @@ impl GossipNode {
                                         proof: p,
                                     })
                             }),
+                        crate::light::ProofKind::GraphNode => {
+                            // For graph nodes the request id is the **insertion
+                            // index** — what the wallet observed from genesis
+                            // forward or from a prior block's graph length. The
+                            // full peer resolves it to a GraphNode by index and
+                            // packages its node_id along with the proof.
+                            let idx = id as usize;
+                            self.chain.state.graph_node_proof(idx).and_then(|p| {
+                                self.chain
+                                    .state
+                                    .graph
+                                    .nodes
+                                    .get(idx)
+                                    .cloned()
+                                    .map(|n| crate::light::ProofEntry::GraphNode {
+                                        node_id: n.node_id,
+                                        graph_node: n,
+                                        proof: p,
+                                    })
+                            })
+                        }
                     };
                     out.push(entry);
                 }
@@ -1736,7 +1757,8 @@ mod tests {
             let leaf = crate::merkle::leaf_hash(&entry.leaf());
             let root = match entry {
                 crate::light::ProofEntry::Account { .. }
-                | crate::light::ProofEntry::Reviewer { .. } => account_root,
+                | crate::light::ProofEntry::Reviewer { .. }
+                | crate::light::ProofEntry::GraphNode { .. } => account_root,
                 crate::light::ProofEntry::Validator { .. } => validator_root,
             };
             assert!(
@@ -1746,9 +1768,9 @@ mod tests {
             );
             // and the root embedded in the header must match what we used.
             let header_root = match entry {
-                crate::light::ProofEntry::Account { .. } | crate::light::ProofEntry::Reviewer { .. } => {
-                    &header.accounts_root
-                }
+                crate::light::ProofEntry::Account { .. }
+                | crate::light::ProofEntry::Reviewer { .. }
+                | crate::light::ProofEntry::GraphNode { .. } => &header.accounts_root,
                 crate::light::ProofEntry::Validator { .. } => &header.next_validators_root,
             };
             assert_eq!(root, header_root, "entry {i}: local root vs header root");
@@ -1970,5 +1992,137 @@ mod tests {
         let (_dst, proof_msg) = reply.into_iter().next().unwrap();
         light.on_message(1, proof_msg);
         assert!(light.take_proof(crate::light::ProofKind::Account, 999).is_none());
+    }
+
+    /// M25: full node serves a `ProofEntry::GraphNode` for a graph node
+    /// already present in its chain state. The wallet receives it, stores it
+    /// keyed by `(GraphNode, node_id)`, and `verify_proof_against_header`
+    /// accepts it against the cert-signed header's `accounts_root`.
+    #[test]
+    fn full_node_serves_a_graph_node_proof_in_response_to_get_proof() {
+        let (blocks, certs) = certified_chain(2);
+        let mut full = GossipNode::new(1, genesis(), 8, [1]);
+        full.load_certified(&blocks, &certs);
+
+        // The chain state must have at least one graph node (genesis seeds or
+        // accepted submissions). Pick index 0 — guaranteed by the demo
+        // genesis.
+        assert!(!full.chain.state.graph.nodes.is_empty());
+        let idx = 0;
+        let expected_node = full.chain.state.graph.nodes[idx].clone();
+
+        let request = GossipMsg::GetProof {
+            items: vec![(crate::light::ProofKind::GraphNode, idx as u64)],
+        };
+        let mut out = full.on_message(99, request);
+        let (_dst, msg) = out.pop().unwrap();
+        let entries = match msg {
+            GossipMsg::Proof { items } => items,
+            other => panic!("expected Proof, got {other:?}"),
+        };
+        assert_eq!(entries.len(), 1);
+        let entry = entries[0].as_ref().expect("graph node proof must be Some");
+
+        // Wire shape: it's a GraphNode entry with the right node_id.
+        match entry {
+            crate::light::ProofEntry::GraphNode { node_id, graph_node, .. } => {
+                assert_eq!(*node_id, expected_node.node_id);
+                assert_eq!(*graph_node, expected_node);
+            }
+            other => panic!("expected GraphNode, got {other:?}"),
+        }
+
+        // And it verifies locally against the chain's accounts_root, which
+        // the cert-signed header commits to.
+        let last_block = blocks.last().unwrap();
+        let header = crate::codec::BlockHeader::from_block(last_block);
+        let leaf = crate::merkle::leaf_hash(&entry.leaf());
+        let root = &full.chain.state.merkle_root();
+        assert!(
+            crate::merkle::verify(root, &leaf, entry.proof()),
+            "graph node proof must verify against accounts_root"
+        );
+        assert_eq!(root.as_slice(), header.accounts_root.as_slice());
+
+        // Light-side cache: the reply arrives, the wallet pulls it.
+        let mut light = LightGossipNode::new(99, &genesis(), [1]);
+        light.on_message(
+            1,
+            GossipMsg::Proof {
+                items: vec![Some(entry.clone())],
+            },
+        );
+        let cached = light
+            .take_proof(crate::light::ProofKind::GraphNode, expected_node.node_id)
+            .expect("light cache must hold the graph node proof");
+        match cached {
+            crate::light::ProofEntry::GraphNode { node_id, .. } => {
+                assert_eq!(node_id, expected_node.node_id);
+            }
+            other => panic!("expected cached GraphNode, got {other:?}"),
+        }
+    }
+
+    /// M25: mixing GraphNode into a batched `GetProof` alongside Account +
+    /// Reviewer + Validator must still work — same bus, same dispatcher.
+    /// Mirrors `full_node_serves_a_batch_of_proofs_in_response_to_get_proof`
+    /// but with the GraphNode slot populated.
+    #[test]
+    fn full_node_serves_a_batched_request_mixing_account_reviewer_validator_and_graph_node() {
+        let (blocks, certs) = certified_chain(2);
+        let mut full = GossipNode::new(1, genesis(), 8, [1]);
+        full.load_certified(&blocks, &certs);
+        assert!(!full.chain.state.graph.nodes.is_empty());
+
+        let request = GossipMsg::GetProof {
+            items: vec![
+                (crate::light::ProofKind::Account, 1),
+                (crate::light::ProofKind::Reviewer, 10),
+                (crate::light::ProofKind::Validator, 21),
+                (crate::light::ProofKind::GraphNode, 0),
+            ],
+        };
+        let mut out = full.on_message(99, request);
+        let (_dst, msg) = out.pop().unwrap();
+        let entries = match msg {
+            GossipMsg::Proof { items } => items,
+            other => panic!("expected Proof, got {other:?}"),
+        };
+        assert_eq!(entries.len(), 4);
+        for (i, e) in entries.iter().enumerate() {
+            e.as_ref().unwrap_or_else(|| panic!("entry {i} must be Some"));
+        }
+
+        // Each entry must verify locally against the right root.
+        let last_block = blocks.last().unwrap();
+        let header = crate::codec::BlockHeader::from_block(last_block);
+        let account_root = &full.chain.state.merkle_root();
+        let validator_root = &full.chain.state.validators.merkle_root();
+        for (i, e) in entries.iter().enumerate() {
+            let entry = e.as_ref().unwrap();
+            let leaf = crate::merkle::leaf_hash(&entry.leaf());
+            let root = match entry {
+                crate::light::ProofEntry::Account { .. }
+                | crate::light::ProofEntry::Reviewer { .. }
+                | crate::light::ProofEntry::GraphNode { .. } => account_root,
+                crate::light::ProofEntry::Validator { .. } => validator_root,
+            };
+            assert!(
+                crate::merkle::verify(root, &leaf, entry.proof()),
+                "entry {i} ({:?}) failed to verify locally",
+                entry.kind()
+            );
+            let header_root = match entry {
+                crate::light::ProofEntry::Account { .. }
+                | crate::light::ProofEntry::Reviewer { .. }
+                | crate::light::ProofEntry::GraphNode { .. } => &header.accounts_root,
+                crate::light::ProofEntry::Validator { .. } => &header.next_validators_root,
+            };
+            assert_eq!(
+                root.as_slice(),
+                header_root.as_slice(),
+                "entry {i}: local root vs header root"
+            );
+        }
     }
 }
