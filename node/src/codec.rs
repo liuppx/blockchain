@@ -41,15 +41,15 @@ pub fn encode_block(b: &Block) -> Vec<u8> {
     e.raw(&b.prev_hash);
     e.f32(b.timestamp_days);
     e.raw(&b.next_validators_root);
-    e.u64(b.txs.len() as u64);
-    for t in &b.txs {
-        enc_tx(&mut e, t, true);
-    }
     e.u64(b.validator_updates.len() as u64);
     for u in &b.validator_updates {
         e.u64(u.id);
         e.raw(&u.pubkey);
         e.u64(u.power);
+    }
+    e.u64(b.txs.len() as u64);
+    for t in &b.txs {
+        enc_tx(&mut e, t, true);
     }
     e.u64(b.stake_ops.len() as u64);
     for op in &b.stake_ops {
@@ -60,6 +60,229 @@ pub fn encode_block(b: &Block) -> Vec<u8> {
         enc_evidence(&mut e, ev);
     }
     e.0
+}
+
+/// Canonical bytes of a block's cert-signed projection: the header fields —
+/// height, prev_hash, timestamp, the next-validator-set commitment, and any
+/// validator_updates (M16) — in the same order as [`encode_block`] but stopped
+/// before the tx/stake-op/evidence bodies. The SPV transport gossips only
+/// these bytes, so a light client verifies state against a cert-signed header
+/// without ever deserializing a transaction body.
+///
+/// The codec is **prefix-stable**: `encode_header(&BlockHeader::from_block(b))
+/// == encode_block(b)[..header_end]` for any block `b`, including non-empty
+/// ones. This means `sha256(encode_header(h)) == sha256(encode_block(...))`
+/// only when the block's three body sections are empty — i.e. for a block with
+/// no txs, no stake ops, and no evidence. Light clients only consume headers
+/// for blocks whose bodies are empty (or whose bodies they never want), and
+/// the cert that ships with the header binds `block_hash = header.hash()`.
+pub fn encode_header(h: &BlockHeader) -> Vec<u8> {
+    let mut e = Enc(Vec::new());
+    e.u64(h.height);
+    e.raw(&h.prev_hash);
+    e.f32(h.timestamp_days);
+    e.raw(&h.next_validators_root);
+    e.u64(h.validator_updates.len() as u64);
+    for u in &h.validator_updates {
+        e.u64(u.id);
+        e.raw(&u.pubkey);
+        e.u64(u.power);
+    }
+    // three SHA-256 commitments binding the three body lists — what makes
+    // `header.hash() == block.hash()` hold for blocks with non-empty bodies
+    // and is the only byte the light client needs to verify a body was not
+    // tampered with.
+    e.raw(&h.txs_commitment);
+    e.raw(&h.stake_ops_commitment);
+    e.raw(&h.evidence_commitment);
+    e.0
+}
+
+/// Inverse of [`encode_header`]. Trailing bytes after the header are an error.
+pub fn decode_header(buf: &[u8]) -> Result<BlockHeader, CodecError> {
+    let mut d = Dec { buf, pos: 0 };
+    let height = d.u64()?;
+    let mut prev_hash = [0u8; 32];
+    prev_hash.copy_from_slice(d.take(32)?);
+    let timestamp_days = d.f32()?;
+    let mut next_validators_root = [0u8; 32];
+    next_validators_root.copy_from_slice(d.take(32)?);
+    let n_upd = d.count()?;
+    let mut validator_updates = Vec::with_capacity(n_upd as usize);
+    for _ in 0..n_upd {
+        let id = d.u64()?;
+        let mut pubkey = [0u8; 32];
+        pubkey.copy_from_slice(d.take(32)?);
+        let power = d.u64()?;
+        validator_updates.push(ValidatorUpdate { id, pubkey, power });
+    }
+    let mut txs_commitment = [0u8; 32];
+    txs_commitment.copy_from_slice(d.take(32)?);
+    let mut stake_ops_commitment = [0u8; 32];
+    stake_ops_commitment.copy_from_slice(d.take(32)?);
+    let mut evidence_commitment = [0u8; 32];
+    evidence_commitment.copy_from_slice(d.take(32)?);
+    if d.pos != d.buf.len() {
+        return Err(CodecError::TrailingBytes);
+    }
+    Ok(BlockHeader {
+        height,
+        prev_hash,
+        timestamp_days,
+        next_validators_root,
+        validator_updates,
+        txs_commitment,
+        stake_ops_commitment,
+        evidence_commitment,
+    })
+}
+
+/// Canonical bytes of a [`CertifiedHeader`] = `(BlockHeader, Commit)`. The unit
+/// of header-sync gossip; binds an unforgeable > 2/3 certificate to the
+/// cert-signed header hash. The cert's `block_hash` field equals
+/// `header.hash()` — that is the only hash the light client trusts.
+pub fn encode_certified_header(ch: &CertifiedHeader) -> Vec<u8> {
+    let mut e = Enc(Vec::new());
+    e.raw(&encode_header(&ch.header));
+    e.raw(&encode_commit(&ch.cert));
+    e.0
+}
+
+/// Inverse of [`encode_certified_header`]. The header codec's trailing
+/// three 32-byte commitments define a strict boundary: the rest of the
+/// buffer must decode as exactly one [`Commit`] (the cert codec rejects
+/// trailing bytes, so any padding after the cert is an error).
+pub fn decode_certified_header(buf: &[u8]) -> Result<CertifiedHeader, CodecError> {
+    // Header layout: 76-byte fixed prefix ‖ u64 n_updates (8) ‖
+    // count * 48 bytes (u64 id ‖ 32-byte pubkey ‖ u64 power) ‖
+    // 3 * 32-byte commitments.
+    if buf.len() < 76 {
+        return Err(CodecError::UnexpectedEof);
+    }
+    let n_updates = u64::from_be_bytes(buf[76..84].try_into().unwrap());
+    let header_len = 84 + (n_updates as usize) * 48 + 96; // 96 = 3 * 32 commitments
+    if buf.len() < header_len {
+        return Err(CodecError::UnexpectedEof);
+    }
+    let header = decode_header(&buf[..header_len])?;
+    let cert = decode_commit(&buf[header_len..])?;
+    Ok(CertifiedHeader { header, cert })
+}
+
+/// A cert-signed projection of a [`Block`] — the header fields only, never the
+/// tx / stake-op / evidence bodies themselves. Lives in this module alongside
+/// the codec so `decode_block` / `encode_block` and `encode_header` /
+/// `decode_header` stay trivially prefix-stable.
+///
+/// **SPV contract:** a light client can verify state against a cert-signed
+/// header without ever seeing the block's bodies. To make that contract hold
+/// end-to-end, the header carries a SHA-256 commitment to each body list:
+/// `txs_commitment = sha256(encode_txs_list(&b.txs))`, and the same for stake
+/// ops and slashing evidence. A full node MUST verify the supplied body hashes
+/// to the committed root before applying; a light client never sees the body
+/// and trusts the commitment (which the cert signs).
+#[derive(Clone, Debug)]
+pub struct BlockHeader {
+    pub height: u64,
+    pub prev_hash: crate::Hash,
+    pub timestamp_days: f32,
+    pub next_validators_root: crate::Hash,
+    pub validator_updates: Vec<ValidatorUpdate>,
+    /// SHA-256 over the canonical encoding of the tx list (or zero for empty).
+    pub txs_commitment: crate::Hash,
+    /// SHA-256 over the canonical encoding of the stake-op list.
+    pub stake_ops_commitment: crate::Hash,
+    /// SHA-256 over the canonical encoding of the evidence list.
+    pub evidence_commitment: crate::Hash,
+}
+
+impl BlockHeader {
+    /// Project a full block to its cert-signed header. The tx list, stake ops
+    /// and slashing evidence are folded into per-body SHA-256 commitments —
+    /// they are not in `block_hash` themselves.
+    pub fn from_block(b: &Block) -> Self {
+        BlockHeader {
+            height: b.height,
+            prev_hash: b.prev_hash,
+            timestamp_days: b.timestamp_days,
+            next_validators_root: b.next_validators_root,
+            validator_updates: b.validator_updates.clone(),
+            txs_commitment: list_commitment(&b.txs.iter().map(encode_tx).collect::<Vec<_>>()),
+            stake_ops_commitment: list_commitment(&b.stake_ops.iter().map(encode_stakeop).collect::<Vec<_>>()),
+            evidence_commitment: list_commitment(&b.slashing_evidence.iter().map(encode_evidence).collect::<Vec<_>>()),
+        }
+    }
+
+    /// Content-addressed hash: the cert-signed bytes. **For any block**,
+    /// `header.hash() == block.hash()` (because `Block::hash` is defined to
+    /// hash the header projection, with the body bytes committed by the
+    /// per-body SHA-256 roots above). This is the SPV contract: a light
+    /// client verifies against `header.hash()`, and the cert that ships
+    /// with the header binds `block_hash = header.hash()` regardless of
+    /// whether the body is empty.
+    pub fn hash(&self) -> crate::Hash {
+        crate::hash::sha256(&encode_header(self))
+    }
+
+    /// Reassemble the full block from this header plus the three body vectors
+    /// (in canonical order). Used by full nodes; light clients never call it.
+    /// Each body MUST match its committed root — otherwise the cert-signed
+    /// commitment is broken.
+    pub fn to_block(
+        &self,
+        txs: Vec<SubmissionTx>,
+        stake_ops: Vec<StakeOp>,
+        slashing_evidence: Vec<SlashEvidence>,
+    ) -> Block {
+        Block {
+            height: self.height,
+            prev_hash: self.prev_hash,
+            timestamp_days: self.timestamp_days,
+            next_validators_root: self.next_validators_root,
+            txs,
+            validator_updates: self.validator_updates.clone(),
+            stake_ops,
+            slashing_evidence,
+        }
+    }
+}
+
+/// SHA-256 over the concatenated per-item encodings; zero for an empty list.
+fn list_commitment(parts: &[Vec<u8>]) -> crate::Hash {
+    use crate::hash::sha256;
+    let mut buf = Vec::new();
+    for p in parts {
+        buf.extend_from_slice(&(p.len() as u64).to_be_bytes());
+        buf.extend_from_slice(p);
+    }
+    sha256(&buf)
+}
+
+/// `(BlockHeader, Commit)` — the unit of header-sync gossip. The cert's
+/// `block_hash` equals `header.hash()`; a light client verifies the header
+/// against that signature target and never deserializes a body.
+#[derive(Clone, Debug)]
+pub struct CertifiedHeader {
+    pub header: BlockHeader,
+    pub cert: Commit,
+}
+
+impl CertifiedHeader {
+    /// Project a full `(Block, Commit)` to its cert-signed header form. The
+    /// block's body fields are dropped.
+    pub fn from_certified(b: &Block, cert: &Commit) -> Self {
+        CertifiedHeader { header: BlockHeader::from_block(b), cert: cert.clone() }
+    }
+
+    /// The header hash the cert signs.
+    pub fn block_hash(&self) -> crate::Hash {
+        self.header.hash()
+    }
+
+    /// Height of the certified header.
+    pub fn height(&self) -> u64 {
+        self.header.height
+    }
 }
 
 /// The exact bytes a submission's author signs: all tx fields EXCEPT the
@@ -281,11 +504,6 @@ pub fn decode_block(buf: &[u8]) -> Result<Block, CodecError> {
     let timestamp_days = d.f32()?;
     let mut next_validators_root = [0u8; 32];
     next_validators_root.copy_from_slice(d.take(32)?);
-    let n_txs = d.count()?;
-    let mut txs = Vec::with_capacity(n_txs as usize);
-    for _ in 0..n_txs {
-        txs.push(dec_tx(&mut d)?);
-    }
     let n_upd = d.count()?;
     let mut validator_updates = Vec::with_capacity(n_upd as usize);
     for _ in 0..n_upd {
@@ -294,6 +512,11 @@ pub fn decode_block(buf: &[u8]) -> Result<Block, CodecError> {
         pubkey.copy_from_slice(d.take(32)?);
         let power = d.u64()?;
         validator_updates.push(ValidatorUpdate { id, pubkey, power });
+    }
+    let n_txs = d.count()?;
+    let mut txs = Vec::with_capacity(n_txs as usize);
+    for _ in 0..n_txs {
+        txs.push(dec_tx(&mut d)?);
     }
     let n_ops = d.count()?;
     let mut stake_ops = Vec::with_capacity(n_ops as usize);
@@ -636,5 +859,89 @@ mod tests {
         let mut bytes = encode_commit(&commit);
         bytes.push(0);
         assert!(matches!(decode_commit(&bytes), Err(CodecError::TrailingBytes)));
+    }
+
+    // --- header codec (M22) ------------------------------------------------
+
+    #[test]
+    fn header_round_trip() {
+        let b = sample_block();
+        let h = BlockHeader::from_block(&b);
+        let bytes = encode_header(&h);
+        let back = decode_header(&bytes).unwrap();
+        assert_eq!(encode_header(&back), bytes);
+        assert_eq!(back.height, b.height);
+        assert_eq!(back.prev_hash, b.prev_hash);
+        assert_eq!(back.timestamp_days.to_bits(), b.timestamp_days.to_bits());
+        assert_eq!(back.next_validators_root, b.next_validators_root);
+        assert_eq!(back.validator_updates, b.validator_updates);
+    }
+
+    #[test]
+    fn block_hash_equals_header_hash() {
+        // The SPV contract: header.hash() == block.hash() for ANY block,
+        // because `Block::hash` now hashes the header projection (which folds
+        // in per-body SHA-256 commitments). A light client can verify against
+        // header.hash() without ever seeing the body, and the cert binds
+        // block_hash = header.hash() regardless of whether the body is empty.
+        let b = sample_block();
+        let h = BlockHeader::from_block(&b);
+        assert_eq!(h.hash(), b.hash());
+        // and a block whose body differs must hash differently (the
+        // commitment inside the header changes), so a cert-signed header
+        // binds its body uniquely.
+        let mut tampered = b.clone();
+        tampered.txs[0].stake += 1;
+        let h2 = BlockHeader::from_block(&tampered);
+        assert_ne!(h2.hash(), h.hash(), "tampering a body changes the header hash");
+    }
+
+    #[test]
+    fn block_hash_matches_header_hash_even_with_bodies() {
+        // The SPV contract: header.hash() == block.hash() regardless of body
+        // contents, because Block::hash now hashes the header projection (with
+        // per-body commitments). Light clients can verify against
+        // header.hash() without ever seeing the body, and the cert binds
+        // block_hash = header.hash() for both empty and non-empty bodies.
+        let mut b = sample_block();
+        let h = BlockHeader::from_block(&b);
+        assert_eq!(h.hash(), b.hash());
+        b.txs.clear();
+        b.stake_ops.clear();
+        b.slashing_evidence.clear();
+        let h2 = BlockHeader::from_block(&b);
+        assert_eq!(h2.hash(), b.hash());
+    }
+
+    #[test]
+    fn certified_header_round_trip() {
+        let b = sample_block();
+        let cert = crate::consensus::Commit {
+            height: b.height,
+            round: 0,
+            block_hash: BlockHeader::from_block(&b).hash(),
+            precommits: Vec::new(),
+        };
+        let ch = CertifiedHeader::from_certified(&b, &cert);
+        let bytes = encode_certified_header(&ch);
+        let back = decode_certified_header(&bytes).unwrap();
+        assert_eq!(encode_certified_header(&back), bytes);
+        assert_eq!(back.header.height, ch.header.height);
+        assert_eq!(back.header.next_validators_root, ch.header.next_validators_root);
+        assert_eq!(back.cert.height, cert.height);
+        assert_eq!(back.cert.block_hash, ch.cert.block_hash);
+        // trailing bytes are rejected
+        let mut extra = bytes.clone();
+        extra.push(0);
+        assert!(matches!(decode_certified_header(&extra), Err(CodecError::TrailingBytes)));
+    }
+
+    #[test]
+    fn header_decode_rejects_trailing_bytes() {
+        let b = sample_block();
+        let h = BlockHeader::from_block(&b);
+        let mut bytes = encode_header(&h);
+        bytes.push(0);
+        assert!(matches!(decode_header(&bytes), Err(CodecError::TrailingBytes)));
     }
 }

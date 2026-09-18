@@ -6,6 +6,7 @@
 //!   cargo run --release --bin node -- bft              # BFT commit certificate over a block
 //!   cargo run --release --bin node -- gossip           # gossip + anti-entropy sync (in-proc + loopback TCP)
 //!   cargo run --release --bin node -- light            # light client: follow the validator set without full replay
+//!   cargo run --release --bin node -- lsync            # header-only SPV sync over the gossip bus (light peer never sees a tx)
 //!   cargo run --release --bin node -- staking          # bond/unbond: stake-bound validator power + unbonding
 //!   cargo run --release --bin node -- slashing         # slash an equivocating validator's bonded stake to the treasury
 //!   cargo run --release --bin node -- run  --dir DIR   # persistent chain (block log)
@@ -27,7 +28,7 @@ use zhixing_node::consensus::{commit_block, detect_equivocation};
 use zhixing_node::driver::ChainDriver;
 use zhixing_node::mempool::Mempool;
 use zhixing_node::merkle;
-use zhixing_node::net::{read_msg, write_msg, GossipMsg, GossipNode, Network};
+use zhixing_node::net::{read_msg, write_msg, GossipMsg, GossipNode, LightGossipNode, LightNetwork, Network};
 use zhixing_node::round::Sim;
 use zhixing_node::store::{BlockLog, CertLog};
 use zhixing_node::validator::{Validator, ValidatorSet, ValidatorUpdate};
@@ -183,6 +184,7 @@ fn main() {
         "slashing" => cmd_slashing(),
         "gossip" => cmd_gossip(),
         "light" => cmd_light(),
+        "lsync" => cmd_lsync(),
         "run" => cmd_run(dir_arg(&args)),
         "status" => cmd_status(dir_arg(&args)),
         "certs" => cmd_certs(dir_arg(&args)),
@@ -221,6 +223,7 @@ fn usage() {
     eprintln!("  node slashing           slash an equivocating validator's bonded stake to the treasury");
     eprintln!("  node gossip             gossip + anti-entropy sync: fresh nodes catch up to a certified chain (in-proc + TCP)");
     eprintln!("  node light              light client: follow the validator set across heights without full replay");
+    eprintln!("  node lsync              header-only SPV sync over the gossip bus: a light peer reaches the full node's height with zero tx bodies");
     eprintln!("  node run    --dir DIR   persistent chain (seeds demo blocks once, then replays)");
     eprintln!("  node status --dir DIR   replay the block log and print state");
     eprintln!("  node certs  --dir DIR   persist a certified chain (blocks+certs) and re-verify finality on reload");
@@ -1086,7 +1089,178 @@ fn cmd_light() {
     assert_eq!(committed_ids, full_ids, "follow_committed diverged from the full chain");
 }
 
-fn cmd_run(dir: String) {    let path = format!("{dir}/blocks.log");
+/// Demonstrate M22 — header-only SPV sync over the gossip bus. A full node holds
+/// the certified chain (with real transactions, stake ops, and slashing
+/// evidence in the block bodies); a light peer announces its height, pulls
+/// only `(CertifiedHeader, next_set)` pairs over the wire, and advances its
+/// [`ValidatorTracker`] to the head — never deserializing a transaction body.
+/// The demo prints the wire-byte savings and the membership proof the SPV
+/// path is designed to enable.
+fn cmd_lsync() {
+    use zhixing_node::codec::{encode_block, encode_certified_header, encode_commit};
+
+    // Build a real certified chain. Same shape as `cmd_light` — a chain that
+    // changes its validator set via explicit update, self-bond, and slashing —
+    // because the demo is most visible across set transitions.
+    let seeds: BTreeMap<u64, [u8; 32]> = [1u64, 2, 3, 21, 22, 23, 24, 25]
+        .iter()
+        .map(|&id| {
+            let mut s = [0u8; 32];
+            s[..8].copy_from_slice(&id.to_le_bytes());
+            (id, s)
+        })
+        .collect();
+    let mut d = ChainDriver::new(demo_genesis(), seeds, 4);
+    d.submit(tx(1, unit(1), 1, reviews(&[(10, 0.9), (11, 0.85), (12, 0.9)]), (3, 3), 1.0)).unwrap();
+    d.submit(tx(2, unit(2), 2, reviews(&[(10, 0.88), (11, 0.9), (12, 0.86)]), (3, 3), 1.0)).unwrap();
+    d.stage_validator_update(ValidatorUpdate { id: 25, pubkey: kp(25).public(), power: 2 * MICRO });
+    d.produce(1.0, &BTreeSet::new()).unwrap_or_else(|e| fail_msg("produce h1", &e));
+    d.stage_stake_op(
+        StakeOp { account: 1, kind: BondKind::Bond, amount: 6 * MICRO, signature: [0u8; 64] }
+            .signed(&kp(1)),
+    );
+    d.produce(2.0, &BTreeSet::new()).unwrap_or_else(|e| fail_msg("produce h2", &e));
+    let ev = SlashEvidence {
+        vote_a: Vote::signed(1, 3, 0, [0xAA; 32], VoteType::Precommit, &kp(1)),
+        vote_b: Vote::signed(1, 3, 0, [0xBB; 32], VoteType::Precommit, &kp(1)),
+    };
+    d.stage_slashing_evidence(ev);
+    d.produce(3.0, &BTreeSet::new()).unwrap_or_else(|e| fail_msg("produce h3", &e));
+
+    let n_txs: usize = d.blocks().iter().map(|b| b.txs.len()).sum();
+    let n_stake_ops: usize = d.blocks().iter().map(|b| b.stake_ops.len()).sum();
+    let n_evidence: usize = d.blocks().iter().map(|b| b.slashing_evidence.len()).sum();
+    println!(
+        "full chain: {} heights, {} txs, {} stake ops, {} evidence, head {}\n",
+        d.blocks().len(),
+        n_txs,
+        n_stake_ops,
+        n_evidence,
+        short(&d.head()),
+    );
+
+    // Full node (id=1) seeds the bus with the certified chain; light node
+    // (id=2) holds only the genesis.
+    let mut full = GossipNode::new(1, demo_genesis(), 16, [1, 2]);
+    let blocks = d.blocks().to_vec();
+    let certs = d.certificates().to_vec();
+    assert!(full.load_certified(&blocks, &certs));
+    let light_id = 2u64;
+    let light = LightGossipNode::new(light_id, &demo_genesis(), [1, 2]);
+
+    println!("SPV header-sync over the gossip bus:");
+    let full_height = full.height();
+    println!("  full peer (id=1): height {}  ·  light peer (id={}): height 0", full_height, light_id);
+    let mut net = LightNetwork::new(vec![full], vec![light]);
+
+    // Per-height authoritative next sets, computed once from a full replay.
+    // The light peer is told "block i+1 was certified by this set, and it
+    // commits to this next set in its `next_validators_root`" — exactly the
+    // side-information `follow_committed`/`follow_header` need.
+    let mut committed_sets: Vec<ValidatorSet> = Vec::new();
+    let mut replay = Chain::new(demo_genesis());
+    for b in d.blocks() {
+        replay.commit(b).unwrap_or_else(|e| fail_msg("replay commit", &e));
+        committed_sets.push(replay.state.validators.clone());
+    }
+    let next_set_for = |h: u64| committed_sets.get((h - 1) as usize).cloned();
+
+    net.announce_all();
+    for round in 0..10 {
+        let n = net.run(1, light_id, &next_set_for);
+        if n == 0 {
+            break;
+        }
+        if round == 0 {
+            println!("  round 1: light Status{{height=0}} -> full replies Headers{{from=1}}");
+        }
+    }
+
+    let l = net.light_node(light_id);
+    assert_eq!(
+        l.tracker().height(),
+        full_height,
+        "light peer reached the full node's height — without ever seeing a tx"
+    );
+
+    // Wire-byte accounting: the certified headers carry no bodies.
+    let certs_ref = d.certificates();
+    let full_bytes: usize = d.blocks().iter().zip(certs_ref.iter()).map(|(b, c)| encode_block(b).len() + encode_commit(c).len()).sum();
+    let header_bytes: usize = d
+        .blocks()
+        .iter()
+        .zip(certs_ref.iter())
+        .map(|(b, c)| encode_certified_header(&zhixing_node::codec::CertifiedHeader::from_certified(b, c)).len())
+        .sum();
+    println!(
+        "\n  bandwidth (block+certs vs certified headers, summed across the chain):"
+    );
+    println!("    full blocks  : {:>6} B", full_bytes);
+    println!("    headers only : {:>6} B", header_bytes);
+    println!(
+        "    savings      : {:>5.1}%  ({})",
+        100.0 * (1.0 - (header_bytes as f64 / full_bytes as f64)),
+        if header_bytes < full_bytes { "SPV saved bytes ✓" } else { "UNEXPECTED: not smaller" },
+    );
+
+    // Light peer can prove a validator's membership against the latest header.
+    // The cert binds the header; the set active for that header's height is
+    // the post-apply set of the *previous* block — which is `committed_sets[h-2]`
+    // (height `h`'s prev block was block `h-1`, committed to height `h-1`'s set
+    // in its `next_validators_root`). For h=1, the active set is the genesis set.
+    let lh = l.headers().last().unwrap();
+    let h = lh.height() as usize; // 1-indexed
+    let active_for_cert: &ValidatorSet = if h >= 2 {
+        &committed_sets[h - 2]
+    } else {
+        &d.chain.state.validators // pre-anything; genesis set for h=1
+    };
+    // Prove a validator who is in the *latest* set (the one committed by this
+    // header's `next_validators_root`): `committed_sets[h-1]`.
+    let next_set = &committed_sets[h - 1];
+    let id = 25u64;
+    let v = next_set.get(id).expect("validator 25 active at the tip").clone();
+    let proof = next_set.proof(id).expect("membership proof exists");
+    match ValidatorTracker::verify_membership_against_header(
+        &lh.header,
+        &lh.cert,
+        active_for_cert,
+        &v,
+        &proof,
+    ) {
+        Ok(()) => println!(
+            "  verify_membership (validator #{id}) against the latest cert-signed header -> true"
+        ),
+        Err(e) => {
+            eprintln!("  membership proof unexpectedly failed: {e}");
+            exit(1);
+        }
+    }
+
+    // Light peer rejects a header whose next set contradicts the cert-signed root.
+    let bad_validator = Validator {
+        id: 99,
+        pubkey: kp(99).public(),
+        power: 1,
+    };
+    // Use the valid proof for validator 25 but claim it opens validator 99 —
+    // merkle::verify rejects it, exercising the proof path.
+    let bad_proof = next_set.proof(25).unwrap();
+    let wrong = ValidatorTracker::verify_membership_against_header(
+        &lh.header,
+        &lh.cert,
+        active_for_cert,
+        &bad_validator,
+        &bad_proof,
+    );
+    println!(
+        "  verify_membership against a forged next set -> {} (must be false)",
+        wrong.is_ok()
+    );
+}
+
+fn cmd_run(dir: String) {
+    let path = format!("{dir}/blocks.log");
     let log = BlockLog::open(&path).unwrap_or_else(|e| fail("open log", e));
     let blocks = log.read_all().unwrap_or_else(|e| fail("read log", e));
 

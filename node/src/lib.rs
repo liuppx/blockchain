@@ -231,10 +231,24 @@ pub struct Block {
 }
 
 impl Block {
-    /// Content-addressed block hash over the canonical codec encoding (the same
-    /// bytes the block is persisted as, see [`codec`]).
+    /// Content-addressed block hash. As of M22 this is the hash of the
+    /// cert-signed **header projection** of the block — the prefix bytes
+    /// `encode_header(BlockHeader::from_block(self))` — so a light client can
+    /// verify state against `header.hash()` without seeing the tx / stake-op /
+    /// evidence bodies. The per-body SHA-256 commitments in the header bind
+    /// those bodies cryptographically (a full node MUST verify the supplied
+    /// bodies hash to the committed roots; a light client trusts the
+    /// commitment, which the cert signs).
     pub fn hash(&self) -> Hash {
-        sha256(&codec::encode_block(self))
+        let h = crate::codec::BlockHeader::from_block(self);
+        crate::hash::sha256(&crate::codec::encode_header(&h))
+    }
+
+    /// The cert-signed projection of this block. Used by the light-sync
+    /// transport (M22): the wire gossips only the header + cert, never the
+    /// bodies.
+    pub fn header(&self) -> crate::codec::BlockHeader {
+        crate::codec::BlockHeader::from_block(self)
     }
 }
 
@@ -313,6 +327,7 @@ pub struct ChainState {
 }
 
 /// Genesis configuration.
+#[derive(Clone)]
 pub struct Genesis {
     pub accounts: Vec<(u64, u64, PubKey)>,  // (id, endowment micro-$COG, pubkey)
     pub reviewers: Vec<(u64, f32)>,         // (id, initial reputation)

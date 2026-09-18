@@ -40,11 +40,14 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::io::{self, Read, Write};
 
 use crate::codec::{
-    decode_block, decode_commit, decode_evidence, decode_stakeop, decode_tx, encode_block,
-    encode_commit, encode_evidence, encode_stakeop, encode_tx, CodecError,
+    decode_block, decode_certified_header, decode_commit, decode_evidence, decode_stakeop,
+    decode_tx, encode_block, encode_certified_header, encode_commit, encode_evidence,
+    encode_stakeop, encode_tx, CertifiedHeader, CodecError,
 };
 use crate::consensus::Commit;
+use crate::light::ValidatorTracker;
 use crate::mempool::Mempool;
+use crate::validator::ValidatorSet;
 use crate::{Block, Chain, Genesis, Hash, SlashEvidence, StakeOp, SubmissionTx};
 
 /// Maximum certified blocks returned in a single [`GossipMsg::Blocks`] batch — a
@@ -73,6 +76,17 @@ pub enum GossipMsg {
     /// admits it into a staking block. Full validation in
     /// `chain.commit.apply_stake_op`.
     StakeOp(StakeOp),
+    /// "Send me cert-signed BLOCK HEADERS (no bodies) from this height onward."
+    /// The light-sync analogue of `GetBlocks` (M22). A light client announces
+    /// its height with `Status`; on seeing a peer ahead, it sends `GetHeaders`
+    /// instead — the response is `Headers(...)` carrying only `(header, cert)`
+    /// pairs. The light client never deserializes a transaction body.
+    GetHeaders { from: u64 },
+    /// A height-ordered batch of cert-signed headers — the response to
+    /// `GetHeaders` and the push of a freshly committed header. The cert's
+    /// `block_hash` equals `header.hash()` (a header is the cert-signed
+    /// projection of a block with empty bodies).
+    Headers(Vec<CertifiedHeader>),
 }
 
 /// One peer: a chain, a mempool, the retained certified chain (blocks paired with
@@ -185,6 +199,32 @@ impl GossipNode {
             .collect()
     }
 
+    /// The cert-signed headers from `height` onward (inclusive), capped at
+    /// [`MAX_BATCH`] — the payload for a peer's `GetHeaders` (M22). Drops
+    /// transaction bodies, stake ops, and slashing evidence; what remains is
+    /// exactly the cert-signed prefix.
+    pub fn headers_from(&self, height: u64) -> Vec<CertifiedHeader> {
+        if height == 0 {
+            return Vec::new();
+        }
+        let start = (height - 1) as usize;
+        (start..self.blocks.len().min(start + MAX_BATCH))
+            .map(|i| CertifiedHeader::from_certified(&self.blocks[i], &self.certs[i]))
+            .collect()
+    }
+
+    /// Every retained certified header (snapshot — the cert-signed projection
+    /// of the full-node's certified chain). The light client uses this with
+    /// [`crate::light::ValidatorTracker::follow_committed`] to advance without
+    /// pulling bodies.
+    pub fn certified_headers(&self) -> Vec<CertifiedHeader> {
+        self.blocks
+            .iter()
+            .zip(self.certs.iter())
+            .map(|(b, c)| CertifiedHeader::from_certified(b, c))
+            .collect()
+    }
+
     /// Trust-nothing acceptance of one certified block: it must be the very next
     /// height, extend our head, and carry a certificate that is a real > 2/3
     /// quorum of the set active for that height and binds exactly this block.
@@ -282,6 +322,19 @@ impl GossipNode {
             GossipMsg::Tx(tx) => self.on_tx(from, tx),
             GossipMsg::Evidence(ev) => self.on_evidence(from, ev),
             GossipMsg::StakeOp(op) => self.on_stake_op(from, op),
+            // M22: a full node answers `GetHeaders` with its retained
+            // cert-signed headers. If we receive `Headers(...)` directly
+            // (e.g. from a peer that pushes), drop them — full nodes don't
+            // track headers as state.
+            GossipMsg::GetHeaders { from: h } => {
+                let batch = self.headers_from(h);
+                if batch.is_empty() {
+                    Vec::new()
+                } else {
+                    vec![(from, GossipMsg::Headers(batch))]
+                }
+            }
+            GossipMsg::Headers(_) => Vec::new(),
         }
     }
 
@@ -450,6 +503,260 @@ impl Network {
     }
 }
 
+// --- M22: light-sync transport (header-only SPV gossip) ---------------------
+
+/// A light-side gossip peer: consumes only cert-signed headers (no tx bodies),
+/// tracks the active validator set via [`ValidatorTracker::follow_committed`],
+/// and never deserializes a transaction. The SPV primitive (M21) over the
+/// header-sync transport (M22).
+///
+/// A `LightGossipNode` does NOT have a `Chain` — it cannot execute blocks. It
+/// only runs the validator-set tracker against the headers it has received,
+/// and proves membership via [`ValidatorTracker::verify_membership`].
+///
+/// To avoid a structural split in [`Network`] (full vs light peers), light
+/// nodes run over [`LightNetwork`] (their own bus). Full nodes expose their
+/// retained headers via [`GossipNode::headers_from`]; a small adapter maps
+/// those into the light peer's protocol.
+pub struct LightGossipNode {
+    pub id: u64,
+    /// Validated headers in height order. Index `i` is height `i + 1`.
+    headers: Vec<CertifiedHeader>,
+    /// The next set we were told certifies each header. The same full node
+    /// that produced the header can produce this snapshot (it knows its own
+    /// `state.validators` after applying the block). For `apply_header` we
+    /// accept it alongside the header.
+    next_sets: Vec<ValidatorSet>,
+    /// Header hashes already seen — re-delivery is a no-op (mirrors the
+    /// full-node dedup discipline for blocks/txs).
+    seen: BTreeSet<Hash>,
+    /// The validator-set tracker, advanced as headers arrive.
+    tracker: ValidatorTracker,
+    peers: BTreeSet<u64>,
+}
+
+impl LightGossipNode {
+    /// A fresh light node holding only `genesis`, aware of `peers`.
+    pub fn new(id: u64, g: &Genesis, peers: impl IntoIterator<Item = u64>) -> Self {
+        let peers = peers.into_iter().filter(|&p| p != id).collect();
+        LightGossipNode {
+            id,
+            headers: Vec::new(),
+            next_sets: Vec::new(),
+            seen: BTreeSet::new(),
+            tracker: ValidatorTracker::from_genesis(g),
+            peers,
+        }
+    }
+
+    pub fn tracker(&self) -> &ValidatorTracker {
+        &self.tracker
+    }
+
+    pub fn tracker_mut(&mut self) -> &mut ValidatorTracker {
+        &mut self.tracker
+    }
+
+    pub fn headers(&self) -> &[CertifiedHeader] {
+        &self.headers
+    }
+
+    /// Light-side equivalent of [`GossipNode::apply_certified`]. Accepts one
+    /// cert-signed header + the next set the sender says the header commits
+    /// to; the header's `next_validators_root` is the unforgeable commitment
+    /// (cert-signed), so a wrong next set is rejected without ever touching a
+    /// body. Returns whether the tracker advanced.
+    pub fn apply_header(
+        &mut self,
+        header: CertifiedHeader,
+        next_set: &ValidatorSet,
+    ) -> Result<u64, crate::light::LightError> {
+        if !self.seen.insert(header.block_hash()) {
+            return Ok(self.tracker.height()); // dedup: already advanced past it
+        }
+        let expected = self.tracker.height() + 1;
+        if header.header.height != expected {
+            // out-of-order or splice; ignore (a gap will trigger another GetHeaders)
+            self.seen.remove(&header.block_hash());
+            return Ok(self.tracker.height());
+        }
+        let power = self
+            .tracker
+            .follow_header(&header.header, &header.cert, next_set)?;
+        self.headers.push(header);
+        self.next_sets.push(next_set.clone());
+        Ok(power)
+    }
+
+    /// React to one gossip message. Light peers only respond to `Status` (with
+    /// `GetHeaders`, the SPV analogue of `GetBlocks`) and to `Headers(...)`.
+    /// Other variants are dropped silently — light clients do not store
+    /// transactions, evidence, or stake ops.
+    pub fn on_message(&mut self, from: u64, msg: GossipMsg) -> Vec<(u64, GossipMsg)> {
+        self.peers.insert(from);
+        match msg {
+            GossipMsg::Status { height } => {
+                if height > self.tracker.height() {
+                    // peer is ahead: pull headers only, not bodies
+                    vec![(from, GossipMsg::GetHeaders { from: self.tracker.height() + 1 })]
+                } else if height < self.tracker.height() {
+                    // peer is behind — but we don't store headers as state until
+                    // we hand them out, and light peers are pure consumers; emit
+                    // nothing and let the peer pull from a full node.
+                    Vec::new()
+                } else {
+                    Vec::new()
+                }
+            }
+            GossipMsg::GetHeaders { .. } => Vec::new(), // light nodes don't serve headers
+            GossipMsg::Headers(batch) => self.on_headers(from, batch),
+            // everything else: light clients forward tx gossip but never store it
+            // — for the M22 demo we just drop, mirroring the "I don't care about
+            // bodies" SPV stance.
+            GossipMsg::Blocks(_)
+            | GossipMsg::GetBlocks { .. }
+            | GossipMsg::Tx(_)
+            | GossipMsg::Evidence(_)
+            | GossipMsg::StakeOp(_) => Vec::new(),
+        }
+    }
+
+    fn on_headers(
+        &mut self,
+        from: u64,
+        batch: Vec<CertifiedHeader>,
+    ) -> Vec<(u64, GossipMsg)> {
+        let mut advanced = 0usize;
+        for ch in batch {
+            // Light peers don't have next_sets over the wire; the demo supplies
+            // them via a side channel (the test/demo function). For the wire
+            // protocol we'd attach the next_set to each header in a later
+            // milestone — for now we still advance if the header is consistent
+            // (the `follow_committed` API takes the next_set separately).
+            // Here we only update `seen` so the gap-tracking logic is right.
+            self.seen.insert(ch.block_hash());
+            advanced += 1;
+        }
+        // tell peer our new height so they keep pushing if there is more
+        let mut out = Vec::new();
+        if advanced > 0 {
+            out.push((from, GossipMsg::Status { height: self.tracker.height() }));
+        }
+        out
+    }
+
+    /// Light-side equivalent of [`GossipNode::announce`].
+    pub fn announce(&self) -> Vec<(u64, GossipMsg)> {
+        self.peers
+            .iter()
+            .copied()
+            .map(|p| (p, GossipMsg::Status { height: self.tracker.height() }))
+            .collect()
+    }
+}
+
+/// A fixed-order, in-process delivery bus that mixes full [`GossipNode`]s
+/// and light [`LightGossipNode`]s. Full peers serve headers in response to
+/// `GetHeaders`; light peers consume them and advance their tracker. The bus
+/// is the M22 SPV-over-gossip analog of [`Network`].
+///
+/// **Headers routing.** A `Headers` batch emitted by a full peer would
+/// normally just be queued for the light peer (which drops it, per
+/// `LightGossipNode::on_message`). To make the demo end-to-end, the bus
+/// also runs a `next_set_for: impl FnMut(u64) -> Option<ValidatorSet>` —
+/// when a full→light `Headers` batch is being delivered, the bus
+/// side-channels each header through the light peer's
+/// [`LightGossipNode::apply_header`] with the authoritative next set
+/// (the full node knows its own `state.validators` after each apply; the
+/// closure projects that for any height).
+pub struct LightNetwork {
+    full: BTreeMap<u64, GossipNode>,
+    light: BTreeMap<u64, LightGossipNode>,
+    queue: VecDeque<(u64, u64, GossipMsg)>,
+}
+
+impl LightNetwork {
+    pub fn new(full: Vec<GossipNode>, light: Vec<LightGossipNode>) -> Self {
+        LightNetwork {
+            full: full.into_iter().map(|n| (n.id, n)).collect(),
+            light: light.into_iter().map(|n| (n.id, n)).collect(),
+            queue: VecDeque::new(),
+        }
+    }
+
+    fn deliver(&mut self, dst: u64, src: u64, msg: GossipMsg) {
+        let out = if let Some(n) = self.full.get_mut(&dst) {
+            n.on_message(src, msg)
+        } else if let Some(n) = self.light.get_mut(&dst) {
+            n.on_message(src, msg)
+        } else {
+            return;
+        };
+        for (d, m) in out {
+            if self.full.contains_key(&d) || self.light.contains_key(&d) {
+                self.queue.push_back((d, dst, m));
+            }
+        }
+    }
+
+    /// Every node announces its height (full nodes via `chain.height`,
+    /// light nodes via `tracker.height()`). Kicks off header anti-entropy.
+    pub fn announce_all(&mut self) {
+        let mut out = Vec::new();
+        for id in self.full.keys() {
+            out.extend(self.full[id].announce().into_iter().map(|(d, m)| (d, *id, m)));
+        }
+        for id in self.light.keys() {
+            out.extend(self.light[id].announce().into_iter().map(|(d, m)| (d, *id, m)));
+        }
+        for (dst, src, msg) in out {
+            self.queue.push_back((dst, src, msg));
+        }
+    }
+
+    /// Run the bus to quiescence, side-channeling any `Headers` batch from a
+    /// full peer to a light peer through the light peer's
+    /// [`LightGossipNode::apply_header`] with `next_set_for(height)` as the
+    /// authoritative next set. `full_id` and `light_id` select which peers
+    /// participate in the bridge.
+    pub fn run(&mut self, full_id: u64, light_id: u64, mut next_set_for: impl FnMut(u64) -> Option<ValidatorSet>) -> usize {
+        let mut delivered = 0;
+        while let Some((dst, src, msg)) = self.queue.pop_front() {
+            // Side-channel: full→light Headers bypass the normal
+            // `on_message` (which would drop them) and feed the light peer
+            // directly with the authoritative next set.
+            if dst == light_id && src == full_id {
+                if let GossipMsg::Headers(batch) = &msg {
+                    let batch = batch.clone();
+                    for ch in batch {
+                        if let Some(ns) = next_set_for(ch.height()) {
+                            let _ = self.light.get_mut(&light_id).unwrap().apply_header(ch, &ns);
+                        }
+                    }
+                    delivered += 1;
+                    if delivered > 1_000_000 {
+                        break;
+                    }
+                    continue;
+                }
+            }
+            self.deliver(dst, src, msg);
+            delivered += 1;
+            if delivered > 1_000_000 {
+                break;
+            }
+        }
+        delivered
+    }
+
+    pub fn full_node(&self, id: u64) -> &GossipNode {
+        &self.full[&id]
+    }
+    pub fn light_node(&self, id: u64) -> &LightGossipNode {
+        &self.light[&id]
+    }
+}
+
 // --- socket transport (thin framing over the wire messages) ------------------
 
 const TAG_STATUS: u8 = 0;
@@ -458,6 +765,8 @@ const TAG_BLOCKS: u8 = 2;
 const TAG_TX: u8 = 3;
 const TAG_EVIDENCE: u8 = 4;
 const TAG_STAKEOP: u8 = 5;
+const TAG_GETHEADERS: u8 = 6;
+const TAG_HEADERS: u8 = 7;
 
 /// Encode a gossip message: a 1-byte tag followed by its length-prefixed payload
 /// (reusing the block/commit/tx codecs). Self-describing, no external crate.
@@ -492,6 +801,17 @@ pub fn encode_gossip(m: &GossipMsg) -> Vec<u8> {
             out.push(TAG_STAKEOP);
             put_bytes(&mut out, &encode_stakeop(op));
         }
+        GossipMsg::GetHeaders { from } => {
+            out.push(TAG_GETHEADERS);
+            out.extend_from_slice(&from.to_be_bytes());
+        }
+        GossipMsg::Headers(batch) => {
+            out.push(TAG_HEADERS);
+            out.extend_from_slice(&(batch.len() as u64).to_be_bytes());
+            for ch in batch {
+                put_bytes(&mut out, &encode_certified_header(ch));
+            }
+        }
     }
     out
 }
@@ -518,6 +838,18 @@ pub fn decode_gossip(buf: &[u8]) -> Result<GossipMsg, CodecError> {
         TAG_TX => GossipMsg::Tx(decode_tx(take_bytes(&mut rest)?)?),
         TAG_EVIDENCE => GossipMsg::Evidence(decode_evidence(take_bytes(&mut rest)?)?),
         TAG_STAKEOP => GossipMsg::StakeOp(decode_stakeop(take_bytes(&mut rest)?)?),
+        TAG_GETHEADERS => GossipMsg::GetHeaders { from: take_u64(&mut rest)? },
+        TAG_HEADERS => {
+            let n = take_u64(&mut rest)?;
+            if n > MAX_BATCH as u64 {
+                return Err(CodecError::TooManyItems(n));
+            }
+            let mut batch = Vec::with_capacity(n as usize);
+            for _ in 0..n {
+                batch.push(decode_certified_header(take_bytes(&mut rest)?)?);
+            }
+            GossipMsg::Headers(batch)
+        }
         other => return Err(CodecError::BadEnum(other as u32)),
     };
     if !rest.is_empty() {
@@ -650,6 +982,11 @@ mod tests {
     fn wire_round_trips_every_message() {
         let (blocks, certs) = certified_chain(2);
         let batch: Vec<(Block, Commit)> = blocks.iter().cloned().zip(certs.iter().cloned()).collect();
+        let headers: Vec<CertifiedHeader> = blocks
+            .iter()
+            .zip(certs.iter())
+            .map(|(b, c)| CertifiedHeader::from_certified(b, c))
+            .collect();
         let msgs = vec![
             GossipMsg::Status { height: 7 },
             GossipMsg::GetBlocks { from: 3 },
@@ -657,6 +994,8 @@ mod tests {
             GossipMsg::Tx(tx(1, 1, 1)),
             GossipMsg::Evidence(sample_evidence(1)),
             GossipMsg::StakeOp(sample_bond(1, 5 * MICRO)),
+            GossipMsg::GetHeaders { from: 3 },
+            GossipMsg::Headers(headers),
         ];
         for m in &msgs {
             let bytes = encode_gossip(m);
@@ -954,5 +1293,147 @@ mod tests {
         // ... and replay re-verifies finality
         Chain::replay_verified(genesis(), driver.blocks(), driver.certificates())
             .expect("replay re-verifies finality");
+    }
+
+    // -- M22: header-only SPV gossip ---------------------------------------
+
+    use crate::validator::Validator;
+
+    /// Per-height committed sets from an authoritative replay: `sets[i]` is
+    /// the validator set that certifies height `i + 2` (what block `i + 1`
+    /// commits to in its `next_validators_root`).
+    fn committed_sets(g: &Genesis, blocks: &[Block]) -> Vec<ValidatorSet> {
+        let mut replay = Chain::new(g.clone());
+        let mut sets = Vec::new();
+        for b in blocks {
+            replay.commit(b).expect("commit");
+            sets.push(replay.state.validators.clone());
+        }
+        sets
+    }
+
+    /// Replay a full chain and return its final validator set (used by the
+    /// `follow_header` cross-check against the authoritative set).
+    fn authoritative_final_set(g: &Genesis, blocks: &[Block]) -> ValidatorSet {
+        let mut replay = Chain::new(g.clone());
+        for b in blocks {
+            replay.commit(b).expect("commit");
+        }
+        replay.state.validators.clone()
+    }
+
+    #[test]
+    fn full_node_serves_headers_in_response_to_get_headers() {
+        let (blocks, certs) = certified_chain(3);
+        let mut full = GossipNode::new(1, genesis(), 8, [1, 2]);
+        full.load_certified(&blocks, &certs);
+
+        // a fresh peer asks for headers from height 1.
+        let out = full.on_message(2, GossipMsg::GetHeaders { from: 1 });
+        assert_eq!(out.len(), 1, "full node replies with one Headers batch");
+        let (_, GossipMsg::Headers(batch)) = &out[0] else { panic!("expected Headers, got {:?}", out[0]) };
+        assert_eq!(batch.len(), 3, "full node serves every retained header");
+        for (i, ch) in batch.iter().enumerate() {
+            assert_eq!(ch.height(), (i + 1) as u64);
+            assert_eq!(ch.cert.block_hash, ch.header.hash());
+        }
+    }
+
+    #[test]
+    fn light_node_pulls_headers_and_tracks_validator_set() {
+        let (blocks, certs) = certified_chain(3);
+        let mut full = GossipNode::new(1, genesis(), 8, [1, 2]);
+        full.load_certified(&blocks, &certs);
+        let light_id = 2u64;
+        let light = LightGossipNode::new(light_id, &genesis(), [1, 2]);
+
+        let mut net = LightNetwork::new(vec![full], vec![light]);
+
+        // Per-height authoritative next sets from a full replay.
+        let sets = committed_sets(&genesis(), &blocks);
+        // Closure: height `i+1`'s next set is `sets[i]` (after applying block `i+1`,
+        // the validator set the next block's `next_validators_root` commits to).
+        let next_set_for = |h: u64| sets.get((h - 1) as usize).cloned();
+
+        net.announce_all();
+        // Round 1: light's Status{height=0} → full sees Status{height=0}, peer ahead=3,
+        // reply with Headers{from=1}. Round 2: bridge side-channels the Headers batch
+        // through `apply_header(ch, &sets[i])`, light advances to height 3.
+        for _ in 0..10 {
+            let n = net.run(1, light_id, &next_set_for);
+            if n == 0 {
+                break;
+            }
+        }
+
+        let l = net.light_node(light_id);
+        assert_eq!(l.tracker().height(), 3, "light node reached the full node's height");
+        let authoritative = authoritative_final_set(&genesis(), &blocks);
+        assert_eq!(
+            l.tracker().validators().merkle_root(),
+            authoritative.merkle_root(),
+            "light-tracked set equals authoritative replayed set"
+        );
+    }
+
+    #[test]
+    fn light_node_rejects_a_wrong_next_set_for_a_header() {
+        // A header commits to a specific next-validator-set Merkle root. If a
+        // malicious peer hands us a header but a *different* next set, the
+        // SPV check rejects — the tracker stays at its prior height.
+        let (blocks, certs) = certified_chain(2);
+        let light_id = 2u64;
+
+        // Manually drive the light peer with a bad next set for block 1.
+        let mut light = LightGossipNode::new(light_id, &genesis(), [1]);
+        let ch = CertifiedHeader::from_certified(&blocks[0], &certs[0]);
+        let bad_set = ValidatorSet::new(vec![Validator {
+            id: 99,
+            pubkey: crate::Keypair::from_seed([7u8; 32]).public(),
+            power: 1,
+        }]);
+        let err = light.apply_header(ch, &bad_set).unwrap_err();
+        assert!(matches!(err, crate::light::LightError::ValidatorRootMismatch { .. }), "got {err}");
+        assert_eq!(light.tracker().height(), 0, "tracker unchanged on rejection");
+    }
+
+    #[test]
+    fn header_gossip_shrinks_the_wire_payload_vs_full_blocks() {
+        // The whole point of M22: a header-only gossip batch is smaller than a
+        // block batch because bodies (txs, stake ops, evidence) are not carried.
+        let (blocks, certs) = certified_chain(3);
+        let full_batch: Vec<(Block, Commit)> = blocks.iter().cloned().zip(certs.iter().cloned()).collect();
+        let header_batch: Vec<CertifiedHeader> = blocks
+            .iter()
+            .zip(certs.iter())
+            .map(|(b, c)| CertifiedHeader::from_certified(b, c))
+            .collect();
+
+        let full_bytes: usize = full_batch.iter().map(|(b, c)| encode_block(b).len() + encode_commit(c).len()).sum();
+        let header_bytes: usize = header_batch.iter().map(|ch| encode_certified_header(ch).len()).sum();
+
+        assert!(
+            header_bytes < full_bytes,
+            "header-only payload ({header_bytes} B) must be strictly smaller than full-block payload ({full_bytes} B) — \
+             bodies were never carried over the wire"
+        );
+    }
+
+    #[test]
+    fn follow_header_advances_the_tracker_with_no_block_bodies() {
+        // Direct unit test of `ValidatorTracker::follow_header` against an
+        // authoritative full replay: the same chain, different verification
+        // path (no bodies seen), must reach the same set.
+        let (blocks, certs) = certified_chain(3);
+        let sets = committed_sets(&genesis(), &blocks);
+
+        let mut lt = ValidatorTracker::from_genesis(&genesis());
+        for (i, (b, c)) in blocks.iter().zip(certs.iter()).enumerate() {
+            let ch = CertifiedHeader::from_certified(b, c);
+            lt.follow_header(&ch.header, &ch.cert, &sets[i]).expect("follow_header");
+        }
+        assert_eq!(lt.height(), 3);
+        let authoritative = authoritative_final_set(&genesis(), &blocks);
+        assert_eq!(lt.validators().merkle_root(), authoritative.merkle_root());
     }
 }

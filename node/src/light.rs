@@ -194,31 +194,46 @@ impl ValidatorTracker {
         self.head
     }
 
-    /// Steps 1-4 shared by [`Self::follow`] and [`Self::follow_committed`]:
-    /// the block must extend the tracked head by one height, chain to it, be
-    /// certified by *exactly* this block's certificate, and that certificate must
-    /// be a real > 2/3 quorum of the currently tracked set. Read-only: on error
-    /// the tracker is untouched. Returns `(block_hash, certifying_power)`.
-    fn verify_cert(&self, block: &Block, cert: &Commit) -> Result<(Hash, u64), LightError> {
-        // 1. the block must extend our head by exactly one height ...
-        if block.height != self.height + 1 {
+    /// Steps 1-4 shared by [`Self::follow`], [`Self::follow_committed`] and the
+    /// M22 header-only [`Self::follow_header`]: the (header|block) must extend
+    /// the tracked head by exactly one height, chain to it, be certified by
+    /// *exactly* the supplied certificate, and that certificate must be a real
+    /// \> 2/3 quorum of the currently tracked set. Read-only: on error the
+    /// tracker is untouched. Returns `(header_hash, certifying_power)` so the
+    /// header-only path uses `header.hash()` and the full path uses
+    /// `block.hash()`.
+    fn verify_cert_header(
+        &self,
+        height: u64,
+        prev_hash: &Hash,
+        header_hash: &Hash,
+        cert: &Commit,
+    ) -> Result<u64, LightError> {
+        // 1. the (header|block) must extend our head by exactly one height ...
+        if height != self.height + 1 {
             return Err(LightError::BadHeight {
                 expected: self.height + 1,
-                got: block.height,
+                got: height,
             });
         }
         // 2. ... and chain to the head we last followed (no splicing).
-        if block.prev_hash != self.head {
-            return Err(LightError::ForkDetected { height: block.height });
+        if *prev_hash != self.head {
+            return Err(LightError::ForkDetected { height });
         }
-        // 3. the certificate must certify exactly this block.
-        let block_hash = block.hash();
-        if cert.height != block.height || cert.block_hash != block_hash {
-            return Err(LightError::CertificateMismatch { height: block.height });
+        // 3. the certificate must certify exactly this (header|block).
+        if cert.height != height || cert.block_hash != *header_hash {
+            return Err(LightError::CertificateMismatch { height });
         }
         // 4. the certificate must be a real > 2/3 quorum of the set active for
         //    this height — the set in force *before* this block applies.
         let power = cert.verify(&self.set).map_err(LightError::Consensus)?;
+        Ok(power)
+    }
+
+    /// The full-Block variant of `verify_cert_header` (M20/M21 path).
+    fn verify_cert(&self, block: &Block, cert: &Commit) -> Result<(Hash, u64), LightError> {
+        let block_hash = block.hash();
+        let power = self.verify_cert_header(block.height, &block.prev_hash, &block_hash, cert)?;
         Ok((block_hash, power))
     }
 
@@ -321,6 +336,32 @@ impl ValidatorTracker {
         Ok(power)
     }
 
+    /// Header-only SPV path (M22). Equivalent to [`Self::follow_committed`]
+    /// but operating on a [`crate::codec::BlockHeader`] instead of a full
+    /// `Block`: a light client can advance the tracker against a cert-signed
+    /// header without ever deserializing a transaction body. The cert's
+    /// `block_hash` equals `header.hash()` (the cert was issued by a full node
+    /// for the empty-bodied projection — see [`crate::codec::encode_header`]).
+    pub fn follow_header(
+        &mut self,
+        header: &crate::codec::BlockHeader,
+        cert: &Commit,
+        next_set: &ValidatorSet,
+    ) -> Result<u64, LightError> {
+        let header_hash = header.hash();
+        let power = self.verify_cert_header(header.height, &header.prev_hash, &header_hash, cert)?;
+        if next_set.merkle_root() != header.next_validators_root {
+            return Err(LightError::ValidatorRootMismatch { height: header.height });
+        }
+        if next_set.is_empty() {
+            return Err(LightError::EmptyValidatorSet);
+        }
+        self.set = next_set.clone();
+        self.head = header_hash;
+        self.height = header.height;
+        Ok(power)
+    }
+
     /// Verify that `validator` is a member of the set that certifies the height
     /// *after* `block` — i.e. is committed by `block.next_validators_root` — given
     /// an inclusion `proof` ([`ValidatorSet::proof`]). `block` must itself be
@@ -343,6 +384,29 @@ impl ValidatorTracker {
         let leaf = merkle::leaf_hash(&validator.merkle_leaf());
         if !merkle::verify(&block.next_validators_root, &leaf, proof) {
             return Err(LightError::MembershipProofInvalid { height: block.height });
+        }
+        Ok(())
+    }
+
+    /// M22 header-only variant of [`Self::verify_membership`]: same SPV contract,
+    /// but takes a [`crate::codec::BlockHeader`] instead of a full [`Block`] —
+    /// the proof and the cert are verified against the header alone, no bodies.
+    /// The cert's `block_hash` must equal `header.hash()`.
+    pub fn verify_membership_against_header(
+        header: &crate::codec::BlockHeader,
+        cert: &Commit,
+        tracked_set: &ValidatorSet,
+        validator: &Validator,
+        proof: &merkle::Proof,
+    ) -> Result<(), LightError> {
+        let hh = header.hash();
+        if cert.height != header.height || cert.block_hash != hh {
+            return Err(LightError::CertificateMismatch { height: header.height });
+        }
+        cert.verify(tracked_set).map_err(LightError::Consensus)?;
+        let leaf = merkle::leaf_hash(&validator.merkle_leaf());
+        if !merkle::verify(&header.next_validators_root, &leaf, proof) {
+            return Err(LightError::MembershipProofInvalid { height: header.height });
         }
         Ok(())
     }
