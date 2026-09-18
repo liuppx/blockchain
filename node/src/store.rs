@@ -162,6 +162,7 @@ mod tests {
             height,
             prev_hash: prev,
             timestamp_days: height as f32,
+            next_validators_root: [0u8; 32],
             txs: vec![SubmissionTx {
                 author: 1,
                 embedding: emb,

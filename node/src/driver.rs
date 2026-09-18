@@ -169,6 +169,7 @@ impl ChainDriver {
                     height: self.chain.state.height + 1,
                     prev_hash: self.chain.head,
                     timestamp_days,
+                    next_validators_root: [0u8; 32],
                     txs: Vec::new(),
                     validator_updates: Vec::new(),
                     stake_ops: Vec::new(),
@@ -180,6 +181,10 @@ impl ChainDriver {
         candidate.validator_updates = self.pending_updates.clone();
         candidate.stake_ops = self.pending_stake_ops.clone();
         candidate.slashing_evidence = self.pending_slashing_evidence.clone();
+        // seal the validator-set commitment now that the block's contents are
+        // final, so consensus votes on (and the post-consensus commit checks)
+        // the header a light client will follow.
+        self.chain.seal(&mut candidate).map_err(DriverError::Apply)?;
         let height = candidate.height;
 
         // consensus over this height uses the set ACTIVE for it — the on-chain

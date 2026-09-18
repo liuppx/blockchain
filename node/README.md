@@ -1,8 +1,8 @@
-# ZhixingGraph 参考节点（Rust · Milestone 6–20）
+# ZhixingGraph 参考节点（Rust · Milestone 6–21）
 
 对应白皮书 [`docs/WHITEPAPER.md`](../docs/WHITEPAPER.md) §5「PoK 共识」与 §7「技术架构」。
 
-这是把 ΔK 引擎（[`engine/`](../engine/)）与经济仿真（[`sim/`](../sim/)）背后的规则，落成一个**可运行、确定性的 PoK 共识状态机**——真正"跑链"的最小内核：区块、交易、账户、状态转移、铸造/罚没、链上声誉、ed25519 签名交易、追加式持久化、确定性 mempool 出块、Merkle 认证状态与轻客户端证明、BFT 最终性证书与验证人集、驱动活性的 BFT 轮次状态机（超时 / 锁定 / 换轮）、逐高度生长的**BFT 认证链**（mempool → 共识 → 提交，每块附可验证证书）、**证书落盘 + 重放即最终性复验**（`blocks.log` + `certs.log`，重放时逐高度复验 > 2/3 证书，恢复的是*最终性*而非仅状态）、**链上/动态验证人集**（区块携带验证人增删/改权，由变更前的集合认证、下一高度生效，重放随之逐高度跟随演进）、**P2P gossip 与反熵状态同步**（交易 epidemic 泛洪 + 认证块拉取追赶，逐块对链上验证人集复验证书，含真实 loopback TCP 传输）、**质押绑定的验证人权重与解绑期**（账户自绑定 $COG → 成为验证人、权重 == 绑定量；解绑经时间锁提款队列，资金留在池中仍可罚没直至到期返还）、**按证据罚没等价双签**（把冲突预提交的密码学证据搬上链，罚没作恶验证人的绑定质押与解绑中金额入 treasury、下一高度移出验证人集，供应守恒）、**P2P 传播证据与质押变更**（`SlashEvidence`/`StakeOp` 经 gossip 进入每个节点的待打包池，下一区块由出块方带出——作恶可归责、质押可远程触发，不再仅靠出块人已持有），**验证人集变更的轻客户端跟随协议**（只凭创世信任根，逐高度对当前集合复验最终性证书、再复刻该块引起的验证人集迁移——不执行任何交易、不追踪账户余额，即得到与全量重放逐字节一致的活跃验证人集），以及内容寻址的区块哈希链与状态根。
+这是把 ΔK 引擎（[`engine/`](../engine/)）与经济仿真（[`sim/`](../sim/)）背后的规则，落成一个**可运行、确定性的 PoK 共识状态机**——真正"跑链"的最小内核：区块、交易、账户、状态转移、铸造/罚没、链上声誉、ed25519 签名交易、追加式持久化、确定性 mempool 出块、Merkle 认证状态与轻客户端证明、BFT 最终性证书与验证人集、驱动活性的 BFT 轮次状态机（超时 / 锁定 / 换轮）、逐高度生长的**BFT 认证链**（mempool → 共识 → 提交，每块附可验证证书）、**证书落盘 + 重放即最终性复验**（`blocks.log` + `certs.log`，重放时逐高度复验 > 2/3 证书，恢复的是*最终性*而非仅状态）、**链上/动态验证人集**（区块携带验证人增删/改权，由变更前的集合认证、下一高度生效，重放随之逐高度跟随演进）、**P2P gossip 与反熵状态同步**（交易 epidemic 泛洪 + 认证块拉取追赶，逐块对链上验证人集复验证书，含真实 loopback TCP 传输）、**质押绑定的验证人权重与解绑期**（账户自绑定 $COG → 成为验证人、权重 == 绑定量；解绑经时间锁提款队列，资金留在池中仍可罚没直至到期返还）、**按证据罚没等价双签**（把冲突预提交的密码学证据搬上链，罚没作恶验证人的绑定质押与解绑中金额入 treasury、下一高度移出验证人集，供应守恒）、**P2P 传播证据与质押变更**（`SlashEvidence`/`StakeOp` 经 gossip 进入每个节点的待打包池，下一区块由出块方带出——作恶可归责、质押可远程触发，不再仅靠出块人已持有），**验证人集变更的轻客户端跟随协议**（只凭创世信任根，逐高度对当前集合复验最终性证书、再复刻该块引起的验证人集迁移——不执行任何交易、不追踪账户余额，即得到与全量重放逐字节一致的活跃验证人集），**验证人集 Merkle 承诺入区块头**（把"下一高度生效的验证人集"的 Merkle 根 `next_validators_root` 折进区块头、纳入证书所签的 `block_hash`——轻客户端遂能**免复刻迁移**地凭一份证书验证整套下一验证人集`follow_committed`，或用 O(log n) 包含证明对 cert 签名的头**证明单个验证人**`verify_membership`，即 SPV 原语；M20 的 `follow` 也逐高度对该承诺根交叉校验），以及内容寻址的区块哈希链与状态根。
 
 > **共识的前提是确定性**：给定相同的创世与相同的区块序列，每个诚实节点算出**逐字节相同**的状态（`state_root` 一致）。本 crate 就是那个状态转移函数 `apply_block`，其 ΔK 由 `zhixing_engine::compute_delta_k` 计算——与白皮书 B.2.3、Python 仿真是**同一份契约**。
 
@@ -19,12 +19,13 @@ cargo run --release --bin node -- chain            # BFT 认证链：mempool →
 cargo run --release --bin node -- validators       # 链上验证人集：逐高度增删验证人，重放随之跟随
 cargo run --release --bin node -- gossip           # P2P：反熵同步（新节点追赶认证链）+ 交易 epidemic 泛洪 + 真实 TCP
 cargo run --release --bin node -- light            # 轻客户端：只凭创世+(块,证书)对，逐高度跟随验证人集，不执行交易
+cargo run --release --bin node -- vprove           # 验证人 Merkle 证明：对 cert 签名的区块头证明单个验证人在下一集合中；伪造叶被拒
 cargo run --release --bin node -- staking          # 质押：绑定 $COG 获得验证人权重；解绑经时间锁提款到期返还
 cargo run --release --bin node -- slashing         # 罚没：验证人双签 → 提交证据 → 绑定质押罚没入 treasury、移出验证人集
 cargo run --release --bin node -- certs  --dir DIR # 证书落盘：产出认证链→落盘 blocks/certs→重放复验最终性
 cargo run --release --bin node -- run  --dir DIR   # 持久化链：首次落盘演示块，之后重放
 cargo run --release --bin node -- status --dir DIR # 重放区块日志并打印状态
-cargo test --release                               # 125 项单元测试（见下）
+cargo test --release                               # 136 项单元测试（见下）
 ```
 
 演示链展示：新颖提交铸造 $COG、跨域桥接拿到 novelty+bonus（ΔK>1）、近重复/低质提交被**罚没入 treasury**、供应守恒、评审声誉按链上结果升降。
@@ -218,6 +219,24 @@ cargo run --release --bin node -- gossip     # 注入一条双签证据 → 4 �
 cargo run --release --bin node -- light   # 造一条三种方式改验证人集的认证链，轻客户端 0 执行交易跟到同一集合
 ```
 
+## Merkle 化验证人集承诺入区块头（Milestone 21）
+
+到 M20 为止，轻客户端 `ValidatorTracker` 虽不执行交易，却仍要**逐高度复刻验证人集迁移**：镜像 `bonds` 映射、账户公钥表，重放 `validator_updates` 与由 `stake_ops`/`slashing_evidence` 派生的权重变化——一份 `apply_block` 的字节级复制。那是比钱包所需更多的机械与信任面。M21 把一份**对"下一高度生效的验证人集"的 Merkle 承诺折进区块头**（`Block.next_validators_root`）。因为该字段落在 `block_hash` 之内、而证书签的正是 `block_hash`，轻客户端遂能：
+
+- **免复刻迁移地验证整套下一验证人集**（`follow_committed`：验完证书后，只需比对给定集合的 `merkle_root == block.next_validators_root`），以及
+- **证明单个验证人** `(id, pubkey, power)` 属于认证高度 `H+1` 的集合——凭一条锚定到 cert 签名头的 O(log n) 包含证明（`verify_membership`，即 SPV 原语）。
+
+同时收紧 M20：`follow` 现在**每高度把自己迁移导出的集合对承诺根交叉校验**，令推导被共识确认、而非仅被信任。
+
+- **承诺的是 post-apply 的"下一"集合**（认证 `H+1` 的那套），与既有规则一致——高度 `H` 由 `H` 应用**之前**在任的集合认证，变更下一高度生效。无循环依赖：验证人集迁移从不读 `next_validators_root`，故导出的集合与该字段取值无关。出块方在共识前 `seal`（`Chain::seal` 在 trial 克隆上跑一遍不带强制的迁移、取根写回），`apply_block` 提交时强制 `block.next_validators_root == self.validators.merkle_root()`，否则 `ChainError::ValidatorRootMismatch`。
+- **一份叶契约**：`Validator::merkle_leaf` 的字节（`u64 id ‖ raw pubkey ‖ u64 power`）与 `state_root` 里每个验证人的三元组**逐字节相同**，故两处承诺同步变化，验证方只需它被告知的那个验证人。`ValidatorSet::merkle_root`/`proof` 复用 M10 的域分隔二叉树（叶 `0x00`、节点 `0x01`、奇数提升），空集合承诺到全零根。
+- **一份编码**：`codec::encode_block` 在 `timestamp_days` 之后、交易之前写这 32 字节根，纳入区块哈希。这是一次性的固定布局变更（无版本化先例），旧 `blocks.log` 不再解码——对原型可接受。
+
+```bash
+cargo run --release --bin node -- light    # M20 迁移式 follow + M21 免迁移 follow_committed 达到同一集合
+cargo run --release --bin node -- vprove   # 对 cert 签名头证明验证人 #25 在下一集合中 → true；伪造 (power+1) 叶 → false
+```
+
 ## 设计要点
 
 | 主题 | 做法 |
@@ -240,6 +259,7 @@ cargo run --release --bin node -- light   # 造一条三种方式改验证人集
 | **等价双签罚没** | `SlashEvidence` = 同验证人同 (h,r) 对两个不同 block_hash 的预提交（各带有效签名）；`apply_evidence` 校验后把绑定池 + 解绑中金额罚没入 treasury（供应守恒），下一高度经 `power==0` 派生更新移出验证人集；块级 `slashing_evidence` 纳入区块哈希但只折**效果**入 `state_root`；坏证据整块回滚（M18） |
 | **块级 ops 走 gossip** | `GossipMsg` 加 `Evidence(SlashEvidence)` / `StakeOp(StakeOp)`，内容哈希去重（`seen_evidence` / `seen_stake_op`）+ 待打包池 `pending_evidence` / `pending_stake_ops`；出块方 `take_pending_*` 灌进 `ChainDriver.pending_*`，下一区块自动带出。密码学校验仍只在 `apply_evidence` / `apply_stake_op`；形状即足够（M19） |
 | **轻客户端跟随验证人集** | `ValidatorTracker::from_genesis` 只信创世；`follow` 每高度用当前集合复验证书、再复刻 `apply_block` 的集合迁移（`validator_updates` + 由 `stake_ops`/`slashing_evidence` 派生的权重），镜像 `bonds` 映射 + 从 `Genesis.accounts` 播种的不可变公钥表；因输入全在 `block_hash`（证书所签）内，结果与 `replay_verified` 逐字节一致却 0 执行交易；复用 `GossipMsg::Blocks` 传输（M20） |
+| **验证人集 Merkle 承诺入头** | `Block.next_validators_root` = 对 post-apply 下一集合的 Merkle 根（`Validator::merkle_leaf` 与 `state_root` 三元组同字节），落在证书所签的 `block_hash` 内；出块方 `Chain::seal`（trial 克隆导出根）、`apply_block` 提交强制根匹配否则 `ValidatorRootMismatch`；轻客户端 `follow_committed` 免复刻迁移地比对整套集合根，`verify_membership` 用 O(log n) 包含证明对 cert 签名头证明单个验证人（SPV 原语），`follow` 亦逐高度交叉校验；迁移从不读该字段故无循环（M21） |
 | **依赖策略** | 引擎零依赖（可嵌入/WASM）；节点作为应用引入审计过的 `ed25519-dalek` 做签名，绝不自实现密码学 |
 
 ## 测试覆盖
@@ -377,26 +397,38 @@ rejects_a_forged_certificate                   证书法定人数不足 → Cons
 rejects_a_spliced_block                        高度跳变 / prev_hash 不接 → BadHeight / ForkDetected
 rejects_a_cert_for_the_wrong_block             证书与区块不匹配 → CertificateMismatch
 matches_replay_verified_final_set              三种迁移 + 交易混合链：跟随集合 == 全量 replay_verified 集合（逐字节）
+# 验证人集 Merkle 承诺入头（validator.rs + lib.rs + light.rs）
+merkle_root_is_order_independent_and_content_addressed  集合根与构造顺序无关、改任一字段则根变、空集合 → 全零根
+membership_proofs_verify_for_every_member      每个成员的包含证明都对 merkle_root 验证通过
+forged_validator_leaf_fails_membership         改权后的伪造叶 → 包含证明验证失败
+genesis_commits_to_the_genesis_validator_set   创世头承诺到创世验证人集的根
+tampered_next_validators_root_is_rejected      篡改区块头承诺根 → ValidatorRootMismatch
+seal_commits_to_the_post_apply_set_across_a_stake_change  seal 承诺到 post-apply（下一高度生效）集合，跨质押变更成立
+stale_root_after_appending_ops_is_rejected     seal 后再追加 ops 令根陈旧 → 提交被拒
+follow_committed_matches_transition_follow      免迁移 follow_committed 与 M20 迁移式 follow 达到同一集合
+follow_committed_rejects_a_wrong_next_set        给错下一集合 → 与承诺根不符被拒
+follow_cross_checks_against_the_committed_root    迁移导出集合逐高度对承诺根交叉校验
+verify_membership_proves_and_rejects_forgery     对 cert 签名头证明成员 → true；伪造叶 → false
 ```
 
 ## 文件
 
 | 文件 | 作用 |
 |---|---|
-| `src/lib.rs` | 状态机核心：`Block`/`SubmissionTx`/`StakeOp`/`SlashEvidence`（含 `hash()` 内容寻址用于 gossip 去重）/`Account`/`ChainState`/`Chain`、`apply_block`（含验证人集跨高度切换、stake_ops 应用、解绑到期返还与按证据罚没）、`apply_stake_op`、`apply_evidence`、`replay`/`replay_verified`、验签、`state_root`（含验证人集 + 绑定/解绑状态）/`merkle_root`/`account_proof`、供应守恒不变量（含 bonded + 解绑中）+ 测试 |
+| `src/lib.rs` | 状态机核心：`Block`（含 `next_validators_root` 验证人集 Merkle 承诺）/`SubmissionTx`/`StakeOp`/`SlashEvidence`（含 `hash()` 内容寻址用于 gossip 去重）/`Account`/`ChainState`/`Chain`、`apply_block`（含验证人集跨高度切换、stake_ops 应用、解绑到期返还、按证据罚没、承诺根强制）、`Chain::seal`/`next_validators_root`、`apply_stake_op`、`apply_evidence`、`replay`/`replay_verified`、验签、`state_root`（含验证人集 + 绑定/解绑状态）/`merkle_root`/`account_proof`、供应守恒不变量（含 bonded + 解绑中）+ 测试 |
 | `src/mempool.rs` | 确定性 mempool 与出块：内容寻址排序 + 试算式 `build_block` + 测试 |
 | `src/merkle.rs` | 二叉 Merkle 树：域分隔叶/节点、奇数提升、包含证明 `Proof`/`verify` + 测试 |
-| `src/validator.rs` | 验证人集与确定性提议人（Tendermint 优先级累加器）、链上变更 `ValidatorUpdate`/`apply_updates` + 测试 |
+| `src/validator.rs` | 验证人集与确定性提议人（Tendermint 优先级累加器）、链上变更 `ValidatorUpdate`/`apply_updates`、集合 Merkle 承诺 `merkle_leaf`/`merkle_root`/`proof`（M21）+ 测试 |
 | `src/consensus.rs` | BFT 投票/最终性证书：`Vote`/`Commit`/`verify`、`commit_block`、`detect_equivocation` + 测试 |
 | `src/round.rs` | BFT 轮次状态机（Tendermint `upon` 规则、超时/锁定/换轮）+ 进程内网络模拟器 `Sim` + 测试 |
 | `src/driver.rs` | BFT 认证链驱动 `ChainDriver`：逐高度 mempool→共识→提交 + 证书保留 + 故障注入 + 链上验证人变更（`stage_validator_update`）+ 质押变更（`stage_stake_op`）+ 罚没证据（`stage_slashing_evidence`）+ 测试 |
 | `src/net.rs` | P2P gossip 与反熵同步：`GossipMsg`/`GossipNode`（纯状态机，认证块 `apply_certified` 复验证书、交易 epidemic 泛洪去重 + **`Evidence` / `StakeOp` 块级 ops 的待打包池与去重 flood**）+ 确定性 `Network` 收敛总线 + `encode_gossip`/`read_msg`/`write_msg`（真实 socket 分帧）+ 测试 |
-| `src/light.rs` | 轻客户端验证人集跟随：`ValidatorTracker`（`from_genesis` / `follow` / `follow_all`，逐高度复验证书 + 复刻 `apply_block` 的集合迁移，镜像 `bonds` + 创世公钥表，不执行交易）+ `LightError` + 测试 |
+| `src/light.rs` | 轻客户端验证人集跟随：`ValidatorTracker`（`from_genesis` / `follow` / `follow_all`，逐高度复验证书 + 复刻 `apply_block` 的集合迁移，镜像 `bonds` + 创世公钥表，不执行交易；M21 `follow` 对 `next_validators_root` 交叉校验、免迁移 `follow_committed`、SPV `verify_membership`）+ `LightError` + 测试 |
 | `src/crypto.rs` | ed25519 身份：`Keypair`/`verify`（封装 `ed25519-dalek`）+ 测试 |
 | `src/codec.rs` | 区块的规范二进制编解码（哈希与落盘共用，含 `validator_updates`、`stake_ops` 与 `slashing_evidence`）+ `tx_signing_bytes`/`encode_tx`/`decode_tx`（签名/tx 哈希/gossip wire 字节）+ `stakeop_signing_bytes`/`encode_stakeop`/`decode_stakeop`（bond/unbond 签名与哈希）+ `encode_evidence`/`decode_evidence`（双签证据）+ `encode_commit`/`decode_commit`（证书落盘）+ 测试 |
 | `src/store.rs` | 追加式日志（长度前缀记录、残缺尾检测）：`BlockLog`（区块）+ `CertLog`（证书）+ 测试 |
 | `src/hash.rs` | 纯 std SHA-256（FIPS 180-4，含已知向量测试）——离线零依赖 |
-| `src/main.rs` | 节点 CLI：`demo` / `build` / `prove` / `bft` / `live` / `chain` / `validators` / `gossip`（含 M19 证据 flood 演示） / `light`（M20 轻客户端跟随演示） / `staking` / `slashing` / `certs` / `run` / `status`（含确定性演示密钥） |
+| `src/main.rs` | 节点 CLI：`demo` / `build` / `prove` / `bft` / `live` / `chain` / `validators` / `gossip`（含 M19 证据 flood 演示） / `light`（M20 跟随 + M21 免迁移 `follow_committed` 演示） / `vprove`（M21 验证人 Merkle 成员证明） / `staking` / `slashing` / `certs` / `run` / `status`（含确定性演示密钥） |
 
 ## 局限与后续（离生产还差什么）
 
@@ -413,10 +445,11 @@ matches_replay_verified_final_set              三种迁移 + 交易混合链：
 - **~~质押绑定权重 + 解绑期~~**：✅ 已完成（M17，账户自绑定 $COG → 权重 == 绑定量、解绑经时间锁提款队列、供应守恒含 bonded/解绑中）。后续：验证人集变更的轻客户端跟随协议、佣金/委托质押（delegation）、绑定/解绑走 mempool 与 gossip。
 - **~~按证据罚没等价双签~~**：✅ 已完成（M18，链上 `slashing_evidence` 双签证据 → 罚没绑定质押 + 解绑中金额入 treasury、下一高度移出验证人集、供应守恒）。后续：更多可归责错误（放大/审查）、部分罚没与 jailing/tombstone。
 - **~~P2P 传播块级 ops（证据 + 质押变更）~~**：✅ 已完成（M19，`GossipMsg::Evidence` / `GossipMsg::StakeOp` 内容哈希去重 + 节点待打包池 + 出块方 `take_pending_*` 灌进 driver → 下一区块自动带出——作恶可远程归责，不再依赖出块人已持有）。后续：Kademlia/节点发现、连接管理与背压、投票 gossip 上真实网络、Sybil/Eclipse 抗性。
-- **~~验证人集变更的轻客户端跟随协议~~**：✅ 已完成（M20，`ValidatorTracker` 只凭创世逐高度复验证书 + 复刻集合迁移，镜像 `bonds` + 创世公钥表，不执行交易即得到与 `replay_verified` 逐字节一致的活跃集合；复用 `GossipMsg::Blocks` 传输）。后续：只拉头部（`(header, cert)`，去掉交易体）的更轻同步、把验证人集 Merkle 化折进区块头以对 `block_hash` 直接证明（免去复刻迁移）、面向钱包的 SPV 账户证明跟随。
+- **~~验证人集变更的轻客户端跟随协议~~**：✅ 已完成（M20，`ValidatorTracker` 只凭创世逐高度复验证书 + 复刻集合迁移，镜像 `bonds` + 创世公钥表，不执行交易即得到与 `replay_verified` 逐字节一致的活跃集合；复用 `GossipMsg::Blocks` 传输）。
+- **~~验证人集 Merkle 承诺入区块头~~**：✅ 已完成（M21，`Block.next_validators_root` 折进 `block_hash`；出块方 `seal`、`apply_block` 强制根匹配；轻客户端 `follow_committed` 免复刻迁移验证整套下一集合、`verify_membership` 用 O(log n) 包含证明对 cert 签名头证明单个验证人（SPV 原语），`follow` 亦逐高度交叉校验）。后续：只拉头部（`(header, cert)`，去掉交易体）的轻同步传输、面向钱包的 SPV 账户证明跟随、把 graph/头字段也纳入 Merkle 根。
 - **~~持久化~~**：✅ 已完成（M7，追加式区块日志 + 重放；M14 加证书日志）。后续可换 RocksDB、加 per-record 校验和与 segment 轮转。
 - **~~Merkle 化状态树~~**：✅ 已完成（M10，二叉 Merkle 树 + 账户包含证明）。后续：非成员证明、增量更新的 Merkle-Patricia trie、把 graph/头字段也纳入根。
 - **手写 SHA-256** 仅为离线零依赖演示，**生产必须换审计实现**（`sha2`）。
 - **kNN 暴力扫描**：随图谱增长需换 HNSW/IVF（见 engine 局限）。
 
-这些构成后续里程碑（~~M7 持久化~~ ✅、~~M8 签名~~ ✅、~~M9 mempool 出块~~ ✅、~~M10 Merkle 认证状态~~ ✅、~~M11 BFT 最终性内核~~ ✅、~~M12 BFT 轮次状态机/活性~~ ✅、~~M13 认证链驱动~~ ✅、~~M14 证书落盘 + 重放复验~~ ✅、~~M15 P2P + gossip~~ ✅、~~M16 动态验证人集~~ ✅、~~M17 质押绑定权重 + 解绑期~~ ✅、~~M18 按证据罚没绑定质押~~ ✅、~~M19 P2P 传播块级 ops~~ ✅、~~M20 验证人集变更的轻客户端跟随协议~~ ✅、M21 只拉头部的轻同步 / 验证人集 Merkle 承诺……），每步仍遵循"可运行、可测试、契约一致"。
+这些构成后续里程碑（~~M7 持久化~~ ✅、~~M8 签名~~ ✅、~~M9 mempool 出块~~ ✅、~~M10 Merkle 认证状态~~ ✅、~~M11 BFT 最终性内核~~ ✅、~~M12 BFT 轮次状态机/活性~~ ✅、~~M13 认证链驱动~~ ✅、~~M14 证书落盘 + 重放复验~~ ✅、~~M15 P2P + gossip~~ ✅、~~M16 动态验证人集~~ ✅、~~M17 质押绑定权重 + 解绑期~~ ✅、~~M18 按证据罚没绑定质押~~ ✅、~~M19 P2P 传播块级 ops~~ ✅、~~M20 验证人集变更的轻客户端跟随协议~~ ✅、~~M21 验证人集 Merkle 承诺入区块头~~ ✅、M22 只拉头部的 SPV 轻同步传输……），每步仍遵循"可运行、可测试、契约一致"。

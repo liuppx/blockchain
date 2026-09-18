@@ -40,6 +40,7 @@ pub fn encode_block(b: &Block) -> Vec<u8> {
     e.u64(b.height);
     e.raw(&b.prev_hash);
     e.f32(b.timestamp_days);
+    e.raw(&b.next_validators_root);
     e.u64(b.txs.len() as u64);
     for t in &b.txs {
         enc_tx(&mut e, t, true);
@@ -278,6 +279,8 @@ pub fn decode_block(buf: &[u8]) -> Result<Block, CodecError> {
     let mut prev_hash = [0u8; 32];
     prev_hash.copy_from_slice(d.take(32)?);
     let timestamp_days = d.f32()?;
+    let mut next_validators_root = [0u8; 32];
+    next_validators_root.copy_from_slice(d.take(32)?);
     let n_txs = d.count()?;
     let mut txs = Vec::with_capacity(n_txs as usize);
     for _ in 0..n_txs {
@@ -309,6 +312,7 @@ pub fn decode_block(buf: &[u8]) -> Result<Block, CodecError> {
         height,
         prev_hash,
         timestamp_days,
+        next_validators_root,
         txs,
         validator_updates,
         stake_ops,
@@ -441,6 +445,7 @@ mod tests {
             height: 7,
             prev_hash: [42u8; 32],
             timestamp_days: 3.5,
+            next_validators_root: [17u8; 32],
             txs: vec![SubmissionTx {
                 author: 1,
                 embedding: emb,

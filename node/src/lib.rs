@@ -200,6 +200,14 @@ pub struct Block {
     pub prev_hash: Hash,
     /// Wall-clock of the block in days; becomes `now_days` for ΔK freshness.
     pub timestamp_days: f32,
+    /// Merkle commitment to the validator set that certifies the *next* height —
+    /// i.e. the post-apply set this block hands off to. Because the field is part
+    /// of the block hash (which the finality certificate signs), a light client
+    /// can verify the whole next set, or prove a single validator's membership,
+    /// against a cert-signed header without replaying the validator-set
+    /// transition. Set by the producer via [`Chain::seal`] and re-checked on
+    /// apply against the derived set ([`ChainError::ValidatorRootMismatch`]).
+    pub next_validators_root: Hash,
     pub txs: Vec<SubmissionTx>,
     /// On-chain validator-set changes carried by this block. Applied after the
     /// transactions and taking effect from the *next* height (this block is
@@ -339,6 +347,10 @@ pub enum ChainError {
     /// invalid signature. The block is rejected; the offending validator id is
     /// returned for diagnostics.
     BadEquivocationEvidence(u64),
+    /// The block's `next_validators_root` does not commit to the validator set
+    /// this block hands off to (the set that certifies the next height). Either a
+    /// producer sealed the wrong root or the block was tampered with.
+    ValidatorRootMismatch { height: u64 },
 }
 
 impl std::fmt::Display for ChainError {
@@ -370,6 +382,10 @@ impl std::fmt::Display for ChainError {
             ChainError::BadEquivocationEvidence(v) => write!(
                 f,
                 "equivocation evidence against validator {v} is malformed, stale, or not signable by that validator"
+            ),
+            ChainError::ValidatorRootMismatch { height } => write!(
+                f,
+                "block {height} next_validators_root does not match the derived validator set"
             ),
         }
     }
@@ -488,11 +504,15 @@ impl ChainState {
             now_days: g.timestamp_days,
             validators,
         };
-        // genesis "block" hash: height 0, zero prev, no txs, no validator updates
+        // genesis "block" hash: height 0, zero prev, no txs, no validator updates.
+        // Its commitment is the genesis validator set (the set that certifies
+        // height 1), so a light client anchored on this hash starts already
+        // committed to the initial set.
         let gh = Block {
             height: 0,
             prev_hash: [0u8; 32],
             timestamp_days: g.timestamp_days,
+            next_validators_root: state.validators.merkle_root(),
             txs: Vec::new(),
             validator_updates: Vec::new(),
             stake_ops: Vec::new(),
@@ -505,6 +525,21 @@ impl ChainState {
     /// Apply a block, mutating self. On `Err` self may be partially mutated —
     /// callers wanting atomicity should apply to a clone (see [`Chain::commit`]).
     pub fn apply_block(&mut self, block: &Block) -> Result<BlockReceipt, ChainError> {
+        self.apply_block_inner(block, true)
+    }
+
+    /// Shared block-application core. When `enforce_commitment` is set, the
+    /// block's `next_validators_root` must equal the Merkle root of the set this
+    /// block hands off to (the last check, after the transition is finalized) —
+    /// how a committed block is validated. The producer computes the root on a
+    /// trial run with the check *off* (see [`Chain::next_validators_root`]);
+    /// since the transition never reads `next_validators_root`, the derived set
+    /// is independent of the field, so there is no circularity.
+    fn apply_block_inner(
+        &mut self,
+        block: &Block,
+        enforce_commitment: bool,
+    ) -> Result<BlockReceipt, ChainError> {
         if block.height != self.height + 1 {
             return Err(ChainError::BadHeight {
                 expected: self.height + 1,
@@ -600,6 +635,14 @@ impl ChainState {
                 return Err(ChainError::EmptyValidatorSet);
             }
             self.validators = next;
+        }
+
+        // The block's header commits to the set that certifies the next height.
+        // Verify it matches the set we just derived (covers the no-updates case,
+        // where the set is unchanged). This is the last check, so a block that is
+        // invalid for any earlier reason fails there first regardless of its root.
+        if enforce_commitment && block.next_validators_root != self.validators.merkle_root() {
+            return Err(ChainError::ValidatorRootMismatch { height: new_height });
         }
 
         self.height = new_height;
@@ -973,6 +1016,7 @@ impl ChainState {
 
 // --- Chain: hash-linked sequence of blocks over the state --------------------
 
+#[derive(Clone)]
 pub struct Chain {
     pub state: ChainState,
     pub head: Hash,
@@ -989,6 +1033,25 @@ impl Chain {
             genesis_hash: gh,
             block_hashes: vec![gh],
         }
+    }
+
+    /// The validator-set Merkle root this block would hand off to (the set that
+    /// certifies the next height), computed by trial-applying the block on a
+    /// clone with the commitment check disabled. The producer uses this to
+    /// [`Self::seal`] a candidate before consensus; the derived set is
+    /// independent of `block.next_validators_root`, so sealing has no circularity.
+    pub fn next_validators_root(&self, block: &Block) -> Result<Hash, ChainError> {
+        let mut trial = self.state.clone();
+        trial.apply_block_inner(block, false)?;
+        Ok(trial.validators.merkle_root())
+    }
+
+    /// Set `block.next_validators_root` to the root the block hands off to, so the
+    /// sealed block passes the commitment check when committed. Call after the
+    /// block's txs/ops are final and before hashing it for consensus.
+    pub fn seal(&self, block: &mut Block) -> Result<(), ChainError> {
+        block.next_validators_root = self.next_validators_root(block)?;
+        Ok(())
     }
 
     /// Validate and commit a block atomically: the block must extend `head`, and
@@ -1123,15 +1186,21 @@ mod tests {
     }
 
     fn block(chain: &Chain, height: u64, txs: Vec<SubmissionTx>) -> Block {
-        Block {
+        let mut b = Block {
             height,
             prev_hash: chain.head,
             timestamp_days: height as f32,
+            next_validators_root: [0u8; 32],
             txs,
             validator_updates: Vec::new(),
             stake_ops: Vec::new(),
             slashing_evidence: Vec::new(),
-        }
+        };
+        // best-effort seal: valid blocks get the correct commitment; blocks the
+        // negative tests build to fail earlier keep [0;32] and still fail at
+        // their intended (earlier) check, since the commitment is checked last.
+        let _ = chain.seal(&mut b);
+        b
     }
 
     #[test]
@@ -1338,6 +1407,7 @@ mod tests {
         // a block that admits validator #24 (alongside a normal submission)
         let mut b = block(&chain, 1, vec![novel_tx(1, 1, 1, 1.0)]);
         b.validator_updates = vec![vupd(24, 1)];
+        chain.seal(&mut b).unwrap();
         chain.commit(&b).unwrap();
         let ids: Vec<u64> = chain
             .state
@@ -1359,6 +1429,7 @@ mod tests {
         let b_plain = block(&plain, 1, vec![novel_tx(1, 1, 1, 1.0)]);
         let mut b_changed = block(&changed, 1, vec![novel_tx(1, 1, 1, 1.0)]);
         b_changed.validator_updates = vec![vupd(24, 1)];
+        changed.seal(&mut b_changed).unwrap();
         plain.commit(&b_plain).unwrap();
         changed.commit(&b_changed).unwrap();
         assert_ne!(
@@ -1389,6 +1460,9 @@ mod tests {
         let op = StakeOp { account, kind, amount, signature: [0u8; 64] }.signed(&kp(account));
         let mut b = block(chain, height, vec![]);
         b.stake_ops = vec![op];
+        // re-seal: block() sealed for an empty block; the appended op changes the
+        // handed-off set, so recompute the commitment over the final contents.
+        let _ = chain.seal(&mut b);
         b
     }
 
@@ -1479,6 +1553,7 @@ mod tests {
         plain.commit(&block(&plain, 1, vec![novel_tx(1, 1, 1, 1.0)])).unwrap();
         let mut b = block(&bonded, 1, vec![novel_tx(1, 1, 1, 1.0)]);
         b.stake_ops = vec![StakeOp { account: 2, kind: BondKind::Bond, amount: 3 * MICRO, signature: [0u8; 64] }.signed(&kp(2))];
+        bonded.seal(&mut b).unwrap();
         bonded.commit(&b).unwrap();
         assert_ne!(plain.state.state_root(), bonded.state.state_root());
     }
@@ -1512,6 +1587,9 @@ mod tests {
     fn evidence_block(chain: &Chain, height: u64, ev: Vec<SlashEvidence>) -> Block {
         let mut b = block(chain, height, vec![]);
         b.slashing_evidence = ev;
+        // re-seal after appending evidence (see stake_block); best-effort so
+        // bad-evidence blocks keep [0;32] and still fail at the evidence check.
+        let _ = chain.seal(&mut b);
         b
     }
 
@@ -1638,15 +1716,17 @@ mod tests {
         let b1 = block(&live, 1, vec![novel_tx(1, 1, 1, 1.0)]);
         live.commit(&b1).unwrap();
         log.append(&b1).unwrap();
-        let b2 = Block {
+        let mut b2 = Block {
             height: 2,
             prev_hash: live.head,
             timestamp_days: 2.0,
+            next_validators_root: [0u8; 32],
             txs: vec![novel_tx(2, 2, 2, 2.0)],
             validator_updates: Vec::new(),
             stake_ops: Vec::new(),
             slashing_evidence: Vec::new(),
         };
+        live.seal(&mut b2).unwrap();
         live.commit(&b2).unwrap();
         log.append(&b2).unwrap();
 
@@ -1658,5 +1738,60 @@ mod tests {
         assert_eq!(replayed.state.state_root(), live.state.state_root());
         assert!(replayed.state.supply_conserved());
         std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn genesis_commits_to_the_genesis_validator_set() {
+        let chain = Chain::new(base_genesis());
+        // a freshly-sealed empty block at height 1 (no updates) hands off exactly
+        // the set genesis committed to.
+        let b = block(&chain, 1, vec![]);
+        assert_eq!(b.next_validators_root, chain.state.validators.merkle_root());
+    }
+
+    #[test]
+    fn tampered_next_validators_root_is_rejected() {
+        let mut chain = Chain::new(base_genesis());
+        let mut b = block(&chain, 1, vec![novel_tx(1, 1, 1, 1.0)]);
+        // block() sealed the correct root; corrupt it — commit must reject.
+        b.next_validators_root = [0xEE; 32];
+        let err = chain.commit(&b).unwrap_err();
+        assert!(
+            matches!(err, ChainError::ValidatorRootMismatch { height: 1 }),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn seal_commits_to_the_post_apply_set_across_a_stake_change() {
+        let mut chain = Chain::new(base_genesis());
+        // account 1 bonds -> becomes a validator next height. The sealed root must
+        // equal the set the block actually hands off to.
+        let b = stake_block(&chain, 1, 1, BondKind::Bond, 5 * MICRO);
+        assert_eq!(b.next_validators_root, chain.next_validators_root(&b).unwrap());
+        chain.commit(&b).unwrap();
+        assert_eq!(chain.state.validators.merkle_root(), b.next_validators_root);
+        // and validator 1 is provable against that committed root.
+        let v = chain.state.validators.get(1).unwrap();
+        let proof = chain.state.validators.proof(1).unwrap();
+        let leaf = merkle::leaf_hash(&v.merkle_leaf());
+        assert!(merkle::verify(&b.next_validators_root, &leaf, &proof));
+    }
+
+    #[test]
+    fn stale_root_after_appending_ops_is_rejected() {
+        // a block sealed for empty contents, then given ops, no longer matches its
+        // committed root — the enforcement catches the staleness.
+        let mut chain = Chain::new(base_genesis());
+        let mut b = block(&chain, 1, vec![]); // sealed for no-change
+        let root_for_empty = b.next_validators_root;
+        b.stake_ops = vec![
+            StakeOp { account: 1, kind: BondKind::Bond, amount: 5 * MICRO, signature: [0u8; 64] }
+                .signed(&kp(1)),
+        ];
+        // the op admits validator 1, so the real handed-off root differs.
+        assert_ne!(chain.next_validators_root(&b).unwrap(), root_for_empty);
+        let err = chain.commit(&b).unwrap_err();
+        assert!(matches!(err, ChainError::ValidatorRootMismatch { .. }), "got {err:?}");
     }
 }

@@ -128,12 +128,17 @@ fn demo_validators() -> (ValidatorSet, BTreeMap<u64, [u8; 32]>) {
     (vset, seeds)
 }
 
-/// The demo block sequence (built against the chain's current head).
+/// The demo block sequence (built against the chain's current head). Each block
+/// is sealed with its validator-set commitment against an advancing trial clone,
+/// so the sealed b1 hash is the one b2 chains to and both pass the commitment
+/// check on commit.
 fn demo_blocks(chain: &Chain) -> Vec<Block> {
-    let b1 = Block {
+    let mut trial = chain.clone();
+    let mut b1 = Block {
         height: 1,
-        prev_hash: chain.head,
+        prev_hash: trial.head,
         timestamp_days: 1.0,
+        next_validators_root: [0u8; 32],
         txs: vec![
             tx(1, unit(1), 1, reviews(&[(10, 0.9), (11, 0.85), (12, 0.9)]), (3, 3), 1.0),
             tx(2, unit(2), 2, reviews(&[(10, 0.88), (11, 0.9), (12, 0.86)]), (3, 3), 1.0),
@@ -142,11 +147,14 @@ fn demo_blocks(chain: &Chain) -> Vec<Block> {
         stake_ops: Vec::new(),
         slashing_evidence: Vec::new(),
     };
-    // block 2 prev_hash is block 1's hash
-    let b2 = Block {
+    trial.seal(&mut b1).expect("seal b1");
+    trial.commit(&b1).expect("commit b1 on trial");
+    // block 2 prev_hash is (sealed) block 1's hash
+    let mut b2 = Block {
         height: 2,
         prev_hash: b1.hash(),
         timestamp_days: 2.0,
+        next_validators_root: [0u8; 32],
         txs: vec![
             tx(3, blend(1, 2), 3, reviews(&[(10, 0.9), (11, 0.9), (12, 0.85)]), (3, 3), 2.0),
             tx(1, unit(0), 0, reviews(&[(10, 0.7), (11, 0.6), (12, 0.65)]), (0, 3), 2.0),
@@ -155,6 +163,7 @@ fn demo_blocks(chain: &Chain) -> Vec<Block> {
         stake_ops: Vec::new(),
         slashing_evidence: Vec::new(),
     };
+    trial.seal(&mut b2).expect("seal b2");
     vec![b1, b2]
 }
 
@@ -165,6 +174,7 @@ fn main() {
         "demo" => cmd_demo(),
         "build" => cmd_build(),
         "prove" => cmd_prove(),
+        "vprove" => cmd_vprove(),
         "bft" => cmd_bft(),
         "live" => cmd_live(),
         "chain" => cmd_chain(),
@@ -202,6 +212,7 @@ fn usage() {
     eprintln!("  node demo               run an in-memory demo chain");
     eprintln!("  node build              feed a mempool (scrambled order) and build one block");
     eprintln!("  node prove              build+verify a light-client Merkle proof of an account");
+    eprintln!("  node vprove             prove a validator's membership in a cert-signed block's next set");
     eprintln!("  node bft                4 validators certify a block; show fault tolerance + equivocation");
     eprintln!("  node live               drive the BFT round FSM to a commit (incl. a dead proposer)");
     eprintln!("  node chain              grow a BFT-certified chain height by height (mempool -> consensus -> commit)");
@@ -244,7 +255,8 @@ fn cmd_build() {
         println!("  author #{}  tx={}", t.author, short(&h));
     }
 
-    let blk = mp.build_block(&chain, 1.0).expect("pool builds a block");
+    let mut blk = mp.build_block(&chain, 1.0).expect("pool builds a block");
+    chain.seal(&mut blk).expect("seal the built block");
     println!("\nbuilder laid out block {} (canonical, hash-ordered):", blk.height);
     for t in &blk.txs {
         println!("  author #{}  tx={}", t.author, short(&t.hash()));
@@ -285,7 +297,58 @@ fn cmd_prove() {
     println!("verify an inflated balance -> {lie} (must be false)");
 }
 
-/// Demonstrate BFT finality: 4 equal-power validators certify a block. Shows
+/// Demonstrate an M21 validator-membership proof: build a certified block that
+/// reshapes the validator set, then prove a single validator is in the *next*
+/// set — committed by that block's `next_validators_root`, which the certificate
+/// signs — via an O(log n) Merkle inclusion proof, no replay. A forged leaf is
+/// rejected.
+fn cmd_vprove() {
+    let seeds: BTreeMap<u64, [u8; 32]> = [1u64, 2, 3, 21, 22, 23, 24, 25]
+        .iter()
+        .map(|&id| {
+            let mut s = [0u8; 32];
+            s[..8].copy_from_slice(&id.to_le_bytes());
+            (id, s)
+        })
+        .collect();
+    let mut d = ChainDriver::new(demo_genesis(), seeds, 4);
+
+    // height 1: admit a brand-new validator (id 25) so the next set differs from
+    // the genesis set — the thing we will prove membership in.
+    d.stage_validator_update(ValidatorUpdate { id: 25, pubkey: kp(25).public(), power: 2 * MICRO });
+    d.produce(1.0, &BTreeSet::new()).unwrap_or_else(|e| fail_msg("produce h1", &e));
+
+    let block = &d.blocks()[0];
+    let cert = &d.certificates()[0];
+    // the set that certifies height 2 — what block 1 commits to in its header.
+    let next_set = d.chain.state.validators.clone();
+    // the set active for height 1 (anchors the certificate): the genesis set.
+    let tracked = ValidatorTracker::from_genesis(&demo_genesis()).validators().clone();
+
+    println!("certified block {} commits next_validators_root = {}", block.height, short(&block.next_validators_root));
+    println!("(the certificate signs the block hash, which includes that root)\n");
+
+    let id = 25u64;
+    let v = next_set.get(id).expect("validator 25 is in the next set").clone();
+    let proof = next_set.proof(id).expect("membership proof exists");
+    println!("light client is told: validator #{id} power={} $COG", cog(v.power));
+    println!("proof: {} sibling hash(es) up to next_validators_root", proof.steps.len());
+    match ValidatorTracker::verify_membership(block, cert, &tracked, &v, &proof) {
+        Ok(()) => println!("verify membership against the cert-signed header -> true"),
+        Err(e) => {
+            eprintln!("membership proof unexpectedly failed: {e}");
+            exit(1);
+        }
+    }
+
+    // negative case: a lie about the validator's power must fail.
+    let mut forged = v.clone();
+    forged.power += 1;
+    let bad = ValidatorTracker::verify_membership(block, cert, &tracked, &forged, &proof);
+    println!("verify a forged (power+1) leaf -> {} (must be false)", bad.is_ok());
+}
+
+
 /// the deterministic proposer, a quorum commit that tolerates one crash, a
 /// sub-quorum that fails to commit, and equivocation being caught.
 fn cmd_bft() {
@@ -996,6 +1059,31 @@ fn cmd_light() {
         light_ids == full_ids && lt.head() == full.head,
     );
     assert_eq!(light_ids, full_ids, "light client diverged from the full chain");
+
+    // M21: the transition-FREE path. Given each block's next set (which a header
+    // sync transport would ship alongside the block), the tracker advances by
+    // verifying it against the certificate-signed `next_validators_root` — never
+    // replaying stake ops / evidence at all.
+    println!("\nM21 — transition-free follow (verify next set vs committed root, no replay):");
+    let mut committed_sets: Vec<ValidatorSet> = Vec::new();
+    let mut replay = Chain::new(demo_genesis());
+    for b in d.blocks() {
+        replay.commit(b).unwrap_or_else(|e| fail_msg("replay commit", &e));
+        committed_sets.push(replay.state.validators.clone());
+    }
+    let mut lt2 = ValidatorTracker::from_genesis(&demo_genesis());
+    for (i, (b, c)) in d.blocks().iter().zip(d.certificates()).enumerate() {
+        lt2.follow_committed(b, c, &committed_sets[i])
+            .unwrap_or_else(|e| fail_msg("follow_committed", &e));
+    }
+    let committed_ids: Vec<(u64, u64)> =
+        lt2.validators().validators().iter().map(|v| (v.id, v.power)).collect();
+    show("transition-free set", lt2.validators());
+    println!(
+        "transition-free set == replayed set: {}",
+        committed_ids == full_ids && lt2.head() == full.head,
+    );
+    assert_eq!(committed_ids, full_ids, "follow_committed diverged from the full chain");
 }
 
 fn cmd_run(dir: String) {    let path = format!("{dir}/blocks.log");

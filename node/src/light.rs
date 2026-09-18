@@ -45,6 +45,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::consensus::{Commit, ConsensusError};
+use crate::merkle;
 use crate::validator::{Validator, ValidatorSet, ValidatorUpdate};
 use crate::{Block, BondKind, Genesis, Hash, PubKey};
 
@@ -95,6 +96,13 @@ pub enum LightError {
     /// An unbond exceeds the tracked bond for the account — impossible for a
     /// genuinely certified block; surfaced defensively instead of underflowing.
     InconsistentStakeOp { account: u64, height: u64 },
+    /// The set the tracker derived (or was handed, in [`ValidatorTracker::follow_committed`])
+    /// does not match the block's `next_validators_root` commitment — a divergent
+    /// transition or a forged/mismatched next set.
+    ValidatorRootMismatch { height: u64 },
+    /// A validator-membership Merkle proof did not verify against a certified
+    /// block's `next_validators_root`.
+    MembershipProofInvalid { height: u64 },
 }
 
 impl std::fmt::Display for LightError {
@@ -119,6 +127,12 @@ impl std::fmt::Display for LightError {
             LightError::InconsistentStakeOp { account, height } => {
                 write!(f, "light: unbond exceeds tracked bond for account {account} at height {height}")
             }
+            LightError::ValidatorRootMismatch { height } => {
+                write!(f, "light: validator set at height {height} does not match next_validators_root commitment")
+            }
+            LightError::MembershipProofInvalid { height } => {
+                write!(f, "light: validator membership proof invalid against block {height}")
+            }
         }
     }
 }
@@ -141,12 +155,14 @@ impl ValidatorTracker {
             .iter()
             .map(|&(id, _endow, pubkey)| (id, pubkey))
             .collect();
-        // genesis-block hash: height 0, zero prev, no txs / updates / ops —
-        // exactly the block `ChainState::genesis` hashes for its head.
+        // genesis-block hash: height 0, zero prev, no txs / updates / ops, and
+        // the genesis set as its next-set commitment — exactly the block
+        // `ChainState::genesis` hashes for its head.
         let head = Block {
             height: 0,
             prev_hash: [0u8; 32],
             timestamp_days: g.timestamp_days,
+            next_validators_root: set.merkle_root(),
             txs: Vec::new(),
             validator_updates: Vec::new(),
             stake_ops: Vec::new(),
@@ -178,11 +194,12 @@ impl ValidatorTracker {
         self.head
     }
 
-    /// Follow one certified height: verify the certificate against the tracked
-    /// set, then evolve the set exactly as the chain would. On success the
-    /// tracker advances by one height and returns the voting power that
-    /// certified the block. On any error the tracker is left unchanged.
-    pub fn follow(&mut self, block: &Block, cert: &Commit) -> Result<u64, LightError> {
+    /// Steps 1-4 shared by [`Self::follow`] and [`Self::follow_committed`]:
+    /// the block must extend the tracked head by one height, chain to it, be
+    /// certified by *exactly* this block's certificate, and that certificate must
+    /// be a real > 2/3 quorum of the currently tracked set. Read-only: on error
+    /// the tracker is untouched. Returns `(block_hash, certifying_power)`.
+    fn verify_cert(&self, block: &Block, cert: &Commit) -> Result<(Hash, u64), LightError> {
         // 1. the block must extend our head by exactly one height ...
         if block.height != self.height + 1 {
             return Err(LightError::BadHeight {
@@ -202,16 +219,32 @@ impl ValidatorTracker {
         // 4. the certificate must be a real > 2/3 quorum of the set active for
         //    this height — the set in force *before* this block applies.
         let power = cert.verify(&self.set).map_err(LightError::Consensus)?;
+        Ok((block_hash, power))
+    }
 
-        // 5. replicate ONLY the validator-set transition (mirror apply_block):
-        //    stake ops and slashing evidence change bonds; the derived update
-        //    of every touched id reads the post-change bond as its new power.
+    /// Follow one certified height: verify the certificate against the tracked
+    /// set, then evolve the set exactly as the chain would. On success the
+    /// tracker advances by one height and returns the voting power that
+    /// certified the block. On any error the tracker is left unchanged.
+    ///
+    /// As of M21 the derived set is cross-checked against the block's
+    /// `next_validators_root` commitment (which the certificate signs), so the
+    /// transition is confirmed against consensus rather than merely trusted —
+    /// and the check also covers pubkeys, not just ids and powers.
+    pub fn follow(&mut self, block: &Block, cert: &Commit) -> Result<u64, LightError> {
+        let (block_hash, power) = self.verify_cert(block, cert)?;
+
+        // 5. replicate ONLY the validator-set transition (mirror apply_block) on
+        //    LOCAL copies, so a failed cross-check leaves the tracker unmutated:
+        //    stake ops and slashing evidence change bonds; the derived update of
+        //    every touched id reads the post-change bond as its new power.
+        let mut bonds = self.bonds.clone();
         let mut touched: BTreeSet<u64> = BTreeSet::new();
         for op in &block.stake_ops {
             match op.kind {
-                BondKind::Bond => *self.bonds.entry(op.account).or_insert(0) += op.amount,
+                BondKind::Bond => *bonds.entry(op.account).or_insert(0) += op.amount,
                 BondKind::Unbond => {
-                    let cur = self.bonds.get(&op.account).copied().unwrap_or(0);
+                    let cur = bonds.get(&op.account).copied().unwrap_or(0);
                     if cur < op.amount {
                         return Err(LightError::InconsistentStakeOp {
                             account: op.account,
@@ -219,9 +252,9 @@ impl ValidatorTracker {
                         });
                     }
                     if cur == op.amount {
-                        self.bonds.remove(&op.account);
+                        bonds.remove(&op.account);
                     } else {
-                        self.bonds.insert(op.account, cur - op.amount);
+                        bonds.insert(op.account, cur - op.amount);
                     }
                 }
             }
@@ -230,7 +263,7 @@ impl ValidatorTracker {
         for ev in &block.slashing_evidence {
             // slashing removes the offender's entire bond; the derived update
             // (power 0) removes them from the set at the next height.
-            self.bonds.remove(&ev.vote_a.validator);
+            bonds.remove(&ev.vote_a.validator);
             touched.insert(ev.vote_a.validator);
         }
 
@@ -238,21 +271,80 @@ impl ValidatorTracker {
         // the exact order and content of apply_block (lib.rs).
         let mut updates = block.validator_updates.clone();
         for id in touched {
-            let power = self.bonds.get(&id).copied().unwrap_or(0);
+            let power = bonds.get(&id).copied().unwrap_or(0);
             let pubkey = self.pubkeys.get(&id).copied().unwrap_or_default();
             updates.push(ValidatorUpdate { id, pubkey, power }); // power 0 == removal
         }
+        let mut next = self.set.clone();
         if !updates.is_empty() {
-            let next = self.set.apply_updates(&updates);
+            next = self.set.apply_updates(&updates);
             if next.is_empty() {
                 return Err(LightError::EmptyValidatorSet);
             }
-            self.set = next;
         }
 
+        // 6. cross-check the derived set against the header commitment (part of
+        //    block_hash, so certificate-signed). Only then commit to self.
+        if next.merkle_root() != block.next_validators_root {
+            return Err(LightError::ValidatorRootMismatch { height: block.height });
+        }
+
+        self.bonds = bonds;
+        self.set = next;
         self.head = block_hash;
         self.height = block.height;
         Ok(power)
+    }
+
+    /// Follow one certified height **without replaying the transition**: verify
+    /// the certificate against the tracked set, then adopt `next_set` after
+    /// checking it against the block's `next_validators_root` commitment. This is
+    /// the M21 SPV path — a wallet that is *handed* each next set (e.g. over a
+    /// header-sync transport) advances by verifying a Merkle root, never touching
+    /// bonds, stake ops, or evidence. On any error the tracker is unchanged.
+    pub fn follow_committed(
+        &mut self,
+        block: &Block,
+        cert: &Commit,
+        next_set: &ValidatorSet,
+    ) -> Result<u64, LightError> {
+        let (block_hash, power) = self.verify_cert(block, cert)?;
+        if next_set.merkle_root() != block.next_validators_root {
+            return Err(LightError::ValidatorRootMismatch { height: block.height });
+        }
+        if next_set.is_empty() {
+            return Err(LightError::EmptyValidatorSet);
+        }
+        self.set = next_set.clone();
+        self.head = block_hash;
+        self.height = block.height;
+        Ok(power)
+    }
+
+    /// Verify that `validator` is a member of the set that certifies the height
+    /// *after* `block` — i.e. is committed by `block.next_validators_root` — given
+    /// an inclusion `proof` ([`ValidatorSet::proof`]). `block` must itself be
+    /// certified by `cert` under `tracked_set` (the set active for `block`'s
+    /// height), anchoring the commitment to a > 2/3 quorum. The SPV membership
+    /// primitive: prove one validator against a cert-signed header, no replay.
+    pub fn verify_membership(
+        block: &Block,
+        cert: &Commit,
+        tracked_set: &ValidatorSet,
+        validator: &Validator,
+        proof: &merkle::Proof,
+    ) -> Result<(), LightError> {
+        // the header must be finalized by a real quorum of the anchoring set ...
+        if cert.height != block.height || cert.block_hash != block.hash() {
+            return Err(LightError::CertificateMismatch { height: block.height });
+        }
+        cert.verify(tracked_set).map_err(LightError::Consensus)?;
+        // ... and the validator's leaf must open against its committed root.
+        let leaf = merkle::leaf_hash(&validator.merkle_leaf());
+        if !merkle::verify(&block.next_validators_root, &leaf, proof) {
+            return Err(LightError::MembershipProofInvalid { height: block.height });
+        }
+        Ok(())
     }
 
     /// Follow a whole certified chain in height order — the `(Block, Commit)`
@@ -543,5 +635,97 @@ mod tests {
         );
         assert_eq!(lt.head(), full.head);
         assert_eq!(lt.height(), full.state.height);
+    }
+
+    /// Per-height committed sets from an authoritative replay: `sets[i]` is the
+    /// validator set that certifies height `i + 2` (what block `i + 1` commits to
+    /// in its `next_validators_root`).
+    fn committed_sets(g: Genesis, blocks: &[Block]) -> Vec<ValidatorSet> {
+        let mut replay = Chain::new(g);
+        let mut sets = Vec::new();
+        for b in blocks {
+            replay.commit(b).expect("commit");
+            sets.push(replay.state.validators.clone());
+        }
+        sets
+    }
+
+    #[test]
+    fn follow_committed_matches_transition_follow() {
+        // a chain exercising explicit updates AND staking; the transition-free
+        // path must reach the same set as the full replay.
+        let mut d = driver(base_genesis());
+        d.submit(novel_tx(1, 1, 1, 1.0)).unwrap();
+        d.stage_validator_update(ValidatorUpdate { id: 24, pubkey: kp(24).public(), power: 2 });
+        d.produce(1.0, &no_silence()).unwrap().expect("block");
+        d.stage_stake_op(bond(2, 7 * MICRO));
+        d.produce(2.0, &no_silence()).unwrap().expect("block");
+
+        let sets = committed_sets(base_genesis(), d.blocks());
+        let mut lt = ValidatorTracker::from_genesis(&base_genesis());
+        for (i, (b, c)) in d.blocks().iter().zip(d.certificates()).enumerate() {
+            lt.follow_committed(b, c, &sets[i]).expect("follow_committed");
+        }
+        assert_eq!(ids_powers(lt.validators()), ids_powers(&d.chain.state.validators));
+        assert_eq!(lt.head(), d.head());
+        assert_eq!(lt.height(), 2);
+    }
+
+    #[test]
+    fn follow_committed_rejects_a_wrong_next_set() {
+        let mut d = driver(base_genesis());
+        d.stage_validator_update(ValidatorUpdate { id: 24, pubkey: kp(24).public(), power: 5 });
+        d.produce(1.0, &no_silence()).unwrap().expect("block");
+
+        let mut lt = ValidatorTracker::from_genesis(&base_genesis());
+        // hand it the genesis set as the "next" set, but block 1 added validator
+        // 24 — its committed root does not match the genesis set's root.
+        let wrong = ValidatorTracker::from_genesis(&base_genesis()).validators().clone();
+        let err = lt
+            .follow_committed(&d.blocks()[0], &d.certificates()[0], &wrong)
+            .unwrap_err();
+        assert!(matches!(err, LightError::ValidatorRootMismatch { .. }), "got {err}");
+        assert_eq!(lt.height(), 0, "tracker unchanged on rejection");
+    }
+
+    #[test]
+    fn follow_cross_checks_against_the_committed_root() {
+        // the M21 strengthening: an honest chain's follow still succeeds, and the
+        // tracked set's own root matches every block's commitment along the way.
+        let mut d = driver(base_genesis());
+        d.stage_validator_update(ValidatorUpdate { id: 24, pubkey: kp(24).public(), power: 3 });
+        d.produce(1.0, &no_silence()).unwrap().expect("block");
+        d.stage_stake_op(bond(1, 6 * MICRO));
+        d.produce(2.0, &no_silence()).unwrap().expect("block");
+
+        let mut lt = ValidatorTracker::from_genesis(&base_genesis());
+        for (b, c) in d.blocks().iter().zip(d.certificates()) {
+            lt.follow(b, c).expect("follow");
+            assert_eq!(lt.validators().merkle_root(), b.next_validators_root);
+        }
+    }
+
+    #[test]
+    fn verify_membership_proves_and_rejects_forgery() {
+        let mut d = driver(base_genesis());
+        d.stage_validator_update(ValidatorUpdate { id: 24, pubkey: kp(24).public(), power: 5 });
+        d.produce(1.0, &no_silence()).unwrap().expect("block");
+
+        let block = &d.blocks()[0];
+        let cert = &d.certificates()[0];
+        let next_set = d.chain.state.validators.clone();
+        let tracked = ValidatorTracker::from_genesis(&base_genesis()).validators().clone();
+
+        let v = next_set.get(24).unwrap().clone();
+        let proof = next_set.proof(24).unwrap();
+        ValidatorTracker::verify_membership(block, cert, &tracked, &v, &proof)
+            .expect("genuine membership verifies");
+
+        // forge the power -> proof no longer opens to the committed root.
+        let mut forged = v.clone();
+        forged.power += 1;
+        let err = ValidatorTracker::verify_membership(block, cert, &tracked, &forged, &proof)
+            .unwrap_err();
+        assert!(matches!(err, LightError::MembershipProofInvalid { .. }), "got {err}");
     }
 }

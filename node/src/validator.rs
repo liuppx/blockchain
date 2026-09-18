@@ -24,6 +24,22 @@ pub struct Validator {
     pub power: u64,
 }
 
+impl Validator {
+    /// Canonical leaf bytes for this validator — the exact preimage a light
+    /// client hashes (via [`crate::merkle::leaf_hash`]) to check an inclusion
+    /// proof against [`ValidatorSet::merkle_root`]. Byte-identical to the
+    /// per-validator triple folded into [`crate::ChainState::state_root`]
+    /// (`u64 id ‖ raw pubkey ‖ u64 power`), so the two commitments move in
+    /// lockstep and a verifier needs only the validator it was told.
+    pub fn merkle_leaf(&self) -> Vec<u8> {
+        let mut e = crate::codec::Enc(Vec::new());
+        e.u64(self.id);
+        e.raw(&self.pubkey);
+        e.u64(self.power);
+        e.0
+    }
+}
+
 /// An on-chain change to the validator set, carried in a [`crate::Block`] and
 /// applied *after* that block's transactions. `power == 0` removes the validator
 /// (a no-op if absent); `power > 0` inserts a new validator or updates an
@@ -67,6 +83,33 @@ impl ValidatorSet {
             .binary_search_by_key(&id, |v| v.id)
             .ok()
             .map(|i| &self.validators[i])
+    }
+
+    /// Merkle commitment to the whole set: a binary tree over each validator's
+    /// [`Validator::merkle_leaf`] in canonical (id-sorted) order. Folding this
+    /// root into the block header (`Block.next_validators_root`) lets a light
+    /// client verify the set — or prove one member — against a cert-signed
+    /// block hash without replaying the validator-set transition.
+    pub fn merkle_root(&self) -> crate::Hash {
+        let leaves = self
+            .validators
+            .iter()
+            .map(|v| crate::merkle::leaf_hash(&v.merkle_leaf()))
+            .collect();
+        crate::merkle::MerkleTree::from_leaf_hashes(leaves).root()
+    }
+
+    /// Inclusion proof that validator `id` is committed by [`Self::merkle_root`],
+    /// or `None` if `id` is absent. The leaf order matches `merkle_root` (sorted
+    /// by id), so the proof index is the validator's position in that order.
+    pub fn proof(&self, id: u64) -> Option<crate::merkle::Proof> {
+        let index = self.validators.iter().position(|v| v.id == id)?;
+        let leaves = self
+            .validators
+            .iter()
+            .map(|v| crate::merkle::leaf_hash(&v.merkle_leaf()))
+            .collect();
+        crate::merkle::MerkleTree::from_leaf_hashes(leaves).proof(index)
     }
 
     pub fn total_power(&self) -> u64 {
@@ -243,5 +286,47 @@ mod tests {
         let ib: Vec<u64> = b.validators().iter().map(|v| v.id).collect();
         assert_eq!(ia, ib);
         assert_eq!(a.total_power(), b.total_power());
+    }
+
+    #[test]
+    fn merkle_root_is_order_independent_and_content_addressed() {
+        // same members, different construction order -> identical root (the set
+        // canonicalizes by id), and any field change flips the root.
+        let a = ValidatorSet::new(vec![
+            Validator { id: 3, pubkey: kp(3).public(), power: 3 },
+            Validator { id: 1, pubkey: kp(1).public(), power: 1 },
+            Validator { id: 2, pubkey: kp(2).public(), power: 2 },
+        ]);
+        let b = vset(&[(1, 1), (2, 2), (3, 3)]);
+        assert_eq!(a.merkle_root(), b.merkle_root());
+        // reweight one validator: root must change
+        let c = vset(&[(1, 1), (2, 9), (3, 3)]);
+        assert_ne!(a.merkle_root(), c.merkle_root());
+        // empty set commits to the all-zero root
+        assert_eq!(ValidatorSet::new(vec![]).merkle_root(), [0u8; 32]);
+    }
+
+    #[test]
+    fn membership_proofs_verify_for_every_member() {
+        let vs = vset(&[(1, 10), (2, 20), (3, 30), (4, 40), (5, 50)]);
+        let root = vs.merkle_root();
+        for v in vs.validators() {
+            let proof = vs.proof(v.id).expect("proof exists");
+            let leaf = crate::merkle::leaf_hash(&v.merkle_leaf());
+            assert!(crate::merkle::verify(&root, &leaf, &proof), "id={}", v.id);
+        }
+        // absent id -> no proof
+        assert!(vs.proof(99).is_none());
+    }
+
+    #[test]
+    fn forged_validator_leaf_fails_membership() {
+        let vs = vset(&[(1, 10), (2, 20), (3, 30)]);
+        let root = vs.merkle_root();
+        let proof = vs.proof(2).expect("proof exists");
+        // a validator with the right id but a tampered power must not verify.
+        let forged = Validator { id: 2, pubkey: kp(2).public(), power: 21 };
+        let leaf = crate::merkle::leaf_hash(&forged.merkle_leaf());
+        assert!(!crate::merkle::verify(&root, &leaf, &proof));
     }
 }
