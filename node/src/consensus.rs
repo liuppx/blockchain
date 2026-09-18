@@ -274,6 +274,9 @@ mod tests {
             prev_hash: [tag; 32],
             timestamp_days: height as f32,
             next_validators_root: [0u8; 32],
+            // M23: state commitments stamped by Chain::commit.
+            state_root: [0u8; 32],
+            accounts_root: [0u8; 32],
             txs: Vec::new(),
             validator_updates: Vec::new(),
             stake_ops: Vec::new(),

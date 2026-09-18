@@ -5,8 +5,9 @@
 //! were persisted. Big-endian, length-prefixed, no external serialization crate.
 
 use crate::consensus::{Commit, Vote, VoteType};
+use crate::merkle::{Proof, Step};
 use crate::validator::ValidatorUpdate;
-use crate::{Block, BondKind, Embedding, Review, SlashEvidence, StakeOp, SubmissionTx};
+use crate::{Account, Block, BondKind, Embedding, Review, SlashEvidence, StakeOp, SubmissionTx};
 use zhixing_engine::DIM;
 
 #[derive(Debug)]
@@ -41,6 +42,13 @@ pub fn encode_block(b: &Block) -> Vec<u8> {
     e.raw(&b.prev_hash);
     e.f32(b.timestamp_days);
     e.raw(&b.next_validators_root);
+    // M23: cert-signed state commitments, written into the cert-signed prefix
+    // (between `next_validators_root` and the length-prefixed validator_updates
+    // loop). The header codec writes the same fields at the same offsets, so
+    // `encode_header(&BlockHeader::from_block(b)) == encode_block(b)[..header_end]`
+    // for any block — the SPV contract holds.
+    e.raw(&b.state_root);
+    e.raw(&b.accounts_root);
     e.u64(b.validator_updates.len() as u64);
     for u in &b.validator_updates {
         e.u64(u.id);
@@ -82,6 +90,11 @@ pub fn encode_header(h: &BlockHeader) -> Vec<u8> {
     e.raw(&h.prev_hash);
     e.f32(h.timestamp_days);
     e.raw(&h.next_validators_root);
+    // M23: the two cert-signed state commitments travel with the header so a
+    // light client can verify account-inclusion proofs (`accounts_root`) and
+    // trust the full-state digest (`state_root`) without pulling any bodies.
+    e.raw(&h.state_root);
+    e.raw(&h.accounts_root);
     e.u64(h.validator_updates.len() as u64);
     for u in &h.validator_updates {
         e.u64(u.id);
@@ -107,6 +120,13 @@ pub fn decode_header(buf: &[u8]) -> Result<BlockHeader, CodecError> {
     let timestamp_days = d.f32()?;
     let mut next_validators_root = [0u8; 32];
     next_validators_root.copy_from_slice(d.take(32)?);
+    // M23: the two cert-signed state commitments sit in the same prefix slot
+    // in the block codec — same offsets here as in `decode_block` so the
+    // header prefix is identical.
+    let mut state_root = [0u8; 32];
+    state_root.copy_from_slice(d.take(32)?);
+    let mut accounts_root = [0u8; 32];
+    accounts_root.copy_from_slice(d.take(32)?);
     let n_upd = d.count()?;
     let mut validator_updates = Vec::with_capacity(n_upd as usize);
     for _ in 0..n_upd {
@@ -130,6 +150,8 @@ pub fn decode_header(buf: &[u8]) -> Result<BlockHeader, CodecError> {
         prev_hash,
         timestamp_days,
         next_validators_root,
+        state_root,
+        accounts_root,
         validator_updates,
         txs_commitment,
         stake_ops_commitment,
@@ -153,14 +175,15 @@ pub fn encode_certified_header(ch: &CertifiedHeader) -> Vec<u8> {
 /// buffer must decode as exactly one [`Commit`] (the cert codec rejects
 /// trailing bytes, so any padding after the cert is an error).
 pub fn decode_certified_header(buf: &[u8]) -> Result<CertifiedHeader, CodecError> {
-    // Header layout: 76-byte fixed prefix ‖ u64 n_updates (8) ‖
-    // count * 48 bytes (u64 id ‖ 32-byte pubkey ‖ u64 power) ‖
-    // 3 * 32-byte commitments.
-    if buf.len() < 76 {
+    // Header layout: 8 (height) + 32 (prev) + 4 (timestamp) + 32 (next_validators_root)
+    //   + 32 (state_root) + 32 (accounts_root) + 8 (n_updates u64) = 148-byte fixed prefix ‖
+    //   n_updates * 48 bytes (u64 id ‖ 32-byte pubkey ‖ u64 power) ‖
+    //   3 * 32-byte commitments = 96 bytes tail.
+    if buf.len() < 148 {
         return Err(CodecError::UnexpectedEof);
     }
-    let n_updates = u64::from_be_bytes(buf[76..84].try_into().unwrap());
-    let header_len = 84 + (n_updates as usize) * 48 + 96; // 96 = 3 * 32 commitments
+    let n_updates = u64::from_be_bytes(buf[140..148].try_into().unwrap());
+    let header_len = 148 + (n_updates as usize) * 48 + 96; // 244 base + 48 per update
     if buf.len() < header_len {
         return Err(CodecError::UnexpectedEof);
     }
@@ -187,6 +210,16 @@ pub struct BlockHeader {
     pub prev_hash: crate::Hash,
     pub timestamp_days: f32,
     pub next_validators_root: crate::Hash,
+    /// M23: full flat digest of every consensus-state field at this height
+    /// (accounts/reviewers/graph/validators/bonds/bonded/unbonding/treasury/supply).
+    /// Cert-signed. Light clients use this as a tamper-detector: the cert
+    /// already vouches for it by binding `block_hash = header.hash()`.
+    pub state_root: crate::Hash,
+    /// M23: Merkle root over `(accounts ∪ reviewers)`. Cert-signed. Light
+    /// clients use this to verify O(log n) account-inclusion proofs against
+    /// `ChainState::account_proof(id)` sourced over the new
+    /// `GetAccountProof`/`AccountProof` gossip pair.
+    pub accounts_root: crate::Hash,
     pub validator_updates: Vec<ValidatorUpdate>,
     /// SHA-256 over the canonical encoding of the tx list (or zero for empty).
     pub txs_commitment: crate::Hash,
@@ -206,6 +239,8 @@ impl BlockHeader {
             prev_hash: b.prev_hash,
             timestamp_days: b.timestamp_days,
             next_validators_root: b.next_validators_root,
+            state_root: b.state_root,
+            accounts_root: b.accounts_root,
             validator_updates: b.validator_updates.clone(),
             txs_commitment: list_commitment(&b.txs.iter().map(encode_tx).collect::<Vec<_>>()),
             stake_ops_commitment: list_commitment(&b.stake_ops.iter().map(encode_stakeop).collect::<Vec<_>>()),
@@ -239,6 +274,8 @@ impl BlockHeader {
             prev_hash: self.prev_hash,
             timestamp_days: self.timestamp_days,
             next_validators_root: self.next_validators_root,
+            state_root: self.state_root,
+            accounts_root: self.accounts_root,
             txs,
             validator_updates: self.validator_updates.clone(),
             stake_ops,
@@ -470,6 +507,90 @@ pub fn decode_commit(buf: &[u8]) -> Result<Commit, CodecError> {
     })
 }
 
+// --- M23: account + Merkle-proof wire codecs for account-proof gossip --------
+
+/// Canonical bytes of one [`Account`] as it travels on the M23
+/// `AccountProof` gossip variant. Fixed-layout, big-endian, no versioning —
+/// mirrors [`encode_tx`] in shape.
+pub fn encode_account(a: &Account) -> Vec<u8> {
+    let mut e = Enc(Vec::new());
+    e.raw(&a.pubkey);
+    e.u64(a.balance);
+    e.u64(a.staked_total);
+    e.u64(a.earned_total);
+    e.u64(a.slashed_total);
+    e.u64(a.submissions);
+    e.u64(a.accepted);
+    e.0
+}
+
+/// Decode exactly one [`Account`] (inverse of [`encode_account`]). Trailing
+/// bytes are an error.
+pub fn decode_account(buf: &[u8]) -> Result<Account, CodecError> {
+    let mut d = Dec { buf, pos: 0 };
+    let mut pubkey = [0u8; 32];
+    pubkey.copy_from_slice(d.take(32)?);
+    let balance = d.u64()?;
+    let staked_total = d.u64()?;
+    let earned_total = d.u64()?;
+    let slashed_total = d.u64()?;
+    let submissions = d.u64()?;
+    let accepted = d.u64()?;
+    if d.pos != d.buf.len() {
+        return Err(CodecError::TrailingBytes);
+    }
+    Ok(Account {
+        pubkey,
+        balance,
+        staked_total,
+        earned_total,
+        slashed_total,
+        submissions,
+        accepted,
+    })
+}
+
+/// Canonical bytes of one [`Proof`]. Each step is one tag byte (0 = Left,
+/// 1 = Right) followed by 32 bytes of sibling hash.
+pub fn encode_proof(p: &Proof) -> Vec<u8> {
+    let mut e = Enc(Vec::new());
+    e.u64(p.steps.len() as u64);
+    for s in &p.steps {
+        match s {
+            Step::Left(h) => {
+                e.u32(0);
+                e.raw(h);
+            }
+            Step::Right(h) => {
+                e.u32(1);
+                e.raw(h);
+            }
+        }
+    }
+    e.0
+}
+
+/// Inverse of [`encode_proof`]. Trailing bytes are an error.
+pub fn decode_proof(buf: &[u8]) -> Result<Proof, CodecError> {
+    let mut d = Dec { buf, pos: 0 };
+    let n = d.count()?;
+    let mut steps = Vec::with_capacity(n as usize);
+    for _ in 0..n {
+        let tag = d.u32()?;
+        let mut h = [0u8; 32];
+        h.copy_from_slice(d.take(32)?);
+        steps.push(match tag {
+            0 => Step::Left(h),
+            1 => Step::Right(h),
+            other => return Err(CodecError::BadEnum(other)),
+        });
+    }
+    if d.pos != d.buf.len() {
+        return Err(CodecError::TrailingBytes);
+    }
+    Ok(Proof { steps })
+}
+
 pub(crate) struct Enc(pub Vec<u8>);
 
 impl Enc {
@@ -504,6 +625,13 @@ pub fn decode_block(buf: &[u8]) -> Result<Block, CodecError> {
     let timestamp_days = d.f32()?;
     let mut next_validators_root = [0u8; 32];
     next_validators_root.copy_from_slice(d.take(32)?);
+    // M23: cert-signed state commitments travel in the same prefix slot the
+    // header codec uses, so `encode_header(&BlockHeader::from_block(b)) ==
+    // encode_block(b)[..validator_updates_offset]` for any block.
+    let mut state_root = [0u8; 32];
+    state_root.copy_from_slice(d.take(32)?);
+    let mut accounts_root = [0u8; 32];
+    accounts_root.copy_from_slice(d.take(32)?);
     let n_upd = d.count()?;
     let mut validator_updates = Vec::with_capacity(n_upd as usize);
     for _ in 0..n_upd {
@@ -536,6 +664,8 @@ pub fn decode_block(buf: &[u8]) -> Result<Block, CodecError> {
         prev_hash,
         timestamp_days,
         next_validators_root,
+        state_root,
+        accounts_root,
         txs,
         validator_updates,
         stake_ops,
@@ -669,6 +799,11 @@ mod tests {
             prev_hash: [42u8; 32],
             timestamp_days: 3.5,
             next_validators_root: [17u8; 32],
+            // M23: cert-signed state commitments. Tests below assert they
+            // round-trip through encode_block/decode_block and that the header
+            // projection carries them through unchanged.
+            state_root: [11u8; 32],
+            accounts_root: [12u8; 32],
             txs: vec![SubmissionTx {
                 author: 1,
                 embedding: emb,

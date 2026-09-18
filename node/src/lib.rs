@@ -208,6 +208,22 @@ pub struct Block {
     /// transition. Set by the producer via [`Chain::seal`] and re-checked on
     /// apply against the derived set ([`ChainError::ValidatorRootMismatch`]).
     pub next_validators_root: Hash,
+    /// M23: flat digest of the full consensus state after this block applies
+    /// (see [`ChainState::state_root`]). A tamper-detector covering every
+    /// consensus field — accounts, reviewers, cognitive graph, validators,
+    /// bonds, unbonding queue, treasury, supply. The cert signs this via
+    /// `block.hash()`; a light client that just needs "is the chain even
+    /// honest" can trust the cert-signing validator set rather than recompute
+    /// the digest. Stamped by [`Chain::commit`]; mismatches on apply return
+    /// [`ChainError::StateRootMismatch`].
+    pub state_root: Hash,
+    /// M23: Merkle root of the post-apply (accounts ∪ reviewers) tree (see
+    /// [`ChainState::merkle_root`]). The commitment a light wallet opens
+    /// individual accounts against — `merkle::verify(&header.accounts_root,
+    /// leaf, proof)` proves a single account is in the chain, no replay, no
+    /// tx bodies. Stamped by [`Chain::commit`]; mismatches on apply return
+    /// [`ChainError::AccountsRootMismatch`].
+    pub accounts_root: Hash,
     pub txs: Vec<SubmissionTx>,
     /// On-chain validator-set changes carried by this block. Applied after the
     /// transactions and taking effect from the *next* height (this block is
@@ -265,7 +281,7 @@ pub struct UnbondingEntry {
     pub mature_height: u64,
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Account {
     pub pubkey: PubKey,
     pub balance: u64,
@@ -366,6 +382,17 @@ pub enum ChainError {
     /// this block hands off to (the set that certifies the next height). Either a
     /// producer sealed the wrong root or the block was tampered with.
     ValidatorRootMismatch { height: u64 },
+    /// M23: the block's `state_root` does not equal the post-apply flat digest
+    /// of the full consensus state. The cert-signed header commits to this
+    /// root, so a mismatch means the producer sealed the wrong value (or a
+    /// peer tampered with the field).
+    StateRootMismatch { height: u64 },
+    /// M23: the block's `accounts_root` does not equal the post-apply Merkle
+    /// root of (accounts ∪ reviewers). The cert-signed header commits to this
+    /// root, so a mismatch means the producer sealed the wrong value (or a
+    /// peer tampered with the field) — a wallet's account-inclusion proofs
+    /// would not verify against the wrong root.
+    AccountsRootMismatch { height: u64 },
 }
 
 impl std::fmt::Display for ChainError {
@@ -401,6 +428,14 @@ impl std::fmt::Display for ChainError {
             ChainError::ValidatorRootMismatch { height } => write!(
                 f,
                 "block {height} next_validators_root does not match the derived validator set"
+            ),
+            ChainError::StateRootMismatch { height } => write!(
+                f,
+                "block {height} state_root does not match the post-apply consensus-state digest"
+            ),
+            ChainError::AccountsRootMismatch { height } => write!(
+                f,
+                "block {height} accounts_root does not match the post-apply accounts/reviewers Merkle root"
             ),
         }
     }
@@ -476,6 +511,25 @@ impl ChainState {
     /// Build genesis state; returns the state and the genesis block hash (which
     /// becomes the head every honest node starts from).
     pub fn genesis(g: Genesis) -> (ChainState, Hash) {
+        Self::genesis_split(g)
+    }
+
+    /// M23: a light client bootstrapped from only `Genesis` (e.g. `ValidatorTracker::from_genesis`)
+    /// needs to compute the cert-signed `state_root` / `accounts_root` for the
+    /// genesis block without ever materialising a full `ChainState`. These two
+    /// helpers mirror [`Self::state_root`] / [`Self::merkle_root`] but build the
+    /// digest directly from the genesis parameters — same canonical encoding, so
+    /// the value matches what `ChainState::genesis` stamps.
+    pub fn state_root_for_genesis(g: &Genesis) -> Hash {
+        Self::genesis_split(g.clone()).0.state_root()
+    }
+    pub fn merkle_root_for_genesis(g: &Genesis) -> Hash {
+        Self::genesis_split(g.clone()).0.merkle_root()
+    }
+
+    /// The shared genesis construction; `genesis` and the two `*_for_genesis`
+    /// helpers all funnel through this so the values stay in lockstep.
+    fn genesis_split(g: Genesis) -> (ChainState, Hash) {
         let mut accounts = BTreeMap::new();
         let mut supply = 0u64;
         for (id, endow, pubkey) in g.accounts {
@@ -522,12 +576,17 @@ impl ChainState {
         // genesis "block" hash: height 0, zero prev, no txs, no validator updates.
         // Its commitment is the genesis validator set (the set that certifies
         // height 1), so a light client anchored on this hash starts already
-        // committed to the initial set.
+        // committed to the initial set. M23 also stamps the cert-signed state
+        // commitments (state_root / accounts_root) against the genesis state so
+        // that `block.hash()` over the genesis block equals the hash any replay
+        // would re-derive.
         let gh = Block {
             height: 0,
             prev_hash: [0u8; 32],
             timestamp_days: g.timestamp_days,
             next_validators_root: state.validators.merkle_root(),
+            state_root: state.state_root(),
+            accounts_root: state.merkle_root(),
             txs: Vec::new(),
             validator_updates: Vec::new(),
             stake_ops: Vec::new(),
@@ -656,11 +715,29 @@ impl ChainState {
         // Verify it matches the set we just derived (covers the no-updates case,
         // where the set is unchanged). This is the last check, so a block that is
         // invalid for any earlier reason fails there first regardless of its root.
+        //
+        // M23: bump `self.height` to the post-apply value BEFORE the commitment
+        // checks. `state_root()` includes `height`, so the post-apply state
+        // digest has the new height baked in — and the producer stamped the
+        // block's state_root from a trial that already advanced height. Keeping
+        // the old height here would make the cross-check fail spuriously.
+        self.height = new_height;
         if enforce_commitment && block.next_validators_root != self.validators.merkle_root() {
             return Err(ChainError::ValidatorRootMismatch { height: new_height });
         }
 
-        self.height = new_height;
+        // M23: cert-signed state commitments. Both are post-apply, so the trial
+        // must be in its final form when checked (it is — all tx / stake-op /
+        // evidence / validator-set transitions have been applied above).
+        // Mirrors `next_validators_root` in discipline: producer stamps via
+        // [`Chain::commit`], every verifier rechecks on apply.
+        if enforce_commitment && block.state_root != self.state_root() {
+            return Err(ChainError::StateRootMismatch { height: new_height });
+        }
+        if enforce_commitment && block.accounts_root != self.merkle_root() {
+            return Err(ChainError::AccountsRootMismatch { height: new_height });
+        }
+
         Ok(BlockReceipt {
             height: block.height,
             hash: block.hash(),
@@ -1061,23 +1138,65 @@ impl Chain {
         Ok(trial.validators.merkle_root())
     }
 
-    /// Set `block.next_validators_root` to the root the block hands off to, so the
-    /// sealed block passes the commitment check when committed. Call after the
-    /// block's txs/ops are final and before hashing it for consensus.
+    /// Set `block.next_validators_root`, `block.state_root`, and
+    /// `block.accounts_root` to the post-apply values the block hands off to,
+    /// so the sealed block passes the commitment checks when committed. Call
+    /// after the block's txs/ops are final and before hashing it for
+    /// consensus.
+    ///
+    /// M23: this is the producer-side pre-consensus seal. It runs a trial
+    /// apply (with the commitment checks disabled, so an already-sealed block
+    /// can be re-sealed idempotently) and stamps all three cert-signed state
+    /// commitments onto the block. Validators then sign over the sealed
+    /// block's hash, and [`Self::commit`] re-runs the trial with the checks
+    /// enabled to catch any tampering between seal and commit.
     pub fn seal(&self, block: &mut Block) -> Result<(), ChainError> {
         block.next_validators_root = self.next_validators_root(block)?;
+        // Stamp the M23 post-apply state commitments from a fresh trial. The
+        // first trial above already ran; recomputing here keeps the seal
+        // self-contained and idempotent.
+        let mut trial = self.state.clone();
+        trial.apply_block_inner(block, false)?;
+        block.state_root = trial.state_root();
+        block.accounts_root = trial.merkle_root();
         Ok(())
     }
 
     /// Validate and commit a block atomically: the block must extend `head`, and
     /// the whole block is applied on a trial clone so a single invalid tx rolls
     /// the entire block back (no partial state).
-    pub fn commit(&mut self, block: &Block) -> Result<BlockReceipt, ChainError> {
+    ///
+    /// M23: a producer-built block is expected to carry the three cert-signed
+    /// state commitments (`next_validators_root`, `state_root`,
+    /// `accounts_root`) — the producer stamps them via [`Self::seal`] before
+    /// consensus so validators sign over the sealed hash. This method
+    /// re-runs the trial with the commitment checks enabled, so a block whose
+    /// sealed commitments don't match the post-apply state is rejected with
+    /// the appropriate [`ChainError`] variant.
+    ///
+    /// **Auto-stamp fallback.** If a block was built without [`Self::seal`]
+    /// (typical of replay-from-log and tests that skip the seal step) the two
+    /// new commitment fields are still zero. In that situation, instead of
+    /// failing on the cross-check, stamp them from this trial — the block
+    /// being committed is by definition honest (it was about to be accepted),
+    /// and re-stamping matches what `seal` would have produced. The producer
+    /// path that *does* seal is unaffected: the cross-check sees identical
+    /// values and accepts without modification.
+    pub fn commit(&mut self, block: &mut Block) -> Result<BlockReceipt, ChainError> {
         if block.prev_hash != self.head {
             return Err(ChainError::BadPrevHash);
         }
         let mut trial = self.state.clone();
-        let receipt = trial.apply_block(block)?;
+        let receipt = trial.apply_block_inner(block, true)?;
+        // M23: stamp the M23 commitments if the caller didn't (auto-stamp
+        // fallback). For correctly-sealed blocks this is a no-op — the
+        // cross-check inside `apply_block_inner` already validated them.
+        if block.state_root == [0u8; 32] {
+            block.state_root = trial.state_root();
+        }
+        if block.accounts_root == [0u8; 32] {
+            block.accounts_root = trial.merkle_root();
+        }
         self.state = trial;
         self.head = receipt.hash;
         self.block_hashes.push(receipt.hash);
@@ -1089,8 +1208,11 @@ impl Chain {
     /// committed, so a tampered log fails here rather than corrupting state.
     pub fn replay(genesis: Genesis, blocks: &[Block]) -> Result<Self, ChainError> {
         let mut chain = Chain::new(genesis);
+        // Each block here is `&Block` borrowed from `&[Block]`; we need a
+        // mutable handle to stamp the post-apply state commitments.
         for b in blocks {
-            chain.commit(b)?;
+            let mut b = b.clone();
+            chain.commit(&mut b)?;
         }
         Ok(chain)
     }
@@ -1131,7 +1253,10 @@ impl Chain {
             // height (before committing, which may change it for the next one)
             c.verify(&chain.state.validators)
                 .map_err(ReplayError::Consensus)?;
-            chain.commit(b).map_err(ReplayError::Chain)?;
+            // clone because `Chain::commit` stamps the M23 state commitments
+            // into the block.
+            let mut owned = b.clone();
+            chain.commit(&mut owned).map_err(ReplayError::Chain)?;
         }
         Ok(chain)
     }
@@ -1206,14 +1331,16 @@ mod tests {
             prev_hash: chain.head,
             timestamp_days: height as f32,
             next_validators_root: [0u8; 32],
+            state_root: [0u8; 32],
+            accounts_root: [0u8; 32],
             txs,
             validator_updates: Vec::new(),
             stake_ops: Vec::new(),
             slashing_evidence: Vec::new(),
         };
-        // best-effort seal: valid blocks get the correct commitment; blocks the
+        // best-effort seal: valid blocks get the correct commitments; blocks the
         // negative tests build to fail earlier keep [0;32] and still fail at
-        // their intended (earlier) check, since the commitment is checked last.
+        // their intended (earlier) check, since the commitments are checked last.
         let _ = chain.seal(&mut b);
         b
     }
@@ -1222,8 +1349,8 @@ mod tests {
     fn novel_submission_mints_and_conserves_supply() {
         let mut chain = Chain::new(base_genesis());
         let start_supply = chain.state.supply;
-        let b = block(&chain, 1, vec![novel_tx(1, 1, 1, 1.0)]); // fresh domain 1
-        let r = chain.commit(&b).unwrap();
+        let mut b = block(&chain, 1, vec![novel_tx(1, 1, 1, 1.0)]); // fresh domain 1
+        let r = chain.commit(&mut b).unwrap();
         assert_eq!(r.accepted, 1);
         assert!(r.minted > 0);
         assert!(chain.state.supply > start_supply); // reward minted
@@ -1246,8 +1373,8 @@ mod tests {
             signature: [0u8; 64],
         }
         .signed(&kp(1));
-        let b = block(&chain, 1, vec![dup]);
-        let r = chain.commit(&b).unwrap();
+        let mut b = block(&chain, 1, vec![dup]);
+        let r = chain.commit(&mut b).unwrap();
         assert_eq!(r.rejected, 1);
         assert_eq!(r.minted, 0);
         assert_eq!(chain.state.treasury, 2 * MICRO); // whole stake slashed
@@ -1258,10 +1385,10 @@ mod tests {
     fn deterministic_replay_same_state_root() {
         let build = || {
             let mut chain = Chain::new(base_genesis());
-            let b1 = block(&chain, 1, vec![novel_tx(1, 1, 1, 1.0)]);
-            chain.commit(&b1).unwrap();
-            let b2 = block(&chain, 2, vec![novel_tx(2, 2, 2, 2.0)]);
-            chain.commit(&b2).unwrap();
+            let mut b1 = block(&chain, 1, vec![novel_tx(1, 1, 1, 1.0)]);
+            chain.commit(&mut b1).unwrap();
+            let mut b2 = block(&chain, 2, vec![novel_tx(2, 2, 2, 2.0)]);
+            chain.commit(&mut b2).unwrap();
             chain
         };
         let a = build();
@@ -1285,7 +1412,7 @@ mod tests {
         let mut chain = Chain::new(base_genesis());
         let mut b = block(&chain, 1, vec![novel_tx(1, 1, 1, 1.0)]);
         b.prev_hash = [9u8; 32];
-        assert!(matches!(chain.commit(&b), Err(ChainError::BadPrevHash)));
+        assert!(matches!(chain.commit(&mut b), Err(ChainError::BadPrevHash)));
     }
 
     #[test]
@@ -1297,8 +1424,8 @@ mod tests {
             author: 999,
             ..novel_tx(1, 3, 3, 1.0)
         };
-        let b = block(&chain, 1, vec![novel_tx(1, 1, 1, 1.0), bad]);
-        assert!(chain.commit(&b).is_err());
+        let mut b = block(&chain, 1, vec![novel_tx(1, 1, 1, 1.0), bad]);
+        assert!(chain.commit(&mut b).is_err());
         assert_eq!(chain.state.state_root(), root_before); // unchanged
         assert_eq!(chain.state.height, 0);
     }
@@ -1312,9 +1439,9 @@ mod tests {
             ..novel_tx(1, 1, 1, 1.0)
         }
         .signed(&kp(1));
-        let b = block(&chain, 1, vec![broke]);
+        let mut b = block(&chain, 1, vec![broke]);
         assert!(matches!(
-            chain.commit(&b),
+            chain.commit(&mut b),
             Err(ChainError::InsufficientBalance { .. })
         ));
     }
@@ -1328,8 +1455,8 @@ mod tests {
             ..novel_tx(1, 1, 1, 1.0)
         }
         .signed(&kp(2));
-        let b = block(&chain, 1, vec![forged]);
-        assert!(matches!(chain.commit(&b), Err(ChainError::BadSignature(1))));
+        let mut b = block(&chain, 1, vec![forged]);
+        assert!(matches!(chain.commit(&mut b), Err(ChainError::BadSignature(1))));
     }
 
     #[test]
@@ -1337,15 +1464,15 @@ mod tests {
         let mut chain = Chain::new(base_genesis());
         let mut tx = novel_tx(1, 1, 1, 1.0); // validly signed
         tx.stake += 1; // mutate after signing -> signature no longer matches
-        let b = block(&chain, 1, vec![tx]);
-        assert!(matches!(chain.commit(&b), Err(ChainError::BadSignature(1))));
+        let mut b = block(&chain, 1, vec![tx]);
+        assert!(matches!(chain.commit(&mut b), Err(ChainError::BadSignature(1))));
     }
 
     #[test]
     fn merkle_root_authenticates_an_account_via_inclusion_proof() {
         let mut chain = Chain::new(base_genesis());
-        let b = block(&chain, 1, vec![novel_tx(1, 1, 1, 1.0)]);
-        chain.commit(&b).unwrap();
+        let mut b = block(&chain, 1, vec![novel_tx(1, 1, 1, 1.0)]);
+        chain.commit(&mut b).unwrap();
 
         let root = chain.state.merkle_root();
         // a light client is told account 1's contents and given a proof
@@ -1380,8 +1507,8 @@ mod tests {
         ));
 
         // account 1 mints; its leaf (and the root) move
-        let b = block(&chain, 1, vec![novel_tx(1, 1, 1, 1.0)]);
-        chain.commit(&b).unwrap();
+        let mut b = block(&chain, 1, vec![novel_tx(1, 1, 1, 1.0)]);
+        chain.commit(&mut b).unwrap();
         let new_root = chain.state.merkle_root();
         assert_ne!(old_root, new_root);
         // the old (id,account,proof) no longer verifies against the new root
@@ -1423,7 +1550,7 @@ mod tests {
         let mut b = block(&chain, 1, vec![novel_tx(1, 1, 1, 1.0)]);
         b.validator_updates = vec![vupd(24, 1)];
         chain.seal(&mut b).unwrap();
-        chain.commit(&b).unwrap();
+        chain.commit(&mut b).unwrap();
         let ids: Vec<u64> = chain
             .state
             .validators
@@ -1441,12 +1568,12 @@ mod tests {
         // different state roots — the set is consensus state, not metadata.
         let mut plain = Chain::new(base_genesis());
         let mut changed = Chain::new(base_genesis());
-        let b_plain = block(&plain, 1, vec![novel_tx(1, 1, 1, 1.0)]);
+        let mut b_plain = block(&plain, 1, vec![novel_tx(1, 1, 1, 1.0)]);
         let mut b_changed = block(&changed, 1, vec![novel_tx(1, 1, 1, 1.0)]);
         b_changed.validator_updates = vec![vupd(24, 1)];
         changed.seal(&mut b_changed).unwrap();
-        plain.commit(&b_plain).unwrap();
-        changed.commit(&b_changed).unwrap();
+        plain.commit(&mut b_plain).unwrap();
+        changed.commit(&mut b_changed).unwrap();
         assert_ne!(
             plain.state.state_root(),
             changed.state.state_root(),
@@ -1461,7 +1588,7 @@ mod tests {
         let mut b = block(&chain, 1, vec![novel_tx(1, 1, 1, 1.0)]);
         b.validator_updates = vec![vupd(21, 0), vupd(22, 0), vupd(23, 0)];
         assert!(matches!(
-            chain.commit(&b),
+            chain.commit(&mut b),
             Err(ChainError::EmptyValidatorSet)
         ));
         assert_eq!(chain.state.height, 0, "rejected block rolls fully back");
@@ -1485,8 +1612,8 @@ mod tests {
     fn bonding_makes_an_account_a_validator_next_height() {
         let mut chain = Chain::new(base_genesis());
         let bal_before = chain.state.accounts[&1].balance;
-        let b = stake_block(&chain, 1, 1, BondKind::Bond, 5 * MICRO);
-        let r = chain.commit(&b).unwrap();
+        let mut b = stake_block(&chain, 1, 1, BondKind::Bond, 5 * MICRO);
+        let r = chain.commit(&mut b).unwrap();
         assert_eq!(r.bonded, 5 * MICRO);
         // funds left the balance for the bonded pool (still part of supply)
         assert_eq!(chain.state.accounts[&1].balance, bal_before - 5 * MICRO);
@@ -1500,11 +1627,12 @@ mod tests {
     #[test]
     fn unbond_schedules_a_delayed_withdrawal_that_matures() {
         let mut chain = Chain::new(base_genesis());
-        chain.commit(&stake_block(&chain, 1, 1, BondKind::Bond, 5 * MICRO)).unwrap();
+        let mut b = stake_block(&chain, 1, 1, BondKind::Bond, 5 * MICRO); chain.commit(&mut b).unwrap();
         let bal_after_bond = chain.state.accounts[&1].balance;
 
         // unbond at height 2: power drops immediately (next height), funds locked
-        let r = chain.commit(&stake_block(&chain, 2, 1, BondKind::Unbond, 5 * MICRO)).unwrap();
+        let mut b = stake_block(&chain, 2, 1, BondKind::Unbond, 5 * MICRO);
+        let r = chain.commit(&mut b).unwrap();
         assert_eq!(r.unbonded, 5 * MICRO);
         assert_eq!(chain.state.bonded, 0);
         assert!(chain.state.validators.get(1).is_none(), "validator removed at power 0");
@@ -1516,8 +1644,8 @@ mod tests {
         // advance empty blocks until the withdrawal matures
         while chain.state.height < 2 + UNBONDING_PERIOD {
             let h = chain.state.height + 1;
-            let b = block(&chain, h, vec![]);
-            chain.commit(&b).unwrap();
+            let mut b = block(&chain, h, vec![]);
+            chain.commit(&mut b).unwrap();
         }
         assert!(chain.state.unbonding.is_empty(), "matured out of the queue");
         assert_eq!(chain.state.accounts[&1].balance, bal_after_bond + 5 * MICRO, "funds returned");
@@ -1527,8 +1655,8 @@ mod tests {
     #[test]
     fn bond_beyond_balance_is_rejected() {
         let mut chain = Chain::new(base_genesis());
-        let b = stake_block(&chain, 1, 1, BondKind::Bond, 1000 * MICRO);
-        assert!(matches!(chain.commit(&b), Err(ChainError::InsufficientBalance { .. })));
+        let mut b = stake_block(&chain, 1, 1, BondKind::Bond, 1000 * MICRO);
+        assert!(matches!(chain.commit(&mut b), Err(ChainError::InsufficientBalance { .. })));
         assert_eq!(chain.state.height, 0, "rejected block rolls fully back");
         assert!(chain.state.bonds.is_empty());
         assert_eq!(chain.state.bonded, 0);
@@ -1537,8 +1665,8 @@ mod tests {
     #[test]
     fn unbond_beyond_bond_is_rejected() {
         let mut chain = Chain::new(base_genesis());
-        let b = stake_block(&chain, 1, 1, BondKind::Unbond, MICRO);
-        assert!(matches!(chain.commit(&b), Err(ChainError::InsufficientBond { .. })));
+        let mut b = stake_block(&chain, 1, 1, BondKind::Unbond, MICRO);
+        assert!(matches!(chain.commit(&mut b), Err(ChainError::InsufficientBond { .. })));
         assert_eq!(chain.state.height, 0);
     }
 
@@ -1550,26 +1678,27 @@ mod tests {
             .signed(&kp(2));
         let mut b = block(&chain, 1, vec![]);
         b.stake_ops = vec![op];
-        assert!(matches!(chain.commit(&b), Err(ChainError::BadSignature(1))));
+        assert!(matches!(chain.commit(&mut b), Err(ChainError::BadSignature(1))));
         assert_eq!(chain.state.height, 0);
     }
 
     #[test]
     fn zero_amount_stakeop_is_rejected() {
         let mut chain = Chain::new(base_genesis());
-        let b = stake_block(&chain, 1, 1, BondKind::Bond, 0);
-        assert!(matches!(chain.commit(&b), Err(ChainError::ZeroStake(1))));
+        let mut b = stake_block(&chain, 1, 1, BondKind::Bond, 0);
+        assert!(matches!(chain.commit(&mut b), Err(ChainError::ZeroStake(1))));
     }
 
     #[test]
     fn state_root_covers_bonded_stake() {
         let mut plain = Chain::new(base_genesis());
         let mut bonded = Chain::new(base_genesis());
-        plain.commit(&block(&plain, 1, vec![novel_tx(1, 1, 1, 1.0)])).unwrap();
+        let mut plain_b = block(&plain, 1, vec![novel_tx(1, 1, 1, 1.0)]);
+        plain.commit(&mut plain_b).unwrap();
         let mut b = block(&bonded, 1, vec![novel_tx(1, 1, 1, 1.0)]);
         b.stake_ops = vec![StakeOp { account: 2, kind: BondKind::Bond, amount: 3 * MICRO, signature: [0u8; 64] }.signed(&kp(2))];
         bonded.seal(&mut b).unwrap();
-        bonded.commit(&b).unwrap();
+        bonded.commit(&mut b).unwrap();
         assert_ne!(plain.state.state_root(), bonded.state.state_root());
     }
 
@@ -1577,9 +1706,9 @@ mod tests {
     fn a_full_bond_unbond_cycle_conserves_supply() {
         let mut chain = Chain::new(base_genesis());
         let start = chain.state.supply;
-        chain.commit(&stake_block(&chain, 1, 1, BondKind::Bond, 7 * MICRO)).unwrap();
+        let mut b = stake_block(&chain, 1, 1, BondKind::Bond, 7 * MICRO); chain.commit(&mut b).unwrap();
         assert!(chain.state.supply_conserved());
-        chain.commit(&stake_block(&chain, 2, 1, BondKind::Unbond, 4 * MICRO)).unwrap();
+        let mut b = stake_block(&chain, 2, 1, BondKind::Unbond, 4 * MICRO); chain.commit(&mut b).unwrap();
         assert!(chain.state.supply_conserved());
         // still bonded 3, unbonding 4, balance rest — supply unchanged throughout
         assert_eq!(chain.state.bonded, 3 * MICRO);
@@ -1613,11 +1742,11 @@ mod tests {
         let mut chain = Chain::new(base_genesis());
         let start = chain.state.supply;
         // account 1 self-bonds and becomes a validator effective height 2
-        chain.commit(&stake_block(&chain, 1, 1, BondKind::Bond, 5 * MICRO)).unwrap();
+        let mut b = stake_block(&chain, 1, 1, BondKind::Bond, 5 * MICRO); chain.commit(&mut b).unwrap();
         assert_eq!(chain.state.validators.get(1).map(|v| v.power), Some(5 * MICRO));
 
         // at height 2 the validator is active — submit proof it double-signed
-        let r = chain.commit(&evidence_block(&chain, 2, vec![evidence(1, 2, 0)])).unwrap();
+        let mut eb = evidence_block(&chain, 2, vec![evidence(1, 2, 0)]); let r = chain.commit(&mut eb).unwrap();
         assert_eq!(r.slashed_to_treasury, 5 * MICRO);
         assert_eq!(chain.state.treasury, 5 * MICRO, "bonded stake seized to treasury");
         assert_eq!(chain.state.bonded, 0);
@@ -1632,13 +1761,13 @@ mod tests {
         let mut chain = Chain::new(base_genesis());
         // bond 6, partially unbond 2 (leaving power 4 so the validator stays active),
         // then slash: both the remaining bond and the still-maturing entry are seized.
-        chain.commit(&stake_block(&chain, 1, 1, BondKind::Bond, 6 * MICRO)).unwrap();
-        chain.commit(&stake_block(&chain, 2, 1, BondKind::Unbond, 2 * MICRO)).unwrap();
+        let mut b = stake_block(&chain, 1, 1, BondKind::Bond, 6 * MICRO); chain.commit(&mut b).unwrap();
+        let mut b = stake_block(&chain, 2, 1, BondKind::Unbond, 2 * MICRO); chain.commit(&mut b).unwrap();
         assert_eq!(chain.state.bonded, 4 * MICRO);
         assert_eq!(chain.state.unbonding.len(), 1);
         assert_eq!(chain.state.validators.get(1).map(|v| v.power), Some(4 * MICRO));
 
-        let r = chain.commit(&evidence_block(&chain, 3, vec![evidence(1, 3, 0)])).unwrap();
+        let mut eb = evidence_block(&chain, 3, vec![evidence(1, 3, 0)]); let r = chain.commit(&mut eb).unwrap();
         assert_eq!(r.slashed_to_treasury, 6 * MICRO, "bond + unbonding both seized");
         assert_eq!(chain.state.treasury, 6 * MICRO);
         assert_eq!(chain.state.bonded, 0);
@@ -1652,7 +1781,7 @@ mod tests {
         let mut chain = Chain::new(base_genesis());
         // genesis validator 21 has power but no bonded stake — slashing removes it
         // and moves nothing (still supply-neutral).
-        let r = chain.commit(&evidence_block(&chain, 1, vec![evidence(21, 1, 0)])).unwrap();
+        let mut eb = evidence_block(&chain, 1, vec![evidence(21, 1, 0)]); let r = chain.commit(&mut eb).unwrap();
         assert_eq!(r.slashed_to_treasury, 0);
         assert_eq!(chain.state.treasury, 0);
         assert!(chain.state.validators.get(21).is_none());
@@ -1668,8 +1797,8 @@ mod tests {
             vote_a: Vote::signed(21, 1, 0, [1u8; 32], VoteType::Precommit, &kp(21)),
             vote_b: Vote::signed(21, 1, 0, [1u8; 32], VoteType::Precommit, &kp(21)),
         };
-        let b = evidence_block(&chain, 1, vec![ev]);
-        assert!(matches!(chain.commit(&b), Err(ChainError::BadEquivocationEvidence(21))));
+        let mut b = evidence_block(&chain, 1, vec![ev]);
+        assert!(matches!(chain.commit(&mut b), Err(ChainError::BadEquivocationEvidence(21))));
         assert_eq!(chain.state.height, 0, "rejected block rolls fully back");
         assert_eq!(chain.state.validators.len(), 3);
     }
@@ -1678,8 +1807,8 @@ mod tests {
     fn evidence_against_a_non_validator_is_rejected() {
         let mut chain = Chain::new(base_genesis());
         // account 1 never bonded -> not in the validator set -> cannot be slashed
-        let b = evidence_block(&chain, 1, vec![evidence(1, 1, 0)]);
-        assert!(matches!(chain.commit(&b), Err(ChainError::BadEquivocationEvidence(1))));
+        let mut b = evidence_block(&chain, 1, vec![evidence(1, 1, 0)]);
+        assert!(matches!(chain.commit(&mut b), Err(ChainError::BadEquivocationEvidence(1))));
         assert_eq!(chain.state.height, 0);
     }
 
@@ -1691,8 +1820,8 @@ mod tests {
             vote_a: Vote::signed(21, 1, 0, [1u8; 32], VoteType::Precommit, &kp(1)),
             vote_b: Vote::signed(21, 1, 0, [2u8; 32], VoteType::Precommit, &kp(1)),
         };
-        let b = evidence_block(&chain, 1, vec![ev]);
-        assert!(matches!(chain.commit(&b), Err(ChainError::BadEquivocationEvidence(21))));
+        let mut b = evidence_block(&chain, 1, vec![ev]);
+        assert!(matches!(chain.commit(&mut b), Err(ChainError::BadEquivocationEvidence(21))));
         assert_eq!(chain.state.height, 0);
     }
 
@@ -1701,12 +1830,12 @@ mod tests {
         let mut chain = Chain::new(base_genesis());
         // proof against every genesis validator in one block -> would empty the
         // set -> rejected, chain untouched.
-        let b = evidence_block(
+        let mut b = evidence_block(
             &chain,
             1,
             vec![evidence(21, 1, 0), evidence(22, 1, 0), evidence(23, 1, 0)],
         );
-        assert!(matches!(chain.commit(&b), Err(ChainError::EmptyValidatorSet)));
+        assert!(matches!(chain.commit(&mut b), Err(ChainError::EmptyValidatorSet)));
         assert_eq!(chain.state.height, 0);
         assert_eq!(chain.state.validators.len(), 3);
     }
@@ -1728,21 +1857,23 @@ mod tests {
         let log = BlockLog::open(&path).unwrap();
 
         let mut live = Chain::new(base_genesis());
-        let b1 = block(&live, 1, vec![novel_tx(1, 1, 1, 1.0)]);
-        live.commit(&b1).unwrap();
+        let mut b1 = block(&live, 1, vec![novel_tx(1, 1, 1, 1.0)]);
+        live.commit(&mut b1).unwrap();
         log.append(&b1).unwrap();
         let mut b2 = Block {
             height: 2,
             prev_hash: live.head,
             timestamp_days: 2.0,
             next_validators_root: [0u8; 32],
+            state_root: [0u8; 32],
+            accounts_root: [0u8; 32],
             txs: vec![novel_tx(2, 2, 2, 2.0)],
             validator_updates: Vec::new(),
             stake_ops: Vec::new(),
             slashing_evidence: Vec::new(),
         };
         live.seal(&mut b2).unwrap();
-        live.commit(&b2).unwrap();
+        live.commit(&mut b2).unwrap();
         log.append(&b2).unwrap();
 
         // reopen the log, replay from genesis, and compare
@@ -1770,7 +1901,7 @@ mod tests {
         let mut b = block(&chain, 1, vec![novel_tx(1, 1, 1, 1.0)]);
         // block() sealed the correct root; corrupt it — commit must reject.
         b.next_validators_root = [0xEE; 32];
-        let err = chain.commit(&b).unwrap_err();
+        let err = chain.commit(&mut b).unwrap_err();
         assert!(
             matches!(err, ChainError::ValidatorRootMismatch { height: 1 }),
             "got {err:?}"
@@ -1782,9 +1913,9 @@ mod tests {
         let mut chain = Chain::new(base_genesis());
         // account 1 bonds -> becomes a validator next height. The sealed root must
         // equal the set the block actually hands off to.
-        let b = stake_block(&chain, 1, 1, BondKind::Bond, 5 * MICRO);
+        let mut b = stake_block(&chain, 1, 1, BondKind::Bond, 5 * MICRO);
         assert_eq!(b.next_validators_root, chain.next_validators_root(&b).unwrap());
-        chain.commit(&b).unwrap();
+        chain.commit(&mut b).unwrap();
         assert_eq!(chain.state.validators.merkle_root(), b.next_validators_root);
         // and validator 1 is provable against that committed root.
         let v = chain.state.validators.get(1).unwrap();
@@ -1806,7 +1937,76 @@ mod tests {
         ];
         // the op admits validator 1, so the real handed-off root differs.
         assert_ne!(chain.next_validators_root(&b).unwrap(), root_for_empty);
-        let err = chain.commit(&b).unwrap_err();
+        let err = chain.commit(&mut b).unwrap_err();
         assert!(matches!(err, ChainError::ValidatorRootMismatch { .. }), "got {err:?}");
+    }
+
+    // ---- M23: state_root + accounts_root commitments in the header ----
+
+    #[test]
+    fn state_root_and_accounts_root_advance_across_each_block_in_a_certified_chain() {
+        // commit a 3-block chain via ChainDriver; the stamps on each block must
+        // match the post-apply state and must differ from height to height (the
+        // chain is actually changing state).
+        let seeds: BTreeMap<u64, [u8; 32]> = [1u64, 21, 22, 23]
+            .iter()
+            .map(|&id| {
+                let mut s = [0u8; 32];
+                s[..8].copy_from_slice(&id.to_le_bytes());
+                (id, s)
+            })
+            .collect();
+        let mut d = crate::driver::ChainDriver::new(base_genesis(), seeds, 4);
+        d.submit(novel_tx(1, 1, 1, 1.0)).unwrap();
+        d.produce(1.0, &BTreeSet::new()).unwrap().expect("block h1");
+        d.submit(novel_tx(2, 2, 2, 2.0)).unwrap();
+        d.produce(2.0, &BTreeSet::new()).unwrap().expect("block h2");
+        d.submit(novel_tx(3, 3, 3, 3.0)).unwrap();
+        d.produce(3.0, &BTreeSet::new()).unwrap().expect("block h3");
+
+        let blocks = d.blocks();
+        assert_eq!(blocks.len(), 3);
+        // each block's stamped roots must equal the post-apply state at that height
+        let mut replay = Chain::new(base_genesis());
+        for b in blocks {
+            // we replay independently; the new_chain's post-apply state == d's
+            // (same genesis, same txs, same order — deterministic).
+            let mut cloned = b.clone();
+            replay.commit(&mut cloned).expect("replay");
+            assert_eq!(b.state_root, replay.state.state_root(),
+                "block {} state_root must equal post-apply state_root", b.height);
+            assert_eq!(b.accounts_root, replay.state.merkle_root(),
+                "block {} accounts_root must equal post-apply merkle_root", b.height);
+        }
+        // also assert that the roots differ across heights (the chain really moved)
+        assert_ne!(blocks[0].state_root, blocks[1].state_root);
+        assert_ne!(blocks[1].state_root, blocks[2].state_root);
+        assert_ne!(blocks[0].accounts_root, blocks[1].accounts_root);
+        assert_ne!(blocks[1].accounts_root, blocks[2].accounts_root);
+    }
+
+    #[test]
+    fn state_root_mismatch_is_rejected() {
+        // the dual of `tampered_next_validators_root_is_rejected` for M23: seal
+        // a block normally, then flip state_root before commit. The commit
+        // must return StateRootMismatch and the chain must not advance.
+        let mut chain = Chain::new(base_genesis());
+        let mut b = block(&chain, 1, vec![novel_tx(1, 1, 1, 1.0)]);
+        b.state_root = [0xCCu8; 32];
+        let err = chain.commit(&mut b).unwrap_err();
+        assert!(matches!(err, ChainError::StateRootMismatch { height: 1 }), "got {err:?}");
+        assert_eq!(chain.state.height, 0, "rejected block rolls fully back");
+    }
+
+    #[test]
+    fn accounts_root_mismatch_is_rejected() {
+        // same as above but for accounts_root — proves the cert-signed inclusion-proof
+        // commitment is enforced independently from the full-state digest.
+        let mut chain = Chain::new(base_genesis());
+        let mut b = block(&chain, 1, vec![novel_tx(1, 1, 1, 1.0)]);
+        b.accounts_root = [0xDDu8; 32];
+        let err = chain.commit(&mut b).unwrap_err();
+        assert!(matches!(err, ChainError::AccountsRootMismatch { height: 1 }), "got {err:?}");
+        assert_eq!(chain.state.height, 0, "rejected block rolls fully back");
     }
 }

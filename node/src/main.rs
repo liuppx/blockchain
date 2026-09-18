@@ -7,6 +7,7 @@
 //!   cargo run --release --bin node -- gossip           # gossip + anti-entropy sync (in-proc + loopback TCP)
 //!   cargo run --release --bin node -- light            # light client: follow the validator set without full replay
 //!   cargo run --release --bin node -- lsync            # header-only SPV sync over the gossip bus (light peer never sees a tx)
+//!   cargo run --release --bin node -- account          # account-membership SPV for a wallet: prove your balance against a cert-signed header
 //!   cargo run --release --bin node -- staking          # bond/unbond: stake-bound validator power + unbonding
 //!   cargo run --release --bin node -- slashing         # slash an equivocating validator's bonded stake to the treasury
 //!   cargo run --release --bin node -- run  --dir DIR   # persistent chain (block log)
@@ -24,7 +25,7 @@ use std::sync::mpsc;
 use std::thread;
 
 use zhixing_engine::{DeltaKParams, DIM};
-use zhixing_node::consensus::{commit_block, detect_equivocation};
+use zhixing_node::consensus::{commit_block, detect_equivocation, Commit};
 use zhixing_node::driver::ChainDriver;
 use zhixing_node::mempool::Mempool;
 use zhixing_node::merkle;
@@ -140,6 +141,9 @@ fn demo_blocks(chain: &Chain) -> Vec<Block> {
         prev_hash: trial.head,
         timestamp_days: 1.0,
         next_validators_root: [0u8; 32],
+        // M23: state commitments stamped by `Chain::commit`.
+        state_root: [0u8; 32],
+        accounts_root: [0u8; 32],
         txs: vec![
             tx(1, unit(1), 1, reviews(&[(10, 0.9), (11, 0.85), (12, 0.9)]), (3, 3), 1.0),
             tx(2, unit(2), 2, reviews(&[(10, 0.88), (11, 0.9), (12, 0.86)]), (3, 3), 1.0),
@@ -149,13 +153,16 @@ fn demo_blocks(chain: &Chain) -> Vec<Block> {
         slashing_evidence: Vec::new(),
     };
     trial.seal(&mut b1).expect("seal b1");
-    trial.commit(&b1).expect("commit b1 on trial");
+    trial.commit(&mut b1).expect("commit b1 on trial");
     // block 2 prev_hash is (sealed) block 1's hash
     let mut b2 = Block {
         height: 2,
         prev_hash: b1.hash(),
         timestamp_days: 2.0,
         next_validators_root: [0u8; 32],
+        // M23: state commitments stamped by `Chain::commit`.
+        state_root: [0u8; 32],
+        accounts_root: [0u8; 32],
         txs: vec![
             tx(3, blend(1, 2), 3, reviews(&[(10, 0.9), (11, 0.9), (12, 0.85)]), (3, 3), 2.0),
             tx(1, unit(0), 0, reviews(&[(10, 0.7), (11, 0.6), (12, 0.65)]), (0, 3), 2.0),
@@ -185,6 +192,7 @@ fn main() {
         "gossip" => cmd_gossip(),
         "light" => cmd_light(),
         "lsync" => cmd_lsync(),
+        "account" => cmd_account(),
         "run" => cmd_run(dir_arg(&args)),
         "status" => cmd_status(dir_arg(&args)),
         "certs" => cmd_certs(dir_arg(&args)),
@@ -224,6 +232,7 @@ fn usage() {
     eprintln!("  node gossip             gossip + anti-entropy sync: fresh nodes catch up to a certified chain (in-proc + TCP)");
     eprintln!("  node light              light client: follow the validator set across heights without full replay");
     eprintln!("  node lsync              header-only SPV sync over the gossip bus: a light peer reaches the full node's height with zero tx bodies");
+    eprintln!("  node account            account-membership SPV for a wallet: prove your own balance against a cert-signed header, no replay, no tx bodies");
     eprintln!("  node run    --dir DIR   persistent chain (seeds demo blocks once, then replays)");
     eprintln!("  node status --dir DIR   replay the block log and print state");
     eprintln!("  node certs  --dir DIR   persist a certified chain (blocks+certs) and re-verify finality on reload");
@@ -277,8 +286,8 @@ fn cmd_build() {
 /// and a proof — no full state needed.
 fn cmd_prove() {
     let mut chain = Chain::new(demo_genesis());
-    for blk in demo_blocks(&chain) {
-        chain.commit(&blk).unwrap();
+    for mut blk in demo_blocks(&chain) {
+        chain.commit(&mut blk).unwrap();
     }
     let root = chain.state.merkle_root();
     println!("merkle_root = {}\n", short(&root));
@@ -1071,7 +1080,8 @@ fn cmd_light() {
     let mut committed_sets: Vec<ValidatorSet> = Vec::new();
     let mut replay = Chain::new(demo_genesis());
     for b in d.blocks() {
-        replay.commit(b).unwrap_or_else(|e| fail_msg("replay commit", &e));
+        let mut b = b.clone();
+        replay.commit(&mut b).unwrap_or_else(|e| fail_msg("replay commit", &e));
         committed_sets.push(replay.state.validators.clone());
     }
     let mut lt2 = ValidatorTracker::from_genesis(&demo_genesis());
@@ -1160,7 +1170,8 @@ fn cmd_lsync() {
     let mut committed_sets: Vec<ValidatorSet> = Vec::new();
     let mut replay = Chain::new(demo_genesis());
     for b in d.blocks() {
-        replay.commit(b).unwrap_or_else(|e| fail_msg("replay commit", &e));
+        let mut b = b.clone();
+        replay.commit(&mut b).unwrap_or_else(|e| fail_msg("replay commit", &e));
         committed_sets.push(replay.state.validators.clone());
     }
     let next_set_for = |h: u64| committed_sets.get((h - 1) as usize).cloned();
@@ -1257,6 +1268,142 @@ fn cmd_lsync() {
         "  verify_membership against a forged next set -> {} (must be false)",
         wrong.is_ok()
     );
+}
+
+/// M23: a light wallet proves its own balance against a cert-signed header
+/// pulled over the M22 gossip bus — no replay, no tx bodies, no full peer
+/// trust. Mirrors the `lsync` demo but goes one step further: after the
+/// light peer reaches the full peer's height, it asks the full peer for an
+/// account inclusion proof, then runs `verify_account_membership_against_header`
+/// against the cert-signed `header.accounts_root`.
+fn cmd_account() {
+    use zhixing_node::light::ValidatorTracker;
+
+    println!("M23 — account-membership SPV for a wallet");
+    println!();
+
+    // 1. Build a real certified chain (same shape as cmd_lsync — a chain that
+    //    reshapes its validator set so M22 is also exercised).
+    let (blocks, certs) = run_driver(3);
+
+    // 2. Wrap in GossipNode (full) + LightGossipNode (light) over LightNetwork.
+    let mut full = GossipNode::new(1, demo_genesis(), 8, [1, 2]);
+    full.load_certified(&blocks, &certs);
+    let light_id = 2u64;
+    let light = LightGossipNode::new(light_id, &demo_genesis(), [1, 2]);
+    let mut net = LightNetwork::new(vec![full], vec![light]);
+
+    // 3. Authoritative per-height next sets from a full replay; needed to
+    //    side-channel the headers from full -> light through
+    //    LightGossipNode::apply_header (the bus drops them otherwise).
+    let sets = committed_sets(&demo_genesis(), &blocks);
+    let next_set_for = |h: u64| sets.get((h - 1) as usize).cloned();
+
+    // 4. Run the M22 sync to header height 2.
+    net.announce_all();
+    for _ in 0..20 {
+        let n = net.run(1, light_id, &next_set_for);
+        if n == 0 && net.light_node(light_id).tracker().height() == 2 {
+            break;
+        }
+        if n == 0 {
+            break; // bus drained — either synced or stuck
+        }
+    }
+    let lt = net.light_node(light_id).tracker().clone();
+    let full_height = blocks.len() as u64;
+    if lt.height() != full_height {
+        eprintln!(
+            "note: light reached height {} / {}",
+            lt.height(),
+            full_height
+        );
+    }
+    println!(
+        "M22 sync: light at height {}, head {}",
+        lt.height(),
+        short(&lt.head())
+    );
+    println!();
+
+    // The wallet proves its account against the latest cert-signed header
+    // the light peer actually advanced to. That is `lt.height()`'s block.
+    let last_idx = (lt.height() as usize).saturating_sub(1);
+    let last_block = &blocks[last_idx];
+    let last_cert = &certs[last_idx];
+
+    // 5. Light wallet asks full peer: GetAccountProof { id: 1 }. Full peer
+    //    replies with AccountProof from its current chain state.
+    let mut full_node = net.take_full(1);
+    let mut light_node = net.take_light(light_id);
+    let reply = full_node.on_message(light_id, GossipMsg::GetAccountProof { id: 1 });
+    assert_eq!(reply.len(), 1, "full peer must serve the account proof");
+    let (_dst, proof_msg) = reply.into_iter().next().unwrap();
+    light_node.on_message(1, proof_msg);
+
+    // 6. Light wallet pulls the cached proof, computes the leaf locally, and
+    //    calls verify_account_membership_against_header against the latest
+    //    cert-signed header's `accounts_root` (the SPV primitive).
+    let (account, proof) = light_node
+        .take_account_proof(1)
+        .expect("proof cached for id 1");
+    let header = zhixing_node::codec::BlockHeader::from_block(last_block);
+    let tracked = lt.validators().clone();
+    let verified = ValidatorTracker::verify_account_membership_against_header(
+        &header, last_cert, &tracked, 1, &account, &proof,
+    );
+    println!("account #1 (post-apply state at height {}):", lt.height());
+    println!("  balance       = {} COG", account.balance / MICRO);
+    println!("  staked_total  = {} COG", account.staked_total / MICRO);
+    println!("  earned_total  = {} COG", account.earned_total / MICRO);
+    println!("  submissions   = {}", account.submissions);
+    println!(
+        "  verify_account_membership_against_header -> {}",
+        verified.is_ok()
+    );
+
+    // 7. Negative: light wallet tampers with the proof's leaf (claims balance+1),
+    //    retry -> MembershipProofInvalid.
+    let mut bad_account = account.clone();
+    bad_account.balance += 1;
+    let bad = ValidatorTracker::verify_account_membership_against_header(
+        &header, last_cert, &tracked, 1, &bad_account, &proof,
+    );
+    println!(
+        "  inflated balance (balance+1) -> {} (must be false: {})",
+        bad.is_ok(),
+        match bad.as_ref().err() {
+            Some(e) => format!("{e}"),
+            None => String::from("ok (UNEXPECTED)"),
+        }
+    );
+
+    // 8. Negative: light wallet tampers with header.accounts_root.
+    let mut bad_header = header.clone();
+    bad_header.accounts_root = [0xAB; 32];
+    let bad_root = ValidatorTracker::verify_account_membership_against_header(
+        &bad_header, last_cert, &tracked, 1, &account, &proof,
+    );
+    println!(
+        "  tampered accounts_root -> {} (must be false: {})",
+        bad_root.is_ok(),
+        match bad_root.as_ref().err() {
+            Some(e) => format!("{e}"),
+            None => String::from("ok (UNEXPECTED)"),
+        }
+    );
+
+    // 9. Dual-root note: state_root covers the full consensus state;
+    //    accounts_root is the inclusion-proof tree for accounts + reviewers.
+    println!();
+    println!("dual-root contract:");
+    println!("  state_root    = {}  (full consensus-state digest)", short(&header.state_root));
+    println!("  accounts_root = {}  (Merkle root over accounts U reviewers)", short(&header.accounts_root));
+    println!("  the cert signs header.hash() which covers BOTH roots; the wallet");
+    println!("  trusts the cert-signing validator set for state_root and verifies");
+    println!("  account membership against accounts_root locally.");
+    net.put_full(full_node);
+    net.put_light(light_node);
 }
 
 fn cmd_run(dir: String) {
@@ -1371,8 +1518,8 @@ fn cmd_certs(dir: String) {
     }
 }
 
-fn commit_print(chain: &mut Chain, log: Option<&BlockLog>, label: &str, blk: Block) {
-    match chain.commit(&blk) {
+fn commit_print(chain: &mut Chain, log: Option<&BlockLog>, label: &str, mut blk: Block) {
+    match chain.commit(&mut blk) {
         Ok(r) => {
             if let Some(l) = log {
                 l.append(&blk).unwrap_or_else(|e| fail("append block", e));
@@ -1446,4 +1593,47 @@ fn fail_chain(ctx: &str, e: zhixing_node::ChainError) -> ! {
 fn fail_msg<E: std::fmt::Display>(ctx: &str, e: &E) -> ! {
     eprintln!("error: {ctx}: {e}");
     exit(1);
+}
+
+/// Run the chain driver until the mempool drains (or `max_heights`), returning
+/// the certified `(blocks, certs)` vectors the driver produced.
+fn run_driver(max_heights: usize) -> (Vec<Block>, Vec<Commit>) {
+    let mut driver = ChainDriver::new(demo_genesis(), demo_driver_seeds(), 4);
+    // Submit enough txs that the mempool actually produces blocks (otherwise
+    // `produce_until_drained` returns 0 because no candidate is yielded).
+    driver.submit(tx(1, unit(1), 1, reviews(&[(10, 0.9), (11, 0.85), (12, 0.9)]), (3, 3), 1.0)).expect("submit 1");
+    driver.submit(tx(2, unit(2), 2, reviews(&[(10, 0.88), (11, 0.9), (12, 0.86)]), (3, 3), 1.0)).expect("submit 2");
+    driver
+        .produce_until_drained(1.0, max_heights)
+        .expect("driver");
+    let blocks = driver.blocks().to_vec();
+    let certs = driver.certificates().to_vec();
+    assert_eq!(blocks.len(), certs.len());
+    (blocks, certs)
+}
+
+/// Deterministic keypair seeds for the demo validator set (ids 21..=24).
+fn demo_driver_seeds() -> std::collections::BTreeMap<u64, [u8; 32]> {
+    let ids = [21u64, 22, 23, 24];
+    ids.iter()
+        .map(|&id| {
+            let mut s = [0u8; 32];
+            s[..8].copy_from_slice(&id.to_le_bytes());
+            (id, s)
+        })
+        .collect()
+}
+
+/// Per-height committed sets from an authoritative replay: `sets[i]` is the
+/// validator set that certifies height `i + 2` (what block `i + 1` commits to
+/// in `next_validators_root`).
+fn committed_sets(g: &Genesis, blocks: &[Block]) -> Vec<ValidatorSet> {
+    let mut replay = Chain::new(g.clone());
+    let mut sets = Vec::new();
+    for b in blocks {
+        let mut b = b.clone();
+        replay.commit(&mut b).expect("commit");
+        sets.push(replay.state.validators.clone());
+    }
+    sets
 }

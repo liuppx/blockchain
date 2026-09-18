@@ -113,6 +113,7 @@ impl Proposal {
 
 /// A consensus message on the wire.
 #[derive(Clone, Debug)]
+#[allow(clippy::large_enum_variant)]
 pub enum Msg {
     Proposal(Proposal),
     Vote(Vote),
@@ -120,6 +121,7 @@ pub enum Msg {
 
 /// A side effect the FSM asks its host to perform.
 #[derive(Clone, Debug)]
+#[allow(clippy::large_enum_variant)]
 pub enum Action {
     /// Send this message to every validator.
     Broadcast(Msg),
@@ -633,7 +635,19 @@ mod tests {
     }
 
     fn block(height: u64) -> Block {
-        Block { height, prev_hash: [9u8; 32], timestamp_days: height as f32, next_validators_root: [0u8; 32], txs: Vec::new(), validator_updates: Vec::new(), stake_ops: Vec::new(), slashing_evidence: Vec::new() }
+        Block {
+            height,
+            prev_hash: [9u8; 32],
+            timestamp_days: height as f32,
+            next_validators_root: [0u8; 32],
+            // M23: state commitments stamped by Chain::commit.
+            state_root: [0u8; 32],
+            accounts_root: [0u8; 32],
+            txs: Vec::new(),
+            validator_updates: Vec::new(),
+            stake_ops: Vec::new(),
+            slashing_evidence: Vec::new(),
+        }
     }
 
     #[test]

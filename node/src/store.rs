@@ -163,6 +163,9 @@ mod tests {
             prev_hash: prev,
             timestamp_days: height as f32,
             next_validators_root: [0u8; 32],
+            // M23: state commitments stamped by Chain::commit.
+            state_root: [0u8; 32],
+            accounts_root: [0u8; 32],
             txs: vec![SubmissionTx {
                 author: 1,
                 embedding: emb,

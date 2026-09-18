@@ -170,6 +170,10 @@ impl ChainDriver {
                     prev_hash: self.chain.head,
                     timestamp_days,
                     next_validators_root: [0u8; 32],
+                    // M23: state_root/accounts_root are stamped by
+                    // `Chain::commit` after the trial apply succeeds.
+                    state_root: [0u8; 32],
+                    accounts_root: [0u8; 32],
                     txs: Vec::new(),
                     validator_updates: Vec::new(),
                     stake_ops: Vec::new(),
@@ -218,7 +222,12 @@ impl ChainDriver {
     }
 
     fn apply(&mut self, block: &Block) -> Result<(), DriverError> {
-        self.chain.commit(block).map_err(DriverError::Apply)?;
+        // M23: `Chain::commit` now mutates the block to stamp the post-apply
+        // state commitments, so clone here (the original stays in the driver's
+        // owned `blocks` list and is what `to_block`/the persisted log care
+        // about).
+        let mut owned = block.clone();
+        self.chain.commit(&mut owned).map_err(DriverError::Apply)?;
         self.mempool.remove_included(block);
         Ok(())
     }
