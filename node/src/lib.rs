@@ -57,6 +57,26 @@ pub const MICRO: u64 = 1_000_000;
 pub type Hash = [u8; 32];
 pub type Embedding = [f32; DIM];
 
+// M27: the canonical reference pivot for the cert-signed secondary graph
+// index. The first standard basis vector — a unit vector along axis 0 —
+// is a deterministic, query-independent choice. All peers sort graph
+// nodes by `(cos_sim(CANONICAL_PIVOT, n.embedding) desc, node_id asc)`,
+// so the cert-signed `header.graph_root` commits to one canonical order
+// independent of any wallet's query. The user's query drives the *cut*;
+// the pivot only fixes the *index*. Lives here (not in the engine) because
+// it's a verifier/wallet-side commitment choice, not a math primitive.
+const CANONICAL_PIVOT: Embedding = [1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
+
+/// M27: typed producer-side return for [`ChainState::graph_range_proof`] —
+/// the sub-root of the cert-signed sorted-graph tree at slice `[a, b)`,
+/// plus the ordered list of `(node_id, GraphNode, merkle::Proof)` for that
+/// slice. The wallet-side `RangeClaim` carries the same shape but drops
+/// the sub-root (the verifier recomputes it from `header.graph_root`).
+pub struct RangeProof {
+    pub sub_root: Hash,
+    pub entries: Vec<(u64, crate::engine::GraphNode, merkle::Proof)>,
+}
+
 // --- Transactions ------------------------------------------------------------
 
 /// A reviewer's score for a submission, in [0, 1]. The reviewer's *reputation*
@@ -229,6 +249,16 @@ pub struct Block {
     /// tx bodies. Stamped by [`Chain::commit`]; mismatches on apply return
     /// [`ChainError::AccountsRootMismatch`].
     pub accounts_root: Hash,
+    /// M27: Merkle root of the post-apply cognitive graph sorted by
+    /// `(cos_sim(CANONICAL_PIVOT, n.embedding) desc, node_id asc)`
+    /// (see [`ChainState::graph_merkle_root`]). A cert-signed secondary
+    /// index committed alongside `accounts_root`, distinct from it because
+    /// the leaf ordering is different (insertion order vs sorted-cosine).
+    /// Cert-signed via `block.hash()`; a wallet opens range proofs against
+    /// `header.graph_root` without trusting the prover's filter. Stamped by
+    /// [`Chain::commit`]; mismatches on apply return
+    /// [`ChainError::GraphRootMismatch`].
+    pub graph_root: Hash,
     pub txs: Vec<SubmissionTx>,
     /// On-chain validator-set changes carried by this block. Applied after the
     /// transactions and taking effect from the *next* height (this block is
@@ -419,6 +449,12 @@ pub enum ChainError {
     /// peer tampered with the field) — a wallet's account-inclusion proofs
     /// would not verify against the wrong root.
     AccountsRootMismatch { height: u64 },
+    /// M27: the block's `graph_root` does not equal the post-apply Merkle
+    /// root of the cognitive-graph nodes sorted by cosine against the
+    /// canonical pivot. Cert-signed via `header.graph_root`, this is the
+    /// commitment a wallet opens the sorted graph view against for M27
+    /// range claims — same root mismatch reasoning as `AccountsRootMismatch`.
+    GraphRootMismatch { height: u64 },
 }
 
 impl std::fmt::Display for ChainError {
@@ -462,6 +498,10 @@ impl std::fmt::Display for ChainError {
             ChainError::AccountsRootMismatch { height } => write!(
                 f,
                 "block {height} accounts_root does not match the post-apply accounts/reviewers Merkle root"
+            ),
+            ChainError::GraphRootMismatch { height } => write!(
+                f,
+                "block {height} graph_root does not match the post-apply graph (sorted-by-cosine) Merkle root"
             ),
         }
     }
@@ -552,6 +592,15 @@ impl ChainState {
     pub fn merkle_root_for_genesis(g: &Genesis) -> Hash {
         Self::genesis_split(g.clone()).0.merkle_root()
     }
+    /// M27: same pattern as `merkle_root_for_genesis`, but for the
+    /// cert-signed sorted-by-cosine graph root that ships in
+    /// `header.graph_root`. A light client anchored on the genesis hash
+    /// computes this without materialising a full `ChainState`, matching
+    /// what `ChainState::genesis` stamps onto the genesis block's
+    /// `graph_root` field.
+    pub fn graph_merkle_root_for_genesis(g: &Genesis) -> Hash {
+        Self::genesis_split(g.clone()).0.graph_merkle_root()
+    }
 
     /// The shared genesis construction; `genesis` and the two `*_for_genesis`
     /// helpers all funnel through this so the values stay in lockstep.
@@ -610,6 +659,11 @@ impl ChainState {
             next_validators_root: state.validators.merkle_root(),
             state_root: state.state_root(),
             accounts_root: state.merkle_root(),
+            // M27: stamp the genesis sorted-by-cosine graph root the same way
+            // we stamp `accounts_root` so a light client anchored on the
+            // genesis hash finds the cert-signed secondary index already
+            // committed for height 0.
+            graph_root: state.graph_merkle_root(),
             txs: Vec::new(),
             validator_updates: Vec::new(),
             stake_ops: Vec::new(),
@@ -759,6 +813,15 @@ impl ChainState {
         }
         if enforce_commitment && block.accounts_root != self.merkle_root() {
             return Err(ChainError::AccountsRootMismatch { height: new_height });
+        }
+        // M27: cert-signed secondary index over the cognitive graph. Same
+        // discipline as `accounts_root` above — producer stamps via
+        // [`Chain::seal`], every verifier rechecks on apply. The two
+        // commitments cover the same underlying graph nodes but with
+        // different orderings (insertion order vs sorted-by-cosine), so a
+        // mismatch on either means a tampering or seal error.
+        if enforce_commitment && block.graph_root != self.graph_merkle_root() {
+            return Err(ChainError::GraphRootMismatch { height: new_height });
         }
 
         Ok(BlockReceipt {
@@ -1141,6 +1204,77 @@ impl ChainState {
         merkle::MerkleTree::from_leaf_hashes(self.merkle_leaves()).proof(offset + idx)
     }
 
+    /// M27: Merkle root over the cognitive graph nodes sorted by
+    /// `(cos_sim(CANONICAL_PIVOT, n.embedding) desc, node_id asc)`. Cert-
+    /// signed via `header.graph_root`. The leaf preimage is identical to
+    /// `GraphNode::merkle_leaf()` (44 bytes), but the leaves are presented
+    /// in a *different* order than `merkle_leaves()` — so the two roots
+    /// commit to the SAME underlying nodes with DIFFERENT orderings, and
+    /// are distinct commitments.
+    ///
+    /// The canonical pivot is the first standard basis vector
+    /// `[1, 0, 0, 0, 0, 0, 0, 0]` (a unit vector along axis 0), the same
+    /// shape used by the engine's existing test fixtures (`engine::unit(1.0)`).
+    /// Sorting against a deterministic pivot makes the index reproducible
+    /// across all peers and across all wallet verifiers, independent of the
+    /// user's query — the user query drives the *cut*, but the index lives
+    /// in the cert-signed header.
+    pub fn graph_merkle_root(&self) -> Hash {
+        let leaves = self.graph_sorted_leaves();
+        merkle::MerkleTree::from_leaf_hashes(leaves).root()
+    }
+
+    /// M27: prove the slice `[a, b)` of the sorted-by-cosine view commits
+    /// to a sub-root under `graph_root`. Returns `(sub_root, ordered list of
+    /// (node_id, GraphNode, merkle::Proof))` for the leaves in that range
+    /// (in the same sorted order used by `graph_merkle_root`). `None` if
+    /// `b > n` or `a > b` or `a == b` (empty slice).
+    pub fn graph_range_proof(
+        &self,
+        a: usize,
+        b: usize,
+    ) -> Option<RangeProof> {
+        let n = self.graph.nodes.len();
+        if a > b || b > n || a == b { return None; }
+        let sorted = self.graph_sorted_nodes();
+        let leaves: Vec<Hash> = sorted.iter()
+            .map(|n| merkle::leaf_hash(&n.merkle_leaf()))
+            .collect();
+        let tree = merkle::MerkleTree::from_leaf_hashes(leaves);
+        let mut entries: Vec<(u64, crate::engine::GraphNode, merkle::Proof)> =
+            Vec::with_capacity(b - a);
+        for (i, node) in sorted.iter().enumerate().take(b).skip(a) {
+            let proof = tree.proof(i)?;
+            entries.push((node.node_id, node.clone(), proof));
+        }
+        Some(RangeProof { sub_root: tree.root(), entries })
+    }
+
+    /// Internal: graph nodes sorted by `(cos_sim(CANONICAL_PIVOT, *) desc,
+    /// node_id asc)`. The single source of truth for the M27 sort order,
+    /// used by both `graph_merkle_root` (to compute the root) and
+    /// `graph_range_proof` (to slice the tree). Index in this Vec is the
+    /// leaf index against `graph_root`.
+    fn graph_sorted_nodes(&self) -> Vec<crate::engine::GraphNode> {
+        let mut sorted: Vec<crate::engine::GraphNode> = self.graph.nodes.clone();
+        sorted.sort_by(|a, b| {
+            let sa = crate::engine::cos_sim(&CANONICAL_PIVOT, &a.embedding);
+            let sb = crate::engine::cos_sim(&CANONICAL_PIVOT, &b.embedding);
+            // Descending cosine; ties broken by `node_id` ascending.
+            sb.partial_cmp(&sa).unwrap_or(std::cmp::Ordering::Equal)
+                .then(a.node_id.cmp(&b.node_id))
+        });
+        sorted
+    }
+
+    /// Internal: preimage leaves for `graph_sorted_nodes`. Mirrors
+    /// `merkle_leaves`'s third slice but in sorted order.
+    fn graph_sorted_leaves(&self) -> Vec<Hash> {
+        self.graph_sorted_nodes().iter()
+            .map(|n| merkle::leaf_hash(&n.merkle_leaf()))
+            .collect()
+    }
+
     /// Accounting invariant: every micro-$COG is in an account balance, in the
     /// treasury, in the bonded pool, or in the unbonding queue (stake escrow for a
     /// submission is always resolved within a tx). Should hold after any sequence
@@ -1208,6 +1342,9 @@ impl Chain {
         trial.apply_block_inner(block, false)?;
         block.state_root = trial.state_root();
         block.accounts_root = trial.merkle_root();
+        // M27: stamp the cert-signed sorted-by-cosine graph root alongside
+        // `accounts_root`. Same trial, same idempotence contract.
+        block.graph_root = trial.graph_merkle_root();
         Ok(())
     }
 
@@ -1245,6 +1382,11 @@ impl Chain {
         }
         if block.accounts_root == [0u8; 32] {
             block.accounts_root = trial.merkle_root();
+        }
+        // M27: same auto-stamp fallback for the cert-signed sorted-graph
+        // commitment.
+        if block.graph_root == [0u8; 32] {
+            block.graph_root = trial.graph_merkle_root();
         }
         self.state = trial;
         self.head = receipt.hash;
@@ -1382,6 +1524,7 @@ mod tests {
             next_validators_root: [0u8; 32],
             state_root: [0u8; 32],
             accounts_root: [0u8; 32],
+            graph_root: [0u8; 32],
             txs,
             validator_updates: Vec::new(),
             stake_ops: Vec::new(),
@@ -1916,6 +2059,7 @@ mod tests {
             next_validators_root: [0u8; 32],
             state_root: [0u8; 32],
             accounts_root: [0u8; 32],
+            graph_root: [0u8; 32],
             txs: vec![novel_tx(2, 2, 2, 2.0)],
             validator_updates: Vec::new(),
             stake_ops: Vec::new(),
@@ -2057,6 +2201,79 @@ mod tests {
         let err = chain.commit(&mut b).unwrap_err();
         assert!(matches!(err, ChainError::AccountsRootMismatch { height: 1 }), "got {err:?}");
         assert_eq!(chain.state.height, 0, "rejected block rolls fully back");
+    }
+
+    // --- M27: graph_root commitment + sorted-graph producer -------------
+
+    #[test]
+    fn graph_root_mismatch_is_rejected() {
+        // the dual for the M27 sorted-graph commitment: seal a block normally,
+        // then flip graph_root before commit. The commit must return
+        // GraphRootMismatch and the chain must not advance.
+        let mut chain = Chain::new(base_genesis());
+        let mut b = block(&chain, 1, vec![novel_tx(1, 1, 1, 1.0)]);
+        b.graph_root = [0xEEu8; 32];
+        let err = chain.commit(&mut b).unwrap_err();
+        assert!(matches!(err, ChainError::GraphRootMismatch { height: 1 }), "got {err:?}");
+        assert_eq!(chain.state.height, 0, "rejected block rolls fully back");
+    }
+
+    #[test]
+    fn graph_merkle_root_is_deterministic_for_a_fixed_pivot() {
+        // Two consecutive calls must produce identical roots: the sorted
+        // view is a pure function of (graph, CANONICAL_PIVOT). If the
+        // determinism contract ever breaks the wallet's verifier cannot
+        // re-derive the same root.
+        let mut chain = Chain::new(base_genesis());
+        chain.commit(&mut block(&chain, 1, vec![novel_tx(1, 1, 1, 1.0)]).clone()).unwrap();
+        let r1 = chain.state.graph_merkle_root();
+        let r2 = chain.state.graph_merkle_root();
+        assert_eq!(r1, r2);
+    }
+
+    #[test]
+    fn graph_merkle_root_differs_from_accounts_root_for_a_non_trivial_graph() {
+        // `accounts_root` commits graph nodes in INSERTION order (M25's
+        // contract), `graph_root` commits them in SORTED-BY-COSINE order.
+        // For any graph with at least two nodes whose insertion order does
+        // not match the cosine order the two roots MUST differ — otherwise
+        // the two commitments collapse and one of them is dead weight.
+        let mut chain = Chain::new(base_genesis());
+        chain.commit(&mut block(&chain, 1, vec![novel_tx(1, 1, 1, 1.0)]).clone()).unwrap();
+        let a = chain.state.merkle_root();
+        let g = chain.state.graph_merkle_root();
+        assert_ne!(a, g, "different leaf orderings must produce different roots");
+    }
+
+    #[test]
+    fn graph_range_proof_round_trip() {
+        // Every per-leaf proof returned by `graph_range_proof(a, b)` must
+        // verify against `graph_merkle_root`; out-of-range slices return
+        // `None`; an empty slice (`a == b`) returns `None`.
+        let mut chain = Chain::new(base_genesis());
+        chain.commit(&mut block(&chain, 1, vec![novel_tx(1, 1, 1, 1.0)]).clone()).unwrap();
+        let n = chain.state.graph.nodes.len();
+        assert!(n >= 2, "genesis + 1 novel tx should give >= 2 graph nodes");
+
+        // Whole-graph slice
+        let proof = chain.state.graph_range_proof(0, n).expect("full slice");
+        assert_eq!(proof.sub_root, chain.state.graph_merkle_root());
+        for (id, node, merkle_proof) in &proof.entries {
+            let leaf_hash = crate::merkle::leaf_hash(&node.merkle_leaf());
+            assert!(crate::merkle::verify(&proof.sub_root, &leaf_hash, merkle_proof),
+                "per-leaf proof failed for node_id {id}");
+        }
+
+        // Empty slice
+        assert!(chain.state.graph_range_proof(0, 0).is_none());
+        assert!(chain.state.graph_range_proof(1, 1).is_none());
+
+        // Out-of-range
+        assert!(chain.state.graph_range_proof(0, n + 1).is_none());
+        assert!(chain.state.graph_range_proof(n, n + 1).is_none());
+
+        // Inverted range
+        assert!(chain.state.graph_range_proof(2, 1).is_none());
     }
 
     // --- M24: reviewer proof producer ------------------------------------

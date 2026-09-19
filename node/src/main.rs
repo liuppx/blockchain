@@ -27,7 +27,8 @@ use std::thread;
 use zhixing_engine::{DeltaKParams, DIM};
 use zhixing_node::consensus::{commit_block, detect_equivocation, Commit};
 use zhixing_node::driver::ChainDriver;
-use zhixing_node::light::{ProofEntry, ValidatorTracker};
+use zhixing_node::codec::BlockHeader;
+use zhixing_node::light::{LightError, ProofEntry, ValidatorTracker};
 use zhixing_node::mempool::Mempool;
 use zhixing_node::merkle;
 use zhixing_node::net::{read_msg, write_msg, GossipMsg, GossipNode, LightGossipNode, LightNetwork, Network};
@@ -145,6 +146,8 @@ fn demo_blocks(chain: &Chain) -> Vec<Block> {
         // M23: state commitments stamped by `Chain::commit`.
         state_root: [0u8; 32],
         accounts_root: [0u8; 32],
+        // M27: stamped by `Chain::commit` (or `Chain::seal`) — builder leaves zero.
+        graph_root: [0u8; 32],
         txs: vec![
             tx(1, unit(1), 1, reviews(&[(10, 0.9), (11, 0.85), (12, 0.9)]), (3, 3), 1.0),
             tx(2, unit(2), 2, reviews(&[(10, 0.88), (11, 0.9), (12, 0.86)]), (3, 3), 1.0),
@@ -164,6 +167,7 @@ fn demo_blocks(chain: &Chain) -> Vec<Block> {
         // M23: state commitments stamped by `Chain::commit`.
         state_root: [0u8; 32],
         accounts_root: [0u8; 32],
+        graph_root: [0u8; 32],
         txs: vec![
             tx(3, blend(1, 2), 3, reviews(&[(10, 0.9), (11, 0.9), (12, 0.85)]), (3, 3), 2.0),
             tx(1, unit(0), 0, reviews(&[(10, 0.7), (11, 0.6), (12, 0.65)]), (0, 3), 2.0),
@@ -196,6 +200,7 @@ fn main() {
         "account" => cmd_account(),
         "graph" => cmd_graph(),
         "knn" => cmd_knn(),
+        "range" => cmd_range(),
         "run" => cmd_run(dir_arg(&args)),
         "status" => cmd_status(dir_arg(&args)),
         "certs" => cmd_certs(dir_arg(&args)),
@@ -238,6 +243,7 @@ fn usage() {
     eprintln!("  node account            account-membership SPV for a wallet: prove your own balance against a cert-signed header, no replay, no tx bodies");
     eprintln!("  node graph              cognitive-graph inclusion proof: prove a graph node against a cert-signed header's accounts_root, no graph download");
     eprintln!("  node knn                cert-signed kNN over the cognitive graph: the wallet re-derives the neighbourhood ranking from committed leaves, no graph download");
+    eprintln!("  node range              cert-signed graph range query: wallet re-derives the cos_sim(q, n) >= min_sim cut set from graph_root, no graph download");
     eprintln!("  node run    --dir DIR   persistent chain (seeds demo blocks once, then replays)");
     eprintln!("  node status --dir DIR   replay the block log and print state");
     eprintln!("  node certs  --dir DIR   persist a certified chain (blocks+certs) and re-verify finality on reload");
@@ -1283,7 +1289,7 @@ fn cmd_lsync() {
 /// trip and a single verifier, against the same cert-signed header pulled over
 /// the M22 gossip bus. No replay, no tx bodies, no full-peer trust.
 fn cmd_account() {
-    use zhixing_node::light::ProofKind;
+use zhixing_node::light::ProofKind;
 
     println!("M24 — batched SPV: account + reviewer + validator in one round-trip");
     println!();
@@ -1488,7 +1494,7 @@ fn cmd_account() {
 /// The wallet never downloads the graph. The prover never gets to lie
 /// about the ranking or omit a tied neighbour.
 fn cmd_knn() {
-    use zhixing_node::light::KnnClaim;
+use zhixing_node::light::KnnClaim;
 
     println!("M26 — cert-signed kNN over the cognitive graph");
     println!();
@@ -1623,13 +1629,155 @@ cert-signed header without downloading the graph."
     );
 }
 
+/// M27 demo: cert-signed graph range query.
+///
+/// A wallet asks "what are the graph nodes with cos_sim(query, n) >= min_sim
+/// at height H?" The full peer serves a `RangeClaim` whose `nodes` are
+/// sorted by cosine against the **user's** query (desc, `node_id` asc
+/// tie-break), and each carries a Merkle proof against `header.graph_root`
+/// (the M27 cert-signed secondary index, distinct from `accounts_root`
+/// because the leaves live in a sorted-by-cosine view).
+///
+/// The verifier:
+///   1. cert-signing contract (header.height/hash ↔ cert, cert.verify(set))
+///   2. cutoff validity (`min_sim ∈ [-1, 1]`)
+///   3. per-leaf Merkle verify against `header.graph_root`
+///   4. re-rank by cosine against `query`, take prefix `sim >= min_sim`
+///   5. set + order equality with the prover's claim
+///
+/// Three negative tests confirm each rejection path triggers:
+///   - drop a node in the cut  → `RangeMismatch`
+///   - tamper `header.graph_root` → `CertificateMismatch` (cert binding flips)
+///   - bad `min_sim` (outside `[-1, 1]`) → `RangeCutoffInvalid`
+fn cmd_range() {
+use zhixing_node::light::RangeClaim;
+
+    println!("M27 — cert-signed graph range query against a cert-signed header");
+    println!();
+
+    // Build a real certified chain so `state.graph` has accepted-submission
+    // nodes (in addition to the genesis seed).
+    let (blocks, certs) = run_driver(1);
+    let last_block = blocks.last().expect("non-empty").clone();
+    let last_cert = certs.last().expect("non-empty").clone();
+    let header = BlockHeader::from_block(&last_block);
+
+    // Wrap a full peer so we can call `serve_range`. The full peer replays
+    // the certified chain internally, so its `chain.state.graph` matches
+    // the wallet's view of the world (modulo the wallet's own copy).
+    let mut full = GossipNode::new(1, demo_genesis(), 8, [1, 2]);
+    full.load_certified(&blocks, &certs);
+
+    // Compose a query near the first graph node's embedding so we have a
+    // known-satisfying cut set. The query is `query = unit(1.0) + small bump`,
+    // which puts the genesis-aligned node at sim ≈ 1.0 and other accepted-
+    // submission nodes somewhere between 0 and 1 depending on their embedding.
+    let query: Emb = [0.9, 0.1, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
+    let min_sim = 0.0;
+    let claim = full
+        .serve_range(query, min_sim)
+        .expect("graph must have at least one node");
+    println!(
+        "full peer served a range claim: query={:?}, min_sim={}, |nodes|={}",
+        query,
+        min_sim,
+        claim.nodes.len()
+    );
+    // Each proof must verify locally against graph_root.
+    for (id, g, proof) in &claim.nodes {
+        let leaf = merkle::leaf_hash(&g.merkle_leaf());
+        assert!(
+            merkle::verify(&header.graph_root, &leaf, proof),
+            "node {id}: leaf did not verify against graph_root"
+        );
+    }
+    println!(
+        "Merkle proofs: every leaf verifies against header.graph_root ({} nodes)",
+        claim.nodes.len()
+    );
+    println!();
+
+    // Wallet-side verifier: set up a light tracker from genesis so we can
+    // validate the cert against the same active set the full peer used.
+    let tracked = ValidatorTracker::from_genesis(&demo_genesis())
+        .validators()
+        .clone();
+    ValidatorTracker::verify_range_against_header(&header, &last_cert, &tracked, &claim)
+        .expect("wallet-side range claim verifies");
+    println!("wallet: verify_range_against_header → Ok");
+    println!();
+
+    // Negative test 1: swap two nodes in the cut. The verifier re-derives
+    // the cut from the verified leaves and applies the same cosine-desc,
+    // node_id-asc sort — so a swap across different sims flips the order
+    // and trips `RangeMismatch`. (Dropping a node cannot be detected
+    // without the full graph; the same limitation M26 documents for kNN.)
+    if claim.nodes.len() >= 2 {
+        let mut bad = RangeClaim {
+            query: claim.query,
+            min_sim: claim.min_sim,
+            nodes: claim.nodes.clone(),
+        };
+        bad.nodes.swap(0, 1);
+        match ValidatorTracker::verify_range_against_header(&header, &last_cert, &tracked, &bad) {
+            Err(LightError::RangeMismatch { .. }) => {
+                println!("negative 1: swap two cut entries → RangeMismatch ✓");
+            }
+            other => panic!("expected RangeMismatch after a swap, got {other:?}"),
+        }
+    }
+
+    // Negative test 2: tamper `header.graph_root`. Since graph_root is in
+    // header.hash(), the cert no longer matches the tampered header —
+    // CertificateMismatch wins before any Merkle check.
+    let mut bad_header = header.clone();
+    bad_header.graph_root = [0xCDu8; 32];
+    match ValidatorTracker::verify_range_against_header(
+        &bad_header,
+        &last_cert,
+        &tracked,
+        &claim,
+    ) {
+        Err(LightError::CertificateMismatch { .. }) => {
+            println!("negative 2: tamper graph_root → CertificateMismatch ✓");
+        }
+        other => panic!("expected CertificateMismatch after tampering graph_root, got {other:?}"),
+    }
+
+    // Negative test 3: `min_sim` outside [-1, 1]. Cutoff is a closed cosine
+    // interval; values above 1.0 are degenerate "match everything" requests
+    // and are rejected before any Merkle work.
+    let bad_claim = RangeClaim {
+        query: claim.query,
+        min_sim: 2.0,
+        nodes: claim.nodes.clone(),
+    };
+    match ValidatorTracker::verify_range_against_header(
+        &header,
+        &last_cert,
+        &tracked,
+        &bad_claim,
+    ) {
+        Err(LightError::RangeCutoffInvalid { .. }) => {
+            println!("negative 3: min_sim=2.0 → RangeCutoffInvalid ✓");
+        }
+        other => panic!("expected RangeCutoffInvalid, got {other:?}"),
+    }
+
+    println!();
+    println!(
+        "M27 — light wallet verified a graph-shaped range claim (cosine cutoff) \
+from a cert-signed header without downloading the graph."
+    );
+}
+
 /// M25 demo: light wallet proves a single cognitive-graph node (kernel of
 /// a concept) against a cert-signed header via the unified GetProof bus —
 /// no replay, no graph download, no tx bodies. The graph node lives in the
 /// same `accounts_root` tree as accounts and reviewers; the wallet
 /// recomputes the leaf locally from the typed `ProofEntry::GraphNode`.
 fn cmd_graph() {
-    use zhixing_node::light::ProofKind;
+use zhixing_node::light::ProofKind;
 
     println!("M25 — cognitive-graph inclusion proof against a cert-signed header");
     println!();

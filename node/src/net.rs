@@ -276,6 +276,79 @@ impl GossipNode {
         Some(crate::light::KnnClaim { query, k, neighbours })
     }
 
+    /// M27: serve a cert-signed range claim for `cos_sim(query, n) >= min_sim`
+    /// against the full peer's current `chain.state.graph`.
+    ///
+    /// The claim's `nodes` are ordered by cosine against the **user's**
+    /// query (desc, with `node_id` asc tie-break) — that is the order the
+    /// wallet expects after re-ranking, and it matches what the engine's
+    /// `rank_by_cosine` produces. Each entry carries a Merkle proof
+    /// against the M27 `header.graph_root` slot (cert-signed secondary
+    /// index over the canonical-pivot-sorted view), so the wallet
+    /// verifies each leaf against `graph_root` and re-ranks locally.
+    ///
+    /// Capped at `MAX_PROOF_BATCH = 32` per claim — same wire cap as the
+    /// single-leaf proof bus and the kNN claim. Beyond the cap the cut
+    /// is truncated from the END (lowest-similarity entries), preserving
+    /// the highest-similarity prefix the wallet cares about most.
+    ///
+    /// Returns `None` iff the cut is empty (no node in the graph matches
+    /// the cutoff) — the wallet's verifier then surfaces `RangeMismatch`
+    /// if a non-empty claim was promised.
+    pub fn serve_range(
+        &self,
+        query: crate::engine::Embedding,
+        min_sim: f32,
+    ) -> Option<crate::light::RangeClaim> {
+        // 1. Locally compute the user-query-sorted ranking. Same rule as
+        //    `engine::CognitiveGraph::rank_by_cosine`: cosine desc, then
+        //    `node_id` asc on ties.
+        let mut ranked = self.chain.state.graph.rank_by_cosine(&query);
+        // 2. Take the prefix where sim >= min_sim. This is the cut set.
+        let take = ranked.iter().take_while(|(_, s)| *s >= min_sim).count();
+        ranked.truncate(take);
+        if ranked.is_empty() {
+            return None;
+        }
+        // Honour the cap. Cut from the END — lowest-similarity entries
+        // are the most expendable; the highest-similarity prefix is
+        // always preserved.
+        if ranked.len() > MAX_PROOF_BATCH {
+            ranked.truncate(MAX_PROOF_BATCH);
+        }
+        // 3. Build the canonical-pivot-sorted leaf index map once (same
+        //    sort the wallet uses to compute the per-leaf proof path),
+        //    then resolve each cut entry to (id, body, proof against
+        //    graph_root).
+        let sorted_index: std::collections::HashMap<u64, usize> = {
+            let mut sorted = self.chain.state.graph.nodes.clone();
+            sorted.sort_by(|a, b| {
+                let sa = crate::engine::cos_sim(
+                    &[1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+                    &a.embedding,
+                );
+                let sb = crate::engine::cos_sim(
+                    &[1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+                    &b.embedding,
+                );
+                sb.partial_cmp(&sa).unwrap_or(std::cmp::Ordering::Equal)
+                    .then(a.node_id.cmp(&b.node_id))
+            });
+            sorted.iter().enumerate().map(|(i, n)| (n.node_id, i)).collect()
+        };
+        let mut nodes: Vec<(u64, crate::engine::GraphNode, merkle::Proof)> =
+            Vec::with_capacity(ranked.len());
+        for (node_id, _sim) in &ranked {
+            let sorted_idx = *sorted_index.get(node_id)?;
+            let proof = self.chain.state.graph_range_proof(
+                sorted_idx, sorted_idx + 1,
+            )?;
+            let (_id, graph_node, merkle_proof) = proof.entries.into_iter().next()?;
+            nodes.push((*node_id, graph_node, merkle_proof));
+        }
+        Some(crate::light::RangeClaim { query, min_sim, nodes })
+    }
+
     /// The certified blocks from `height` onward (inclusive), capped at
     /// [`MAX_BATCH`] — the payload for a peer's `GetBlocks`.
     fn batch_from(&self, height: u64) -> Vec<(Block, Commit)> {
@@ -2227,5 +2300,54 @@ mod tests {
         let query = [0.0f32; 8];
         let claim = node.serve_knn(query, 3).expect("genesis seeds one node");
         assert!(!claim.neighbours.is_empty());
+    }
+
+    // ----- M27: GossipNode::serve_range -----
+
+    #[test]
+    fn serve_range_returns_a_typed_claim_with_verifiable_proofs() {
+        // Build a 1-block chain; full peer serves a range claim; every
+        // returned node must round-trip against `header.graph_root` (the
+        // M27 cert-signed secondary index), and the wallet verifier
+        // must accept the claim end-to-end.
+        let (blocks, certs) = certified_chain(2);
+        let last = blocks.last().expect("non-empty chain").clone();
+        let last_cert = certs.last().expect("non-empty chain").clone();
+        let mut node = GossipNode::new(1, genesis(), 8, []);
+        node.load_certified(&blocks, &certs);
+
+        let query = [0.5f32, 0.5, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
+        let min_sim = 0.0;
+        let claim = node
+            .serve_range(query, min_sim)
+            .expect("range claim");
+        assert!(!claim.nodes.is_empty(), "graph must have at least one node");
+        // Each leaf must verify against graph_root (NOT accounts_root).
+        let header = crate::codec::BlockHeader::from_block(&last);
+        for (id, g, proof) in &claim.nodes {
+            let leaf = crate::merkle::leaf_hash(&g.merkle_leaf());
+            assert!(
+                crate::merkle::verify(&header.graph_root, &leaf, proof),
+                "node {id}: leaf did not verify against graph_root"
+            );
+        }
+        // And the wallet-side verifier must accept the claim end-to-end.
+        let tracked = ValidatorTracker::from_genesis(&genesis()).validators().clone();
+        ValidatorTracker::verify_range_against_header(
+            &header, &last_cert, &tracked, &claim,
+        ).expect("wallet-side range claim verifies");
+    }
+
+    #[test]
+    fn serve_range_returns_none_when_no_node_meets_the_cutoff() {
+        // Cutoff = 1.1 is outside the cosine range and yields no nodes; the
+        // helper returns None. (The wallet-side `verify_range_against_header`
+        // separately rejects the same invalid `min_sim` via
+        // `RangeCutoffInvalid`.) We use a permissive graph: at least one
+        // node has cosine < 1.0 with any non-aligned query.
+        let node = GossipNode::new(1, genesis(), 8, []);
+        let query = [0.0f32; 8];
+        let claim = node.serve_range(query, 1.1);
+        assert!(claim.is_none(), "cutoff above 1.0 must yield no nodes");
     }
 }

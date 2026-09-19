@@ -52,6 +52,10 @@ pub fn encode_block(b: &Block) -> Vec<u8> {
     // for any block — the SPV contract holds.
     e.raw(&b.state_root);
     e.raw(&b.accounts_root);
+    // M27: sorted-graph-root slot, kept in the prefix region alongside the
+    // other two M23 commitments so `encode_header` and `encode_block` agree
+    // on prefix bytes for the same block.
+    e.raw(&b.graph_root);
     e.u64(b.validator_updates.len() as u64);
     for u in &b.validator_updates {
         e.u64(u.id);
@@ -98,6 +102,11 @@ pub fn encode_header(h: &BlockHeader) -> Vec<u8> {
     // trust the full-state digest (`state_root`) without pulling any bodies.
     e.raw(&h.state_root);
     e.raw(&h.accounts_root);
+    // M27: sorted-by-(sim-to-canonical-pivot desc, node_id asc) Merkle root
+    // over the graph nodes. Cert-signed so wallets can verify
+    // `cos_sim ≥ θ` range claims via `verify_range_against_header` without
+    // downloading the graph.
+    e.raw(&h.graph_root);
     e.u64(h.validator_updates.len() as u64);
     for u in &h.validator_updates {
         e.u64(u.id);
@@ -130,6 +139,11 @@ pub fn decode_header(buf: &[u8]) -> Result<BlockHeader, CodecError> {
     state_root.copy_from_slice(d.take(32)?);
     let mut accounts_root = [0u8; 32];
     accounts_root.copy_from_slice(d.take(32)?);
+    // M27: the sorted-graph-root slot, placed right after `accounts_root`
+    // so both commitments share the same prefix-stability contract. See
+    // `BlockHeader::graph_root` for the cert-signed range-proof contract.
+    let mut graph_root = [0u8; 32];
+    graph_root.copy_from_slice(d.take(32)?);
     let n_upd = d.count()?;
     let mut validator_updates = Vec::with_capacity(n_upd as usize);
     for _ in 0..n_upd {
@@ -155,6 +169,7 @@ pub fn decode_header(buf: &[u8]) -> Result<BlockHeader, CodecError> {
         next_validators_root,
         state_root,
         accounts_root,
+        graph_root,
         validator_updates,
         txs_commitment,
         stake_ops_commitment,
@@ -179,14 +194,14 @@ pub fn encode_certified_header(ch: &CertifiedHeader) -> Vec<u8> {
 /// trailing bytes, so any padding after the cert is an error).
 pub fn decode_certified_header(buf: &[u8]) -> Result<CertifiedHeader, CodecError> {
     // Header layout: 8 (height) + 32 (prev) + 4 (timestamp) + 32 (next_validators_root)
-    //   + 32 (state_root) + 32 (accounts_root) + 8 (n_updates u64) = 148-byte fixed prefix ‖
+    //   + 32 (state_root) + 32 (accounts_root) + 32 (graph_root, M27) + 8 (n_updates u64) = 180-byte fixed prefix ‖
     //   n_updates * 48 bytes (u64 id ‖ 32-byte pubkey ‖ u64 power) ‖
     //   3 * 32-byte commitments = 96 bytes tail.
-    if buf.len() < 148 {
+    if buf.len() < 180 {
         return Err(CodecError::UnexpectedEof);
     }
-    let n_updates = u64::from_be_bytes(buf[140..148].try_into().unwrap());
-    let header_len = 148 + (n_updates as usize) * 48 + 96; // 244 base + 48 per update
+    let n_updates = u64::from_be_bytes(buf[172..180].try_into().unwrap());
+    let header_len = 180 + (n_updates as usize) * 48 + 96; // 276 base + 48 per update
     if buf.len() < header_len {
         return Err(CodecError::UnexpectedEof);
     }
@@ -223,6 +238,14 @@ pub struct BlockHeader {
     /// `ChainState::account_proof(id)` sourced over the new
     /// `GetAccountProof`/`AccountProof` gossip pair.
     pub accounts_root: crate::Hash,
+    /// M27: Merkle root over the cognitive graph nodes sorted by
+    /// `(cos_sim(CANONICAL_PIVOT, n.embedding) desc, node_id asc)`. Cert-signed.
+    /// Light clients use this to verify sorted-range proofs (`sim ≥ θ` cuts)
+    /// against `ChainState::graph_range_proof(a, b)` sourced via
+    /// `serve_range`/`verify_range_against_header`. Different ordering
+    /// than the graph slice inside `accounts_root` (insertion order), so the
+    /// two roots carry distinct commitments to the same underlying nodes.
+    pub graph_root: crate::Hash,
     pub validator_updates: Vec<ValidatorUpdate>,
     /// SHA-256 over the canonical encoding of the tx list (or zero for empty).
     pub txs_commitment: crate::Hash,
@@ -244,6 +267,7 @@ impl BlockHeader {
             next_validators_root: b.next_validators_root,
             state_root: b.state_root,
             accounts_root: b.accounts_root,
+            graph_root: b.graph_root,
             validator_updates: b.validator_updates.clone(),
             txs_commitment: list_commitment(&b.txs.iter().map(encode_tx).collect::<Vec<_>>()),
             stake_ops_commitment: list_commitment(&b.stake_ops.iter().map(encode_stakeop).collect::<Vec<_>>()),
@@ -279,6 +303,7 @@ impl BlockHeader {
             next_validators_root: self.next_validators_root,
             state_root: self.state_root,
             accounts_root: self.accounts_root,
+            graph_root: self.graph_root,
             txs,
             validator_updates: self.validator_updates.clone(),
             stake_ops,
@@ -827,6 +852,11 @@ pub fn decode_block(buf: &[u8]) -> Result<Block, CodecError> {
     state_root.copy_from_slice(d.take(32)?);
     let mut accounts_root = [0u8; 32];
     accounts_root.copy_from_slice(d.take(32)?);
+    // M27: the sorted-graph-root slot, placed right after `accounts_root`
+    // so both commitments share the same prefix-stability contract. See
+    // `BlockHeader::graph_root` for the cert-signed range-proof contract.
+    let mut graph_root = [0u8; 32];
+    graph_root.copy_from_slice(d.take(32)?);
     let n_upd = d.count()?;
     let mut validator_updates = Vec::with_capacity(n_upd as usize);
     for _ in 0..n_upd {
@@ -861,6 +891,7 @@ pub fn decode_block(buf: &[u8]) -> Result<Block, CodecError> {
         next_validators_root,
         state_root,
         accounts_root,
+        graph_root,
         txs,
         validator_updates,
         stake_ops,
@@ -1003,6 +1034,7 @@ mod tests {
             // projection carries them through unchanged.
             state_root: [11u8; 32],
             accounts_root: [12u8; 32],
+            graph_root: [13u8; 32],
             txs: vec![SubmissionTx {
                 author: 1,
                 embedding: emb,
@@ -1268,6 +1300,39 @@ mod tests {
         let mut extra = bytes.clone();
         extra.push(0);
         assert!(matches!(decode_certified_header(&extra), Err(CodecError::TrailingBytes)));
+    }
+
+    // --- M27: graph_root slot round-trip ----------------------------------
+
+    #[test]
+    fn header_round_trip_with_graph_root() {
+        // M27: `header.graph_root` must round-trip through encode/decode
+        // alongside the other two M23 commitments.
+        let b = sample_block();
+        let h = BlockHeader::from_block(&b);
+        assert_eq!(h.graph_root, b.graph_root, "from_block copies the field");
+        let bytes = encode_header(&h);
+        let back = decode_header(&bytes).unwrap();
+        assert_eq!(back.graph_root, h.graph_root);
+    }
+
+    #[test]
+    fn block_round_trip_with_graph_root() {
+        // M27: the prefix region must remain byte-identical between
+        // `encode_block` and `encode_header`, so a tamper to `graph_root`
+        // flips both. Decode-from-block must reproduce the slot.
+        let b = sample_block();
+        let bytes = encode_block(&b);
+        let back = decode_block(&bytes).unwrap();
+        assert_eq!(back.graph_root, b.graph_root);
+
+        // Prefix contract: encode_header bytes equal encode_block bytes up
+        // to the n_updates length-prefix slot (graph_root is in the prefix).
+        let h = BlockHeader::from_block(&b);
+        let hdr_bytes = encode_header(&h);
+        let prefix_len = 8 + 32 + 4 + 32 + 32 + 32 + 32; // 180-byte fixed prefix
+        assert_eq!(hdr_bytes[..prefix_len], bytes[..prefix_len],
+            "encode_header and encode_block must share the 180-byte prefix");
     }
 
     #[test]

@@ -643,6 +643,7 @@ mod tests {
             // M23: state commitments stamped by Chain::commit.
             state_root: [0u8; 32],
             accounts_root: [0u8; 32],
+            graph_root: [0u8; 32],
             txs: Vec::new(),
             validator_updates: Vec::new(),
             stake_ops: Vec::new(),

@@ -348,6 +348,16 @@ mint($COG) = base_emission × impact_score(ΔK) × time_decay
 
 **设计原则**：性能关键路径用 Rust 并以校验和与 Python 参考实现交叉验证；建模与仿真保留在 Python；两者绑定同一份形式化契约（B.2.3），避免"文档、仿真、实现"三者漂移。生产环境的 kNN 应从暴力扫描升级为 HNSW/IVF 等近似最近邻索引。详见 [`engine/README.md`](../engine/README.md)。
 
+**认知图谱的轻客户端可证明查询**（参考节点 M25–M27）：钱包在不下载整个图谱的前提下，可对 cert-signed 区块头（来自 BFT 共识的最终性证书）发起三类图谱查询，全部由 Rust 节点状态机按全量重放成本为零的方式核对：
+
+| 原语 | 用途 | 承诺根 | 复杂度 |
+|---|---|---|---|
+| M25：图节点包含证明（`ProofEntry::GraphNode`） | 证明某 node_id 在某高度图谱中 | `accounts_root`（插入序） | O(log n) |
+| M26：邻域证明（`KnnClaim`，`verify_knn_against_header`） | "embedding 附近的 k 个邻居是谁" | `accounts_root`（插入序） | O(k) |
+| M27：范围查询（`RangeClaim`，`verify_range_against_header`） | "cos_sim(query, n) ≥ θ 的全部节点" | `graph_root`（按 `(cos_sim(CANONICAL_PIVOT, n.embedding) desc, node_id asc)` 排序索引） | O(cut) |
+
+三类查询的 `prover`（全节点）都**不可信**：钱包在本地重排/重切，仅信任 cert-signed header 与 BFT 证书的最终性。同形信任模型让"证图谱"与"证账户"走同一条 SPV 总线（`GetProof/Proof`，M24）。详见 [`node/README.md`](../node/README.md) §"图节点 cert-signed 包含证明/邻域证明/范围查询"。
+
 **Python 绑定（pyo3）**：同一个 Rust 引擎通过 pyo3（abi3，无需 maturin）导出为 Python 扩展模块 `zhixing_engine`，使经济仿真（`sim/`）在**不改变契约**的前提下把 ΔK 热路径交给 Rust——既加速离线参数扫描，也加速 ABM 仿真本身。实测：
 
 | 工作负载 | 纯 Python | Rust（pyo3） | 加速比 | 一致性 |

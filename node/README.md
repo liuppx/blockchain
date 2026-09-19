@@ -25,7 +25,7 @@ cargo run --release --bin node -- slashing         # 罚没：验证人双签 �
 cargo run --release --bin node -- certs  --dir DIR # 证书落盘：产出认证链→落盘 blocks/certs→重放复验最终性
 cargo run --release --bin node -- run  --dir DIR   # 持久化链：首次落盘演示块，之后重放
 cargo run --release --bin node -- status --dir DIR # 重放区块日志并打印状态
-cargo test --release                               # 186 项单元测试（见下）
+cargo test --release                               # 193 项单元测试（见下）
 ```
 
 演示链展示：新颖提交铸造 $COG、跨域桥接拿到 novelty+bonus（ΔK>1）、近重复/低质提交被**罚没入 treasury**、供应守恒、评审声誉按链上结果升降。
@@ -309,6 +309,9 @@ cargo run --release --bin node -- account  # 钱包 SPV 三证明批量化：账
 | **验证人集 Merkle 承诺入头** | `Block.next_validators_root` = 对 post-apply 下一集合的 Merkle 根（`Validator::merkle_leaf` 与 `state_root` 三元组同字节），落在证书所签的 `block_hash` 内；出块方 `Chain::seal`（trial 克隆导出根）、`apply_block` 提交强制根匹配否则 `ValidatorRootMismatch`；轻客户端 `follow_committed` 免复刻迁移地比对整套集合根，`verify_membership` 用 O(log n) 包含证明对 cert 签名头证明单个验证人（SPV 原语），`follow` 亦逐高度交叉校验；迁移从不读该字段故无循环（M21） |
 | **钱包 SPV 账户证明（双根承诺）** | `BlockHeader` 再携 `state_root`（`ChainState::state_root()` 完整共识状态 digest，证书签 = 钱包信任根）与 `accounts_root`（accounts ∪ reviewers 二叉 Merkle 根，供 O(log n) 包含证明）；`Chain::commit` 走 trial 路径把两根盖到 `block` 上，`apply_block_inner` 多两条强制度 `StateRootMismatch` / `AccountsRootMismatch`；新 SPV `verify_account_membership_against_header` 在本地重算 `leaf = leaf_hash(account.merkle_leaf(id))` 并对 `header.accounts_root` 验证——钱包证明自己余额只下头、不下体、零重放（M23） |
 | **M24 批量化、类型化 SPV 原语** | `GossipMsg::GetProof { items }` / `Proof { items }` 一对承载任意混合 `[(Account|Reviewer|Validator, id), ...]` 列表（`MAX_PROOF_BATCH = 32`），wire tags 8/9 完全替换 M23 的 `GetAccountProof/AccountProof`；新 `ProofEntry` typed 枚举 + `Reviewer::merkle_leaf()` + `ChainState::reviewer_proof(id)` 闭合审阅人路径；wallet 端**唯一** SPV 验证器 `ValidatorTracker::verify_proof_against_header(header, cert, tracked_set, entry)` 按 `entry.kind()` 选根（Account/Reviewer → `accounts_root`，Validator → `next_validators_root`），本地重算 leaf、零信任 prover；M22/M23 的 kind-specific 验证器全部删除 |
+| **图节点 cert-signed 包含证明（M25）** | `engine::GraphNode` 加单调 `node_id` 字段；`ChainState::merkle_leaves` 增第三段承载 graph 节点（插入序）；`BlockHeader.accounts_root` 自动扩展覆盖 accounts ∪ reviewers ∪ graph 三集合的同一 Merkle 根；新 `ProofKind::GraphNode = 3` + `ProofEntry::GraphNode { node_id, graph_node, proof }` 走 M24 同一 `GetProof`/`Proof` 总线；`verify_proof_against_header` 加 `GraphNode → accounts_root` 一支；`ChainState::graph_node_proof(idx)` 闭合图节点的 O(log n) 证明路径；wallet 端仍是**唯一**的验证器+零信任 prover |
+| **图节点 cert-signed 邻域证明（M26）** | `engine::CognitiveGraph::k_nearest_with_ties(query, k)` 按 cosine 降序 + `node_id` 升序稳定排序，边界 ties 全留（`len ≥ k`）；新 `KnnClaim { query, k, neighbours: Vec<(node_id, GraphNode, merkle::Proof)> }` + `ValidatorTracker::verify_knn_against_header` 把**单一** cert-signed header 拆成 (1) header/cert 绑定、(2) 每个 neighbour leaf 对 `accounts_root` 的 Merkle 验证、(3) 本地用 `cos_sim` 重排+同 cut、(4) 与 prover 序列等比——prover 不可省略 tied 邻居也不可重排 |
+| **图节点 cert-signed 范围查询（M27）** | `BlockHeader` 新增 32-byte `graph_root` 槽位，对同一 cert-signed header 提交；`ChainState::graph_merkle_root()` 按 `(cos_sim(CANONICAL_PIVOT, n.embedding) desc, node_id asc)` 排序索引（`CANONICAL_PIVOT = [1,0,0,0,0,0,0,0]`，确定且 query-无关）——区别于 M25 的 `accounts_root` 插入序；新 `ChainState::graph_range_proof(a, b)` 返回 `RangeProof { sub_root, entries }`；新 `RangeClaim { query, min_sim, nodes }` + `GossipNode::serve_range(query, min_sim)` 把 cosine-cutoff `(query, min_sim)` 派给全节点；wallet 端 `ValidatorTracker::verify_range_against_header` 把单一 cert-signed header 拆成 (1) header/cert 绑定、(2) `min_sim ∈ [-1, 1]` cutoff 验证、(3) 每个 node leaf 对 **`graph_root`**（**非** `accounts_root`）的 Merkle 验证、(4) 本地用 `cos_sim` 重排+`sim >= min_sim` 的 prefix cut、(5) 与 prover 序列等比——prover 不可重排；同一 kNN 同形信任模型 |
 | **依赖策略** | 引擎零依赖（可嵌入/WASM）；节点作为应用引入审计过的 `ed25519-dalek` 做签名，绝不自实现密码学 |
 
 ## 测试覆盖
@@ -482,26 +485,56 @@ full_node_serves_a_batch_of_proofs_in_response_to_get_proof  三类证明批量�
 full_node_serves_a_reviewer_proof_for_a_reviewer_id_not_in_accounts  非账户 id 的审阅人也能取到合法 proof
 get_proof_with_too_many_items_is_a_codec_error  33 项超出 MAX_PROOF_BATCH → decode 拒绝
 proof_request_for_unknown_id_yields_none_in_the_response  未知 id → 服务端 None、客户端缺槽
+# 图节点 cert-signed 包含证明（M25，lib.rs + codec.rs + light.rs + net.rs）
+graph_node_proof_round_trip                    ChainState::graph_node_proof(idx) 对 accounts_root 验证通过；越界 idx → None
+graph_node_proof_lies_after_all_reviewers      graph 节点的 proof index 在所有 reviewer proof 之后
+verify_proof_against_header_accepts_graph_node_in_one_call  ProofEntry::GraphNode 对 accounts_root 验证通过
+verify_proof_against_header_rejects_a_tampered_graph_node  改 embedding → MembershipProofInvalid
+full_node_serves_a_graph_node_proof_in_response_to_get_proof  全节点 GetProof 含 GraphNode 变种 → Proof 含可验证明
+light_node_proves_graph_node_membership_against_cert_signed_header  光端经 gossip 取证明 → 本地验 → Ok
+# 图节点 cert-signed 邻域证明（M26，engine + lib.rs + light.rs + net.rs）
+rank_by_cosine_is_stable_across_ties          同 sim 邻居按 node_id 升序稳定
+k_nearest_with_ties_returns_prefix_with_all_ties_at_boundary  边界 ties 全留，len ≥ k
+verify_knn_against_header_accepts_a_cert_signed_neighborhood_claim  wallet 重排+cut 与 prover 等比 → Ok
+verify_knn_against_header_rejects_a_swapped_neighbour_order  交换 → KnnRankingMismatch
+verify_knn_against_header_rejects_a_tampered_neighbour_embedding  改 embedding → MembershipProofInvalid
+verify_knn_against_header_rejects_a_tampered_accounts_root  改根 → CertificateMismatch（根在证书内）
+verify_knn_against_header_rejects_an_empty_claim  k > 0 但空邻居 → EmptyKnnQuery
+serve_knn_returns_a_typed_claim_with_verifiable_neighbours  全节点 kNN claim → 每叶 accounts_root 验通过 + wallet 端 Ok
+serve_knn_returns_none_for_an_empty_graph       空图（边界情形） → None
+# 图节点 cert-signed 范围查询（M27，engine + lib.rs + codec.rs + light.rs + net.rs）
+graph_root_mismatch_is_rejected                篡改 graph_root → GraphRootMismatch、整块回滚
+graph_merkle_root_is_deterministic_for_a_fixed_pivot  同图两次 graph_merkle_root 相等（canonical pivot 决定性）
+graph_merkle_root_differs_from_accounts_root_for_a_non_trivial_graph  同图不同叶序 → 不同根
+graph_range_proof_round_trip                   graph_range_proof(a, b) 子根 = graph_merkle_root；越界/空 → None
+header_round_trip_with_graph_root              encode_header/decode_header 保留 graph_root
+block_round_trip_with_graph_root               encode_block/decode_block 保留 graph_root；prefix 仍 180B 与 encode_header 同字节
+verify_range_against_header_accepts_a_cert_signed_cutoff_claim  wallet cosine 重排+cut 与 prover 等比 → Ok
+verify_range_against_header_rejects_a_missing_node_in_the_cut  交换 → RangeMismatch
+verify_range_against_header_rejects_an_invalid_cutoff  min_sim ∉ [-1, 1] → RangeCutoffInvalid
+verify_range_against_header_rejects_a_tampered_graph_root  改根 → CertificateMismatch（根在证书内）
+serve_range_returns_a_typed_claim_with_verifiable_proofs  全节点 range claim → 每叶 graph_root 验通过 + wallet 端 Ok
+serve_range_returns_none_when_no_node_meets_the_cutoff  过高 cutoff → None
 ```
 
 ## 文件
 
 | 文件 | 作用 |
 |---|---|
-| `src/lib.rs` | 状态机核心：`Block`（含 `next_validators_root` 验证人集 Merkle 承诺 + **M23 `state_root` 完整共识状态 digest 与 `accounts_root` accounts/reviewers Merkle 根两条承诺根**）/`SubmissionTx`/`StakeOp`/`SlashEvidence`（含 `hash()` 内容寻址用于 gossip 去重）/`Account`/`ChainState`/`Chain`、`apply_block`（含验证人集跨高度切换、stake_ops 应用、解绑到期返还、按证据罚没、承诺根强制 + **M23 多 `StateRootMismatch`/`AccountsRootMismatch` 强制度**）、`Chain::seal`/`next_validators_root`（**M23 同 trial 路径盖两根**）、`apply_stake_op`、`apply_evidence`、`replay`/`replay_verified`、验签、`state_root`（含验证人集 + 绑定/解绑状态）/`merkle_root`/`account_proof`、供应守恒不变量（含 bonded + 解绑中）+ 测试 |
+| `src/lib.rs` | 状态机核心：`Block`（含 `next_validators_root` 验证人集 Merkle 承诺 + **M23 `state_root` 完整共识状态 digest 与 `accounts_root` accounts/reviewers Merkle 根两条承诺根** + **M27 `graph_root` 按 (cos_sim(CANONICAL_PIVOT, *) desc, node_id asc) 排序的图节点 Merkle 根第三条承诺根**）/`SubmissionTx`/`StakeOp`/`SlashEvidence`（含 `hash()` 内容寻址用于 gossip 去重）/`Account`/`ChainState`/`Chain`、`apply_block`（含验证人集跨高度切换、stake_ops 应用、解绑到期返还、按证据罚没、承诺根强制 + **M23 多 `StateRootMismatch`/`AccountsRootMismatch` 强制度 + M27 多 `GraphRootMismatch` 强制度**）、`Chain::seal`/`next_validators_root`（**M23 同 trial 路径盖两根 + M27 同 trial 路径盖 graph_root**）、`apply_stake_op`、`apply_evidence`、`replay`/`replay_verified`、验签、`state_root`（含验证人集 + 绑定/解绑状态）/`merkle_root`/`account_proof`、**M27 `graph_merkle_root`（按 CANONICAL_PIVOT 排序索引）/`graph_range_proof(a, b)`（`RangeProof { sub_root, entries }`）**、供应守恒不变量（含 bonded + 解绑中）+ 测试 |
 | `src/mempool.rs` | 确定性 mempool 与出块：内容寻址排序 + 试算式 `build_block` + 测试 |
 | `src/merkle.rs` | 二叉 Merkle 树：域分隔叶/节点、奇数提升、包含证明 `Proof`/`verify` + 测试 |
 | `src/validator.rs` | 验证人集与确定性提议人（Tendermint 优先级累加器）、链上变更 `ValidatorUpdate`/`apply_updates`、集合 Merkle 承诺 `merkle_leaf`/`merkle_root`/`proof`（M21）+ 测试 |
 | `src/consensus.rs` | BFT 投票/最终性证书：`Vote`/`Commit`/`verify`、`commit_block`、`detect_equivocation` + 测试 |
 | `src/round.rs` | BFT 轮次状态机（Tendermint `upon` 规则、超时/锁定/换轮）+ 进程内网络模拟器 `Sim` + 测试 |
 | `src/driver.rs` | BFT 认证链驱动 `ChainDriver`：逐高度 mempool→共识→提交 + 证书保留 + 故障注入 + 链上验证人变更（`stage_validator_update`）+ 质押变更（`stage_stake_op`）+ 罚没证据（`stage_slashing_evidence`）+ 测试 |
-| `src/net.rs` | P2P gossip 与反熵同步：`GossipMsg`/`GossipNode`（纯状态机，认证块 `apply_certified` 复验证书、交易 epidemic 泛洪去重 + **`Evidence` / `StakeOp` 块级 ops 的待打包池与去重 flood**；M22 增 `GetHeaders` / `Headers` 服务 + **M24 完全替换 `GetProof { items }` / `Proof { items }` 一对（wire tags 8/9 复用），承载 Account/Reviewer/Validator 任意混合 `items`，上限 `MAX_PROOF_BATCH = 32`；全节点在 on_message 现取现发 account_proof/reviewer_proof/ValidatorSet::proof 三类；光节点入 `proofs` 缓存（键 `(ProofKind, u64)`）**）+ 确定性 `Network` 收敛总线 + **M22 光节点 `LightGossipNode`（仅头、`ValidatorTracker`、从不解码交易）+ 混入全/光节点的总线 `LightNetwork`** + `encode_gossip`/`read_msg`/`write_msg`（真实 socket 分帧，含新 TAG_GETHEADERS/TAG_HEADERS + **TAG_GETPROOF=8 / TAG_PROOF=9**） + 测试 |
-| `src/light.rs` | 轻客户端验证人集跟随：`ValidatorTracker`（`from_genesis` / `follow` / `follow_all`，逐高度复验证书 + 复刻 `apply_block` 的集合迁移，镜像 `bonds` + 创世公钥表，不执行交易；M21 `follow` 对 `next_validators_root` 交叉校验、免迁移 `follow_committed`、SPV `verify_membership`；M22 只对头的 `follow_header` + `verify_membership_against_header` + **M24 唯一 SPV 验证器 `verify_proof_against_header`（按 entry.kind() 选根，Account/Reviewer → accounts_root、Validator → next_validators_root，本地重算 leaf）；M23 的 `verify_account_membership_against_header` 与 M22 的 `verify_membership_against_header` 全部删除；`verify_state_root_against_header` 保留**）+ `LightError` + 测试 |
+| `src/net.rs` | P2P gossip 与反熵同步：`GossipMsg`/`GossipNode`（纯状态机，认证块 `apply_certified` 复验证书、交易 epidemic 泛洪去重 + **`Evidence` / `StakeOp` 块级 ops 的待打包池与去重 flood**；M22 增 `GetHeaders` / `Headers` 服务 + **M24 完全替换 `GetProof { items }` / `Proof { items }` 一对（wire tags 8/9 复用），承载 Account/Reviewer/Validator 任意混合 `items`，上限 `MAX_PROOF_BATCH = 32`；全节点在 on_message 现取现发 account_proof/reviewer_proof/ValidatorSet::proof 三类；光节点入 `proofs` 缓存（键 `(ProofKind, u64)`）** + **M26 `GossipNode::serve_knn(query, k)` 派 `KnnClaim` 给光端（叶子账密存于 accounts_root 插入序侧）** + **M27 `GossipNode::serve_range(query, min_sim)` 派 `RangeClaim` 给光端（叶子存于 `graph_root` 排序索引侧）**）+ 确定性 `Network` 收敛总线 + **M22 光节点 `LightGossipNode`（仅头、`ValidatorTracker`、从不解码交易）+ 混入全/光节点的总线 `LightNetwork`** + `encode_gossip`/`read_msg`/`write_msg`（真实 socket 分帧，含新 TAG_GETHEADERS/TAG_HEADERS + **TAG_GETPROOF=8 / TAG_PROOF=9**） + 测试 |
+| `src/light.rs` | 轻客户端验证人集跟随：`ValidatorTracker`（`from_genesis` / `follow` / `follow_all`，逐高度复验证书 + 复刻 `apply_block` 的集合迁移，镜像 `bonds` + 创世公钥表，不执行交易；M21 `follow` 对 `next_validators_root` 交叉校验、免迁移 `follow_committed`、SPV `verify_membership`；M22 只对头的 `follow_header` + `verify_membership_against_header` + **M24 唯一 SPV 验证器 `verify_proof_against_header`（按 entry.kind() 选根，Account/Reviewer → accounts_root、Validator → next_validators_root，本地重算 leaf）；M23 的 `verify_account_membership_against_header` 与 M22 的 `verify_membership_against_header` 全部删除；`verify_state_root_against_header` 保留** + **M26 `KnnClaim` + `verify_knn_against_header`（对 accounts_root 验邻域 leaf，本地 cos_sim 重排+cut，prover 序列等比）** + **M27 `RangeClaim` + `verify_range_against_header`（对 `graph_root` 验范围 leaf，cutoff ∈ [-1,1] 校验 + 本地 cos_sim 重排+prefix cut，prover 序列等比；新增 `LightError::RangeMismatch`/`RangeCutoffInvalid`）**）+ `LightError` + 测试 |
 | `src/crypto.rs` | ed25519 身份：`Keypair`/`verify`（封装 `ed25519-dalek`）+ 测试 |
-| `src/codec.rs` | 区块的规范二进制编解码（哈希与落盘共用，含 `validator_updates`、`stake_ops` 与 `slashing_evidence`；M22 增 `BlockHeader`（含 `txs_commitment`/`stake_ops_commitment`/`evidence_commitment` 三份 SHA-256 承诺）+ `CertifiedHeader` + `encode_header`/`decode_header` + `encode_certified_header`/`decode_certified_header` + **M23 头再加 `state_root`/`accounts_root` 两根、`Block`/`BlockHeader` 同步增两字段、`decode_certified_header` 长度算术从 `84 + n*48 + 96` 改为 `148 + n*48 + 96 = 244 + n*48`**）+ `tx_signing_bytes`/`encode_tx`/`decode_tx`（签名/tx 哈希/gossip wire 字节）+ `stakeop_signing_bytes`/`encode_stakeop`/`decode_stakeop`（bond/unbond 签名与哈希）+ `encode_evidence`/`decode_evidence`（双签证据）+ `encode_commit`/`decode_commit`（证书落盘）+ **`encode_account`/`decode_account`/`encode_proof`/`decode_proof`（M23 AccountProof 的 wire 字节）** + 测试 |
+| `src/codec.rs` | 区块的规范二进制编解码（哈希与落盘共用，含 `validator_updates`、`stake_ops` 与 `slashing_evidence`；M22 增 `BlockHeader`（含 `txs_commitment`/`stake_ops_commitment`/`evidence_commitment` 三份 SHA-256 承诺）+ `CertifiedHeader` + `encode_header`/`decode_header` + `encode_certified_header`/`decode_certified_header` + **M23 头再加 `state_root`/`accounts_root` 两根、`Block`/`BlockHeader` 同步增两字段、`decode_certified_header` 长度算术从 `84 + n*48 + 96` 改为 `148 + n*48 + 96 = 244 + n*48`** + **M27 头再加 `graph_root` 根、`Block`/`BlockHeader` 同步增字段、`decode_certified_header` 长度算术从 `148` 改为 `180 + n*48 + 96 = 276 + n*48`，prefix 仍与 `encode_block` 字节对齐**）+ `tx_signing_bytes`/`encode_tx`/`decode_tx`（签名/tx 哈希/gossip wire 字节）+ `stakeop_signing_bytes`/`encode_stakeop`/`decode_stakeop`（bond/unbond 签名与哈希）+ `encode_evidence`/`decode_evidence`（双签证据）+ `encode_commit`/`decode_commit`（证书落盘）+ **`encode_account`/`decode_account`/`encode_proof`/`decode_proof`（M23 AccountProof 的 wire 字节）** + 测试 |
 | `src/store.rs` | 追加式日志（长度前缀记录、残缺尾检测）：`BlockLog`（区块）+ `CertLog`（证书）+ 测试 |
 | `src/hash.rs` | 纯 std SHA-256（FIPS 180-4，含已知向量测试）——离线零依赖 |
-| `src/main.rs` | 节点 CLI：`demo` / `build` / `prove` / `bft` / `live` / `chain` / `validators` / `gossip`（含 M19 证据 flood 演示） / `light`（M20 跟随 + M21 免迁移 `follow_committed` 演示） / `vprove`（M21 验证人 Merkle 成员证明） / `lsync`（M22 头部轻同步演示：全+光节点同总线、光端 0 笔交易入眼即够到全节点高度，附线缆字节节省 + `verify_membership_against_header`） / **`account`（M23 钱包账户-成员 SPV 演示：光端经 `GetAccountProof` 取账户、本地重算 leaf 对头里的 `accounts_root` 验证，含双根对比）** / `staking` / `slashing` / `certs` / `run` / `status`（含确定性演示密钥） |
+| `src/main.rs` | 节点 CLI：`demo` / `build` / `prove` / `bft` / `live` / `chain` / `validators` / `gossip`（含 M19 证据 flood 演示） / `light`（M20 跟随 + M21 免迁移 `follow_committed` 演示） / `vprove`（M21 验证人 Merkle 成员证明） / `lsync`（M22 头部轻同步演示：全+光节点同总线、光端 0 笔交易入眼即够到全节点高度，附线缆字节节省 + `verify_membership_against_header`） / **`account`（M23 钱包账户-成员 SPV 演示：光端经 `GetAccountProof` 取账户、本地重算 leaf 对头里的 `accounts_root` 验证，含双根对比）** / **`graph`（M25 图节点 cert-signed 包含证明演示：单次 GetProof 拿图节点 + 账户，光端对 accounts_root 重算 leaf、零信任 prover）** / **`knn`（M26 cert-signed 邻域证明演示：full peer 本地 kNN → KnnClaim，wallet 端 verify_knn_against_header 重排 + cut）** / **`range`（M27 cert-signed 范围查询演示：full peer 本地 cosine cutoff → RangeClaim，wallet 端 verify_range_against_header 对 graph_root 重排 + cut，含 cut/根/cutoff 三类负测）** / `staking` / `slashing` / `certs` / `run` / `status`（含确定性演示密钥） |
 
 ## 局限与后续（离生产还差什么）
 

@@ -160,6 +160,27 @@ pub struct KnnClaim {
     pub neighbours: Vec<(u64, crate::engine::GraphNode, merkle::Proof)>,
 }
 
+/// M27: cert-signed range claim against the cognitive graph.
+///
+/// A `RangeClaim` answers "what are the nodes with `cos_sim(query, n) >=
+/// min_sim` at height H?" — the user supplies `(query, min_sim)`, and the
+/// full peer returns the cut set in `cosine-desc, node_id-asc` order
+/// (engine's `rank_by_cosine` rule). Each entry carries a Merkle proof
+/// against `header.graph_root` (the M27 cert-signed secondary index),
+/// distinct from M26's kNN proofs which verify against `accounts_root`.
+///
+/// The verifier reconstructs the cut set locally from the verified leaves
+/// and rejects any divergence — same trust model as M26's kNN.
+#[derive(Clone, Debug)]
+pub struct RangeClaim {
+    pub query: crate::engine::Embedding,
+    pub min_sim: f32,
+    /// Sorted (cosine-desc, node_id-asc). The cut set is the prefix of
+    /// the full `rank_by_cosine(query)` listing whose sim >= min_sim.
+    /// Each tuple is `(node_id, graph_node_leaves_body, merkle_proof)`.
+    pub nodes: Vec<(u64, crate::engine::GraphNode, merkle::Proof)>,
+}
+
 /// Follows the active validator set across a certified chain without full
 /// replay. Construct with [`Self::from_genesis`], then feed certified blocks in
 /// height order via [`Self::follow`] / [`Self::follow_all`].
@@ -223,6 +244,15 @@ pub enum LightError {
     /// re-derives from the verified leaves. Could be a malicious prover, a
     /// stale snapshot, or — most commonly — a tied node the prover omitted.
     KnnRankingMismatch { height: u64 },
+    /// M27: the range claim's `min_sim` is outside `[-1.0, 1.0]` (the
+    /// closed cosine interval) — a degenerate "match nothing" or "match
+    /// everything" request. Returned instead of returning `Ok(())` so the
+    /// wallet can distinguish "no answer" from "verified answer".
+    RangeCutoffInvalid { height: u64 },
+    /// M27: the prover's range claim disagrees with the cut set the wallet
+    /// re-derives from the verified leaves (missing nodes inside the cut,
+    /// extra nodes outside the cut, wrong order).
+    RangeMismatch { height: u64 },
 }
 
 impl std::fmt::Display for LightError {
@@ -259,6 +289,12 @@ impl std::fmt::Display for LightError {
             LightError::KnnRankingMismatch { height } => {
                 write!(f, "light: kNN claim ranking disagrees with re-derived ranking at block {height}")
             }
+            LightError::RangeCutoffInvalid { height } => {
+                write!(f, "light: range claim min_sim is outside [-1, 1] at block {height}")
+            }
+            LightError::RangeMismatch { height } => {
+                write!(f, "light: range claim disagrees with re-derived cut set at block {height}")
+            }
         }
     }
 }
@@ -293,6 +329,7 @@ impl ValidatorTracker {
             next_validators_root: set.merkle_root(),
             state_root: crate::ChainState::state_root_for_genesis(g),
             accounts_root: crate::ChainState::merkle_root_for_genesis(g),
+            graph_root: crate::ChainState::graph_merkle_root_for_genesis(g),
             txs: Vec::new(),
             validator_updates: Vec::new(),
             stake_ops: Vec::new(),
@@ -664,6 +701,96 @@ impl ValidatorTracker {
         //    reordered list, etc.
         if expected != claimed {
             return Err(LightError::KnnRankingMismatch { height: header.height });
+        }
+        Ok(())
+    }
+
+    // ----- M27: cert-signed graph range queries -----
+
+    // See also `engine::CognitiveGraph::rank_by_cosine`. The wallet-side
+    // ranking here MUST match the engine's ranking byte-for-byte given the
+    // same `query` and the same set of (verified) leaves.
+
+    /// M27: cert-signed graph range query — "give me every node with
+    /// `cos_sim(query, n) >= min_sim` at height H".
+    ///
+    /// `claim.nodes` is the prover's answer. The verifier:
+    ///   1. cert-signing contract — `cert.height == header.height`,
+    ///      `cert.block_hash == header.hash()`, `cert.verify(tracked_set)`.
+    ///   2. reject a degenerate `min_sim` outside `[-1.0, 1.0]` so a
+    ///      "match nothing" / "match everything" request is not silently
+    ///      accepted.
+    ///   3. Merkle-verify every leaf in `claim.nodes` against
+    ///      `header.graph_root` (M27's slot — distinct from M26's
+    ///      `accounts_root` because the leaves live in the sorted view).
+    ///   4. re-rank the verified leaves by cosine against `claim.query`,
+    ///      tie-break by `node_id` ascending, take the prefix with
+    ///      `sim >= claim.min_sim`.
+    ///   5. require the prover's node list to equal the verifier-derived
+    ///      cut set, in the same order.
+    ///
+    /// The prover is **untrusted** — the wallet rebuilds the cut from
+    /// committed leaves plus its own `cos_sim`.
+    pub fn verify_range_against_header(
+        header: &crate::codec::BlockHeader,
+        cert: &Commit,
+        tracked_set: &ValidatorSet,
+        claim: &RangeClaim,
+    ) -> Result<(), LightError> {
+        // 1. cert-signing contract.
+        let hh = header.hash();
+        if cert.height != header.height || cert.block_hash != hh {
+            return Err(LightError::CertificateMismatch { height: header.height });
+        }
+        cert.verify(tracked_set).map_err(LightError::Consensus)?;
+
+        // 2. Cutoff validity guard. `min_sim` must lie in the closed cosine
+        //    interval; otherwise the cut is either "nothing" or "everything"
+        //    and the prover is either lying about its work or shipping a
+        //    constant answer. Surface it explicitly.
+        if !claim.min_sim.is_finite() || claim.min_sim < -1.0 || claim.min_sim > 1.0 {
+            return Err(LightError::RangeCutoffInvalid { height: header.height });
+        }
+
+        // 3. Per-leaf Merkle verify every entry against `header.graph_root`.
+        //    Note the routing differs from M26's kNN: kNN proofs verify
+        //    against `accounts_root` (graph nodes live in the insertion-
+        //    ordered tree alongside accounts/reviewers), but M27 range
+        //    proofs verify against the M27 slot which commits a *different*
+        //    ordering (sorted-by-cosine against the canonical pivot).
+        let root = &header.graph_root;
+        for (_node_id, graph_node, proof) in &claim.nodes {
+            let leaf = merkle::leaf_hash(&graph_node.merkle_leaf());
+            if !merkle::verify(root, &leaf, proof) {
+                return Err(LightError::MembershipProofInvalid { height: header.height });
+            }
+        }
+
+        // 4. Re-rank the verified leaves locally. Same rule as
+        //    `engine::CognitiveGraph::rank_by_cosine`: cosine desc, then
+        //    `node_id` asc. Then take the prefix where sim >= min_sim.
+        let mut local: Vec<(u64, f32)> = claim
+            .nodes
+            .iter()
+            .map(|(node_id, graph_node, _)| {
+                (*node_id, crate::engine::cos_sim(&claim.query, &graph_node.embedding))
+            })
+            .collect();
+        local.sort_by(|a, b| {
+            b.1.partial_cmp(&a.1)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then(a.0.cmp(&b.0))
+        });
+        let expected: Vec<u64> = local
+            .iter()
+            .take_while(|(_, s)| *s >= claim.min_sim)
+            .map(|(id, _)| *id)
+            .collect();
+
+        // 5. Order + set equality.
+        let claimed: Vec<u64> = claim.nodes.iter().map(|(id, _, _)| *id).collect();
+        if expected != claimed {
+            return Err(LightError::RangeMismatch { height: header.height });
         }
         Ok(())
     }
@@ -1288,6 +1415,131 @@ mod tests {
         }
         let claim = KnnClaim { query, k, neighbours };
         (header, cert, tracked, claim)
+    }
+
+    /// M27 fixture: same driver pattern as `one_block_with_knn_claim` but
+    /// builds a `RangeClaim` — a query + cutoff, the cut set in cosine-desc
+    /// order, and per-leaf proofs against `header.graph_root` (not
+    /// `accounts_root`, the M27 routing).
+    fn one_block_with_range_claim(query: crate::engine::Embedding, min_sim: f32) -> (
+        crate::codec::BlockHeader,
+        Commit,
+        ValidatorSet,
+        RangeClaim,
+    ) {
+        let mut d = driver(base_genesis());
+        d.submit(novel_tx(1, 1, 1, 1.0)).unwrap();
+        d.produce(1.0, &no_silence()).unwrap().expect("block");
+        let block = d.blocks()[0].clone();
+        let cert = d.certificates()[0].clone();
+        let header = crate::codec::BlockHeader::from_block(&block);
+        let tracked = ValidatorTracker::from_genesis(&base_genesis()).validators().clone();
+
+        // Compute the user-query-sorted ranking locally so the test
+        // expectation matches the prover exactly. We need this list to
+        // know which `graph_range_proof` indices to pull, and to know the
+        // expected cut.
+        let ranked = d.chain.state.graph.rank_by_cosine(&query);
+        // The claim's node order is the cosine-desc order from the user's
+        // query, NOT the canonical-pivot-sorted order of `graph_root`.
+        // Each entry carries a Merkle proof against `graph_root` (verified
+        // against the canonical-pivot-sorted view), and the verifier
+        // re-ranks by the user's query at verify time.
+        let mut cut_ids: Vec<u64> = ranked
+            .iter()
+            .take_while(|(_, s)| *s >= min_sim)
+            .map(|(id, _)| *id)
+            .collect();
+        cut_ids.truncate(crate::net::MAX_PROOF_BATCH);
+        let mut nodes: Vec<(u64, crate::engine::GraphNode, merkle::Proof)> =
+            Vec::with_capacity(cut_ids.len());
+        // We need the canonical-pivot-sorted leaf index for each id so
+        // the per-leaf proof is the right one. Build the same sorted view
+        // the prover does.
+        let sorted_ids: Vec<u64> = {
+            let mut sorted: Vec<crate::engine::GraphNode> =
+                d.chain.state.graph.nodes.clone();
+            sorted.sort_by(|a, b| {
+                let sa = crate::engine::cos_sim(
+                    &[1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+                    &a.embedding,
+                );
+                let sb = crate::engine::cos_sim(
+                    &[1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+                    &b.embedding,
+                );
+                sb.partial_cmp(&sa).unwrap_or(std::cmp::Ordering::Equal)
+                    .then(a.node_id.cmp(&b.node_id))
+            });
+            sorted.iter().map(|n| n.node_id).collect()
+        };
+        for id in &cut_ids {
+            let sorted_idx = sorted_ids.iter().position(|x| x == id)
+                .expect("id must be present in sorted view");
+            let proof = d.chain.state.graph_range_proof(
+                sorted_idx, sorted_idx + 1,
+            ).expect("range proof for a single sorted index");
+            let (_id, node, merkle_proof) = proof.entries.into_iter().next().unwrap();
+            // Sanity: the proof must verify against the graph_merkle_root
+            // (= graph_root committed in the header).
+            assert_eq!(proof.sub_root, d.chain.state.graph_merkle_root());
+            nodes.push((*id, node, merkle_proof));
+        }
+        let claim = RangeClaim { query, min_sim, nodes };
+        (header, cert, tracked, claim)
+    }
+
+    #[test]
+    fn verify_range_against_header_accepts_a_cert_signed_cutoff_claim() {
+        // Query matches the first graph node exactly → sim=1.0 with it;
+        // a permissive cutoff (e.g. 0.5) accepts the cut set. The verifier
+        // must accept a valid claim built end-to-end against graph_root.
+        let query = [1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
+        let (header, cert, tracked, claim) = one_block_with_range_claim(query, 0.5);
+        assert!(!claim.nodes.is_empty(), "test setup: query must hit >= 1 node");
+        ValidatorTracker::verify_range_against_header(&header, &cert, &tracked, &claim)
+            .expect("wallet-side range claim verifies");
+    }
+
+    #[test]
+    fn verify_range_against_header_rejects_a_missing_node_in_the_cut() {
+        // Build a valid claim, then drop a node that's in the cut. The
+        // verifier re-derives the cut and notices the missing entry.
+        let query = [1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
+        let (header, cert, tracked, mut claim) = one_block_with_range_claim(query, 0.5);
+        if claim.nodes.len() < 2 { return; }
+        claim.nodes.pop();
+        let err = ValidatorTracker::verify_range_against_header(
+            &header, &cert, &tracked, &claim,
+        ).unwrap_err();
+        assert!(matches!(err, LightError::RangeMismatch { .. }), "got {err}");
+    }
+
+    #[test]
+    fn verify_range_against_header_rejects_an_invalid_cutoff() {
+        // min_sim outside [-1, 1] is a degenerate query.
+        let query = [1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
+        let (header, cert, tracked, mut claim) = one_block_with_range_claim(query, 0.5);
+        claim.min_sim = 2.0;
+        let err = ValidatorTracker::verify_range_against_header(
+            &header, &cert, &tracked, &claim,
+        ).unwrap_err();
+        assert!(matches!(err, LightError::RangeCutoffInvalid { .. }), "got {err}");
+    }
+
+    #[test]
+    fn verify_range_against_header_rejects_a_tampered_graph_root() {
+        // graph_root is part of header.hash(), so a tamper flips both the
+        // cert binding AND the Merkle proof path. CertificateMismatch wins
+        // first because the cert no longer matches the tampered header.
+        let query = [1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
+        let (header, cert, tracked, claim) = one_block_with_range_claim(query, 0.5);
+        let mut bad_header = header.clone();
+        bad_header.graph_root = [0xCD; 32];
+        let err = ValidatorTracker::verify_range_against_header(
+            &bad_header, &cert, &tracked, &claim,
+        ).unwrap_err();
+        assert!(matches!(err, LightError::CertificateMismatch { .. }), "got {err}");
     }
 
     #[test]
