@@ -657,6 +657,68 @@ pub fn decode_proof_kind(b: u8) -> Result<ProofKind, CodecError> {
     }
 }
 
+/// M29: wire tag for one [`crate::light::BatchResponseItem`] kind.
+/// Same numeric values as [`BatchItem::kind_tag`] in
+/// `node/src/light.rs` so adding a new variant means appending —
+/// never renumbering. The request side uses the same tag; see
+/// [`BatchItem::kind_tag`] for the request tag. The two namespaces
+/// are kept identical (rather than e.g. request=0..3 and response=0..3)
+/// so a swap shows up as `BatchItemKindMismatch` rather than a silent
+/// reinterpretation.
+pub fn encode_batch_response_kind(k: u8) -> u8 {
+    // identity for the current four kinds; future kinds would extend
+    // both sides of this identity in lockstep.
+    k
+}
+
+/// M29: inverse of [`encode_batch_response_kind`].
+pub fn decode_batch_response_kind(b: u8) -> Result<u8, CodecError> {
+    match b {
+        0..=3 => Ok(b),
+        other => Err(CodecError::BadEnum(other as u32)),
+    }
+}
+
+/// M29: canonical bytes of a kNN request slot: 8×f32 query ‖ u32 k.
+/// 32 + 4 = 36 bytes.
+pub fn encode_knn_request(query: &Embedding, k: usize) -> Vec<u8> {
+    let mut e = Enc(Vec::new());
+    e.emb(query);
+    e.u32(k as u32);
+    e.0
+}
+
+/// M29: inverse of [`encode_knn_request`].
+pub fn decode_knn_request(buf: &[u8]) -> Result<(Embedding, usize), CodecError> {
+    let mut d = Dec { buf, pos: 0 };
+    let query = d.emb()?;
+    let k = d.u32()? as usize;
+    if d.pos != d.buf.len() {
+        return Err(CodecError::TrailingBytes);
+    }
+    Ok((query, k))
+}
+
+/// M29: canonical bytes of a range request slot: 8×f32 query ‖ f32 min_sim.
+/// 32 + 4 = 36 bytes.
+pub fn encode_range_request(query: &Embedding, min_sim: f32) -> Vec<u8> {
+    let mut e = Enc(Vec::new());
+    e.emb(query);
+    e.f32(min_sim);
+    e.0
+}
+
+/// M29: inverse of [`encode_range_request`].
+pub fn decode_range_request(buf: &[u8]) -> Result<(Embedding, f32), CodecError> {
+    let mut d = Dec { buf, pos: 0 };
+    let query = d.emb()?;
+    let min_sim = d.f32()?;
+    if d.pos != d.buf.len() {
+        return Err(CodecError::TrailingBytes);
+    }
+    Ok((query, min_sim))
+}
+
 /// M24: canonical bytes of one [`Validator`] for the M24 `Proof` response.
 /// Byte-identical to [`Validator::merkle_leaf`] so the verifier can recompute
 /// the leaf locally and reject a prover that swaps one for the other.
@@ -1451,5 +1513,357 @@ mod tests {
         assert_eq!(&bytes[1..45], n.merkle_leaf().as_slice());
         let back = decode_proof_entry(&bytes).expect("decode must succeed");
         assert_eq!(back, entry);
+    }
+
+    // ----- M29 codec round-trips -----
+
+    #[test]
+    fn encode_knn_request_round_trips() {
+        let q: Embedding = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8];
+        let bytes = encode_knn_request(&q, 5);
+        assert_eq!(bytes.len(), 32 + 4); // 8×f32 + u32
+        let (q2, k2) = decode_knn_request(&bytes).expect("decode must succeed");
+        assert_eq!(q2, q);
+        assert_eq!(k2, 5);
+    }
+
+    #[test]
+    fn encode_knn_request_rejects_trailing_bytes() {
+        let q: Embedding = [0.0; 8];
+        let mut bytes = encode_knn_request(&q, 1);
+        bytes.push(0); // garbage trailing byte
+        assert!(matches!(
+            decode_knn_request(&bytes),
+            Err(CodecError::TrailingBytes)
+        ));
+    }
+
+    #[test]
+    fn encode_range_request_round_trips() {
+        let q: Embedding = [1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
+        let bytes = encode_range_request(&q, -0.5);
+        assert_eq!(bytes.len(), 32 + 4);
+        let (q2, s2) = decode_range_request(&bytes).expect("decode must succeed");
+        assert_eq!(q2, q);
+        assert_eq!(s2, -0.5);
+    }
+
+    #[test]
+    fn encode_knn_claim_round_trips() {
+        use crate::light::{KnnClaim, ProofEntry};
+        // Build a synthetic KnnClaim via the public codec path so the
+        // round-trip exercises real bytes.
+        let g = crate::engine::GraphNode {
+            node_id: 7,
+            embedding: [0.1; 8],
+            domain: 42,
+        };
+        let proof = crate::merkle::Proof { steps: vec![] };
+        let claim = KnnClaim {
+            query: [0.5; 8],
+            k: 3,
+            neighbours: vec![(7, g.clone(), proof.clone())],
+        };
+        let bytes = crate::net::encode_knn_claim(&claim);
+        let back = crate::net::decode_knn_claim(&bytes).expect("decode must succeed");
+        assert_eq!(back.query, claim.query);
+        assert_eq!(back.k, claim.k);
+        assert_eq!(back.neighbours.len(), 1);
+        assert_eq!(back.neighbours[0].0, 7);
+        assert_eq!(back.neighbours[0].1, g);
+        assert_eq!(back.neighbours[0].2, proof);
+        // Reference ProofEntry just to silence the import warning if any.
+        let _ = std::mem::size_of::<ProofEntry>();
+    }
+
+    #[test]
+    fn encode_range_claim_round_trips() {
+        use crate::light::RangeClaim;
+        let g = crate::engine::GraphNode {
+            node_id: 11,
+            embedding: [0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+            domain: 5,
+        };
+        let proof = crate::merkle::Proof { steps: vec![] };
+        let claim = RangeClaim {
+            query: [1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+            min_sim: 0.5,
+            nodes: vec![(11, g.clone(), proof.clone())],
+        };
+        let bytes = crate::net::encode_range_claim(&claim);
+        let back = crate::net::decode_range_claim(&bytes).expect("decode must succeed");
+        assert_eq!(back.query, claim.query);
+        assert_eq!(back.min_sim, claim.min_sim);
+        assert_eq!(back.nodes.len(), 1);
+        assert_eq!(back.nodes[0].0, 11);
+        assert_eq!(back.nodes[0].1, g);
+        assert_eq!(back.nodes[0].2, proof);
+    }
+
+    #[test]
+    fn encode_batch_envelope_round_trips() {
+        use crate::light::{
+            BatchItem, BatchResponseEnvelope, BatchResponseItem, DiffEnvelope,
+            ProofEntry,
+        };
+        let g = crate::engine::GraphNode {
+            node_id: 0,
+            embedding: [0.0; 8],
+            domain: 1,
+        };
+        let acct = crate::Account {
+            pubkey: [9u8; 32],
+            balance: 100 * MICRO,
+            staked_total: 0,
+            earned_total: 0,
+            slashed_total: 0,
+            submissions: 0,
+            accepted: 0,
+        };
+        let inclusion_entry = ProofEntry::Account {
+            id: 1,
+            account: acct,
+            proof: crate::merkle::Proof { steps: vec![] },
+        };
+        let diff_env = DiffEnvelope {
+            header_prev: crate::codec::BlockHeader {
+                height: 1,
+                prev_hash: [0u8; 32],
+                timestamp_days: 0.0,
+                next_validators_root: [0u8; 32],
+                state_root: [0u8; 32],
+                accounts_root: [0u8; 32],
+                graph_root: [0u8; 32],
+                validator_updates: vec![],
+                txs_commitment: [0u8; 32],
+                stake_ops_commitment: [0u8; 32],
+                evidence_commitment: [0u8; 32],
+            },
+            cert_prev: crate::consensus::Commit {
+                height: 1,
+                round: 0,
+                block_hash: [0u8; 32],
+                precommits: vec![],
+            },
+            header_new: crate::codec::BlockHeader {
+                height: 2,
+                prev_hash: [1u8; 32],
+                timestamp_days: 1.0,
+                next_validators_root: [0u8; 32],
+                state_root: [0u8; 32],
+                accounts_root: [0u8; 32],
+                graph_root: [0u8; 32],
+                validator_updates: vec![],
+                txs_commitment: [0u8; 32],
+                stake_ops_commitment: [0u8; 32],
+                evidence_commitment: [0u8; 32],
+            },
+            cert_new: crate::consensus::Commit {
+                height: 2,
+                round: 0,
+                block_hash: [0u8; 32],
+                precommits: vec![],
+            },
+            diff: crate::DiffClaim {
+                added: vec![crate::GraphLeafAtHeight {
+                    node_id: 0,
+                    graph_node: g.clone(),
+                    proof: crate::merkle::Proof { steps: vec![] },
+                }],
+                dropped: vec![],
+            },
+            tracked_set_h1: crate::validator::ValidatorSet::new(vec![]),
+            tracked_set_h2: crate::validator::ValidatorSet::new(vec![]),
+        };
+        let env = BatchResponseEnvelope {
+            items: vec![
+                BatchResponseItem::Inclusion(Some(inclusion_entry)),
+                BatchResponseItem::Inclusion(None), // skip slot
+                BatchResponseItem::Diff(Box::new(diff_env)),
+            ],
+        };
+        let bytes = crate::net::encode_batch_envelope(&env);
+        let back = crate::net::decode_batch_envelope(&bytes).expect("decode must succeed");
+        assert_eq!(back.items.len(), 3);
+        // Inclusion Some
+        match &back.items[0] {
+            BatchResponseItem::Inclusion(Some(ProofEntry::Account { id, account, .. })) => {
+                assert_eq!(*id, 1);
+                assert_eq!(account.balance, 100 * MICRO);
+            }
+            other => panic!("expected inclusion Some at 0, got {other:?}"),
+        }
+        // Inclusion None
+        match &back.items[1] {
+            BatchResponseItem::Inclusion(None) => {}
+            other => panic!("expected inclusion None at 1, got {other:?}"),
+        }
+        // Diff
+        match &back.items[2] {
+            BatchResponseItem::Diff(d) => {
+                assert_eq!(d.header_prev.height, 1);
+                assert_eq!(d.header_new.height, 2);
+                assert_eq!(d.diff.added.len(), 1);
+                assert_eq!(d.diff.added[0].node_id, 0);
+            }
+            other => panic!("expected Diff at 2, got {other:?}"),
+        }
+        // Reference BatchItem so the import doesn't go unused.
+        let _: BatchItem = BatchItem::Diff { h1: 1, h2: 2 };
+    }
+
+    #[test]
+    fn encode_batch_envelope_rejects_trailing_bytes() {
+        use crate::light::{BatchResponseEnvelope, BatchResponseItem};
+        let env = BatchResponseEnvelope {
+            items: vec![BatchResponseItem::Inclusion(None)],
+        };
+        let mut bytes = crate::net::encode_batch_envelope(&env);
+        bytes.push(0xff);
+        assert!(matches!(
+            crate::net::decode_batch_envelope(&bytes),
+            Err(CodecError::TrailingBytes)
+        ));
+    }
+
+    #[test]
+    fn encode_batch_envelope_rejects_oversized_batch() {
+        use crate::light::{BatchResponseEnvelope, BatchResponseItem};
+        let items = vec![BatchResponseItem::Inclusion(None); crate::net::MAX_BATCH_ITEMS + 1];
+        let env = BatchResponseEnvelope { items };
+        let bytes = crate::net::encode_batch_envelope(&env);
+        assert!(matches!(
+            crate::net::decode_batch_envelope(&bytes),
+            Err(CodecError::TooManyItems(_))
+        ));
+    }
+
+    #[test]
+    fn gossip_getbatch_and_batch_round_trip() {
+        use crate::light::{BatchItem, BatchResponseEnvelope, BatchResponseItem, ProofEntry};
+        let q: Embedding = [0.5; 8];
+        let items = vec![
+            BatchItem::Inclusion {
+                kind: crate::light::ProofKind::Account,
+                id: 7,
+            },
+            BatchItem::Knn {
+                query: q,
+                k: 3,
+            },
+            BatchItem::Range {
+                query: q,
+                min_sim: 0.0,
+            },
+            BatchItem::Diff { h1: 1, h2: 2 },
+        ];
+        let env = BatchResponseEnvelope {
+            items: vec![
+                BatchResponseItem::Inclusion(None),
+                BatchResponseItem::Knn(None),
+                BatchResponseItem::Range(None),
+                BatchResponseItem::Diff(Box::new(crate::light::DiffEnvelope {
+                    header_prev: crate::codec::BlockHeader {
+                        height: 1,
+                        prev_hash: [0u8; 32],
+                        timestamp_days: 0.0,
+                        next_validators_root: [0u8; 32],
+                        state_root: [0u8; 32],
+                        accounts_root: [0u8; 32],
+                        graph_root: [0u8; 32],
+                        validator_updates: vec![],
+                        txs_commitment: [0u8; 32],
+                        stake_ops_commitment: [0u8; 32],
+                        evidence_commitment: [0u8; 32],
+                    },
+                    cert_prev: crate::consensus::Commit {
+                        height: 1,
+                        round: 0,
+                        block_hash: [0u8; 32],
+                        precommits: vec![],
+                    },
+                    header_new: crate::codec::BlockHeader {
+                        height: 2,
+                        prev_hash: [1u8; 32],
+                        timestamp_days: 1.0,
+                        next_validators_root: [0u8; 32],
+                        state_root: [0u8; 32],
+                        accounts_root: [0u8; 32],
+                        graph_root: [0u8; 32],
+                        validator_updates: vec![],
+                        txs_commitment: [0u8; 32],
+                        stake_ops_commitment: [0u8; 32],
+                        evidence_commitment: [0u8; 32],
+                    },
+                    cert_new: crate::consensus::Commit {
+                        height: 2,
+                        round: 0,
+                        block_hash: [0u8; 32],
+                        precommits: vec![],
+                    },
+                    diff: crate::DiffClaim {
+                        added: vec![],
+                        dropped: vec![],
+                    },
+                    tracked_set_h1: crate::validator::ValidatorSet::new(vec![]),
+                    tracked_set_h2: crate::validator::ValidatorSet::new(vec![]),
+                })),
+            ],
+        };
+        // Reference ProofEntry to silence the import.
+        let _ = std::mem::size_of::<ProofEntry>();
+
+        let get = GossipMsg::GetBatch { items: items.clone() };
+        let bytes = encode_gossip(&get);
+        let back = decode_gossip(&bytes).expect("decode GetBatch");
+        match back {
+            GossipMsg::GetBatch { items: got } => {
+                assert_eq!(got.len(), 4);
+                match &got[0] {
+                    BatchItem::Inclusion { kind, id } => {
+                        assert_eq!(*kind, crate::light::ProofKind::Account);
+                        assert_eq!(*id, 7);
+                    }
+                    other => panic!("expected Inclusion at 0, got {other:?}"),
+                }
+                match &got[1] {
+                    BatchItem::Knn { query, k } => {
+                        assert_eq!(*query, q);
+                        assert_eq!(*k, 3);
+                    }
+                    other => panic!("expected Knn at 1, got {other:?}"),
+                }
+                match &got[2] {
+                    BatchItem::Range { query, min_sim } => {
+                        assert_eq!(*query, q);
+                        assert_eq!(*min_sim, 0.0);
+                    }
+                    other => panic!("expected Range at 2, got {other:?}"),
+                }
+                match &got[3] {
+                    BatchItem::Diff { h1, h2 } => {
+                        assert_eq!(*h1, 1);
+                        assert_eq!(*h2, 2);
+                    }
+                    other => panic!("expected Diff at 3, got {other:?}"),
+                }
+            }
+            other => panic!("expected GetBatch, got {other:?}"),
+        }
+        let batch = GossipMsg::Batch {
+            envelope: Box::new(env),
+        };
+        let bytes = encode_gossip(&batch);
+        let back = decode_gossip(&bytes).expect("decode Batch");
+        match back {
+            GossipMsg::Batch { envelope } => {
+                assert_eq!(envelope.items.len(), 4);
+                matches!(envelope.items[0], BatchResponseItem::Inclusion(None));
+                matches!(envelope.items[1], BatchResponseItem::Knn(None));
+                matches!(envelope.items[2], BatchResponseItem::Range(None));
+                matches!(envelope.items[3], BatchResponseItem::Diff(_));
+            }
+            other => panic!("expected Batch, got {other:?}"),
+        }
     }
 }

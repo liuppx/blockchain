@@ -208,6 +208,99 @@ pub struct DiffEnvelope {
     pub tracked_set_h2: ValidatorSet,
 }
 
+/// M29: one slot in a heterogeneous batched proof request. Mirrors the
+/// request-side arguments of each existing per-primitive producer;
+/// carries **no** cert-binding context (the wallet holds the cert-signed
+/// header for the tracked height in its M22 header cache, and the
+/// wallet resolves the tracked validator set via `ValidatorTracker`).
+///
+/// Each variant routes to the matching existing verifier:
+///   * [`BatchItem::Inclusion`] → [`ValidatorTracker::verify_proof_against_header`]
+///   * [`BatchItem::Knn`]       → [`ValidatorTracker::verify_knn_against_header`]
+///   * [`BatchItem::Range`]     → [`ValidatorTracker::verify_range_against_header`]
+///   * [`BatchItem::Diff`]      → [`ValidatorTracker::verify_diff_against_headers`]
+///
+/// M29 adds **no** new SPV logic — these variants are a transport +
+/// dispatch layer on top of M22–M28.
+#[derive(Clone, Debug)]
+pub enum BatchItem {
+    /// M24–M25 inclusion: prove that `(kind, id)` is in the cert-signed
+    /// header's account/reviewer/validator/graph Merkle root.
+    Inclusion { kind: ProofKind, id: u64 },
+    /// M26 kNN: top-`k` nearest neighbours of `query` at the
+    /// cert-signed header's graph state.
+    Knn { query: crate::engine::Embedding, k: usize },
+    /// M27 range: nodes whose cosine similarity to `query` is at least
+    /// `min_sim` at the cert-signed header's graph state.
+    Range { query: crate::engine::Embedding, min_sim: f32 },
+    /// M28 diff: graph nodes added/dropped between `h1` and `h2`.
+    Diff { h1: u64, h2: u64 },
+}
+
+impl BatchItem {
+    /// M29: kind tag for protocol-mismatch detection. The same tag
+    /// appears in the response (`BatchResponseItem::kind_tag`) so a
+    /// mismatched pair (e.g. Inclusion request paired with Knn
+    /// response) surfaces as `BatchItemKindMismatch` instead of being
+    /// silently miscast.
+    pub fn kind_tag(&self) -> u8 {
+        match self {
+            BatchItem::Inclusion { .. } => 0,
+            BatchItem::Knn { .. } => 1,
+            BatchItem::Range { .. } => 2,
+            BatchItem::Diff { .. } => 3,
+        }
+    }
+}
+
+/// M29: one slot in the matching heterogeneous batched response. Each
+/// variant carries the **same body** that the per-primitive single-shot
+/// producer would have shipped:
+///   * `Inclusion(Option<ProofEntry>)`     — None means "unknown key"
+///     (M24 semantics; the wallet treats it as a verified no-op),
+///   * `Knn(Option<KnnClaim>)`             — None means "empty engine
+///     answer" (same skip semantics as M26's `serve_knn` returning
+///     `None`),
+///   * `Range(Option<RangeClaim>)`         — None means "empty cut set"
+///     (same skip semantics as M27's `serve_range` returning `None`),
+///   * `Diff(Box<DiffEnvelope>)`           — Box-wrapped to keep the
+///     enum size bounded (same `large_enum_variant` discipline as
+///     `GossipMsg::Diff`).
+///
+/// Self-contained per item — the `Diff` envelope carries its own
+/// cert-binding context, the same as the M28 single-shot envelope.
+#[derive(Clone, Debug)]
+pub enum BatchResponseItem {
+    Inclusion(Option<ProofEntry>),
+    Knn(Option<KnnClaim>),
+    Range(Option<RangeClaim>),
+    Diff(Box<DiffEnvelope>),
+}
+
+impl BatchResponseItem {
+    /// M29: counterpart of [`BatchItem::kind_tag`]. Used by the
+    /// verifier to surface `BatchItemKindMismatch` when the request and
+    /// response slots disagree.
+    pub fn kind_tag(&self) -> u8 {
+        match self {
+            BatchResponseItem::Inclusion(_) => 0,
+            BatchResponseItem::Knn(_) => 1,
+            BatchResponseItem::Range(_) => 2,
+            BatchResponseItem::Diff(_) => 3,
+        }
+    }
+}
+
+/// M29: the full self-contained response. Item ordering is parallel
+/// to the request's `Vec<BatchItem>` — slot `i` in the response
+/// answers slot `i` in the request. `items.len() ==
+/// request.items.len()` is a protocol invariant enforced by
+/// [`ValidatorTracker::verify_batch`] via [`LightError::BatchItemCountMismatch`].
+#[derive(Clone, Debug)]
+pub struct BatchResponseEnvelope {
+    pub items: Vec<BatchResponseItem>,
+}
+
 /// Follows the active validator set across a certified chain without full
 /// replay. Construct with [`Self::from_genesis`], then feed certified blocks in
 /// height order via [`Self::follow`] / [`Self::follow_all`].
@@ -291,6 +384,19 @@ pub enum LightError {
     /// in the wrong order. The replay-derived partition is the
     /// authoritative ground truth.
     DiffMismatch { height: u64 },
+    /// M29: the heterogeneous batched request has more items than
+    /// `MAX_BATCH_ITEMS = 32` allows. Surfaces the count so callers can
+    /// distinguish "too many" from "request is malformed".
+    BatchTooManyItems { count: usize },
+    /// M29: the request and response item counts disagree. The wallet
+    /// trusts neither side in isolation; the protocol requires 1:1
+    /// pairing. Surfaced before any per-item verifier runs so the
+    /// failure mode is unambiguous.
+    BatchItemCountMismatch { request: usize, response: usize },
+    /// M29: the request item at slot `i` is a different kind from the
+    /// response item at slot `i`. The protocol preserves request order,
+    /// so a swap or shuffled response is detectable per slot.
+    BatchItemKindMismatch { request_kind: u8, response_kind: u8 },
 }
 
 impl std::fmt::Display for LightError {
@@ -338,6 +444,15 @@ impl std::fmt::Display for LightError {
             }
             LightError::DiffMismatch { height } => {
                 write!(f, "light: diff claim disagrees with replay-derived partition at block {height}")
+            }
+            LightError::BatchTooManyItems { count } => {
+                write!(f, "light: batched request has {count} items, exceeds MAX_BATCH_ITEMS = 32")
+            }
+            LightError::BatchItemCountMismatch { request, response } => {
+                write!(f, "light: batched request has {request} items but response has {response}")
+            }
+            LightError::BatchItemKindMismatch { request_kind, response_kind } => {
+                write!(f, "light: batched slot kind mismatch (request kind={request_kind}, response kind={response_kind})")
             }
         }
     }
@@ -1019,6 +1134,106 @@ impl ValidatorTracker {
             }
         }
 
+        Ok(())
+    }
+
+    /// M29: verify a heterogeneous batched proof response in a single
+    /// pass. Each request slot is dispatched to the matching existing
+    /// per-primitive verifier:
+    ///
+    /// | request kind                | dispatched verifier                          |
+    /// |-----------------------------|---------------------------------------------|
+    /// | [`BatchItem::Inclusion`]    | [`Self::verify_proof_against_header`] (M24/M25) |
+    /// | [`BatchItem::Knn`]          | [`Self::verify_knn_against_header`] (M26)  |
+    /// | [`BatchItem::Range`]        | [`Self::verify_range_against_header`] (M27) |
+    /// | [`BatchItem::Diff`]         | [`Self::verify_diff_against_headers`] (M28) |
+    ///
+    /// Inclusion / kNN / range items are verified against `(header,
+    /// cert, tracked_set)` from the wallet's tracked height (one
+    /// cert-signed header per request — the wallet already has it in
+    /// its M22 header cache). Diff items use the headers + tracked
+    /// sets carried *inside* the response `DiffEnvelope` (M28 is
+    /// already self-contained for this reason).
+    ///
+    /// Soundness reduces to the four existing verifiers — M29 adds no
+    /// new SPV logic. A first `LightError` from any per-primitive
+    /// verifier short-circuits the batch, mirroring how the existing
+    /// single-shot verifiers behave.
+    ///
+    /// The wallet-side partial replay needed by [`BatchItem::Diff`]
+    /// runs against `blocks_in_range` (the wallet's M22 header cache
+    /// for `[1..=h₂_max]`). M29 does **not** hoist replay state across
+    /// items: each `verify_diff_against_headers` invocation is
+    /// self-contained, exactly as it is when called standalone.
+    ///
+    /// `header` / `cert` / `tracked_set` are the cert-signed header
+    /// for the tracked height plus the validator set that certifies
+    /// it (resolved by the wallet from its M22 header cache +
+    /// `ValidatorTracker`). `blocks_in_range` is the wallet's M22
+    /// header cache for `[1..=h₂_max]`, used by diff items.
+    #[allow(clippy::too_many_arguments)]
+    pub fn verify_batch(
+        &self,
+        genesis: &Genesis,
+        header: &crate::codec::BlockHeader,
+        cert: &Commit,
+        tracked_set: &ValidatorSet,
+        blocks_in_range: &[(Block, Commit)],
+        items: &[BatchItem],
+        response: &BatchResponseEnvelope,
+    ) -> Result<(), LightError> {
+        if items.len() > 32 {
+            return Err(LightError::BatchTooManyItems { count: items.len() });
+        }
+        if items.len() != response.items.len() {
+            return Err(LightError::BatchItemCountMismatch {
+                request: items.len(),
+                response: response.items.len(),
+            });
+        }
+        for (req, resp) in items.iter().zip(response.items.iter()) {
+            match (req, resp) {
+                // Inclusion: route to M24 verifier. A None slot is the
+                // M24 "unknown key" semantics — skip silently.
+                (
+                    BatchItem::Inclusion { .. },
+                    BatchResponseItem::Inclusion(Some(entry)),
+                ) => {
+                    ValidatorTracker::verify_proof_against_header(
+                        header, cert, tracked_set, entry,
+                    )?;
+                }
+                (BatchItem::Knn { .. }, BatchResponseItem::Knn(Some(claim))) => {
+                    ValidatorTracker::verify_knn_against_header(
+                        header, cert, tracked_set, claim,
+                    )?;
+                }
+                (BatchItem::Range { .. }, BatchResponseItem::Range(Some(claim))) => {
+                    ValidatorTracker::verify_range_against_header(
+                        header, cert, tracked_set, claim,
+                    )?;
+                }
+                (BatchItem::Diff { .. }, BatchResponseItem::Diff(env)) => {
+                    ValidatorTracker::verify_diff_against_headers(
+                        genesis, blocks_in_range, env,
+                    )?;
+                }
+                // Empty answer on the producer side: same skip semantics
+                // as M26/M27 — the wallet treats it as a verified
+                // no-op.
+                (BatchItem::Inclusion { .. }, BatchResponseItem::Inclusion(None)) => {}
+                (BatchItem::Knn { .. }, BatchResponseItem::Knn(None)) => {}
+                (BatchItem::Range { .. }, BatchResponseItem::Range(None)) => {}
+                // Pairing mismatch — protocol violation, surface
+                // explicitly.
+                (req, resp) => {
+                    return Err(LightError::BatchItemKindMismatch {
+                        request_kind: req.kind_tag(),
+                        response_kind: resp.kind_tag(),
+                    });
+                }
+            }
+        }
         Ok(())
     }
     pub fn follow_all(&mut self, blocks: &[Block], certs: &[Commit]) -> Result<(), LightError> {
@@ -2071,5 +2286,506 @@ mod tests {
         // runs first — both are equally rejecting. Just confirm SOME
         // LightError is returned.
         let _ = envelope; // unused: covered above
+    }
+
+    // ----- M29: verify_batch (heterogeneous batched proof transport) -----
+
+    /// M29: build a `ValidatorTracker` for `verify_batch` to dispatch from.
+    /// `verify_batch` reads the cert-binding context (header, cert, set)
+    /// from explicit arguments, so the tracker just needs to exist.
+    fn fresh_tracker(g: &Genesis) -> ValidatorTracker {
+        ValidatorTracker::from_genesis(g)
+    }
+
+    /// M29: produce a single-block chain and return the artifacts needed
+    /// for verifying any heterogeneous batch (header + cert + tracked set +
+    /// block range).
+    #[allow(clippy::type_complexity)]
+    fn one_block_artifacts() -> (
+        Genesis,
+        Vec<Block>,
+        Vec<Commit>,
+        crate::codec::BlockHeader,
+        Commit,
+        ValidatorSet,
+        Vec<(Block, Commit)>,
+    ) {
+        let mut d = driver(base_genesis());
+        d.submit(novel_tx(1, 1, 1, 1.0)).unwrap();
+        d.produce(1.0, &no_silence()).unwrap().expect("block");
+        let genesis = base_genesis();
+        let blocks = d.blocks().to_vec();
+        let certs = d.certificates().to_vec();
+        let header = crate::codec::BlockHeader::from_block(&blocks[0]);
+        let cert = certs[0].clone();
+        let tracked = crate::Chain::replay(genesis.clone(), &[]).unwrap().state.validators.clone();
+        let blocks_in_range: Vec<(Block, Commit)> = blocks
+            .iter()
+            .cloned()
+            .zip(certs.iter().cloned())
+            .collect();
+        (genesis, blocks, certs, header, cert, tracked, blocks_in_range)
+    }
+
+    #[test]
+    fn verify_batch_accepts_a_heterogeneous_inclusion_knn_diff_request() {
+        let (genesis, blocks, certs, tracked_h1, tracked_h2, header_h1, header_h2) =
+            two_block_certified_chain_for_diff();
+        let mut d = driver(base_genesis());
+        d.submit(novel_tx(1, 1, 1, 1.0)).unwrap();
+        d.produce(1.0, &no_silence()).unwrap().expect("block 1");
+        d.submit(novel_tx(2, 2, 2, 2.0)).unwrap();
+        d.produce(2.0, &no_silence()).unwrap().expect("block 2");
+
+        // Inclusion: Account(1) at h₂.
+        let acct_proof = d.chain.state.account_proof(1).expect("acct 1 proof");
+        let acct = d.chain.state.accounts.get(&1).cloned().expect("acct 1");
+        let inclusion_entry =
+            ProofEntry::Account { id: 1, account: acct, proof: acct_proof };
+
+        // kNN: 3 nearest to the first graph node's embedding at h₂.
+        let query = d.chain.state.graph.nodes[0].embedding;
+        let ranked = d.chain.state.graph.k_nearest_with_ties(&query, 3);
+        let mut neighbours: Vec<(u64, crate::engine::GraphNode, merkle::Proof)> =
+            Vec::with_capacity(ranked.len());
+        for (id, _sim) in &ranked {
+            let idx = *id as usize;
+            let proof = d.chain.state.graph_node_proof(idx).expect("proof");
+            let node = d.chain.state.graph.nodes[idx].clone();
+            neighbours.push((*id, node, proof));
+        }
+        let claim = KnnClaim { query, k: 3, neighbours };
+
+        // Diff: h₁=1 → h₂=2.
+        let state_h1 = crate::Chain::replay(genesis.clone(), &blocks[..1]).unwrap().state;
+        let state_h2 = crate::Chain::replay(genesis.clone(), &blocks).unwrap().state;
+        let diff = state_h2.graph_diff(&state_h1);
+        let diff_env = DiffEnvelope {
+            header_prev: header_h1.clone(),
+            cert_prev: certs[0].clone(),
+            header_new: header_h2.clone(),
+            cert_new: certs[1].clone(),
+            diff,
+            tracked_set_h1: tracked_h1,
+            tracked_set_h2: tracked_h2,
+        };
+
+        let items = vec![
+            BatchItem::Inclusion { kind: ProofKind::Account, id: 1 },
+            BatchItem::Knn { query, k: 3 },
+            BatchItem::Diff { h1: 1, h2: 2 },
+        ];
+        let response = BatchResponseEnvelope {
+            items: vec![
+                BatchResponseItem::Inclusion(Some(inclusion_entry)),
+                BatchResponseItem::Knn(Some(claim)),
+                BatchResponseItem::Diff(Box::new(diff_env)),
+            ],
+        };
+        let blocks_in_range: Vec<(Block, Commit)> = blocks
+            .iter()
+            .cloned()
+            .zip(certs.iter().cloned())
+            .collect();
+        let tracker = fresh_tracker(&genesis);
+        // The h₂ tracked set certifies header_h2.
+        let tracked_h2_cert = ValidatorTracker::from_genesis(&genesis).validators().clone();
+        ValidatorTracker::verify_batch(
+            &tracker, &genesis, &header_h2, &certs[1], &tracked_h2_cert,
+            &blocks_in_range, &items, &response,
+        )
+        .expect("M29: heterogeneous (Inclusion, Knn, Diff) batch verifies end-to-end");
+    }
+
+    #[test]
+    fn verify_batch_accepts_all_four_kinds_in_one_request() {
+        let (genesis, blocks, certs, tracked_h1, tracked_h2, header_h1, header_h2) =
+            two_block_certified_chain_for_diff();
+        let mut d = driver(base_genesis());
+        d.submit(novel_tx(1, 1, 1, 1.0)).unwrap();
+        d.produce(1.0, &no_silence()).unwrap().expect("block 1");
+        d.submit(novel_tx(2, 2, 2, 2.0)).unwrap();
+        d.produce(2.0, &no_silence()).unwrap().expect("block 2");
+
+        // Range claim at h₂ — sorted-by-cosine against the canonical pivot.
+        let query = [1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
+        let min_sim = 0.0_f32;
+        let ranked = d.chain.state.graph.rank_by_cosine(&query);
+        let cut_ids: Vec<u64> = ranked
+            .iter()
+            .take_while(|(_, s)| *s >= min_sim)
+            .map(|(id, _)| *id)
+            .collect();
+        // Canonical sorted view (desc sim, then id asc).
+        let mut sorted: Vec<(crate::engine::GraphNode, f32)> = d
+            .chain
+            .state
+            .graph
+            .nodes
+            .iter()
+            .map(|n| {
+                let s = crate::engine::cos_sim(&query, &n.embedding);
+                (n.clone(), s)
+            })
+            .collect();
+        sorted.sort_by(|a, b| {
+            b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal)
+                .then(a.0.node_id.cmp(&b.0.node_id))
+        });
+        let sorted_ids: Vec<u64> = sorted.iter().map(|(n, _)| n.node_id).collect();
+        let mut range_nodes: Vec<(u64, crate::engine::GraphNode, merkle::Proof)> =
+            Vec::with_capacity(cut_ids.len());
+        for id in &cut_ids {
+            let sorted_idx = sorted_ids.iter().position(|x| x == id)
+                .expect("id must be in sorted view");
+            let proof = d
+                .chain
+                .state
+                .graph_range_proof(sorted_idx, sorted_idx + 1)
+                .expect("range proof");
+            let (_id, node, merkle_proof) = proof.entries.into_iter().next().unwrap();
+            range_nodes.push((*id, node, merkle_proof));
+        }
+        let range_claim = RangeClaim { query, min_sim, nodes: range_nodes };
+
+        let acct_proof = d.chain.state.account_proof(1).expect("acct 1 proof");
+        let acct = d.chain.state.accounts.get(&1).cloned().expect("acct 1");
+        let inclusion_entry =
+            ProofEntry::Account { id: 1, account: acct, proof: acct_proof };
+
+        let state_h1 = crate::Chain::replay(genesis.clone(), &blocks[..1]).unwrap().state;
+        let state_h2 = crate::Chain::replay(genesis.clone(), &blocks).unwrap().state;
+        let diff = state_h2.graph_diff(&state_h1);
+        let diff_env = DiffEnvelope {
+            header_prev: header_h1.clone(),
+            cert_prev: certs[0].clone(),
+            header_new: header_h2.clone(),
+            cert_new: certs[1].clone(),
+            diff,
+            tracked_set_h1: tracked_h1,
+            tracked_set_h2: tracked_h2,
+        };
+
+        let items = vec![
+            BatchItem::Inclusion { kind: ProofKind::Account, id: 1 },
+            BatchItem::Range { query, min_sim },
+            BatchItem::Diff { h1: 1, h2: 2 },
+        ];
+        let response = BatchResponseEnvelope {
+            items: vec![
+                BatchResponseItem::Inclusion(Some(inclusion_entry)),
+                BatchResponseItem::Range(Some(range_claim)),
+                BatchResponseItem::Diff(Box::new(diff_env)),
+            ],
+        };
+        let blocks_in_range: Vec<(Block, Commit)> = blocks
+            .iter()
+            .cloned()
+            .zip(certs.iter().cloned())
+            .collect();
+        let tracker = fresh_tracker(&genesis);
+        let tracked_h2_cert = ValidatorTracker::from_genesis(&genesis).validators().clone();
+        ValidatorTracker::verify_batch(
+            &tracker, &genesis, &header_h2, &certs[1], &tracked_h2_cert,
+            &blocks_in_range, &items, &response,
+        )
+        .expect("M29: heterogeneous (Inclusion, Range, Diff) batch verifies end-to-end");
+    }
+
+    #[test]
+    fn verify_batch_rejects_a_tampered_inclusion_leaf() {
+        let (genesis, blocks, certs, tracked_h1, tracked_h2, header_h1, header_h2) =
+            two_block_certified_chain_for_diff();
+        let mut d = driver(base_genesis());
+        d.submit(novel_tx(1, 1, 1, 1.0)).unwrap();
+        d.produce(1.0, &no_silence()).unwrap().expect("block 1");
+        d.submit(novel_tx(2, 2, 2, 2.0)).unwrap();
+        d.produce(2.0, &no_silence()).unwrap().expect("block 2");
+
+        let acct_proof = d.chain.state.account_proof(1).expect("acct 1 proof");
+        let mut acct = d.chain.state.accounts.get(&1).cloned().expect("acct 1");
+        acct.balance += 1; // tamper
+        let tampered_entry =
+            ProofEntry::Account { id: 1, account: acct, proof: acct_proof };
+
+        let state_h1 = crate::Chain::replay(genesis.clone(), &blocks[..1]).unwrap().state;
+        let state_h2 = crate::Chain::replay(genesis.clone(), &blocks).unwrap().state;
+        let diff = state_h2.graph_diff(&state_h1);
+        let diff_env = DiffEnvelope {
+            header_prev: header_h1.clone(),
+            cert_prev: certs[0].clone(),
+            header_new: header_h2.clone(),
+            cert_new: certs[1].clone(),
+            diff,
+            tracked_set_h1: tracked_h1,
+            tracked_set_h2: tracked_h2,
+        };
+
+        let items = vec![
+            BatchItem::Inclusion { kind: ProofKind::Account, id: 1 },
+            BatchItem::Diff { h1: 1, h2: 2 },
+        ];
+        let response = BatchResponseEnvelope {
+            items: vec![
+                BatchResponseItem::Inclusion(Some(tampered_entry)),
+                BatchResponseItem::Diff(Box::new(diff_env)),
+            ],
+        };
+        let blocks_in_range: Vec<(Block, Commit)> = blocks
+            .iter()
+            .cloned()
+            .zip(certs.iter().cloned())
+            .collect();
+        let tracker = fresh_tracker(&genesis);
+        let tracked_h2_cert = ValidatorTracker::from_genesis(&genesis).validators().clone();
+        let err = ValidatorTracker::verify_batch(
+            &tracker, &genesis, &header_h2, &certs[1], &tracked_h2_cert,
+            &blocks_in_range, &items, &response,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, LightError::MembershipProofInvalid { .. }),
+            "expected MembershipProofInvalid, got {err}"
+        );
+    }
+
+    #[test]
+    fn verify_batch_rejects_a_swapped_knn_neighbour_order() {
+        let (genesis, blocks, certs, tracked_h1, tracked_h2, header_h1, header_h2) =
+            two_block_certified_chain_for_diff();
+        let mut d = driver(base_genesis());
+        d.submit(novel_tx(1, 1, 1, 1.0)).unwrap();
+        d.produce(1.0, &no_silence()).unwrap().expect("block 1");
+        d.submit(novel_tx(2, 2, 2, 2.0)).unwrap();
+        d.produce(2.0, &no_silence()).unwrap().expect("block 2");
+
+        let query = d.chain.state.graph.nodes[0].embedding;
+        let ranked = d.chain.state.graph.k_nearest_with_ties(&query, 3);
+        let mut neighbours: Vec<(u64, crate::engine::GraphNode, merkle::Proof)> =
+            Vec::with_capacity(ranked.len());
+        for (id, _sim) in &ranked {
+            let idx = *id as usize;
+            let proof = d.chain.state.graph_node_proof(idx).expect("proof");
+            let node = d.chain.state.graph.nodes[idx].clone();
+            neighbours.push((*id, node, proof));
+        }
+        let mut claim = KnnClaim { query, k: 3, neighbours };
+        if claim.neighbours.len() >= 2 {
+            claim.neighbours.swap(0, 1); // tamper ranking order
+        }
+
+        let state_h1 = crate::Chain::replay(genesis.clone(), &blocks[..1]).unwrap().state;
+        let state_h2 = crate::Chain::replay(genesis.clone(), &blocks).unwrap().state;
+        let diff = state_h2.graph_diff(&state_h1);
+        let diff_env = DiffEnvelope {
+            header_prev: header_h1.clone(),
+            cert_prev: certs[0].clone(),
+            header_new: header_h2.clone(),
+            cert_new: certs[1].clone(),
+            diff,
+            tracked_set_h1: tracked_h1,
+            tracked_set_h2: tracked_h2,
+        };
+
+        let items = vec![
+            BatchItem::Knn { query, k: 3 },
+            BatchItem::Diff { h1: 1, h2: 2 },
+        ];
+        let response = BatchResponseEnvelope {
+            items: vec![
+                BatchResponseItem::Knn(Some(claim)),
+                BatchResponseItem::Diff(Box::new(diff_env)),
+            ],
+        };
+        let blocks_in_range: Vec<(Block, Commit)> = blocks
+            .iter()
+            .cloned()
+            .zip(certs.iter().cloned())
+            .collect();
+        let tracker = fresh_tracker(&genesis);
+        let tracked_h2_cert = ValidatorTracker::from_genesis(&genesis).validators().clone();
+        let err = ValidatorTracker::verify_batch(
+            &tracker, &genesis, &header_h2, &certs[1], &tracked_h2_cert,
+            &blocks_in_range, &items, &response,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, LightError::KnnRankingMismatch { .. }),
+            "expected KnnRankingMismatch, got {err}"
+        );
+    }
+
+    #[test]
+    fn verify_batch_rejects_a_diff_with_omitted_added_node() {
+        let (genesis, blocks, certs, tracked_h1, tracked_h2, header_h1, header_h2) =
+            two_block_certified_chain_for_diff();
+        let mut d = driver(base_genesis());
+        d.submit(novel_tx(1, 1, 1, 1.0)).unwrap();
+        d.produce(1.0, &no_silence()).unwrap().expect("block 1");
+        d.submit(novel_tx(2, 2, 2, 2.0)).unwrap();
+        d.produce(2.0, &no_silence()).unwrap().expect("block 2");
+
+        let state_h1 = crate::Chain::replay(genesis.clone(), &blocks[..1]).unwrap().state;
+        let state_h2 = crate::Chain::replay(genesis.clone(), &blocks).unwrap().state;
+        let mut diff = state_h2.graph_diff(&state_h1);
+        assert!(!diff.added.is_empty(), "block 2 added at least one graph node");
+        diff.added.pop(); // tamper: drop one added entry
+
+        let diff_env = DiffEnvelope {
+            header_prev: header_h1.clone(),
+            cert_prev: certs[0].clone(),
+            header_new: header_h2.clone(),
+            cert_new: certs[1].clone(),
+            diff,
+            tracked_set_h1: tracked_h1,
+            tracked_set_h2: tracked_h2,
+        };
+
+        let items = vec![BatchItem::Diff { h1: 1, h2: 2 }];
+        let response = BatchResponseEnvelope {
+            items: vec![BatchResponseItem::Diff(Box::new(diff_env))],
+        };
+        let blocks_in_range: Vec<(Block, Commit)> = blocks
+            .iter()
+            .cloned()
+            .zip(certs.iter().cloned())
+            .collect();
+        let tracker = fresh_tracker(&genesis);
+        let tracked_h2_cert = ValidatorTracker::from_genesis(&genesis).validators().clone();
+        let err = ValidatorTracker::verify_batch(
+            &tracker, &genesis, &header_h2, &certs[1], &tracked_h2_cert,
+            &blocks_in_range, &items, &response,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, LightError::DiffMismatch { .. }),
+            "expected DiffMismatch, got {err}"
+        );
+    }
+
+    #[test]
+    fn verify_batch_rejects_a_kind_mismatch_pair() {
+        // Single-block chain: ask for (Inclusion, Knn) but the response
+        // puts them at swapped slots → BatchItemKindMismatch.
+        let (genesis, _blocks, _certs, header, cert, tracked, blocks_in_range) =
+            one_block_artifacts();
+        let mut d = driver(base_genesis());
+        d.submit(novel_tx(1, 1, 1, 1.0)).unwrap();
+        d.produce(1.0, &no_silence()).unwrap().expect("block");
+
+        let query = [1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
+        let ranked = d.chain.state.graph.k_nearest_with_ties(&query, 1);
+        let mut neighbours: Vec<(u64, crate::engine::GraphNode, merkle::Proof)> =
+            Vec::with_capacity(ranked.len());
+        for (id, _sim) in &ranked {
+            let idx = *id as usize;
+            let proof = d.chain.state.graph_node_proof(idx).expect("proof");
+            let node = d.chain.state.graph.nodes[idx].clone();
+            neighbours.push((*id, node, proof));
+        }
+        let knn_claim = KnnClaim { query, k: 1, neighbours };
+
+        let acct_proof = d.chain.state.account_proof(1).expect("acct 1 proof");
+        let acct = d.chain.state.accounts.get(&1).cloned().expect("acct 1");
+        let inclusion_entry =
+            ProofEntry::Account { id: 1, account: acct, proof: acct_proof };
+
+        let items = vec![
+            BatchItem::Inclusion { kind: ProofKind::Account, id: 1 },
+            BatchItem::Knn { query, k: 1 },
+        ];
+        // Slot 0 gets Knn, slot 1 gets Inclusion — the kinds at the
+        // wrong slots trigger BatchItemKindMismatch.
+        let response = BatchResponseEnvelope {
+            items: vec![
+                BatchResponseItem::Knn(Some(knn_claim)),
+                BatchResponseItem::Inclusion(Some(inclusion_entry)),
+            ],
+        };
+        let tracker = fresh_tracker(&genesis);
+        let err = ValidatorTracker::verify_batch(
+            &tracker, &genesis, &header, &cert, &tracked, &blocks_in_range,
+            &items, &response,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, LightError::BatchItemKindMismatch { .. }),
+            "expected BatchItemKindMismatch, got {err}"
+        );
+    }
+
+    #[test]
+    fn verify_batch_rejects_a_request_response_count_mismatch() {
+        let (genesis, _blocks, _certs, header, cert, tracked, blocks_in_range) =
+            one_block_artifacts();
+        let items = vec![
+            BatchItem::Inclusion { kind: ProofKind::Account, id: 1 },
+            BatchItem::Inclusion { kind: ProofKind::Reviewer, id: 1 },
+            BatchItem::Range { query: [0.0; 8], min_sim: 0.0 },
+        ];
+        let response = BatchResponseEnvelope {
+            items: vec![
+                BatchResponseItem::Inclusion(None),
+                BatchResponseItem::Inclusion(None),
+            ],
+        };
+        let tracker = fresh_tracker(&genesis);
+        let err = ValidatorTracker::verify_batch(
+            &tracker, &genesis, &header, &cert, &tracked, &blocks_in_range,
+            &items, &response,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, LightError::BatchItemCountMismatch { request: 3, response: 2 }),
+            "expected BatchItemCountMismatch {{ 3, 2 }}, got {err}"
+        );
+    }
+
+    #[test]
+    fn verify_batch_skips_inclusion_none_and_continues() {
+        // Inclusion request returns None (unknown key) and KNN returns
+        // a real claim → batch verifies.
+        let (genesis, blocks, certs, _tracked_h1, _tracked_h2, _header_h1, header_h2) =
+            two_block_certified_chain_for_diff();
+        let mut d = driver(base_genesis());
+        d.submit(novel_tx(1, 1, 1, 1.0)).unwrap();
+        d.produce(1.0, &no_silence()).unwrap().expect("block 1");
+        d.submit(novel_tx(2, 2, 2, 2.0)).unwrap();
+        d.produce(2.0, &no_silence()).unwrap().expect("block 2");
+
+        let query = d.chain.state.graph.nodes[0].embedding;
+        let ranked = d.chain.state.graph.k_nearest_with_ties(&query, 1);
+        let mut neighbours: Vec<(u64, crate::engine::GraphNode, merkle::Proof)> =
+            Vec::with_capacity(ranked.len());
+        for (id, _sim) in &ranked {
+            let idx = *id as usize;
+            let proof = d.chain.state.graph_node_proof(idx).expect("proof");
+            let node = d.chain.state.graph.nodes[idx].clone();
+            neighbours.push((*id, node, proof));
+        }
+        let claim = KnnClaim { query, k: 1, neighbours };
+
+        let items = vec![
+            BatchItem::Inclusion { kind: ProofKind::Account, id: 999 },
+            BatchItem::Knn { query, k: 1 },
+        ];
+        let response = BatchResponseEnvelope {
+            items: vec![
+                BatchResponseItem::Inclusion(None),
+                BatchResponseItem::Knn(Some(claim)),
+            ],
+        };
+        let blocks_in_range: Vec<(Block, Commit)> = blocks
+            .iter()
+            .cloned()
+            .zip(certs.iter().cloned())
+            .collect();
+        let tracker = fresh_tracker(&genesis);
+        let tracked_h2_cert = ValidatorTracker::from_genesis(&genesis).validators().clone();
+        ValidatorTracker::verify_batch(
+            &tracker, &genesis, &header_h2, &certs[1], &tracked_h2_cert,
+            &blocks_in_range, &items, &response,
+        )
+        .expect("M29: skipping a None inclusion slot leaves the rest verifiable");
     }
 }

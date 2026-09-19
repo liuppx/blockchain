@@ -202,6 +202,7 @@ fn main() {
         "knn" => cmd_knn(),
         "range" => cmd_range(),
         "diff" => cmd_diff(),
+        "batch" => cmd_batch(),
         "run" => cmd_run(dir_arg(&args)),
         "status" => cmd_status(dir_arg(&args)),
         "certs" => cmd_certs(dir_arg(&args)),
@@ -246,6 +247,7 @@ fn usage() {
     eprintln!("  node knn                cert-signed kNN over the cognitive graph: the wallet re-derives the neighbourhood ranking from committed leaves, no graph download");
     eprintln!("  node range              cert-signed graph range query: wallet re-derives the cos_sim(q, n) >= min_sim cut set from graph_root, no graph download");
     eprintln!("  node diff               cert-signed temporal graph diff between two cert-signed heights: added/dropped, wallet re-derives via partial replay");
+    eprintln!("  node batch              heterogeneous batched proof transport: Inclusion + kNN + Range + Diff in a single round-trip");
     eprintln!("  node run    --dir DIR   persistent chain (seeds demo blocks once, then replays)");
     eprintln!("  node status --dir DIR   replay the block log and print state");
     eprintln!("  node certs  --dir DIR   persist a certified chain (blocks+certs) and re-verify finality on reload");
@@ -1934,6 +1936,177 @@ between two cert-signed heights without trusting the prover's claim: \
 the wallet-side partial replay re-derives every added/dropped node \
 from its own header cache, and per-leaf Merkle proofs bind each \
 claim entry to its accounts_root."
+    );
+}
+
+/// M29 demo: heterogeneous batched proof transport — one round-trip
+/// fetches any mix of Account inclusion + kNN claim + Range claim +
+/// Diff envelope under a single self-contained response. The wallet
+/// dispatches each slot to the matching existing verifier; no new SPV
+/// logic is added on top of M22–M28.
+fn cmd_batch() {
+use zhixing_node::light::{
+    BatchItem, BatchResponseEnvelope, BatchResponseItem, ProofKind,
+};
+
+    println!("M29 — heterogeneous batched proof transport (Inclusion + kNN + Range + Diff in one round-trip)");
+    println!();
+
+    // Build the same 2-block certified chain cmd_diff uses — that way
+    // every batched slot has a non-trivial body to verify.
+    let mut driver = ChainDriver::new(demo_genesis(), demo_driver_seeds(), 4);
+    driver
+        .submit(tx(1, unit(1), 1, reviews(&[(10, 0.9), (11, 0.85), (12, 0.9)]), (3, 3), 1.0))
+        .expect("submit 1");
+    driver.produce(1.0, &BTreeSet::new()).unwrap().expect("block 1");
+    driver
+        .submit(tx(2, unit(2), 2, reviews(&[(10, 0.88), (11, 0.9), (12, 0.86)]), (3, 3), 2.0))
+        .expect("submit 2");
+    driver
+        .submit(tx(3, blend(1, 2), 3, reviews(&[(10, 0.9), (11, 0.9), (12, 0.85)]), (3, 3), 2.5))
+        .expect("submit 3");
+    driver.produce(2.0, &BTreeSet::new()).unwrap().expect("block 2");
+    let blocks = driver.blocks().to_vec();
+    let certs = driver.certificates().to_vec();
+    let header_h2 = BlockHeader::from_block(&blocks[1]);
+    let cert_h2 = certs[1].clone();
+    let blocks_in_range: Vec<(Block, Commit)> = blocks
+        .iter()
+        .cloned()
+        .zip(certs.iter().cloned())
+        .collect();
+
+    // Full peer — wraps the same certified chain, so `serve_batch` reads
+    // from the same state every per-primitive serve_* method does.
+    let mut full = GossipNode::new(1, demo_genesis(), 8, [1, 2]);
+    full.load_certified(&blocks, &certs);
+
+    // Build a heterogeneous request: (Inclusion, Knn, Range, Diff).
+    // The full peer responds with one envelope carrying all four bodies.
+    let query = [1.0_f32, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
+    let items = vec![
+        BatchItem::Inclusion { kind: ProofKind::Account, id: 1 },
+        BatchItem::Knn { query, k: 3 },
+        BatchItem::Range { query, min_sim: 0.0 },
+        BatchItem::Diff { h1: 1, h2: 2 },
+    ];
+    let envelope: BatchResponseEnvelope = full
+        .serve_batch(items.clone())
+        .expect("full peer serves a heterogeneous batch");
+    assert_eq!(envelope.items.len(), 4, "envelope must have one slot per request item");
+    println!(
+        "full peer served a heterogeneous batch: 4 items, |inclusion|={:?}, |knn_neighbours|={:?}, |range_nodes|={:?}, diff.added={}",
+        matches!(envelope.items[0], BatchResponseItem::Inclusion(Some(_))),
+        if let BatchResponseItem::Knn(Some(c)) = &envelope.items[1] { Some(c.neighbours.len()) } else { None },
+        if let BatchResponseItem::Range(Some(c)) = &envelope.items[2] { Some(c.nodes.len()) } else { None },
+        if let BatchResponseItem::Diff(d) = &envelope.items[3] { d.diff.added.len() } else { 0 },
+    );
+
+    // The wallet threads (header_h2, cert_h2, tracked_set_h2) explicitly
+    // because the tracker's `self` only stores set/bonds/pubkeys/head/height.
+    let mut tracker = ValidatorTracker::from_genesis(&demo_genesis());
+    // follow_all populates the tracked set chain so verify_batch's
+    // cert-binding context matches the live header cache.
+    tracker.follow_all(&blocks, &certs).expect("follow");
+    let tracked_h2 = tracker.validators().clone();
+    ValidatorTracker::verify_batch(
+        &tracker,
+        &demo_genesis(),
+        &header_h2,
+        &cert_h2,
+        &tracked_h2,
+        &blocks_in_range,
+        &items,
+        &envelope,
+    )
+    .expect("wallet-side verify_batch accepts the heterogeneous envelope");
+    println!("wallet: verify_batch → Ok");
+    println!();
+
+    // Negative 1: tamper inclusion balance → MembershipProofInvalid.
+    if let BatchResponseItem::Inclusion(Some(ProofEntry::Account { id, mut account, proof })) =
+        envelope.items[0].clone()
+    {
+        account.balance = account.balance.wrapping_add(1);
+        let mut bad = envelope.clone();
+        bad.items[0] = BatchResponseItem::Inclusion(Some(ProofEntry::Account {
+            id,
+            account,
+            proof,
+        }));
+        match ValidatorTracker::verify_batch(
+            &tracker,
+            &demo_genesis(),
+            &header_h2,
+            &cert_h2,
+            &tracked_h2,
+            &blocks_in_range,
+            &items,
+            &bad,
+        ) {
+            Err(LightError::MembershipProofInvalid { .. }) => {
+                println!("negative 1: tamper inclusion balance → MembershipProofInvalid ✓");
+            }
+            other => panic!("expected MembershipProofInvalid, got {other:?}"),
+        }
+    }
+
+    // Negative 2: swap two kNN neighbours → KnnRankingMismatch.
+    if let BatchResponseItem::Knn(Some(mut claim)) = envelope.items[1].clone() {
+        if claim.neighbours.len() >= 2 {
+            claim.neighbours.swap(0, 1);
+        }
+        let mut bad = envelope.clone();
+        bad.items[1] = BatchResponseItem::Knn(Some(claim));
+        match ValidatorTracker::verify_batch(
+            &tracker,
+            &demo_genesis(),
+            &header_h2,
+            &cert_h2,
+            &tracked_h2,
+            &blocks_in_range,
+            &items,
+            &bad,
+        ) {
+            Err(LightError::KnnRankingMismatch { .. }) => {
+                println!("negative 2: swap two kNN neighbours → KnnRankingMismatch ✓");
+            }
+            other => panic!("expected KnnRankingMismatch, got {other:?}"),
+        }
+    }
+
+    // Negative 3: pop one diff `added` entry → DiffMismatch.
+    if let BatchResponseItem::Diff(env) = envelope.items[3].clone() {
+        if env.diff.added.len() >= 2 {
+            let mut bad_env = (*env).clone();
+            bad_env.diff.added.pop();
+            let mut bad = envelope.clone();
+            bad.items[3] = BatchResponseItem::Diff(Box::new(bad_env));
+            match ValidatorTracker::verify_batch(
+                &tracker,
+                &demo_genesis(),
+                &header_h2,
+                &cert_h2,
+                &tracked_h2,
+                &blocks_in_range,
+                &items,
+                &bad,
+            ) {
+                Err(LightError::DiffMismatch { .. }) => {
+                    println!("negative 3: pop one diff added entry → DiffMismatch ✓");
+                }
+                other => panic!("expected DiffMismatch, got {other:?}"),
+            }
+        }
+    }
+
+    println!();
+    println!(
+        "M29 — light wallet verified a heterogeneous batched envelope \
+         (Inclusion + kNN + Range + Diff) in a single round-trip: each slot \
+         dispatches to its existing per-primitive verifier, no new SPV \
+         logic, and protocol violations (kind mismatch, count mismatch) \
+         surface as explicit BatchItemKindMismatch / BatchItemCountMismatch."
     );
 }
 

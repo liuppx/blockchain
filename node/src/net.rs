@@ -126,6 +126,28 @@ pub enum GossipMsg {
     Diff {
         envelope: Box<crate::light::DiffEnvelope>,
     },
+    /// M29: a light wallet asks a full peer for a **heterogeneous**
+    /// batched proof — any mix of inclusion proofs, kNN claims, range
+    /// claims, and diff envelopes in a single round-trip. The full
+    /// peer dispatches each slot to the matching per-primitive
+    /// producer (`serve_inclusion` / `serve_knn` / `serve_range` /
+    /// `serve_diff`) and assembles a typed `Batch` response. Capped
+    /// at [`MAX_BATCH_ITEMS`] items per message. Each item carries
+    /// only its request-side arguments — the cert-binding context
+    /// (header, cert, tracked set) is supplied by the wallet's
+    /// tracked height.
+    GetBatch { items: Vec<crate::light::BatchItem> },
+    /// M29: the heterogeneous batched response. Each slot is the
+    /// same body as the per-primitive single-shot producer would
+    /// have shipped (`ProofEntry` / `KnnClaim` / `RangeClaim` /
+    /// `DiffEnvelope`), so soundness reduces to dispatching each
+    /// item to the matching existing verifier. Self-contained
+    /// per-item — the `Diff` variant carries its own cert-binding
+    /// context, the same as the M28 single-shot envelope. Box-wrapped
+    /// to keep the enum size bounded.
+    Batch {
+        envelope: Box<crate::light::BatchResponseEnvelope>,
+    },
 }
 
 /// M24: maximum items in a single [`GossipMsg::GetProof`] / [`GossipMsg::Proof`]
@@ -147,6 +169,20 @@ pub const TAG_GETPROOF: u8 = 8;
 pub const TAG_PROOF: u8 = 9;
 pub const TAG_GETDIFF: u8 = 10;
 pub const TAG_DIFF: u8 = 11;
+/// M29: heterogeneous batched proof request — slots in `items` carry
+/// any mix of inclusion / kNN / range / diff. Distinct from
+/// `TAG_GETPROOF` so the per-kind `GetProof`/`Diff` pair stays a
+/// single-shot primitive; the M29 pair is the *batched* one.
+pub const TAG_GETBATCH: u8 = 12;
+/// M29: heterogeneous batched proof response envelope.
+pub const TAG_BATCH: u8 = 13;
+
+/// M29: maximum items in a single heterogeneous batched
+/// request/response. Mirrors `MAX_PROOF_BATCH = 32` so the bus caps
+/// stay self-consistent. Per-primitive inner caps (kNN neighbour
+/// bound, range cut bound, etc.) are enforced inside each
+/// `serve_*` helper as today.
+pub const MAX_BATCH_ITEMS: usize = 32;
 
 /// One peer: a chain, a mempool, the retained certified chain (blocks paired with
 /// certificates, for serving sync), and the gossip bookkeeping. Its [`on_message`]
@@ -251,6 +287,153 @@ impl GossipNode {
                 .iter()
                 .zip(certs)
                 .all(|(b, c)| self.apply_certified(b.clone(), c.clone()))
+    }
+
+    /// M29-extracted: pull a single typed inclusion proof out of the
+    /// local chain state. Identical logic to the M24 `GetProof` arm
+    /// of `on_message`, factored out so both the M24 single-kind
+    /// request and the M29 heterogeneous `GetBatch` request can
+    /// dispatch through the same code path.
+    ///
+    /// Returns `None` iff the requested `(kind, id)` is not in local
+    /// state — same "unknown key" semantics as the M24 producer
+    /// (the wallet treats `None` as a verified no-op slot).
+    fn serve_inclusion(
+        &self,
+        kind: crate::light::ProofKind,
+        id: u64,
+    ) -> Option<crate::light::ProofEntry> {
+        match kind {
+            crate::light::ProofKind::Account => {
+                self.chain.state.account_proof(id).and_then(|p| {
+                    self.chain
+                        .state
+                        .accounts
+                        .get(&id)
+                        .cloned()
+                        .map(|a| crate::light::ProofEntry::Account {
+                            id,
+                            account: a,
+                            proof: p,
+                        })
+                })
+            }
+            crate::light::ProofKind::Reviewer => {
+                self.chain.state.reviewer_proof(id).map(|p| {
+                    let reputation = self
+                        .chain
+                        .state
+                        .reviewers
+                        .get(&id)
+                        .copied()
+                        .unwrap_or(0.0);
+                    crate::light::ProofEntry::Reviewer { id, reputation, proof: p }
+                })
+            }
+            crate::light::ProofKind::Validator => {
+                self.chain.state.validators.proof(id).and_then(|p| {
+                    self.chain
+                        .state
+                        .validators
+                        .validators()
+                        .iter()
+                        .find(|v| v.id == id)
+                        .cloned()
+                        .map(|v| crate::light::ProofEntry::Validator {
+                            id,
+                            validator: v,
+                            proof: p,
+                        })
+                })
+            }
+            crate::light::ProofKind::GraphNode => {
+                // M25: graph nodes are addressed by insertion index —
+                // what the wallet observed from genesis forward or
+                // from a prior block's graph length. The full peer
+                // resolves it to a GraphNode by index and packages its
+                // node_id along with the proof.
+                let idx = id as usize;
+                self.chain.state.graph_node_proof(idx).and_then(|p| {
+                    self.chain
+                        .state
+                        .graph
+                        .nodes
+                        .get(idx)
+                        .cloned()
+                        .map(|n| crate::light::ProofEntry::GraphNode {
+                            node_id: n.node_id,
+                            graph_node: n,
+                            proof: p,
+                        })
+                })
+            }
+        }
+    }
+
+    /// M29: serve a heterogeneous batched proof request. Walks
+    /// `items`, dispatches each one to the matching existing
+    /// `serve_*` helper, and assembles a typed
+    /// `BatchResponseEnvelope`. Each slot's body is **exactly** what
+    /// the per-primitive single-shot producer would have shipped, so
+    /// soundness reduces to dispatching each slot to the matching
+    /// existing verifier.
+    ///
+    /// Returns `None` iff `items.len() > MAX_BATCH_ITEMS` (caller-side
+    /// cap check; codec rejects larger requests at decode time with
+    /// `TooManyItems`). Per-primitive `serve_*` helpers may still
+    /// return `None` for their own internal reasons (e.g.
+    /// `serve_diff` returns `None` for degenerate height ranges);
+    /// that propagates as `BatchResponseItem::*` empty-answer
+    /// variants — except for `Diff`, where a degenerate range aborts
+    /// the whole batch and we return `None` (a `Diff` envelope is
+    /// non-empty by construction, so the wallet treats `None` here
+    /// as a producer-side failure rather than a silent skip).
+    pub fn serve_batch(
+        &self,
+        items: Vec<crate::light::BatchItem>,
+    ) -> Option<crate::light::BatchResponseEnvelope> {
+        if items.len() > MAX_BATCH_ITEMS {
+            return None;
+        }
+        let mut out_items = Vec::with_capacity(items.len());
+        for item in items {
+            let resp = match item {
+                crate::light::BatchItem::Inclusion { kind, id } => {
+                    crate::light::BatchResponseItem::Inclusion(self.serve_inclusion(kind, id))
+                }
+                crate::light::BatchItem::Knn { query, k } => {
+                    crate::light::BatchResponseItem::Knn(self.serve_knn(query, k))
+                }
+                crate::light::BatchItem::Range { query, min_sim } => {
+                    crate::light::BatchResponseItem::Range(self.serve_range(query, min_sim))
+                }
+                crate::light::BatchItem::Diff { h1, h2 } => {
+                    // M29: diff items are minimal — the producer pulls
+                    // both headers from its own `self.blocks[..]` (the
+                    // wallet supplied the heights; the headers are
+                    // already content-addressed by the block hash the
+                    // wallet will cross-check against its M22 header
+                    // cache). This matches M28's `serve_diff`
+                    // contract: producer-side `state_at_h1` /
+                    // `state_at_h2` come from `Chain::replay` over
+                    // `self.blocks[..]`, not from the request.
+                    // `serve_diff` rejects h1 == 0 internally; we mirror
+                    // the same guard here so the `usize - 1` below can't
+                    // underflow.
+                    if h1 == 0 || h1 >= h2 || h2 > self.height() {
+                        return None;
+                    }
+                    let block_h1 = &self.blocks[h1 as usize - 1];
+                    let block_h2 = &self.blocks[h2 as usize - 1];
+                    let header_h1 = crate::codec::BlockHeader::from_block(block_h1);
+                    let header_h2 = crate::codec::BlockHeader::from_block(block_h2);
+                    let env = self.serve_diff(h1, h2, &header_h1, &header_h2)?;
+                    crate::light::BatchResponseItem::Diff(Box::new(env))
+                }
+            };
+            out_items.push(resp);
+        }
+        Some(crate::light::BatchResponseEnvelope { items: out_items })
     }
 
     /// M26: serve a cert-signed kNN claim against this full peer's current
@@ -617,79 +800,32 @@ impl GossipNode {
                 }
                 let mut out = Vec::with_capacity(items.len());
                 for (kind, id) in items {
-                    let entry = match kind {
-                        crate::light::ProofKind::Account => {
-                            self.chain.state.account_proof(id).and_then(|p| {
-                                self.chain
-                                    .state
-                                    .accounts
-                                    .get(&id)
-                                    .cloned()
-                                    .map(|a| crate::light::ProofEntry::Account {
-                                        id,
-                                        account: a,
-                                        proof: p,
-                                    })
-                            })
-                        }
-                        crate::light::ProofKind::Reviewer => {
-                            self.chain.state.reviewer_proof(id).map(|p| {
-                                let reputation = self
-                                    .chain
-                                    .state
-                                    .reviewers
-                                    .get(&id)
-                                    .copied()
-                                    .unwrap_or(0.0);
-                                crate::light::ProofEntry::Reviewer { id, reputation, proof: p }
-                            })
-                        }
-                        crate::light::ProofKind::Validator => self
-                            .chain
-                            .state
-                            .validators
-                            .proof(id)
-                            .and_then(|p| {
-                                self.chain
-                                    .state
-                                    .validators
-                                    .validators()
-                                    .iter()
-                                    .find(|v| v.id == id)
-                                    .cloned()
-                                    .map(|v| crate::light::ProofEntry::Validator {
-                                        id,
-                                        validator: v,
-                                        proof: p,
-                                    })
-                            }),
-                        crate::light::ProofKind::GraphNode => {
-                            // For graph nodes the request id is the **insertion
-                            // index** — what the wallet observed from genesis
-                            // forward or from a prior block's graph length. The
-                            // full peer resolves it to a GraphNode by index and
-                            // packages its node_id along with the proof.
-                            let idx = id as usize;
-                            self.chain.state.graph_node_proof(idx).and_then(|p| {
-                                self.chain
-                                    .state
-                                    .graph
-                                    .nodes
-                                    .get(idx)
-                                    .cloned()
-                                    .map(|n| crate::light::ProofEntry::GraphNode {
-                                        node_id: n.node_id,
-                                        graph_node: n,
-                                        proof: p,
-                                    })
-                            })
-                        }
-                    };
-                    out.push(entry);
+                    out.push(self.serve_inclusion(kind, id));
                 }
                 vec![(from, GossipMsg::Proof { items: out })]
             }
             GossipMsg::Proof { .. } => Vec::new(), // full nodes don't consume proofs
+            // M29: heterogeneous batched proof request. Dispatches
+            // each slot to the matching per-primitive producer. The
+            // wallet supplies the cert-binding context (header, cert,
+            // tracked set) from its M22 header cache when verifying —
+            // the producer just answers each slot in isolation, the
+            // same way the standalone M24/M26/M27/M28 producers do.
+            GossipMsg::GetBatch { items } => {
+                if items.len() > MAX_BATCH_ITEMS {
+                    return Vec::new(); // codec-level cap
+                }
+                match self.serve_batch(items) {
+                    Some(envelope) => vec![(
+                        from,
+                        GossipMsg::Batch {
+                            envelope: Box::new(envelope),
+                        },
+                    )],
+                    None => Vec::new(),
+                }
+            }
+            GossipMsg::Batch { .. } => Vec::new(), // full nodes don't consume batches
             // M28: full peer serves a cert-signed temporal diff between two
             // cert-signed heights. Replays from genesis to h₁ to derive
             // `state_at_h1`, then packages the diff body plus per-side
@@ -911,6 +1047,11 @@ pub struct LightGossipNode {
     /// it pulls, verifies, then pulls again for the next pair). The wallet
     /// retrieves via [`Self::take_diff`].
     diffs: Option<crate::light::DiffEnvelope>,
+    /// M29: cached `Batch` envelopes from full peers. Same "most
+    /// recent" discipline as `diffs` — a single response covers all
+    /// items so we don't need a per-item map. The wallet retrieves via
+    /// [`Self::take_batch`].
+    batches: Option<crate::light::BatchResponseEnvelope>,
 }
 
 impl LightGossipNode {
@@ -926,6 +1067,7 @@ impl LightGossipNode {
             peers,
             proofs: BTreeMap::new(),
             diffs: None,
+            batches: None,
         }
     }
 
@@ -945,6 +1087,16 @@ impl LightGossipNode {
     /// `ValidatorTracker::verify_diff_against_headers`).
     pub fn take_diff(&mut self) -> Option<crate::light::DiffEnvelope> {
         self.diffs.take()
+    }
+
+    /// M29: pop the cached batch envelope (consumes the entry — a
+    /// wallet pulls once, then verifies each slot locally with the
+    /// matching per-primitive verifier via
+    /// `ValidatorTracker::verify_batch`). The same "most recent"
+    /// discipline as `take_diff` — a wallet that wants a fresher
+    /// batch just pulls again.
+    pub fn take_batch(&mut self) -> Option<crate::light::BatchResponseEnvelope> {
+        self.batches.take()
     }
 
     pub fn tracker(&self) -> &ValidatorTracker {
@@ -1030,6 +1182,15 @@ impl LightGossipNode {
                 Vec::new()
             }
             GossipMsg::GetDiff { .. } => Vec::new(),
+            // M29: cache incoming batch envelopes for the wallet to
+            // verify locally via `ValidatorTracker::verify_batch`.
+            // Light nodes don't serve batch requests — they have no
+            // chain state to produce proofs against.
+            GossipMsg::Batch { envelope } => {
+                self.batches = Some(*envelope);
+                Vec::new()
+            }
+            GossipMsg::GetBatch { .. } => Vec::new(),
             // everything else: light clients forward tx gossip but never store it
             // — for the M22 demo we just drop, mirroring the "I don't care about
             // bodies" SPV stance.
@@ -1288,6 +1449,39 @@ pub fn encode_gossip(m: &GossipMsg) -> Vec<u8> {
             out.push(TAG_DIFF);
             put_bytes(&mut out, &encode_diff_envelope(envelope));
         }
+        // M29: heterogeneous batched proof pair. Both directions ride
+        // a single length-prefixed envelope so the wire format is
+        // symmetric with the M24/M28 pairs.
+        GossipMsg::GetBatch { items } => {
+            out.push(TAG_GETBATCH);
+            out.extend_from_slice(&(items.len() as u32).to_be_bytes());
+            for item in items.iter() {
+                out.push(crate::codec::encode_batch_response_kind(item.kind_tag()));
+                match item {
+                    crate::light::BatchItem::Inclusion { kind, id } => {
+                        out.push(crate::codec::encode_proof_kind(*kind));
+                        out.extend_from_slice(&id.to_be_bytes());
+                    }
+                    crate::light::BatchItem::Knn { query, k } => {
+                        put_bytes(&mut out, &crate::codec::encode_knn_request(query, *k));
+                    }
+                    crate::light::BatchItem::Range { query, min_sim } => {
+                        put_bytes(
+                            &mut out,
+                            &crate::codec::encode_range_request(query, *min_sim),
+                        );
+                    }
+                    crate::light::BatchItem::Diff { h1, h2 } => {
+                        out.extend_from_slice(&h1.to_be_bytes());
+                        out.extend_from_slice(&h2.to_be_bytes());
+                    }
+                }
+            }
+        }
+        GossipMsg::Batch { envelope } => {
+            out.push(TAG_BATCH);
+            put_bytes(&mut out, &encode_batch_envelope(envelope));
+        }
     }
     out
 }
@@ -1375,6 +1569,52 @@ pub fn decode_gossip(buf: &[u8]) -> Result<GossipMsg, CodecError> {
         TAG_DIFF => GossipMsg::Diff {
             envelope: Box::new(decode_diff_envelope(take_bytes(&mut rest)?)?),
         },
+        // M29: heterogeneous batched proof pair. Symmetric with the
+        // M24/M28 pairs — single length-prefixed envelopes on both
+        // sides.
+        TAG_GETBATCH => {
+            let n = take_u32(&mut rest)?;
+            if n as usize > MAX_BATCH_ITEMS {
+                return Err(CodecError::TooManyItems(n as u64));
+            }
+            let mut items = Vec::with_capacity(n as usize);
+            for _ in 0..n {
+                let kind = crate::codec::decode_batch_response_kind(
+                    rest.first().copied().ok_or(CodecError::UnexpectedEof)?,
+                )?;
+                rest = &rest[1..];
+                match kind {
+                    0 => {
+                        let kind_byte =
+                            rest.first().copied().ok_or(CodecError::UnexpectedEof)?;
+                        rest = &rest[1..];
+                        let k = crate::codec::decode_proof_kind(kind_byte)?;
+                        let id = take_u64(&mut rest)?;
+                        items.push(crate::light::BatchItem::Inclusion { kind: k, id });
+                    }
+                    1 => {
+                        let (query, k) =
+                            crate::codec::decode_knn_request(take_bytes(&mut rest)?)?;
+                        items.push(crate::light::BatchItem::Knn { query, k });
+                    }
+                    2 => {
+                        let (query, min_sim) =
+                            crate::codec::decode_range_request(take_bytes(&mut rest)?)?;
+                        items.push(crate::light::BatchItem::Range { query, min_sim });
+                    }
+                    3 => {
+                        let h1 = take_u64(&mut rest)?;
+                        let h2 = take_u64(&mut rest)?;
+                        items.push(crate::light::BatchItem::Diff { h1, h2 });
+                    }
+                    other => return Err(CodecError::BadEnum(other as u32)),
+                }
+            }
+            GossipMsg::GetBatch { items }
+        }
+        TAG_BATCH => GossipMsg::Batch {
+            envelope: Box::new(decode_batch_envelope(take_bytes(&mut rest)?)?),
+        },
         other => return Err(CodecError::BadEnum(other as u32)),
     };
     if !rest.is_empty() {
@@ -1454,6 +1694,124 @@ pub fn decode_diff_envelope(buf: &[u8]) -> Result<crate::light::DiffEnvelope, Co
     })
 }
 
+/// M29: encode a `BatchResponseEnvelope` as a single length-prefixed
+/// blob for the `Batch { envelope }` wire format. Body layout:
+///   u32_be(|items|)
+///   for each item: 1-byte kind tag ‖ per-variant body
+///     Inclusion: 1-byte presence tag ‖ length-prefixed `encode_proof_entry`
+///                (1=Some, 0=None)
+///     Knn:       1-byte presence tag ‖ length-prefixed `encode_knn_claim`
+///     Range:     1-byte presence tag ‖ length-prefixed `encode_range_claim`
+///     Diff:      length-prefixed `encode_diff_envelope`
+pub fn encode_batch_envelope(env: &crate::light::BatchResponseEnvelope) -> Vec<u8> {
+    let mut out = Vec::new();
+    out.extend_from_slice(&(env.items.len() as u32).to_be_bytes());
+    for item in &env.items {
+        match item {
+            crate::light::BatchResponseItem::Inclusion(entry) => {
+                out.push(0);
+                match entry {
+                    Some(e) => {
+                        out.push(1);
+                        put_bytes(&mut out, &crate::codec::encode_proof_entry(e));
+                    }
+                    None => out.push(0),
+                }
+            }
+            crate::light::BatchResponseItem::Knn(claim) => {
+                out.push(1);
+                match claim {
+                    Some(c) => {
+                        out.push(1);
+                        put_bytes(&mut out, &encode_knn_claim(c));
+                    }
+                    None => out.push(0),
+                }
+            }
+            crate::light::BatchResponseItem::Range(claim) => {
+                out.push(2);
+                match claim {
+                    Some(c) => {
+                        out.push(1);
+                        put_bytes(&mut out, &encode_range_claim(c));
+                    }
+                    None => out.push(0),
+                }
+            }
+            crate::light::BatchResponseItem::Diff(env) => {
+                out.push(3);
+                put_bytes(&mut out, &encode_diff_envelope(env));
+            }
+        }
+    }
+    out
+}
+
+/// M29: inverse of [`encode_batch_envelope`].
+pub fn decode_batch_envelope(
+    buf: &[u8],
+) -> Result<crate::light::BatchResponseEnvelope, CodecError> {
+    let mut p = buf;
+    let n = take_u32(&mut p)? as usize;
+    if n > MAX_BATCH_ITEMS {
+        return Err(CodecError::TooManyItems(n as u64));
+    }
+    let mut items = Vec::with_capacity(n);
+    for _ in 0..n {
+        let kind = crate::codec::decode_batch_response_kind(
+            p.first().copied().ok_or(CodecError::UnexpectedEof)?,
+        )?;
+        p = &p[1..];
+        match kind {
+            0 => {
+                let present = p.first().copied().ok_or(CodecError::UnexpectedEof)?;
+                p = &p[1..];
+                let entry = if present == 0 {
+                    None
+                } else if present == 1 {
+                    Some(crate::codec::decode_proof_entry(take_bytes(&mut p)?)?)
+                } else {
+                    return Err(CodecError::BadEnum(present as u32));
+                };
+                items.push(crate::light::BatchResponseItem::Inclusion(entry));
+            }
+            1 => {
+                let present = p.first().copied().ok_or(CodecError::UnexpectedEof)?;
+                p = &p[1..];
+                let claim = if present == 0 {
+                    None
+                } else if present == 1 {
+                    Some(decode_knn_claim(take_bytes(&mut p)?)?)
+                } else {
+                    return Err(CodecError::BadEnum(present as u32));
+                };
+                items.push(crate::light::BatchResponseItem::Knn(claim));
+            }
+            2 => {
+                let present = p.first().copied().ok_or(CodecError::UnexpectedEof)?;
+                p = &p[1..];
+                let claim = if present == 0 {
+                    None
+                } else if present == 1 {
+                    Some(decode_range_claim(take_bytes(&mut p)?)?)
+                } else {
+                    return Err(CodecError::BadEnum(present as u32));
+                };
+                items.push(crate::light::BatchResponseItem::Range(claim));
+            }
+            3 => {
+                let env = decode_diff_envelope(take_bytes(&mut p)?)?;
+                items.push(crate::light::BatchResponseItem::Diff(Box::new(env)));
+            }
+            other => return Err(CodecError::BadEnum(other as u32)),
+        }
+    }
+    if !p.is_empty() {
+        return Err(CodecError::TrailingBytes);
+    }
+    Ok(crate::light::BatchResponseEnvelope { items })
+}
+
 fn encode_validator_set(out: &mut Vec<u8>, vs: &crate::validator::ValidatorSet) {
     let v = vs.validators();
     out.extend_from_slice(&(v.len() as u32).to_be_bytes());
@@ -1469,6 +1827,74 @@ fn decode_validator_set(p: &mut &[u8]) -> Result<crate::validator::ValidatorSet,
         vs.push(crate::codec::decode_validator(take_bytes(p)?)?);
     }
     Ok(crate::validator::ValidatorSet::new(vs))
+}
+
+/// M29: encode a `KnnClaim` as a length-prefixed blob for the
+/// `Batch { envelope }` wire format. Layout:
+///   u32_be(|neighbours|)
+///   for each neighbour: u32_be(graph_node body) ‖ graph_node body ‖
+///                        u32_be(proof) ‖ proof bytes
+///   8×f32 query ‖ u32 k
+/// Query + k come last so decode can grow the vec first.
+pub fn encode_knn_claim(c: &crate::light::KnnClaim) -> Vec<u8> {
+    let mut out = Vec::new();
+    out.extend_from_slice(&(c.neighbours.len() as u32).to_be_bytes());
+    for (_id, gn, proof) in &c.neighbours {
+        put_bytes(&mut out, &crate::codec::encode_graph_node(gn));
+        put_bytes(&mut out, &crate::codec::encode_proof(proof));
+    }
+    put_bytes(&mut out, &crate::codec::encode_knn_request(&c.query, c.k));
+    out
+}
+
+/// M29: inverse of [`encode_knn_claim`].
+pub fn decode_knn_claim(buf: &[u8]) -> Result<crate::light::KnnClaim, CodecError> {
+    let mut p = buf;
+    let n = take_u32(&mut p)? as usize;
+    let mut neighbours = Vec::with_capacity(n);
+    for _ in 0..n {
+        let gn = crate::codec::decode_graph_node(take_bytes(&mut p)?)?;
+        let proof = crate::codec::decode_proof(take_bytes(&mut p)?)?;
+        let node_id = gn.node_id;
+        neighbours.push((node_id, gn, proof));
+    }
+    let (query, k) = crate::codec::decode_knn_request(take_bytes(&mut p)?)?;
+    if !p.is_empty() {
+        return Err(CodecError::TrailingBytes);
+    }
+    Ok(crate::light::KnnClaim { query, k, neighbours })
+}
+
+/// M29: encode a `RangeClaim` as a length-prefixed blob for the
+/// `Batch { envelope }` wire format. Mirrors [`encode_knn_claim`]
+/// but with `min_sim: f32` instead of `k: u32`.
+pub fn encode_range_claim(c: &crate::light::RangeClaim) -> Vec<u8> {
+    let mut out = Vec::new();
+    out.extend_from_slice(&(c.nodes.len() as u32).to_be_bytes());
+    for (_id, gn, proof) in &c.nodes {
+        put_bytes(&mut out, &crate::codec::encode_graph_node(gn));
+        put_bytes(&mut out, &crate::codec::encode_proof(proof));
+    }
+    put_bytes(&mut out, &crate::codec::encode_range_request(&c.query, c.min_sim));
+    out
+}
+
+/// M29: inverse of [`encode_range_claim`].
+pub fn decode_range_claim(buf: &[u8]) -> Result<crate::light::RangeClaim, CodecError> {
+    let mut p = buf;
+    let n = take_u32(&mut p)? as usize;
+    let mut nodes = Vec::with_capacity(n);
+    for _ in 0..n {
+        let gn = crate::codec::decode_graph_node(take_bytes(&mut p)?)?;
+        let proof = crate::codec::decode_proof(take_bytes(&mut p)?)?;
+        let node_id = gn.node_id;
+        nodes.push((node_id, gn, proof));
+    }
+    let (query, min_sim) = crate::codec::decode_range_request(take_bytes(&mut p)?)?;
+    if !p.is_empty() {
+        return Err(CodecError::TrailingBytes);
+    }
+    Ok(crate::light::RangeClaim { query, min_sim, nodes })
 }
 
 fn put_bytes(out: &mut Vec<u8>, b: &[u8]) {
