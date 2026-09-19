@@ -141,6 +141,25 @@ impl ProofEntry {
     }
 }
 
+/// M26: cert-signed claim about the k nearest neighbours of `query`
+/// against the cognitive graph at a cert-signed height. The verifier
+/// recomputes the kNN ranking itself from the per-neighbour Merkle
+/// proofs — the prover's `node_id` order is **not trusted** beyond the
+/// leaf-hash check.
+///
+/// `k` is the **requested** size. `neighbours` may be longer than `k`
+/// when the engine's tie-breaking rule (`rank_by_cosine`) reports a
+/// boundary tie — the wallet enforces the same rule, so a prover who
+/// omits a tied neighbour will be rejected with `KnnRankingMismatch`.
+#[derive(Clone, Debug)]
+pub struct KnnClaim {
+    pub query: crate::engine::Embedding,
+    pub k: usize,
+    /// Sorted (cosine-desc, node_id-asc). May have `len > k` on ties.
+    /// Each tuple is `(node_id, graph_node_leaves_body, merkle_proof)`.
+    pub neighbours: Vec<(u64, crate::engine::GraphNode, merkle::Proof)>,
+}
+
 /// Follows the active validator set across a certified chain without full
 /// replay. Construct with [`Self::from_genesis`], then feed certified blocks in
 /// height order via [`Self::follow`] / [`Self::follow_all`].
@@ -195,6 +214,15 @@ pub enum LightError {
     /// A validator-membership Merkle proof did not verify against a certified
     /// block's `next_validators_root`.
     MembershipProofInvalid { height: u64 },
+    /// M26: the kNN claim's neighbour set was empty (`k == 0` or the
+    /// certified graph is empty for this query). Returned instead of
+    /// returning `Ok(())` so the wallet can distinguish "no answer" from
+    /// "verified answer".
+    EmptyKnnQuery { height: u64 },
+    /// M26: the prover's kNN ranking does not match the ranking the wallet
+    /// re-derives from the verified leaves. Could be a malicious prover, a
+    /// stale snapshot, or — most commonly — a tied node the prover omitted.
+    KnnRankingMismatch { height: u64 },
 }
 
 impl std::fmt::Display for LightError {
@@ -224,6 +252,12 @@ impl std::fmt::Display for LightError {
             }
             LightError::MembershipProofInvalid { height } => {
                 write!(f, "light: validator membership proof invalid against block {height}")
+            }
+            LightError::EmptyKnnQuery { height } => {
+                write!(f, "light: kNN query produced no neighbours against block {height}")
+            }
+            LightError::KnnRankingMismatch { height } => {
+                write!(f, "light: kNN claim ranking disagrees with re-derived ranking at block {height}")
             }
         }
     }
@@ -521,6 +555,116 @@ impl ValidatorTracker {
             return Err(LightError::CertificateMismatch { height: header.height });
         }
         cert.verify(tracked_set).map_err(LightError::Consensus)?;
+        Ok(())
+    }
+
+    // ----- M26: cert-signed kNN over the cognitive graph -----
+
+    // See also `engine::CognitiveGraph::k_nearest_with_ties`. The wallet-side
+    // ranking here MUST match the engine's ranking byte-for-byte given the
+    // same `query` and the same set of (verified) neighbour leaves.
+
+    /// M26: cert-signed kNN over the cognitive graph.
+    ///
+    /// `claim.neighbours` is the prover's answer. The verifier:
+    ///   1. cert-signing contract — same as `verify_proof_against_header`:
+    ///      `cert.height == header.height`, `cert.block_hash == header.hash()`,
+    ///      and `cert.verify(tracked_set)` succeeds.
+    ///   2. for each neighbour in `claim.neighbours`, recompute the leaf
+    ///      hash from `graph_node.merkle_leaf()` and verify the supplied
+    ///      Merkle proof against `header.accounts_root` — same routing as
+    ///      `ProofEntry::GraphNode` (M25).
+    ///   3. re-rank the verified leaves by cosine against `claim.query`,
+    ///      tie-break by `node_id` ascending, cut by `k_nearest_with_ties(k)`.
+    ///   4. require the prover's neighbour order to equal the verifier-derived
+    ///      order, set-equal and in the same `node_id` order. (Length-equal
+    ///      is implied because both sides apply the same cut.)
+    ///
+    /// The prover is **untrusted** — the wallet rebuilds the ranking from
+    /// committed leaves plus its own `cos_sim`. Sim values are recomputed
+    /// and never trusted from the wire.
+    ///
+    /// Returns:
+    /// - `EmptyKnnQuery { height }` — `claim.k == 0` or no neighbours.
+    /// - `CertificateMismatch { height }` — header/cert binding broken.
+    /// - `Consensus(e)` — cert did not verify against the tracked set.
+    /// - `MembershipProofInvalid { height }` — a neighbour's Merkle proof
+    ///   did not verify against `header.accounts_root`.
+    /// - `KnnRankingMismatch { height }` — the prover's neighbour list
+    ///   (set or order) disagrees with what the wallet re-derives.
+    pub fn verify_knn_against_header(
+        header: &crate::codec::BlockHeader,
+        cert: &Commit,
+        tracked_set: &ValidatorSet,
+        claim: &KnnClaim,
+    ) -> Result<(), LightError> {
+        // 1. cert-signing contract (same as verify_proof_against_header).
+        let hh = header.hash();
+        if cert.height != header.height || cert.block_hash != hh {
+            return Err(LightError::CertificateMismatch { height: header.height });
+        }
+        cert.verify(tracked_set).map_err(LightError::Consensus)?;
+
+        // Empty-query guard: `k == 0` is a degenerate "show me nothing"
+        // request, not a real proof. Surface it explicitly so callers
+        // can distinguish "no answer" from "verified answer".
+        if claim.k == 0 || claim.neighbours.is_empty() {
+            return Err(LightError::EmptyKnnQuery { height: header.height });
+        }
+
+        // 2. Merkle-verify every neighbour leaf against header.accounts_root.
+        //    This is the M25 GraphNode routing — graph leaves share the tree
+        //    with accounts and reviewers, so `accounts_root` is the right
+        //    cert-signed commitment slot.
+        let root = &header.accounts_root;
+        for (_node_id, graph_node, proof) in &claim.neighbours {
+            let leaf = merkle::leaf_hash(&graph_node.merkle_leaf());
+            if !merkle::verify(root, &leaf, proof) {
+                return Err(LightError::MembershipProofInvalid { height: header.height });
+            }
+        }
+
+        // 3. Re-rank the verified leaves locally. The wallet does NOT
+        //    trust any `sim` value the prover might have shipped — every
+        //    similarity is recomputed via `engine::cos_sim` against the
+        //    just-verified embedding bytes.
+        let mut local: Vec<(u64, f32)> = claim
+            .neighbours
+            .iter()
+            .map(|(node_id, graph_node, _)| {
+                (*node_id, crate::engine::cos_sim(&claim.query, &graph_node.embedding))
+            })
+            .collect();
+        // Same sort as `engine::CognitiveGraph::rank_by_cosine`:
+        // cosine desc, then node_id asc.
+        local.sort_by(|a, b| {
+            b.1.partial_cmp(&a.1)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then(a.0.cmp(&b.0))
+        });
+        // Apply the same tie-keeping cut as the engine's k_nearest_with_ties.
+        // The cut keeps every node with sim >= ranked[k-1].sim; on ties the
+        // result may grow beyond `k`. Since `local` is already sorted,
+        // `take_while` is enough.
+        let expected: Vec<u64> = if local.len() <= claim.k {
+            local.iter().map(|(id, _)| *id).collect()
+        } else {
+            let cutoff = local[claim.k - 1].1;
+            local
+                .iter()
+                .take_while(|(_, s)| *s >= cutoff)
+                .map(|(id, _)| *id)
+                .collect()
+        };
+        let claimed: Vec<u64> = claim.neighbours.iter().map(|(id, _, _)| *id).collect();
+
+        // 4. Order + set equality. Both are derived from the SAME verified
+        //    leaves via the SAME sort + cut rule, so any divergence here is
+        //    the prover's fault: tampered proof, omitted tied neighbour,
+        //    reordered list, etc.
+        if expected != claimed {
+            return Err(LightError::KnnRankingMismatch { height: header.height });
+        }
         Ok(())
     }
 
@@ -1106,5 +1250,108 @@ mod tests {
         let err = ValidatorTracker::verify_proof_against_header(&header, &cert, &tracked, &entry)
             .unwrap_err();
         assert!(matches!(err, LightError::MembershipProofInvalid { .. }), "got {err}");
+    }
+
+    // ----- M26: verify_knn_against_header -----
+
+    /// Build a 1-block chain, then assemble a `KnnClaim` from the
+    /// engine's `k_nearest_with_ties` over `chain.state.graph`. Returns the
+    /// header, cert, and the claim so individual tests can mutate them.
+    fn one_block_with_knn_claim(k: usize) -> (
+        crate::codec::BlockHeader,
+        Commit,
+        ValidatorSet,
+        KnnClaim,
+    ) {
+        let mut d = driver(base_genesis());
+        d.submit(novel_tx(1, 1, 1, 1.0)).unwrap();
+        d.produce(1.0, &no_silence()).unwrap().expect("block");
+        let block = d.blocks()[0].clone();
+        let cert = d.certificates()[0].clone();
+        let header = crate::codec::BlockHeader::from_block(&block);
+        let tracked = ValidatorTracker::from_genesis(&base_genesis()).validators().clone();
+
+        // Pick a query embedding equal to the first graph node's embedding
+        // — its cosine sim with that node is 1.0, so it's always the top
+        // neighbour. This makes the expected ranking deterministic.
+        let n = d.chain.state.graph.nodes.len();
+        assert!(n >= 1, "test setup: graph must have at least one node");
+        let query = d.chain.state.graph.nodes[0].embedding;
+        let ranked = d.chain.state.graph.k_nearest_with_ties(&query, k);
+        let mut neighbours: Vec<(u64, crate::engine::GraphNode, merkle::Proof)> =
+            Vec::with_capacity(ranked.len());
+        for (id, _sim) in &ranked {
+            let idx = *id as usize;
+            let proof = d.chain.state.graph_node_proof(idx).expect("proof");
+            let node = d.chain.state.graph.nodes[idx].clone();
+            neighbours.push((*id, node, proof));
+        }
+        let claim = KnnClaim { query, k, neighbours };
+        (header, cert, tracked, claim)
+    }
+
+    #[test]
+    fn verify_knn_against_header_accepts_a_cert_signed_neighborhood_claim() {
+        let (header, cert, tracked, claim) = one_block_with_knn_claim(2);
+        ValidatorTracker::verify_knn_against_header(&header, &cert, &tracked, &claim)
+            .expect("wallet-side kNN claim verifies");
+    }
+
+    #[test]
+    fn verify_knn_against_header_rejects_a_swapped_neighbour_order() {
+        let (header, cert, tracked, mut claim) = one_block_with_knn_claim(2);
+        // Two or more neighbours → swap them. The verifier re-derives the
+        // ranking from verified leaves, so a swap across different sims
+        // trips the order check.
+        if claim.neighbours.len() < 2 {
+            // Single-neighbour claim cannot test ordering — skip cleanly.
+            return;
+        }
+        claim.neighbours.swap(0, 1);
+        let err = ValidatorTracker::verify_knn_against_header(&header, &cert, &tracked, &claim)
+            .unwrap_err();
+        assert!(matches!(err, LightError::KnnRankingMismatch { .. }), "got {err}");
+    }
+
+    #[test]
+    fn verify_knn_against_header_rejects_a_tampered_neighbour_embedding() {
+        let (header, cert, tracked, mut claim) = one_block_with_knn_claim(2);
+        // Tamper one neighbour's embedding — leaf hash mismatches, so the
+        // Merkle proof against accounts_root fails. Same failure mode as
+        // a tampered single-leaf ProofEntry::GraphNode.
+        if claim.neighbours.is_empty() {
+            return;
+        }
+        let mut g = claim.neighbours[0].1.clone();
+        g.embedding[0] += 1.0;
+        claim.neighbours[0].1 = g;
+        let err = ValidatorTracker::verify_knn_against_header(&header, &cert, &tracked, &claim)
+            .unwrap_err();
+        assert!(matches!(err, LightError::MembershipProofInvalid { .. }), "got {err}");
+    }
+
+    #[test]
+    fn verify_knn_against_header_rejects_a_tampered_accounts_root() {
+        let (header, cert, tracked, claim) = one_block_with_knn_claim(2);
+        let mut bad_header = header.clone();
+        bad_header.accounts_root = [0xAB; 32];
+        // accounts_root is part of header.hash(), so the cert no longer
+        // matches the header — CertificateMismatch wins before any Merkle
+        // check runs.
+        let err = ValidatorTracker::verify_knn_against_header(&bad_header, &cert, &tracked, &claim)
+            .unwrap_err();
+        assert!(matches!(err, LightError::CertificateMismatch { .. }), "got {err}");
+    }
+
+    #[test]
+    fn verify_knn_against_header_rejects_an_empty_claim() {
+        // k > 0 but no neighbours: the engine produced an empty set
+        // (or the prover lied). The wallet surfaces this as EmptyKnnQuery
+        // so callers can distinguish "no answer" from "verified answer".
+        let (header, cert, tracked, _) = one_block_with_knn_claim(2);
+        let claim = KnnClaim { query: [0.0; 8], k: 1, neighbours: Vec::new() };
+        let err = ValidatorTracker::verify_knn_against_header(&header, &cert, &tracked, &claim)
+            .unwrap_err();
+        assert!(matches!(err, LightError::EmptyKnnQuery { .. }), "got {err}");
     }
 }

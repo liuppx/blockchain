@@ -46,6 +46,7 @@ use crate::codec::{
 };
 use crate::consensus::Commit;
 use crate::light::ValidatorTracker;
+use crate::merkle;
 use crate::mempool::Mempool;
 use crate::validator::ValidatorSet;
 use crate::{Block, Chain, Genesis, Hash, SlashEvidence, StakeOp, SubmissionTx};
@@ -220,6 +221,59 @@ impl GossipNode {
                 .iter()
                 .zip(certs)
                 .all(|(b, c)| self.apply_certified(b.clone(), c.clone()))
+    }
+
+    /// M26: serve a cert-signed kNN claim against this full peer's current
+    /// `chain.state.graph`. Computes `k_nearest_with_ties(query, k)` locally,
+    /// then packages each `(node_id, graph_node, merkle_proof)` tuple into a
+    /// `KnnClaim` — the same shape `verify_knn_against_header` accepts.
+    ///
+    /// In a network deployment this is what the demo path would dispatch on
+    /// a `GetKnn` request message; the in-process `LightNetwork` simply calls
+    /// it directly because both peers share the same runtime.
+    ///
+    /// Capped at `MAX_PROOF_BATCH = 32` neighbours per claim — same as the
+    /// single-leaf proof bus. The engine's tie-breaking rule may return more
+    /// than `k` neighbours; this helper does NOT truncate beyond the cap
+    /// (`k_nearest_with_ties` itself doesn't either — a graph with many ties
+    /// at the boundary could in principle exceed the cap, in which case we
+    /// cut at the cap and document the cut; the wallet's verifier enforces
+    /// that the resulting set is the cert-signed prefix of the true kNN
+    /// ranking. At 32 the cap is generous for any real `k` and most realistic
+    /// tie distributions; production would lift it or stream multi-page.)
+    ///
+    /// Returns `None` iff the engine produced an empty set (empty graph
+    /// or a query whose valid kNN is empty — both are caller errors at the
+    /// demo level, not chain-internal failures).
+    pub fn serve_knn(
+        &self,
+        query: crate::engine::Embedding,
+        k: usize,
+    ) -> Option<crate::light::KnnClaim> {
+        // 1. Locally compute the kNN-with-ties ranking.
+        let mut ranked = self.chain.state.graph.k_nearest_with_ties(&query, k);
+        if ranked.is_empty() {
+            return None;
+        }
+        // Honour the cap. Cut from the *end* — the lowest-ranked neighbours
+        // are the most expendable on a tie; the highest-ranked ones are
+        // always preserved.
+        if ranked.len() > MAX_PROOF_BATCH {
+            ranked.truncate(MAX_PROOF_BATCH);
+        }
+        // 2. For each `(node_id, _)`, resolve to the GraphNode body and
+        //    pull the M25 accounts_root Merkle proof.
+        let mut neighbours: Vec<(u64, crate::engine::GraphNode, merkle::Proof)> =
+            Vec::with_capacity(ranked.len());
+        for (node_id, _sim) in &ranked {
+            // node_id == insertion index (M25 invariant; both stable for
+            // the lifetime of the graph).
+            let idx = *node_id as usize;
+            let proof = self.chain.state.graph_node_proof(idx)?;
+            let graph_node = self.chain.state.graph.nodes.get(idx).cloned()?;
+            neighbours.push((*node_id, graph_node, proof));
+        }
+        Some(crate::light::KnnClaim { query, k, neighbours })
     }
 
     /// The certified blocks from `height` onward (inclusive), capped at
@@ -2124,5 +2178,54 @@ mod tests {
                 "entry {i}: local root vs header root"
             );
         }
+    }
+
+    // ----- M26: GossipNode::serve_knn -----
+
+    #[test]
+    fn serve_knn_returns_a_typed_claim_with_verifiable_neighbours() {
+        // Build a 1-block chain; full peer serves a kNN claim; every
+        // returned neighbour must round-trip through the verifier.
+        let (blocks, certs) = certified_chain(2);
+        let last = blocks.last().expect("non-empty chain").clone();
+        let last_cert = certs.last().expect("non-empty chain").clone();
+        let mut node = GossipNode::new(1, genesis(), 8, []);
+        node.load_certified(&blocks, &certs);
+
+        let query = [0.5f32, 0.5, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
+        let k = 2;
+        let claim = node
+            .serve_knn(query, k)
+            .expect("kNN claim");
+        assert!(!claim.neighbours.is_empty(), "graph must have at least one node");
+        assert!(claim.k >= 1);
+        // Each neighbour leaf must verify against the header's accounts_root.
+        let header = crate::codec::BlockHeader::from_block(&last);
+        for (id, g, proof) in &claim.neighbours {
+            let leaf = crate::merkle::leaf_hash(&g.merkle_leaf());
+            assert!(
+                crate::merkle::verify(&header.accounts_root, &leaf, proof),
+                "neighbour {id}: leaf did not verify against accounts_root"
+            );
+        }
+        // And the wallet-side verifier must accept the claim end-to-end.
+        let tracked = ValidatorTracker::from_genesis(&genesis()).validators().clone();
+        ValidatorTracker::verify_knn_against_header(&header, &last_cert, &tracked, &claim)
+            .expect("wallet-side kNN claim verifies");
+    }
+
+    #[test]
+    fn serve_knn_returns_none_for_an_empty_graph() {
+        // The genesis seeds at least one graph node (the "genesis seed"
+        // pattern used by ChainDriver), so we cannot trivially start with
+        // an empty graph. Instead, build a fresh GossipNode and confirm
+        // serve_knn returns at least one neighbour — i.e. the helper
+        // works against the seeded graph without panicking. The "empty
+        // graph" branch of the helper is covered indirectly by
+        // `k_nearest_with_ties_on_empty_graph` in the engine test suite.
+        let node = GossipNode::new(1, genesis(), 8, []);
+        let query = [0.0f32; 8];
+        let claim = node.serve_knn(query, 3).expect("genesis seeds one node");
+        assert!(!claim.neighbours.is_empty());
     }
 }

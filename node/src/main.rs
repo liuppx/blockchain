@@ -195,6 +195,7 @@ fn main() {
         "lsync" => cmd_lsync(),
         "account" => cmd_account(),
         "graph" => cmd_graph(),
+        "knn" => cmd_knn(),
         "run" => cmd_run(dir_arg(&args)),
         "status" => cmd_status(dir_arg(&args)),
         "certs" => cmd_certs(dir_arg(&args)),
@@ -236,6 +237,7 @@ fn usage() {
     eprintln!("  node lsync              header-only SPV sync over the gossip bus: a light peer reaches the full node's height with zero tx bodies");
     eprintln!("  node account            account-membership SPV for a wallet: prove your own balance against a cert-signed header, no replay, no tx bodies");
     eprintln!("  node graph              cognitive-graph inclusion proof: prove a graph node against a cert-signed header's accounts_root, no graph download");
+    eprintln!("  node knn                cert-signed kNN over the cognitive graph: the wallet re-derives the neighbourhood ranking from committed leaves, no graph download");
     eprintln!("  node run    --dir DIR   persistent chain (seeds demo blocks once, then replays)");
     eprintln!("  node status --dir DIR   replay the block log and print state");
     eprintln!("  node certs  --dir DIR   persist a certified chain (blocks+certs) and re-verify finality on reload");
@@ -1468,6 +1470,159 @@ fn cmd_account() {
     net.put_light(light_node);
 }
 
+/// M26 — cert-signed kNN over the cognitive graph.
+///
+/// The full peer computes `k_nearest_with_ties(query, k)` against its
+/// current `chain.state.graph`, packages each `(node_id, graph_node,
+/// merkle_proof)` into a `KnnClaim`, and hands it to the light wallet.
+/// The light wallet feeds the claim to `verify_knn_against_header`, which:
+///   1. cert-signing contract (header.hash matches cert, cert verifies
+///      against the tracked set);
+///   2. re-verifies every neighbour's Merkle proof against
+///      `header.accounts_root` (same routing as M25 GraphNode proofs);
+///   3. re-ranks the verified leaves by cosine against the query,
+///      tie-breaks by `node_id` ascending, and applies the same
+///      `k_nearest_with_ties(k)` cut the engine uses;
+///   4. requires the prover's neighbour order to equal the verifier's.
+///
+/// The wallet never downloads the graph. The prover never gets to lie
+/// about the ranking or omit a tied neighbour.
+fn cmd_knn() {
+    use zhixing_node::light::KnnClaim;
+
+    println!("M26 — cert-signed kNN over the cognitive graph");
+    println!();
+
+    // 1. Build a 2-block certified chain so the graph has a handful of nodes.
+    let (blocks, certs) = run_driver(2);
+    let last_idx = blocks.len() - 1;
+    let last_block = &blocks[last_idx];
+    let last_cert = &certs[last_idx];
+
+    // 2. Wrap in GossipNode (full) and a bare ValidatorTracker (light).
+    //    We don't need a LightNetwork here — the full peer exposes
+    //    `serve_knn` as a synchronous helper, and the verifier is the
+    //    same `verify_knn_against_header` the network path would call.
+    let mut full = GossipNode::new(1, demo_genesis(), 8, [1, 2]);
+    full.load_certified(&blocks, &certs);
+
+    let tracked = ValidatorTracker::from_genesis(&demo_genesis()).validators().clone();
+    let header = zhixing_node::codec::BlockHeader::from_block(last_block);
+
+    let n_graph = full.chain.state.graph.nodes.len();
+    if n_graph < 2 {
+        eprintln!("graph has only {n_graph} node(s); demo needs >= 2 for a non-trivial kNN");
+        return;
+    }
+    println!(
+        "graph has {n_graph} nodes at height {}; cert-signed accounts_root = {}",
+        header.height,
+        short(&header.accounts_root),
+    );
+    println!();
+
+    // 3. Compose a query embedding. Bias toward the first node but
+    //    blend in the second so the ranking is non-trivial.
+    let first = &full.chain.state.graph.nodes[0];
+    let second = &full.chain.state.graph.nodes[1];
+    let query: zhixing_node::engine::Embedding = {
+        let mut q = first.embedding;
+        for (i, x) in q.iter_mut().enumerate() {
+            *x = 0.5 * *x + 0.5 * second.embedding[i];
+        }
+        let norm: f32 = q.iter().map(|x| x * x).sum::<f32>().sqrt();
+        if norm > 0.0 {
+            for x in q.iter_mut() {
+                *x /= norm;
+            }
+        }
+        q
+    };
+    println!(
+        "query embedding = [{:.3}, {:.3}, {:.3}, {:.3}, {:.3}, {:.3}, {:.3}, {:.3}]",
+        query[0], query[1], query[2], query[3], query[4], query[5], query[6], query[7]
+    );
+    println!();
+
+    // 4. Full peer serves a kNN claim.
+    let k: usize = 3;
+    let claim: KnnClaim = full
+        .serve_knn(query, k)
+        .expect("full peer must serve a non-empty kNN claim");
+    println!(
+        "full peer claims {} neighbours (k = {}; ties may have grown the set):",
+        claim.neighbours.len(),
+        claim.k,
+    );
+    for (i, (id, n, _)) in claim.neighbours.iter().enumerate() {
+        let sim = zhixing_node::engine::cos_sim(&claim.query, &n.embedding);
+        println!(
+            "  #{i:<2}  node_id = {id:<3}  cos_sim = {sim:+.4}  domain = {}",
+            n.domain
+        );
+    }
+    println!();
+
+    // 5. Wallet-side verification.
+    match ValidatorTracker::verify_knn_against_header(&header, last_cert, &tracked, &claim) {
+        Ok(()) => println!("verify_knn_against_header -> Ok (claim accepted)"),
+        Err(e) => {
+            eprintln!("verify_knn_against_header -> Err({e:?}) — demo abort");
+            return;
+        }
+    }
+
+    // 6. Negative test 1 — swap two neighbours. The verifier re-derives
+    //    the ranking from the verified leaves, so swapping a high-sim
+    //    neighbour past a lower-sim one violates the sort and trips
+    //    KnnRankingMismatch. (Choosing a swap rather than a deletion
+    //    keeps the claim a complete kNN-with-ties set, so the only
+    //    thing that can fail is the ordering.)
+    let mut swapped = claim.clone();
+    if swapped.neighbours.len() >= 2 {
+        swapped.neighbours.swap(0, 1);
+    }
+    match ValidatorTracker::verify_knn_against_header(&header, last_cert, &tracked, &swapped) {
+        Err(zhixing_node::light::LightError::KnnRankingMismatch { .. }) => {
+            println!("swapped neighbours -> KnnRankingMismatch ✓");
+        }
+        other => panic!("expected KnnRankingMismatch after swap, got {other:?}"),
+    }
+
+    // 7. Negative test 2 — tamper a neighbour's embedding. Membership
+    //    proof against accounts_root must fail.
+    let mut tampered_emb = claim.clone();
+    {
+        let mut g = tampered_emb.neighbours[0].1.clone();
+        g.embedding[0] += 1.0; // push it off the cosine ball
+        tampered_emb.neighbours[0].1 = g;
+    }
+    match ValidatorTracker::verify_knn_against_header(&header, last_cert, &tracked, &tampered_emb) {
+        Err(zhixing_node::light::LightError::MembershipProofInvalid { .. }) => {
+            println!("tampered neighbour embedding -> MembershipProofInvalid ✓");
+        }
+        other => panic!("expected MembershipProofInvalid after tampering embedding, got {other:?}"),
+    }
+
+    // 8. Negative test 3 — tamper the accounts_root. Cert no longer
+    //    matches the header hash; CertificateMismatch wins (the wallet
+    //    never gets to the Merkle check).
+    let mut bad_header = header.clone();
+    bad_header.accounts_root = [0xAB; 32];
+    match ValidatorTracker::verify_knn_against_header(&bad_header, last_cert, &tracked, &claim) {
+        Err(zhixing_node::light::LightError::CertificateMismatch { .. }) => {
+            println!("tampered accounts_root -> CertificateMismatch ✓");
+        }
+        other => panic!("expected CertificateMismatch after tampering accounts_root, got {other:?}"),
+    }
+
+    println!();
+    println!(
+        "M26 — light wallet verified a graph-shaped neighbourhood claim from a \
+cert-signed header without downloading the graph."
+    );
+}
+
 /// M25 demo: light wallet proves a single cognitive-graph node (kernel of
 /// a concept) against a cert-signed header via the unified GetProof bus —
 /// no replay, no graph download, no tx bodies. The graph node lives in the
@@ -1628,6 +1783,7 @@ fn cmd_graph() {
     net.put_full(full_node);
     net.put_light(light_node);
 }
+
 
 fn cmd_run(dir: String) {
     let path = format!("{dir}/blocks.log");

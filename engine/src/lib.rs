@@ -172,6 +172,66 @@ impl CognitiveGraph {
         }
         (seen.count_ones() as usize) + extra.len()
     }
+
+    /// M26: full sorted (cosine-desc, node_id-asc) ranking of every node
+    /// against `query`. Cross-domain (no domain filter). No truncation —
+    /// the caller decides whether to keep all ties or cut at k. Pure,
+    /// append-only-safe; identical output on any client given the same
+    /// committed graph. O(n) one-pass scan + O(n log n) sort.
+    pub fn rank_by_cosine(&self, query: &Embedding) -> Vec<(u64, f32)> {
+        let mut out: Vec<(u64, f32)> = self
+            .nodes
+            .iter()
+            .map(|n| (n.node_id, cos_sim(query, &n.embedding)))
+            .collect();
+        // Stable sort: cosine desc, then node_id asc (final tie-breaker).
+        // `partial_cmp` returns None for NaN; we treat NaN ties as Equal
+        // and let node_id break them — defensive: `cos_sim` can only
+        // produce NaN if an embedding contains NaN, which the chain
+        // never admits, but the verifier must not panic on a malicious
+        // prover who tampered at the Merkle-leaf level.
+        out.sort_by(|a, b| {
+            b.1.partial_cmp(&a.1)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then(a.0.cmp(&b.0))
+        });
+        out
+    }
+
+    /// M26: top-k with all ties at the boundary. If the node at rank k-1
+    /// shares cosine similarity with rank k (or any later), all matching
+    /// nodes are returned — the result may have `len > k`. Pure; identical
+    /// output on any client.
+    ///
+    /// Ties are broken by `node_id` ascending, the same tie-breaker used
+    /// by `rank_by_cosine`. So if 5 nodes all share sim 0.95 and k=3, the
+    /// 3 lowest-`node_id` ones are kept (and the higher-`node_id` 0.95
+    /// nodes are dropped — they're truly indistinguishable by cosine, so
+    /// dropping by node_id is the only fair deterministic cut).
+    pub fn k_nearest_with_ties(&self, query: &Embedding, k: usize) -> Vec<(u64, f32)> {
+        if k == 0 {
+            return Vec::new();
+        }
+        let ranked = self.rank_by_cosine(query);
+        if ranked.is_empty() {
+            return Vec::new();
+        }
+        if ranked.len() <= k {
+            return ranked;
+        }
+        let cutoff = ranked[k - 1].1;
+        // Keep every node with sim >= cutoff. The sort is stable, so ties
+        // before the k-th slot are already in (node_id asc) order; ties
+        // past the k-th slot share the same sim and we include them too.
+        // `ranked` is sorted cos-desc, so once we see one < cutoff we are
+        // done — every later node has even lower sim.
+        let out: Vec<(u64, f32)> = ranked
+            .into_iter()
+            .take_while(|(_, s)| *s >= cutoff)
+            .collect();
+        debug_assert!(out.len() >= k);
+        out
+    }
 }
 
 impl Default for CognitiveGraph {
@@ -359,6 +419,92 @@ mod tests {
         let reviews = vec![(1.0, 0.05); 5];
         let dk = compute_delta_k(&sub, &g, &reviews, (0, 3), &DeltaKParams::default(), 0.0);
         assert_eq!(dk, 0.0);
+    }
+
+    // ----- M26: k_nearest_with_ties -----
+
+    /// Build a graph with 5 nodes whose embeddings, vs query=[1,0,0,0,0,0,0,0],
+    /// have cosine similarities [0.95, 0.80, 0.70, 0.70, 0.60] in insertion order.
+    ///
+    /// `cos_sim(query, n) = n[0]` when both are unit-length AND query is
+    /// `unit(1.0)`. So `unit(x)` works only for x in {-1, 0, +1}; for in-between
+    /// values we have to fill in the other dimensions to keep the vector unit.
+    fn embed(c: f32) -> Embedding {
+        // cos_sim(query=[1,0,...], n) = n[0] / |n|. We pick n = (c, s, 0, ...)
+        // where s = sqrt(1 - c^2), so |n| = 1 and cos_sim = c.
+        let s = (1.0 - c * c).max(0.0).sqrt();
+        let mut e = [0.0f32; DIM];
+        e[0] = c;
+        e[1] = s;
+        e
+    }
+
+    fn build_knn_graph() -> CognitiveGraph {
+        let mut g = CognitiveGraph::new();
+        g.add(embed(0.95), 0); // id=0
+        g.add(embed(0.80), 0); // id=1
+        g.add(embed(0.70), 0); // id=2  (tied with id=3)
+        g.add(embed(0.70), 0); // id=3  (tied with id=2)
+        g.add(embed(0.60), 0); // id=4
+        g
+    }
+
+    #[test]
+    fn rank_by_cosine_is_cosine_desc_then_id_asc() {
+        let g = build_knn_graph();
+        let ranked = g.rank_by_cosine(&unit(1.0));
+        // Expected order: 0.95 (id 0), 0.80 (id 1), 0.70 (id 2), 0.70 (id 3), 0.60 (id 4)
+        let ids: Vec<u64> = ranked.iter().map(|(id, _)| *id).collect();
+        assert_eq!(ids, vec![0, 1, 2, 3, 4]);
+        // Sanity: sims match insertion values (within 1e-5).
+        let sims: Vec<f32> = ranked.iter().map(|(_, s)| *s).collect();
+        for (got, want) in sims.iter().zip([0.95f32, 0.80, 0.70, 0.70, 0.60].iter()) {
+            assert!((got - want).abs() < 1e-5, "got {got}, want {want}");
+        }
+    }
+
+    #[test]
+    fn k_nearest_with_ties_keeps_all_nodes_at_the_boundary() {
+        let g = build_knn_graph();
+        // k=2: cutoff = ranked[1].1 = 0.80. Nodes with sim >= 0.80 are id=0 and id=1.
+        // Tied-at-0.70 nodes (id=2, id=3) are NOT included because their sim (0.70)
+        // is strictly less than the cutoff (0.80). Result: exactly 2 nodes.
+        let r2 = g.k_nearest_with_ties(&unit(1.0), 2);
+        assert_eq!(r2.len(), 2, "k=2 result: {:?}", r2);
+        let ids: Vec<u64> = r2.iter().map(|(id, _)| *id).collect();
+        assert_eq!(ids, vec![0, 1]);
+
+        // Now k=3: cutoff = ranked[2].1 = 0.70. Nodes with sim >= 0.70 are
+        // id={0,1,2,3} — four nodes returned because both tied 0.70 nodes
+        // are at the boundary. The tie-breaker is node_id asc, so id=2 comes
+        // before id=3. Result: exactly 4 nodes (1 over k).
+        let r3 = g.k_nearest_with_ties(&unit(1.0), 3);
+        assert_eq!(r3.len(), 4, "k=3 result: {:?}", r3);
+        let ids: Vec<u64> = r3.iter().map(|(id, _)| *id).collect();
+        assert_eq!(ids, vec![0, 1, 2, 3]);
+    }
+
+    #[test]
+    fn k_nearest_with_ties_returns_all_when_n_leq_k() {
+        let g = build_knn_graph(); // n = 5
+        let r = g.k_nearest_with_ties(&unit(1.0), 5);
+        assert_eq!(r.len(), 5);
+        let r10 = g.k_nearest_with_ties(&unit(1.0), 10);
+        assert_eq!(r10.len(), 5);
+    }
+
+    #[test]
+    fn k_nearest_with_ties_returns_empty_for_k_zero() {
+        let g = build_knn_graph();
+        let r = g.k_nearest_with_ties(&unit(1.0), 0);
+        assert!(r.is_empty());
+    }
+
+    #[test]
+    fn k_nearest_with_ties_on_empty_graph() {
+        let g = CognitiveGraph::new();
+        let r = g.k_nearest_with_ties(&unit(1.0), 5);
+        assert!(r.is_empty());
     }
 }
 
