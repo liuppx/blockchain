@@ -201,6 +201,7 @@ fn main() {
         "graph" => cmd_graph(),
         "knn" => cmd_knn(),
         "range" => cmd_range(),
+        "diff" => cmd_diff(),
         "run" => cmd_run(dir_arg(&args)),
         "status" => cmd_status(dir_arg(&args)),
         "certs" => cmd_certs(dir_arg(&args)),
@@ -244,6 +245,7 @@ fn usage() {
     eprintln!("  node graph              cognitive-graph inclusion proof: prove a graph node against a cert-signed header's accounts_root, no graph download");
     eprintln!("  node knn                cert-signed kNN over the cognitive graph: the wallet re-derives the neighbourhood ranking from committed leaves, no graph download");
     eprintln!("  node range              cert-signed graph range query: wallet re-derives the cos_sim(q, n) >= min_sim cut set from graph_root, no graph download");
+    eprintln!("  node diff               cert-signed temporal graph diff between two cert-signed heights: added/dropped, wallet re-derives via partial replay");
     eprintln!("  node run    --dir DIR   persistent chain (seeds demo blocks once, then replays)");
     eprintln!("  node status --dir DIR   replay the block log and print state");
     eprintln!("  node certs  --dir DIR   persist a certified chain (blocks+certs) and re-verify finality on reload");
@@ -1768,6 +1770,170 @@ use zhixing_node::light::RangeClaim;
     println!(
         "M27 — light wallet verified a graph-shaped range claim (cosine cutoff) \
 from a cert-signed header without downloading the graph."
+    );
+}
+
+/// M28 demo: cert-signed temporal graph diff between two cert-signed
+/// heights. The full peer serves a `DiffEnvelope` (two headers + two
+/// certs + the diff body with per-leaf proofs); the light wallet
+/// re-derives the diff from its own cached range of blocks via
+/// `verify_diff_against_headers` and checks the prover's claim. The
+/// load-bearing soundness step is the wallet-side partial replay — the
+/// per-leaf proofs verify each entry's body, but completeness is bound
+/// to the replay.
+fn cmd_diff() {
+use zhixing_node::light::DiffEnvelope;
+
+    println!("M28 — cert-signed temporal graph diff between two cert-signed heights");
+    println!();
+
+    // Build a 2-block certified chain so (h₁, h₂) = (1, 2) is non-trivial:
+    // each block carries an accepted submission so the graph grows in
+    // both blocks — block 1 accepts one tx, block 2 accepts another.
+    // We use the driver's helper (which seeds the validator set the same
+    // way `run_driver` does), then submit a fresh tx for the second
+    // block after the first is produced.
+    let mut driver = ChainDriver::new(demo_genesis(), demo_driver_seeds(), 4);
+    driver
+        .submit(tx(1, unit(1), 1, reviews(&[(10, 0.9), (11, 0.85), (12, 0.9)]), (3, 3), 1.0))
+        .expect("submit 1");
+    driver.produce(1.0, &BTreeSet::new()).unwrap().expect("block 1");
+    // Block 2 carries two txs so the diff's `added` set has 2+ entries
+    // (negative test 3 below requires at least two to drop one).
+    driver
+        .submit(tx(2, unit(2), 2, reviews(&[(10, 0.88), (11, 0.9), (12, 0.86)]), (3, 3), 2.0))
+        .expect("submit 2");
+    driver
+        .submit(tx(3, blend(1, 2), 3, reviews(&[(10, 0.9), (11, 0.9), (12, 0.85)]), (3, 3), 2.5))
+        .expect("submit 3");
+    driver.produce(2.0, &BTreeSet::new()).unwrap().expect("block 2");
+    let blocks = driver.blocks().to_vec();
+    let certs = driver.certificates().to_vec();
+    assert_eq!(blocks.len(), 2, "test setup: chain must have 2 blocks");
+    let header_h1 = BlockHeader::from_block(&blocks[0]);
+    let header_h2 = BlockHeader::from_block(&blocks[1]);
+    let _cert_h1 = certs[0].clone();
+    let cert_h2 = certs[1].clone();
+
+    // Wrap a full peer so we can call `serve_diff`. The full peer replays
+    // the certified chain internally, so its `chain.state.graph` matches
+    // the wallet's view of the world.
+    let mut full = GossipNode::new(1, demo_genesis(), 8, [1, 2]);
+    full.load_certified(&blocks, &certs);
+
+    // The full peer serves the diff envelope.
+    let envelope: DiffEnvelope = full
+        .serve_diff(1, 2, &header_h1, &header_h2)
+        .expect("full peer serves a 2-height diff");
+    println!(
+        "full peer served a diff envelope: h₁=1, h₂=2, |added|={}, |dropped|={}",
+        envelope.diff.added.len(),
+        envelope.diff.dropped.len(),
+    );
+
+    // Sanity: every `added` proof must verify locally against h₂ accounts_root.
+    for entry in &envelope.diff.added {
+        let leaf = merkle::leaf_hash(&entry.graph_node.merkle_leaf());
+        assert!(
+            merkle::verify(&header_h2.accounts_root, &leaf, &entry.proof),
+            "added leaf {} did not verify against h₂ accounts_root",
+            entry.node_id,
+        );
+    }
+    println!(
+        "Merkle proofs: every added leaf verifies against header_h2.accounts_root"
+    );
+    println!();
+
+    // Wallet-side verifier: the wallet replays the full `[1..=h₂]` range
+    // and re-derives the diff from scratch.
+    let blocks_in_range: Vec<(Block, Commit)> = blocks
+        .iter()
+        .cloned()
+        .zip(certs.iter().cloned())
+        .collect();
+    ValidatorTracker::verify_diff_against_headers(
+        &demo_genesis(),
+        &blocks_in_range,
+        &envelope,
+    )
+    .expect("wallet-side diff verifier accepts the envelope");
+    println!("wallet: verify_diff_against_headers → Ok");
+    println!();
+
+    // Negative test 1: tamper one `added` proof → MembershipProofInvalid.
+    if let Some(first) = envelope.diff.added.first().cloned() {
+        let mut bad = envelope.clone();
+        let mut forged = first.clone();
+        // Flip the first step's side tag — same hash bytes but wrong
+        // direction — which trips the Merkle verifier.
+        if let Some(step0) = forged.proof.steps.first().cloned() {
+            forged.proof.steps[0] = match step0 {
+                merkle::Step::Right(h) => merkle::Step::Left(h),
+                merkle::Step::Left(h) => merkle::Step::Right(h),
+            };
+        }
+        bad.diff.added[0] = forged;
+        match ValidatorTracker::verify_diff_against_headers(
+            &demo_genesis(),
+            &blocks_in_range,
+            &bad,
+        ) {
+            Err(LightError::MembershipProofInvalid { .. }) => {
+                println!("negative 1: tamper added proof → MembershipProofInvalid ✓");
+            }
+            other => panic!("expected MembershipProofInvalid, got {other:?}"),
+        }
+    }
+
+    // Negative test 2: tamper `header_h2.accounts_root` → CertificateMismatch.
+    // The field is part of `header_h2.hash()`, so the cert no longer binds it.
+    let mut bad_header_h2 = header_h2.clone();
+    bad_header_h2.accounts_root = [0xCDu8; 32];
+    let bad_envelope = DiffEnvelope {
+        header_prev: envelope.header_prev.clone(),
+        cert_prev: envelope.cert_prev.clone(),
+        header_new: bad_header_h2,
+        cert_new: cert_h2.clone(),
+        diff: envelope.diff.clone(),
+        tracked_set_h1: envelope.tracked_set_h1.clone(),
+        tracked_set_h2: envelope.tracked_set_h2.clone(),
+    };
+    match ValidatorTracker::verify_diff_against_headers(
+        &demo_genesis(),
+        &blocks_in_range,
+        &bad_envelope,
+    ) {
+        Err(LightError::CertificateMismatch { .. }) => {
+            println!("negative 2: tamper header_h2.accounts_root → CertificateMismatch ✓");
+        }
+        other => panic!("expected CertificateMismatch, got {other:?}"),
+    }
+
+    // Negative test 3: drop one `added` entry → DiffMismatch. The wallet's
+    // replay finds the missing node and rejects the smaller claim.
+    if envelope.diff.added.len() >= 2 {
+        let mut bad_envelope = envelope.clone();
+        bad_envelope.diff.added.pop();
+        match ValidatorTracker::verify_diff_against_headers(
+            &demo_genesis(),
+            &blocks_in_range,
+            &bad_envelope,
+        ) {
+            Err(LightError::DiffMismatch { .. }) => {
+                println!("negative 3: drop one added entry → DiffMismatch ✓");
+            }
+            other => panic!("expected DiffMismatch after dropping an added entry, got {other:?}"),
+        }
+    }
+
+    println!();
+    println!(
+        "M28 — light wallet verified a cert-signed temporal graph diff \
+between two cert-signed heights without trusting the prover's claim: \
+the wallet-side partial replay re-derives every added/dropped node \
+from its own header cache, and per-leaf Merkle proofs bind each \
+claim entry to its accounts_root."
     );
 }
 

@@ -77,6 +77,40 @@ pub struct RangeProof {
     pub entries: Vec<(u64, crate::engine::GraphNode, merkle::Proof)>,
 }
 
+/// M28: a single (node_id, graph_node, proof) tuple where the proof
+/// verifies against the cert-signed `accounts_root` at *one* of the two
+/// heights. Used by both sides of a temporal diff (`added` against
+/// `header_h2.accounts_root`, `dropped` against `header_h1.accounts_root`).
+#[derive(Clone, Debug)]
+pub struct GraphLeafAtHeight {
+    pub node_id: u64,
+    pub graph_node: crate::engine::GraphNode,
+    pub proof: merkle::Proof,
+}
+
+/// M28: the producer-side temporal graph diff between two cert-signed
+/// heights `h1 < h2`. `added` are the node_ids present at h₂ but absent
+/// at h₁ (each proven against `header_h2.accounts_root`); `dropped` are
+/// the node_ids present at h₁ but absent at h₂ (each proven against
+/// `header_h1.accounts_root`). The wallet's verifier re-derives both
+/// sets from a partial replay of `[h₁+1..h₂]` and checks the prover's
+/// claim against its own derivation; completeness is established by the
+/// replay, not by the per-leaf proofs.
+///
+/// M25's invariant makes graph nodes immutable (monotonic `node_id`,
+/// append-only `add`), so the third class of change — same id, different
+/// embedding — is **structurally unreachable**. M28 deliberately does
+/// not carry one.
+///
+/// Order: ascending by `node_id`. Same on the prover side (which sorts)
+/// and the wallet side (which reads `state.graph.nodes` in insertion
+/// order, which is the same order).
+#[derive(Clone, Debug, Default)]
+pub struct DiffClaim {
+    pub added: Vec<GraphLeafAtHeight>,
+    pub dropped: Vec<GraphLeafAtHeight>,
+}
+
 // --- Transactions ------------------------------------------------------------
 
 /// A reviewer's score for a submission, in [0, 1]. The reviewer's *reputation*
@@ -1273,6 +1307,64 @@ impl ChainState {
         self.graph_sorted_nodes().iter()
             .map(|n| merkle::leaf_hash(&n.merkle_leaf()))
             .collect()
+    }
+
+    /// M28: produce the producer-side graph diff between this state (the
+    /// "h₂" side) and `prev_state` (the "h₁" side). Caller must guarantee
+    /// `prev_state.height < self.height` and both states share the same
+    /// genesis (deterministic replay).
+    ///
+    /// `added` are the nodes present at h₂ but absent at h₁ — by M25's
+    /// append-only invariant this is exactly `[n_H1, n_H2)`. `dropped`
+    /// are the nodes present at h₁ but absent at h₂ — by the same
+    /// invariant this list is **always empty** under the current engine
+    /// (`CognitiveGraph::add` is the only mutator, and it appends). The
+    /// shape is preserved for future engine evolution (e.g. prune) so the
+    /// verifier doesn't need a wire-format bump.
+    ///
+    /// Each `added` entry carries an inclusion proof against *this* state's
+    /// `accounts_root`; each `dropped` carries a proof against `prev_state`'s
+    /// `accounts_root`. The wallet-side verifier in `light.rs` re-derives
+    /// the diff locally from a partial replay of `(h₁..h₂]` and rejects any
+    /// divergence with `DiffMismatch`.
+    pub fn graph_diff(&self, prev_state: &ChainState) -> DiffClaim {
+        let prev_n = prev_state.graph.nodes.len();
+        let new_n = self.graph.nodes.len();
+
+        // `added` ⊆ [prev_n, new_n). With the append-only invariant every
+        // node at insertion index >= prev_n is new.
+        let mut added: Vec<GraphLeafAtHeight> =
+            Vec::with_capacity(new_n.saturating_sub(prev_n));
+        for idx in prev_n..new_n {
+            let node = self.graph.nodes[idx].clone();
+            let proof = self
+                .graph_node_proof(idx)
+                .expect("in-bounds index from own graph");
+            added.push(GraphLeafAtHeight {
+                node_id: node.node_id,
+                graph_node: node,
+                proof,
+            });
+        }
+
+        // `dropped` ⊆ [0, prev_n). With the current engine this is always
+        // empty. When prune lands, populate this list and the wallet
+        // verifier's contract stays the same.
+        let mut dropped: Vec<GraphLeafAtHeight> = Vec::new();
+        for (idx, node) in prev_state.graph.nodes.iter().enumerate() {
+            if idx >= new_n {
+                let proof = prev_state
+                    .graph_node_proof(idx)
+                    .expect("in-bounds index from prev graph");
+                dropped.push(GraphLeafAtHeight {
+                    node_id: node.node_id,
+                    graph_node: node.clone(),
+                    proof,
+                });
+            }
+        }
+
+        DiffClaim { added, dropped }
     }
 
     /// Accounting invariant: every micro-$COG is in an account balance, in the

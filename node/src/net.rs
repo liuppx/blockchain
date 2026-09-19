@@ -105,6 +105,27 @@ pub enum GossipMsg {
     /// nodes cache entries by `(kind, id)` via
     /// [`LightGossipNode::take_proof`].
     Proof { items: Vec<Option<crate::light::ProofEntry>> },
+    /// M28: a light wallet asks a full peer for a cert-signed temporal diff
+    /// between two cert-signed heights it already holds. The full peer
+    /// replays `(h₁+1..h₂]` on its own chain state and packages the
+    /// result in a `Diff` reply carrying the typed envelope (cert-signed
+    /// headers, certs, per-leaf proofs, diff body). The wallet
+    /// cross-verifies the claim against its own cached range via
+    /// `ValidatorTracker::verify_diff_against_headers`.
+    GetDiff {
+        h1: u64,
+        h2: u64,
+        header_h1: Box<crate::codec::BlockHeader>,
+        header_h2: Box<crate::codec::BlockHeader>,
+    },
+    /// M28: the diff response. Bundles the two certified headers and certs
+    /// (one per side) so the wallet can verify both certs without a
+    /// separate round-trip; the diff body itself is
+    /// `crate::DiffClaim { added, dropped }` with per-leaf proofs against
+    /// the right `accounts_root` for each side.
+    Diff {
+        envelope: Box<crate::light::DiffEnvelope>,
+    },
 }
 
 /// M24: maximum items in a single [`GossipMsg::GetProof`] / [`GossipMsg::Proof`]
@@ -113,7 +134,7 @@ pub enum GossipMsg {
 pub const MAX_PROOF_BATCH: usize = 32;
 
 /// Wire-tag assignments. Each GossipMsg variant is one byte; bumping a tag
-/// outside the existing range (0..=9) requires a major-version bump.
+/// outside the existing range (0..=11) requires a major-version bump.
 pub const TAG_STATUS: u8 = 0;
 pub const TAG_GETBLOCKS: u8 = 1;
 pub const TAG_BLOCKS: u8 = 2;
@@ -124,6 +145,8 @@ pub const TAG_GETHEADERS: u8 = 6;
 pub const TAG_HEADERS: u8 = 7;
 pub const TAG_GETPROOF: u8 = 8;
 pub const TAG_PROOF: u8 = 9;
+pub const TAG_GETDIFF: u8 = 10;
+pub const TAG_DIFF: u8 = 11;
 
 /// One peer: a chain, a mempool, the retained certified chain (blocks paired with
 /// certificates, for serving sync), and the gossip bookkeeping. Its [`on_message`]
@@ -135,6 +158,12 @@ pub const TAG_PROOF: u8 = 9;
 pub struct GossipNode {
     pub id: u64,
     pub chain: Chain,
+    /// M28: cached genesis so we can replay from genesis when serving a
+    /// `Diff` envelope (which needs `state_at_h1` to compute the diff
+    /// body). `Chain::new` only stores `state` post-genesis, so the
+    /// genesis itself was previously recoverable only by the test that
+    /// built the peer; caching it here makes `serve_diff` self-contained.
+    pub genesis: Genesis,
     pub mempool: Mempool,
     /// Retained certified chain, height order; `blocks[i]`/`certs[i]` is height
     /// `i+1`. Kept so this node can answer a peer's `GetBlocks`.
@@ -160,7 +189,8 @@ impl GossipNode {
     pub fn new(id: u64, genesis: Genesis, max_txs: usize, peers: impl IntoIterator<Item = u64>) -> Self {
         GossipNode {
             id,
-            chain: Chain::new(genesis),
+            chain: Chain::new(genesis.clone()),
+            genesis,
             mempool: Mempool::new(max_txs),
             blocks: Vec::new(),
             certs: Vec::new(),
@@ -347,6 +377,84 @@ impl GossipNode {
             nodes.push((*node_id, graph_node, merkle_proof));
         }
         Some(crate::light::RangeClaim { query, min_sim, nodes })
+    }
+
+    /// M28: serve a cert-signed temporal graph diff between two cert-signed
+    /// heights this full peer holds. The diff is computed against the
+    /// full peer's own chain state; per-leaf proofs are pulled from the
+    /// same `chain.state.graph_node_proof(idx)` the M25 proof bus uses.
+    ///
+    /// `header_h1` / `header_h2` must be the cert-signed headers at the
+    /// two heights. The two `Commit`s in the returned envelope are looked
+    /// up by height from this peer's retained certificate log. The two
+    /// `ValidatorSet`s in the envelope are the post-apply sets from a
+    /// replay — the wallet verifies each cert against its corresponding
+    /// tracked set.
+    ///
+    /// Returns `None` iff either height is missing from this peer's
+    /// retained chain or `h1 == 0` / `h1 >= h2`.
+    pub fn serve_diff(
+        &self,
+        h1: u64,
+        h2: u64,
+        header_h1: &crate::codec::BlockHeader,
+        header_h2: &crate::codec::BlockHeader,
+    ) -> Option<crate::light::DiffEnvelope> {
+        // Range guard mirrors the wallet-side `InvalidDiffRange`.
+        if h1 == 0 || h1 >= h2 || h2 > self.height() {
+            return None;
+        }
+        if header_h1.height != h1 || header_h2.height != h2 {
+            return None;
+        }
+        // The genesis is cached on the peer so we can replay from
+        // genesis to derive `state_at_h1` (the state AT height h₁ — after
+        // applying block h₁). `graph_diff` takes the h₁ side as the
+        // "previous" state, so for h₁ = 1 we replay blocks `[0..1]` (just
+        // block 1). For h₁ > 1 we replay `[0..h1]` (blocks 1..h₁). The
+        // prefix length is exactly `h1` (not `h1 - 1`) so we capture the
+        // post-block-h₁ state, not the pre-block-h₁ state.
+        let state_h1 = {
+            let prefix: Vec<crate::Block> =
+                self.blocks[..h1 as usize].to_vec();
+            crate::Chain::replay(self.genesis.clone(), &prefix)
+                .ok()?
+                .state
+        };
+        let cert_h1 = self.certs.get((h1 - 1) as usize)?.clone();
+        let cert_h2 = self.certs.get((h2 - 1) as usize)?.clone();
+        let diff = self.chain.state.graph_diff(&state_h1);
+        // Per-side tracked sets come from the wallet's POV: after
+        // applying block `h` the set that certifies `h+1` is
+        // `state.validators`. The wallet already maintains this set
+        // via `ValidatorTracker::follow`, but for the producer we
+        // surface the sets as-is — the wallet re-derives them anyway
+        // from its header cache.
+        let tracked_h1 = {
+            let replay = crate::Chain::replay(
+                self.genesis.clone(),
+                &self.blocks[..h1 as usize],
+            )
+            .ok()?;
+            replay.state.validators.clone()
+        };
+        let tracked_h2 = {
+            let replay = crate::Chain::replay(
+                self.genesis.clone(),
+                &self.blocks[..h2 as usize],
+            )
+            .ok()?;
+            replay.state.validators.clone()
+        };
+        Some(crate::light::DiffEnvelope {
+            header_prev: header_h1.clone(),
+            cert_prev: cert_h1,
+            header_new: header_h2.clone(),
+            cert_new: cert_h2,
+            diff,
+            tracked_set_h1: tracked_h1,
+            tracked_set_h2: tracked_h2,
+        })
     }
 
     /// The certified blocks from `height` onward (inclusive), capped at
@@ -582,6 +690,18 @@ impl GossipNode {
                 vec![(from, GossipMsg::Proof { items: out })]
             }
             GossipMsg::Proof { .. } => Vec::new(), // full nodes don't consume proofs
+            // M28: full peer serves a cert-signed temporal diff between two
+            // cert-signed heights. Replays from genesis to h₁ to derive
+            // `state_at_h1`, then packages the diff body plus per-side
+            // certs/headers into a typed envelope. The wallet re-verifies
+            // every piece against its own cached range and tracked sets.
+            GossipMsg::GetDiff { h1, h2, header_h1, header_h2 } => {
+                match self.serve_diff(h1, h2, &header_h1, &header_h2) {
+                    Some(envelope) => vec![(from, GossipMsg::Diff { envelope: Box::new(envelope) })],
+                    None => Vec::new(),
+                }
+            }
+            GossipMsg::Diff { .. } => Vec::new(), // full nodes don't consume diffs
         }
     }
 
@@ -786,6 +906,11 @@ pub struct LightGossipNode {
     /// header's `accounts_root` (for Account/Reviewer) or `next_validators_root`
     /// (for Validator).
     proofs: BTreeMap<(crate::light::ProofKind, u64), crate::light::ProofEntry>,
+    /// M28: cached `Diff` envelopes from full peers. Light peers cache the
+    /// most recent envelope received (a wallet only needs one at a time —
+    /// it pulls, verifies, then pulls again for the next pair). The wallet
+    /// retrieves via [`Self::take_diff`].
+    diffs: Option<crate::light::DiffEnvelope>,
 }
 
 impl LightGossipNode {
@@ -800,6 +925,7 @@ impl LightGossipNode {
             tracker: ValidatorTracker::from_genesis(g),
             peers,
             proofs: BTreeMap::new(),
+            diffs: None,
         }
     }
 
@@ -812,6 +938,13 @@ impl LightGossipNode {
         id: u64,
     ) -> Option<crate::light::ProofEntry> {
         self.proofs.remove(&(kind, id))
+    }
+
+    /// M28: pop the cached diff envelope (consumes the entry — a wallet
+    /// pulls once, then verifies locally with
+    /// `ValidatorTracker::verify_diff_against_headers`).
+    pub fn take_diff(&mut self) -> Option<crate::light::DiffEnvelope> {
+        self.diffs.take()
     }
 
     pub fn tracker(&self) -> &ValidatorTracker {
@@ -888,6 +1021,15 @@ impl LightGossipNode {
             // Light nodes do not serve proof requests (they have no chain state
             // to prove against).
             GossipMsg::GetProof { .. } => Vec::new(),
+            // M28: cache incoming diff envelopes for the wallet to verify
+            // locally via `verify_diff_against_headers`. Light nodes don't
+            // serve diff requests — they have no chain state to diff
+            // against.
+            GossipMsg::Diff { envelope } => {
+                self.diffs = Some(*envelope);
+                Vec::new()
+            }
+            GossipMsg::GetDiff { .. } => Vec::new(),
             // everything else: light clients forward tx gossip but never store it
             // — for the M22 demo we just drop, mirroring the "I don't care about
             // bodies" SPV stance.
@@ -1131,6 +1273,21 @@ pub fn encode_gossip(m: &GossipMsg) -> Vec<u8> {
                 }
             }
         }
+        // M28: cert-signed temporal diff pair. Body layout mirrors the
+        // existing proof pair (length-prefixed, tagged sub-payloads):
+        //   - GetDiff: u64_be(h1), u64_be(h2), header_h1, header_h2
+        //   - Diff:    the typed DiffEnvelope as a single length-prefixed blob
+        GossipMsg::GetDiff { h1, h2, header_h1, header_h2 } => {
+            out.push(TAG_GETDIFF);
+            out.extend_from_slice(&h1.to_be_bytes());
+            out.extend_from_slice(&h2.to_be_bytes());
+            put_bytes(&mut out, &crate::codec::encode_header(header_h1));
+            put_bytes(&mut out, &crate::codec::encode_header(header_h2));
+        }
+        GossipMsg::Diff { envelope } => {
+            out.push(TAG_DIFF);
+            put_bytes(&mut out, &encode_diff_envelope(envelope));
+        }
     }
     out
 }
@@ -1205,12 +1362,113 @@ pub fn decode_gossip(buf: &[u8]) -> Result<GossipMsg, CodecError> {
             }
             GossipMsg::Proof { items }
         }
+        // M28: cert-signed temporal diff pair. The full body for `Diff` is
+        // a single length-prefixed envelope, so the framing is symmetric
+        // with the other length-prefixed payloads.
+        TAG_GETDIFF => {
+            let h1 = take_u64(&mut rest)?;
+            let h2 = take_u64(&mut rest)?;
+            let header_h1 = Box::new(crate::codec::decode_header(take_bytes(&mut rest)?)?);
+            let header_h2 = Box::new(crate::codec::decode_header(take_bytes(&mut rest)?)?);
+            GossipMsg::GetDiff { h1, h2, header_h1, header_h2 }
+        }
+        TAG_DIFF => GossipMsg::Diff {
+            envelope: Box::new(decode_diff_envelope(take_bytes(&mut rest)?)?),
+        },
         other => return Err(CodecError::BadEnum(other as u32)),
     };
     if !rest.is_empty() {
         return Err(CodecError::TrailingBytes);
     }
     Ok(msg)
+}
+
+/// M28: encode a `DiffEnvelope` as a single length-prefixed blob.
+///
+/// Layout (all multi-byte ints big-endian):
+///   u32_be(|added|) | for each: codec::encode_graph_node + codec::encode_proof
+///   u32_be(|dropped|) | for each: codec::encode_graph_node + codec::encode_proof
+///   header_prev (length-prefixed via `put_bytes`)
+///   cert_prev
+///   header_new
+///   cert_new
+///   tracked_set_h1 (u32_be(|validators|) + for each: codec::encode_validator)
+///   tracked_set_h2 (same)
+pub fn encode_diff_envelope(env: &crate::light::DiffEnvelope) -> Vec<u8> {
+    let mut out = Vec::new();
+    out.extend_from_slice(&(env.diff.added.len() as u32).to_be_bytes());
+    for entry in &env.diff.added {
+        put_bytes(&mut out, &crate::codec::encode_graph_node(&entry.graph_node));
+        put_bytes(&mut out, &crate::codec::encode_proof(&entry.proof));
+    }
+    out.extend_from_slice(&(env.diff.dropped.len() as u32).to_be_bytes());
+    for entry in &env.diff.dropped {
+        put_bytes(&mut out, &crate::codec::encode_graph_node(&entry.graph_node));
+        put_bytes(&mut out, &crate::codec::encode_proof(&entry.proof));
+    }
+    put_bytes(&mut out, &crate::codec::encode_header(&env.header_prev));
+    put_bytes(&mut out, &crate::codec::encode_commit(&env.cert_prev));
+    put_bytes(&mut out, &crate::codec::encode_header(&env.header_new));
+    put_bytes(&mut out, &crate::codec::encode_commit(&env.cert_new));
+    encode_validator_set(&mut out, &env.tracked_set_h1);
+    encode_validator_set(&mut out, &env.tracked_set_h2);
+    out
+}
+
+/// M28: decode a `DiffEnvelope` produced by [`encode_diff_envelope`].
+pub fn decode_diff_envelope(buf: &[u8]) -> Result<crate::light::DiffEnvelope, CodecError> {
+    let mut p = buf;
+    let n_added = take_u32(&mut p)? as usize;
+    let mut added = Vec::with_capacity(n_added);
+    for _ in 0..n_added {
+        let gn = crate::codec::decode_graph_node(take_bytes(&mut p)?)?;
+        let proof = crate::codec::decode_proof(take_bytes(&mut p)?)?;
+        let node_id = gn.node_id;
+        added.push(crate::GraphLeafAtHeight { node_id, graph_node: gn, proof });
+    }
+    let n_dropped = take_u32(&mut p)? as usize;
+    let mut dropped = Vec::with_capacity(n_dropped);
+    for _ in 0..n_dropped {
+        let gn = crate::codec::decode_graph_node(take_bytes(&mut p)?)?;
+        let proof = crate::codec::decode_proof(take_bytes(&mut p)?)?;
+        let node_id = gn.node_id;
+        dropped.push(crate::GraphLeafAtHeight { node_id, graph_node: gn, proof });
+    }
+    let header_prev = crate::codec::decode_header(take_bytes(&mut p)?)?;
+    let cert_prev = crate::codec::decode_commit(take_bytes(&mut p)?)?;
+    let header_new = crate::codec::decode_header(take_bytes(&mut p)?)?;
+    let cert_new = crate::codec::decode_commit(take_bytes(&mut p)?)?;
+    let tracked_set_h1 = decode_validator_set(&mut p)?;
+    let tracked_set_h2 = decode_validator_set(&mut p)?;
+    if !p.is_empty() {
+        return Err(CodecError::TrailingBytes);
+    }
+    Ok(crate::light::DiffEnvelope {
+        header_prev,
+        cert_prev,
+        header_new,
+        cert_new,
+        diff: crate::DiffClaim { added, dropped },
+        tracked_set_h1,
+        tracked_set_h2,
+    })
+}
+
+fn encode_validator_set(out: &mut Vec<u8>, vs: &crate::validator::ValidatorSet) {
+    let v = vs.validators();
+    out.extend_from_slice(&(v.len() as u32).to_be_bytes());
+    for val in v {
+        out.extend_from_slice(&crate::codec::encode_validator(val));
+    }
+}
+
+fn decode_validator_set(p: &mut &[u8]) -> Result<crate::validator::ValidatorSet, CodecError> {
+    let n = take_u32(p)? as usize;
+    let mut vs = Vec::with_capacity(n);
+    for _ in 0..n {
+        vs.push(crate::codec::decode_validator(take_bytes(p)?)?);
+    }
+    Ok(crate::validator::ValidatorSet::new(vs))
 }
 
 fn put_bytes(out: &mut Vec<u8>, b: &[u8]) {
@@ -2349,5 +2607,101 @@ mod tests {
         let query = [0.0f32; 8];
         let claim = node.serve_range(query, 1.1);
         assert!(claim.is_none(), "cutoff above 1.0 must yield no nodes");
+    }
+
+    // ----- M28: GossipNode::serve_diff -----
+
+    /// M28: a 2-block certified chain served by a full peer produces a
+    /// `DiffEnvelope` whose `added` entries are exactly the graph nodes
+    /// inserted at h₂ (the per-side tracked sets cover the wallet's
+    /// dynamic validator handoff between h₁ and h₂).
+    #[test]
+    fn serve_diff_returns_a_typed_envelope_for_a_height_range() {
+        let (blocks, certs) = certified_chain(2);
+        let mut full = GossipNode::new(1, genesis(), 8, []);
+        full.load_certified(&blocks, &certs);
+        // Both cert-signed headers must be supplied by the caller.
+        let header_h1 = crate::codec::BlockHeader::from_block(&blocks[0]);
+        let header_h2 = crate::codec::BlockHeader::from_block(&blocks[1]);
+
+        let env = full
+            .serve_diff(1, 2, &header_h1, &header_h2)
+            .expect("full peer serves a 2-height diff envelope");
+
+        // The envelope binds the certs the wallet will check against.
+        assert_eq!(env.header_prev.height, 1);
+        assert_eq!(env.header_new.height, 2);
+        assert_eq!(env.cert_prev.block_hash, header_h1.hash());
+        assert_eq!(env.cert_new.block_hash, header_h2.hash());
+        // At least one node was added at h₂ (the txs in block 1 grow the graph).
+        assert!(!env.diff.added.is_empty(), "block 2 added >= 1 graph node");
+        // dropped is always empty under the current append-only engine.
+        assert!(env.diff.dropped.is_empty());
+        // Each added leaf must verify locally against the h₂ accounts_root.
+        let last_block = blocks.last().unwrap();
+        let header = crate::codec::BlockHeader::from_block(last_block);
+        for entry in &env.diff.added {
+            let leaf = crate::merkle::leaf_hash(&entry.graph_node.merkle_leaf());
+            assert!(
+                crate::merkle::verify(&header.accounts_root, &leaf, &entry.proof),
+                "added leaf {} did not verify against h₂ accounts_root",
+                entry.node_id,
+            );
+        }
+        // And the wallet-side verifier accepts the envelope end-to-end.
+        let blocks_in_range: Vec<(Block, Commit)> = blocks
+            .iter()
+            .cloned()
+            .zip(certs.iter().cloned())
+            .collect();
+        crate::light::ValidatorTracker::verify_diff_against_headers(
+            &genesis(), &blocks_in_range, &env,
+        ).expect("wallet-side diff verifier accepts the envelope");
+
+        // Round-trip through the wire codec (GetDiff + Diff + back).
+        let get = GossipMsg::GetDiff {
+            h1: 1,
+            h2: 2,
+            header_h1: Box::new(header_h1.clone()),
+            header_h2: Box::new(header_h2.clone()),
+        };
+        let bytes = encode_gossip(&get);
+        let decoded = decode_gossip(&bytes).expect("decode getdiff");
+        let out = full.on_message(99, decoded);
+        assert_eq!(out.len(), 1);
+        let (_dst, diff_msg) = out.into_iter().next().unwrap();
+        let back_envelope = match diff_msg {
+            GossipMsg::Diff { envelope } => *envelope,
+            other => panic!("expected Diff, got {other:?}"),
+        };
+        // The wire-roundtripped envelope must verify identically.
+        crate::light::ValidatorTracker::verify_diff_against_headers(
+            &genesis(), &blocks_in_range, &back_envelope,
+        ).expect("wallet-side diff verifier accepts the wire-roundtripped envelope");
+    }
+
+    #[test]
+    fn serve_diff_returns_none_for_degenerate_ranges() {
+        // Boundary cases: h₁ == 0, h₁ >= h₂, h₂ beyond this peer's height,
+        // and headers whose heights don't match the supplied h₁/h₂.
+        let (blocks, certs) = certified_chain(2);
+        let mut full = GossipNode::new(1, genesis(), 8, []);
+        full.load_certified(&blocks, &certs);
+        let header_h1 = crate::codec::BlockHeader::from_block(&blocks[0]);
+        let header_h2 = crate::codec::BlockHeader::from_block(&blocks[1]);
+
+        assert!(full.serve_diff(0, 2, &header_h1, &header_h2).is_none(), "h1 == 0");
+        assert!(full.serve_diff(2, 2, &header_h1, &header_h2).is_none(), "h1 == h2");
+        assert!(full.serve_diff(2, 1, &header_h1, &header_h2).is_none(), "h1 > h2");
+        assert!(full.serve_diff(1, 99, &header_h1, &header_h2).is_none(), "h2 > height");
+        // Wrong-height headers:
+        assert!(
+            full.serve_diff(1, 2, &header_h2, &header_h2).is_none(),
+            "header_h1.height != h1"
+        );
+        assert!(
+            full.serve_diff(1, 2, &header_h1, &header_h1).is_none(),
+            "header_h2.height != h2"
+        );
     }
 }
