@@ -28,7 +28,8 @@ use zhixing_engine::{DeltaKParams, DIM};
 use zhixing_node::consensus::{commit_block, detect_equivocation, Commit};
 use zhixing_node::driver::ChainDriver;
 use zhixing_node::codec::BlockHeader;
-use zhixing_node::light::{LightError, ProofEntry, ValidatorTracker};
+use zhixing_node::bridge::{BridgeEndpoint, BridgeError};
+use zhixing_node::light::{DiffEnvelope, LightError, ProofEntry, ValidatorTracker};
 use zhixing_node::mempool::Mempool;
 use zhixing_node::merkle;
 use zhixing_node::net::{read_msg, write_msg, GossipMsg, GossipNode, LightGossipNode, LightNetwork, Network};
@@ -36,8 +37,8 @@ use zhixing_node::round::Sim;
 use zhixing_node::store::{BlockLog, CertLog};
 use zhixing_node::validator::{Validator, ValidatorSet, ValidatorUpdate};
 use zhixing_node::{
-    hex, Block, BondKind, Chain, Genesis, Keypair, Review, SlashEvidence, StakeOp, SubmissionTx,
-    Vote, VoteType, MICRO,
+    hex, Block, BondKind, BridgeLock, Chain, ChainState, Genesis, Keypair, Review, SlashEvidence,
+    StakeOp, SubmissionTx, Vote, VoteType, MICRO,
 };
 
 type Emb = [f32; DIM];
@@ -111,6 +112,17 @@ fn demo_genesis() -> Genesis {
     }
 }
 
+/// M30: a second genesis for the cross-chain demo. Identical to
+/// `demo_genesis` except for `timestamp_days`, so the two chains have
+/// distinct `genesis_hash` values — each can name the other's hash in a
+/// `BridgeLock::dest_chain` field, and a relayer cannot substitute one
+/// chain's envelope for the other's.
+fn demo_genesis_b() -> Genesis {
+    let mut g = demo_genesis();
+    g.timestamp_days = 1.0;
+    g
+}
+
 /// The fixed validator set of this reference network (ids 21..=24, equal power)
 /// and their signing-key seeds — a network constant both producers and replayers
 /// reconstruct identically.
@@ -148,6 +160,7 @@ fn demo_blocks(chain: &Chain) -> Vec<Block> {
         accounts_root: [0u8; 32],
         // M27: stamped by `Chain::commit` (or `Chain::seal`) — builder leaves zero.
         graph_root: [0u8; 32],
+        bridge_root: [0u8; 32],
         txs: vec![
             tx(1, unit(1), 1, reviews(&[(10, 0.9), (11, 0.85), (12, 0.9)]), (3, 3), 1.0),
             tx(2, unit(2), 2, reviews(&[(10, 0.88), (11, 0.9), (12, 0.86)]), (3, 3), 1.0),
@@ -155,6 +168,7 @@ fn demo_blocks(chain: &Chain) -> Vec<Block> {
         validator_updates: Vec::new(),
         stake_ops: Vec::new(),
         slashing_evidence: Vec::new(),
+        bridge_locks: Vec::new(),
     };
     trial.seal(&mut b1).expect("seal b1");
     trial.commit(&mut b1).expect("commit b1 on trial");
@@ -168,6 +182,7 @@ fn demo_blocks(chain: &Chain) -> Vec<Block> {
         state_root: [0u8; 32],
         accounts_root: [0u8; 32],
         graph_root: [0u8; 32],
+        bridge_root: [0u8; 32],
         txs: vec![
             tx(3, blend(1, 2), 3, reviews(&[(10, 0.9), (11, 0.9), (12, 0.85)]), (3, 3), 2.0),
             tx(1, unit(0), 0, reviews(&[(10, 0.7), (11, 0.6), (12, 0.65)]), (0, 3), 2.0),
@@ -175,6 +190,7 @@ fn demo_blocks(chain: &Chain) -> Vec<Block> {
         validator_updates: Vec::new(),
         stake_ops: Vec::new(),
         slashing_evidence: Vec::new(),
+        bridge_locks: Vec::new(),
     };
     trial.seal(&mut b2).expect("seal b2");
     vec![b1, b2]
@@ -203,6 +219,7 @@ fn main() {
         "range" => cmd_range(),
         "diff" => cmd_diff(),
         "batch" => cmd_batch(),
+        "bridge" => cmd_bridge(),
         "run" => cmd_run(dir_arg(&args)),
         "status" => cmd_status(dir_arg(&args)),
         "certs" => cmd_certs(dir_arg(&args)),
@@ -248,6 +265,7 @@ fn usage() {
     eprintln!("  node range              cert-signed graph range query: wallet re-derives the cos_sim(q, n) >= min_sim cut set from graph_root, no graph download");
     eprintln!("  node diff               cert-signed temporal graph diff between two cert-signed heights: added/dropped, wallet re-derives via partial replay");
     eprintln!("  node batch              heterogeneous batched proof transport: Inclusion + kNN + Range + Diff in a single round-trip");
+    eprintln!("  node bridge             trustless bridge: chain A locks to chain B, relayer ferries a cert-signed envelope, B's endpoint verifies + credits — no relayer trust");
     eprintln!("  node run    --dir DIR   persistent chain (seeds demo blocks once, then replays)");
     eprintln!("  node status --dir DIR   replay the block log and print state");
     eprintln!("  node certs  --dir DIR   persist a certified chain (blocks+certs) and re-verify finality on reload");
@@ -1784,7 +1802,6 @@ from a cert-signed header without downloading the graph."
 /// per-leaf proofs verify each entry's body, but completeness is bound
 /// to the replay.
 fn cmd_diff() {
-use zhixing_node::light::DiffEnvelope;
 
     println!("M28 — cert-signed temporal graph diff between two cert-signed heights");
     println!();
@@ -2107,6 +2124,155 @@ use zhixing_node::light::{
          dispatches to its existing per-primitive verifier, no new SPV \
          logic, and protocol violations (kind mismatch, count mismatch) \
          surface as explicit BatchItemKindMismatch / BatchItemCountMismatch."
+    );
+}
+
+/// M30 demo: trustless bridge between two chains running the same protocol.
+///
+/// Chain A locks tokens in a `BridgeLock`, committing to A's cert-signed
+/// `bridge_root`. A relayer ferries the resulting `LockEnvelope` (header,
+/// cert, validator set, lock, inclusion proof) to chain B. B's destination
+/// `BridgeEndpoint` verifies the lock against A's cert-signed root — no new
+/// SPV logic, just the M22 cert-binding + Merkle inclusion primitives — then
+/// credits the destination account, with a dedup set blocking replay.
+///
+/// The soundness claim: a bridge is a light client + a dedup set.
+fn cmd_bridge() {
+    println!("M30 — trustless bridge (relay + verify-from-counterparty)");
+    println!();
+
+    let ga = demo_genesis();
+    let gb = demo_genesis_b();
+    let b_genesis_hash = ChainState::genesis(gb.clone()).1;
+
+    // Chain A: account 1 locks 12 micro-$COG for account 7 on chain B.
+    let mut driver_a = ChainDriver::new(ga.clone(), demo_driver_seeds(), 4);
+    let lock = BridgeLock {
+        account: 1,
+        amount: 12 * MICRO,
+        dest_chain: b_genesis_hash,
+        dest_account: 7,
+        nonce: 0,
+        signature: [0u8; 64],
+    }
+    .signed(&kp(1));
+    driver_a.stage_bridge_lock(lock.clone());
+    driver_a.produce(1.0, &BTreeSet::new()).unwrap().expect("A block 1");
+    let blocks_a = driver_a.blocks().to_vec();
+    let certs_a = driver_a.certificates().to_vec();
+    assert_eq!(blocks_a.len(), 1);
+    assert_eq!(certs_a.len(), 1);
+
+    // Source-side accounting sanity: A's balance dropped, A's bridge_locked
+    // rose; supply is conserved (a redistribution within supply).
+    let a_balance = driver_a.chain.state.accounts.get(&1).unwrap().balance;
+    let a_locked = driver_a.chain.state.bridge_locked;
+    let a_supply = driver_a.chain.state.supply;
+    assert_eq!(a_locked, 12 * MICRO, "source bridge_locked pool");
+    assert!(a_supply > 0, "supply remains positive");
+    assert!(driver_a.chain.state.supply_conserved());
+    println!(
+        "chain A: account 1 balance={}, bridge_locked={}, supply conserved ✓",
+        a_balance, a_locked
+    );
+
+    // Relay: a full peer of A serves the lock envelope to a peer of B.
+    let mut full_a = GossipNode::new(1, ga.clone(), 8, [1, 2]);
+    full_a.load_certified(&blocks_a, &certs_a);
+    let env = full_a.serve_lock(0).expect("relay: A serves lock 0");
+    println!(
+        "relay: served LockEnvelope (header h={}, lock_id=0, amount={})",
+        env.source_header.height, env.lock.amount
+    );
+
+    // Destination endpoint on B: follow source chain, verify lock, credit.
+    let mut endpoint_b = BridgeEndpoint::new(&gb, &ga);
+    endpoint_b
+        .follow_source(&env.source_header, &env.source_cert, &env.source_tracked_set)
+        .expect("B follows A's height 1");
+    let verified = endpoint_b.verify_lock(&env).expect("verify_lock → Ok");
+    println!(
+        "chain B: verify_lock → Ok (dest_account={}, amount={})",
+        verified.dest_account, verified.amount
+    );
+    endpoint_b.consume(&verified).expect("consume");
+    assert_eq!(endpoint_b.minted(7), 12 * MICRO, "B credits destination");
+    println!("chain B: consume → minted(7) = {} ✓", endpoint_b.minted(7));
+    println!();
+
+    // Negative 1: tamper the lock amount in the envelope → inclusion fails.
+    let mut bad1 = env.clone();
+    bad1.lock.amount += 1; // leaf no longer matches the committed root
+    match endpoint_b.verify_lock(&bad1) {
+        Err(BridgeError::Cert(LightError::MembershipProofInvalid { .. })) => {
+            println!("negative 1: tamper lock.amount → MembershipProofInvalid ✓");
+        }
+        other => panic!("expected MembershipProofInvalid, got {other:?}"),
+    }
+
+    // Negative 2: wrong destination. Build a fresh lock destined for a
+    // *third* chain; B's endpoint must reject with WrongDestination.
+    let mut gc = demo_genesis();
+    gc.timestamp_days = 2.0;
+    let c_genesis_hash = ChainState::genesis(gc.clone()).1;
+    let mut driver_a2 = ChainDriver::new(ga.clone(), demo_driver_seeds(), 4);
+    let wrong_dest_lock = BridgeLock {
+        account: 1,
+        amount: 4 * MICRO,
+        dest_chain: c_genesis_hash, // NOT chain B
+        dest_account: 5,
+        nonce: 0,
+        signature: [0u8; 64],
+    }
+    .signed(&kp(1));
+    driver_a2.stage_bridge_lock(wrong_dest_lock.clone());
+    driver_a2
+        .produce(1.0, &BTreeSet::new())
+        .unwrap()
+        .expect("A block 1 (wrong dest)");
+    let mut full_a2 = GossipNode::new(1, ga.clone(), 8, [1, 2]);
+    full_a2.load_certified(driver_a2.blocks(), driver_a2.certificates());
+    let env_wrong = full_a2.serve_lock(0).expect("serve wrong-dest lock");
+    let mut endpoint_b2 = BridgeEndpoint::new(&gb, &ga);
+    endpoint_b2
+        .follow_source(
+            &env_wrong.source_header,
+            &env_wrong.source_cert,
+            &env_wrong.source_tracked_set,
+        )
+        .expect("B follows A");
+    match endpoint_b2.verify_lock(&env_wrong) {
+        Err(BridgeError::WrongDestination { .. }) => {
+            println!("negative 2: lock destined for chain C → WrongDestination ✓");
+        }
+        other => panic!("expected WrongDestination, got {other:?}"),
+    }
+
+    // Negative 3: replay the *verified* (and consumed) lock → AlreadyConsumed.
+    match endpoint_b.verify_lock(&env) {
+        Err(BridgeError::AlreadyConsumed { .. }) => {
+            println!("negative 3: replay verified lock → AlreadyConsumed ✓");
+        }
+        other => panic!("expected AlreadyConsumed, got {other:?}"),
+    }
+
+    // Negative 4: tamper source_header.bridge_root → CertificateMismatch.
+    let mut bad4 = env.clone();
+    bad4.source_header.bridge_root = [0xFFu8; 32]; // changes header.hash()
+    match endpoint_b.verify_lock(&bad4) {
+        Err(BridgeError::Cert(LightError::CertificateMismatch { .. })) => {
+            println!("negative 4: tamper header.bridge_root → CertificateMismatch ✓");
+        }
+        other => panic!("expected CertificateMismatch, got {other:?}"),
+    }
+
+    println!();
+    println!(
+        "M30 — trustless bridge: A's validator-signed BridgeLock was relayed \
+         to B and verified entirely from the cert-signed bridge_root (no \
+         new SPV logic — M22 cert-binding + M25–M28 Merkle inclusion), then \
+         credited on B; replay / wrong-destination / tampered-proof / \
+         tampered-root are each rejected by the destination endpoint."
     );
 }
 

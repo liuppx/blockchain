@@ -167,6 +167,7 @@ mod tests {
             state_root: [0u8; 32],
             accounts_root: [0u8; 32],
             graph_root: [0u8; 32],
+            bridge_root: [0u8; 32],
             txs: vec![SubmissionTx {
                 author: 1,
                 embedding: emb,
@@ -181,6 +182,7 @@ mod tests {
             validator_updates: Vec::new(),
             stake_ops: Vec::new(),
             slashing_evidence: Vec::new(),
+            bridge_locks: Vec::new(),
         }
     }
 

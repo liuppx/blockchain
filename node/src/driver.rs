@@ -23,7 +23,7 @@ use crate::consensus::Commit;
 use crate::mempool::Mempool;
 use crate::round::Sim;
 use crate::validator::ValidatorUpdate;
-use crate::{Block, Chain, ChainError, Genesis, Hash, Keypair, SlashEvidence, StakeOp, SubmissionTx};
+use crate::{Block, BridgeLock, Chain, ChainError, Genesis, Hash, Keypair, SlashEvidence, StakeOp, SubmissionTx};
 
 #[derive(Debug)]
 pub enum DriverError {
@@ -70,6 +70,9 @@ pub struct ChainDriver {
     pending_stake_ops: Vec<StakeOp>,
     /// Equivocation evidence staged to ride along in the next produced block.
     pending_slashing_evidence: Vec<SlashEvidence>,
+    /// M30: cross-chain bridge locks staged to ride along in the next produced
+    /// block.
+    pending_bridge_locks: Vec<BridgeLock>,
     /// Each committed block, in height order — retained so the chain can be
     /// persisted (block log) alongside its certificates.
     blocks: Vec<Block>,
@@ -86,6 +89,7 @@ impl ChainDriver {
             pending_updates: Vec::new(),
             pending_stake_ops: Vec::new(),
             pending_slashing_evidence: Vec::new(),
+            pending_bridge_locks: Vec::new(),
             blocks: Vec::new(),
             certs: Vec::new(),
         }
@@ -115,6 +119,13 @@ impl ChainDriver {
     /// removal taking effect next height (same discipline as staking/updates).
     pub fn stage_slashing_evidence(&mut self, ev: SlashEvidence) {
         self.pending_slashing_evidence.push(ev);
+    }
+
+    /// M30: stage a signed cross-chain bridge lock to be carried by the next
+    /// block [`Self::produce`] finalizes. The lock drains the source account's
+    /// balance into `bridge_locked` on apply (same discipline as a stake op).
+    pub fn stage_bridge_lock(&mut self, lock: BridgeLock) {
+        self.pending_bridge_locks.push(lock);
     }
 
     pub fn height(&self) -> u64 {
@@ -163,7 +174,8 @@ impl ChainDriver {
             Some(b) => b,
             None if !self.pending_updates.is_empty()
                 || !self.pending_stake_ops.is_empty()
-                || !self.pending_slashing_evidence.is_empty() =>
+                || !self.pending_slashing_evidence.is_empty()
+                || !self.pending_bridge_locks.is_empty() =>
             {
                 Block {
                     height: self.chain.state.height + 1,
@@ -175,10 +187,12 @@ impl ChainDriver {
                     state_root: [0u8; 32],
                     accounts_root: [0u8; 32],
                     graph_root: [0u8; 32],
+                    bridge_root: [0u8; 32],
                     txs: Vec::new(),
                     validator_updates: Vec::new(),
                     stake_ops: Vec::new(),
                     slashing_evidence: Vec::new(),
+                    bridge_locks: Vec::new(),
                 }
             }
             None => return Ok(None),
@@ -186,6 +200,7 @@ impl ChainDriver {
         candidate.validator_updates = self.pending_updates.clone();
         candidate.stake_ops = self.pending_stake_ops.clone();
         candidate.slashing_evidence = self.pending_slashing_evidence.clone();
+        candidate.bridge_locks = self.pending_bridge_locks.clone();
         // seal the validator-set commitment now that the block's contents are
         // final, so consensus votes on (and the post-consensus commit checks)
         // the header a light client will follow.
@@ -217,6 +232,7 @@ impl ChainDriver {
         self.pending_updates.clear();
         self.pending_stake_ops.clear();
         self.pending_slashing_evidence.clear();
+        self.pending_bridge_locks.clear();
         self.blocks.push(candidate);
         self.certs.push(commit.clone());
         Ok(Some(commit))

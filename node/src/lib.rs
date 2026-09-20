@@ -23,6 +23,7 @@
 //! gossip. That is a later milestone; see README. Money is integer micro-$COG
 //! (no floats), so accounting is exact.
 
+pub mod bridge;
 pub mod codec;
 pub mod consensus;
 pub mod crypto;
@@ -252,6 +253,63 @@ impl SlashEvidence {
     }
 }
 
+/// M30: a signed cross-chain lock op. An account on the **source** chain locks
+/// `amount` micro-$COG destined for `dest_account` on `dest_chain` (identified
+/// by its genesis hash). Apply drains the balance into `ChainState::bridge_locked`
+/// and appends to the cumulative `bridge_locks` map so the lock survives across
+/// heights and the cert-signed `bridge_root` can be opened against any height
+/// ≥ creation. The destination chain verifies the lock via a `bridge::BridgeEndpoint`
+/// (a light client + a replay-protected dedup set) — same shape as M22/M28
+/// SPV, but on a different chain's cert-signed header.
+///
+/// On the destination side, consuming a verified lock mints new supply backed
+/// 1:1 by the source's locked pool. The lock op itself only needs to commit
+/// the source-side bookkeeping; the destination's mint is a bridge-module
+/// concern (not consensus), which is why dedup lives in `bridge` not here.
+#[derive(Clone, Debug)]
+pub struct BridgeLock {
+    pub account: u64,
+    pub amount: u64,
+    /// Destination chain's `genesis_hash`. A lock destined for any other
+    /// chain is rejected by the destination endpoint (`BridgeError::WrongDestination`).
+    pub dest_chain: Hash,
+    pub dest_account: u64,
+    /// Replay-protected nonce for `account` (mirrors the SubmissionTx /
+    /// StakeOp discipline so the source chain can detect a re-signed op).
+    pub nonce: u64,
+    /// ed25519 signature by `account`'s key over [`codec::bridgelock_signing_bytes`].
+    pub signature: Sig,
+}
+
+impl BridgeLock {
+    /// Sign this op's canonical fields with `kp` (the account's key).
+    pub fn signed(mut self, kp: &Keypair) -> Self {
+        self.signature = kp.sign(&codec::bridgelock_signing_bytes(&self));
+        self
+    }
+
+    /// Content-addressed hash over the full signed encoding. Used for dedup.
+    pub fn hash(&self) -> Hash {
+        sha256(&codec::encode_bridge_lock(self))
+    }
+
+    /// Canonical leaf preimage under the assigned `lock_id` — the exact
+    /// bytes a light client hashes (via [`merkle::leaf_hash`]) to verify a
+    /// lock-inclusion proof against `ChainState::bridge_root`. Mirrors
+    /// `GraphNode::merkle_leaf` and `Account::merkle_leaf` for the
+    /// bridge_root tree.
+    pub fn merkle_leaf(&self, lock_id: u64) -> Vec<u8> {
+        let mut e = codec::Enc(Vec::new());
+        e.u64(lock_id);
+        e.u64(self.account);
+        e.u64(self.amount);
+        e.raw(&self.dest_chain);
+        e.u64(self.dest_account);
+        e.u64(self.nonce);
+        e.0
+    }
+}
+
 /// A block: an ordered batch of submissions applied atomically.
 #[derive(Clone, Debug)]
 pub struct Block {
@@ -293,6 +351,14 @@ pub struct Block {
     /// [`Chain::commit`]; mismatches on apply return
     /// [`ChainError::GraphRootMismatch`].
     pub graph_root: Hash,
+    /// M30: Merkle root of the post-apply cumulative `bridge_locks` map,
+    /// sorted by `lock_id` (see [`ChainState::bridge_merkle_root`]).
+    /// Cert-signed alongside `accounts_root` / `graph_root` — opens
+    /// inclusion proofs for individual locks so the destination chain's
+    /// bridge endpoint can verify a single lock against this chain's
+    /// cert-signed header. Stamped by [`Chain::commit`]; mismatches on
+    /// apply return [`ChainError::BridgeRootMismatch`].
+    pub bridge_root: Hash,
     pub txs: Vec<SubmissionTx>,
     /// On-chain validator-set changes carried by this block. Applied after the
     /// transactions and taking effect from the *next* height (this block is
@@ -313,6 +379,14 @@ pub struct Block {
     /// of the block hash, but its *effects* — reduced bonds, grown treasury —
     /// are what fold into `state_root`, so honest chains see no root change.
     pub slashing_evidence: Vec<SlashEvidence>,
+    /// M30: cross-chain lock ops carried by this block. Each entry is a signed
+    /// [`BridgeLock`] that moves value from an account's balance into the
+    /// `bridge_locked` pool on this (source) chain, destined for an account on
+    /// another chain identified by its genesis hash. Usually empty; populated
+    /// only when a bridge lock is staged. Locks are part of the block hash, and
+    /// their cumulative effect folds into both `state_root` and the header's
+    /// `bridge_root` Merkle commitment.
+    pub bridge_locks: Vec<BridgeLock>,
 }
 
 impl Block {
@@ -430,6 +504,22 @@ pub struct ChainState {
     /// each block's [`Block::validator_updates`]. Holds the set that certifies
     /// the *next* height (at genesis, the set that certifies height 1).
     pub validators: ValidatorSet,
+    /// M30: total micro-$COG locked in outbound cross-chain bridge locks. A
+    /// [`BridgeLock`] drains an account's balance into this pool; the funds are
+    /// held out of balances but remain part of `supply` (a redistribution, like
+    /// `bonded`). The destination chain mints backing supply against this pool.
+    pub bridge_locked: u64,
+    /// M30: every bridge lock ever created, keyed by monotonic `lock_id`.
+    /// Append-only (cumulative, like accounts) so an inclusion proof against a
+    /// past `bridge_root` stays valid at any later height. Folds into
+    /// `state_root` and the header's `bridge_root` Merkle commitment.
+    pub bridge_locks: BTreeMap<u64, BridgeLock>,
+    /// M30: `lock_id -> block_height` so a producer (and a network relayer)
+    /// can resolve which certified header a given lock is bound to. Header
+    /// binding is what the destination endpoint's cert-binding step checks.
+    pub bridge_lock_heights: BTreeMap<u64, u64>,
+    /// M30: next `lock_id` to assign. Monotonic; never reused.
+    pub next_lock_id: u64,
 }
 
 /// Genesis configuration.
@@ -489,6 +579,12 @@ pub enum ChainError {
     /// commitment a wallet opens the sorted graph view against for M27
     /// range claims — same root mismatch reasoning as `AccountsRootMismatch`.
     GraphRootMismatch { height: u64 },
+    /// M30: the block's `bridge_root` does not equal the post-apply Merkle
+    /// root of the cumulative `bridge_locks` map sorted by `lock_id`.
+    /// Cert-signed via `header.bridge_root`, this is the commitment a
+    /// destination chain's bridge endpoint opens a single lock against — same
+    /// root-mismatch reasoning as `AccountsRootMismatch` / `GraphRootMismatch`.
+    BridgeRootMismatch { height: u64 },
 }
 
 impl std::fmt::Display for ChainError {
@@ -536,6 +632,10 @@ impl std::fmt::Display for ChainError {
             ChainError::GraphRootMismatch { height } => write!(
                 f,
                 "block {height} graph_root does not match the post-apply graph (sorted-by-cosine) Merkle root"
+            ),
+            ChainError::BridgeRootMismatch { height } => write!(
+                f,
+                "block {height} bridge_root does not match the post-apply bridge_locks (sorted-by-lock_id) Merkle root"
             ),
         }
     }
@@ -678,6 +778,10 @@ impl ChainState {
             height: 0,
             now_days: g.timestamp_days,
             validators,
+            bridge_locked: 0,
+            bridge_locks: BTreeMap::new(),
+            bridge_lock_heights: BTreeMap::new(),
+            next_lock_id: 0,
         };
         // genesis "block" hash: height 0, zero prev, no txs, no validator updates.
         // Its commitment is the genesis validator set (the set that certifies
@@ -698,10 +802,15 @@ impl ChainState {
             // genesis hash finds the cert-signed secondary index already
             // committed for height 0.
             graph_root: state.graph_merkle_root(),
+            // M30: stamp the genesis bridge_root (empty locks → empty-tree
+            // root) so a light client anchored on the genesis hash finds the
+            // cert-signed bridge commitment already committed for height 0.
+            bridge_root: state.bridge_merkle_root(),
             txs: Vec::new(),
             validator_updates: Vec::new(),
             stake_ops: Vec::new(),
             slashing_evidence: Vec::new(),
+            bridge_locks: Vec::new(),
         }
         .hash();
         (state, gh)
@@ -801,6 +910,15 @@ impl ChainState {
             touched.insert(ev.vote_a.validator);
         }
 
+        // M30: cross-chain bridge locks. Each drains an account's balance into
+        // the `bridge_locked` pool and appends to the cumulative `bridge_locks`
+        // map under a freshly-assigned monotonic `lock_id`. Validation fully
+        // precedes mutation (as with stake ops), so a bad lock rolls the whole
+        // block back. Locks do not touch the validator set.
+        for lock in &block.bridge_locks {
+            self.apply_bridge_lock(lock, new_height)?;
+        }
+
         // on-chain validator-set transition: explicit updates PLUS the changes
         // implied by this block's staking ops (power == bonded stake). Both take
         // effect from the NEXT height — this block was certified by the set in
@@ -856,6 +974,14 @@ impl ChainState {
         // mismatch on either means a tampering or seal error.
         if enforce_commitment && block.graph_root != self.graph_merkle_root() {
             return Err(ChainError::GraphRootMismatch { height: new_height });
+        }
+        // M30: cert-signed commitment over the cumulative `bridge_locks` map.
+        // Same seal-then-enforce discipline as `graph_root` / `accounts_root`:
+        // a destination chain's bridge endpoint opens a single lock against
+        // this commitment, so any mismatch here means the source-side proof
+        // would not verify on the dest side.
+        if enforce_commitment && block.bridge_root != self.bridge_merkle_root() {
+            return Err(ChainError::BridgeRootMismatch { height: new_height });
         }
 
         Ok(BlockReceipt {
@@ -991,6 +1117,47 @@ impl ChainState {
         self.unbonding = still;
         self.treasury += moved;
         Ok(moved)
+    }
+
+    /// M30: validate and apply one cross-chain bridge lock. Drains
+    /// `lock.amount` from `lock.account`'s balance into `bridge_locked` and
+    /// appends to the cumulative `bridge_locks` map under a freshly-assigned
+    /// monotonic `lock_id`. All checks precede mutation, so a bad lock rolls
+    /// the whole block back. The lock itself only commits the source-side
+    /// bookkeeping; the destination's mint is a bridge-module concern
+    /// (`bridge::BridgeEndpoint::consume`) keyed off the source's cert-signed
+    /// `bridge_root`.
+    fn apply_bridge_lock(&mut self, lock: &BridgeLock, height: u64) -> Result<(), ChainError> {
+        if lock.amount == 0 {
+            return Err(ChainError::ZeroStake(lock.account));
+        }
+        let acct = self
+            .accounts
+            .get(&lock.account)
+            .ok_or(ChainError::UnknownAccount(lock.account))?;
+        // authenticate: the signature must be by the account's registered key.
+        if !crypto::verify(
+            &acct.pubkey,
+            &codec::bridgelock_signing_bytes(lock),
+            &lock.signature,
+        ) {
+            return Err(ChainError::BadSignature(lock.account));
+        }
+        if acct.balance < lock.amount {
+            return Err(ChainError::InsufficientBalance {
+                account: lock.account,
+                need: lock.amount,
+                have: acct.balance,
+            });
+        }
+        // -- mutate (all checks above passed) --------------------------------
+        self.accounts.get_mut(&lock.account).unwrap().balance -= lock.amount;
+        self.bridge_locked += lock.amount;
+        let lock_id = self.next_lock_id;
+        self.next_lock_id += 1;
+        self.bridge_locks.insert(lock_id, lock.clone());
+        self.bridge_lock_heights.insert(lock_id, height);
+        Ok(())
     }
 
     /// Static validity checks that do NOT depend on ΔK or mutate state: reviews
@@ -1168,6 +1335,20 @@ impl ChainState {
             e.u64(u.amount);
             e.u64(u.mature_height);
         }
+        // M30: bridge state. A lock is a redistribution within `supply`
+        // (balance → bridge_locked), so folding both sides + the cumulative
+        // map keeps the digest sensitive to either side being tampered with.
+        e.u64(self.bridge_locked);
+        e.u64(self.bridge_locks.len() as u64);
+        for (id, lock) in &self.bridge_locks {
+            e.raw(&lock.merkle_leaf(*id));
+        }
+        e.u64(self.bridge_lock_heights.len() as u64);
+        for (id, h) in &self.bridge_lock_heights {
+            e.u64(*id);
+            e.u64(*h);
+        }
+        e.u64(self.next_lock_id);
         sha256(&e.0)
     }
 
@@ -1309,6 +1490,40 @@ impl ChainState {
             .collect()
     }
 
+    /// M30: Merkle root over the cumulative `bridge_locks` map, sorted by
+    /// `lock_id` (BTreeMap order is already `lock_id`-ascending). Cert-signed
+    /// via `header.bridge_root`. The leaf preimage is exactly
+    /// `lock.merkle_leaf(lock_id)`. Mirrors `graph_merkle_root`'s shape
+    /// (cumulative state, separate from `accounts_root`), but ordered by
+    /// `lock_id` instead of cosine — locks have no embeddings.
+    pub fn bridge_merkle_root(&self) -> Hash {
+        let leaves: Vec<Hash> = self.bridge_locks.iter()
+            .map(|(id, lock)| merkle::leaf_hash(&lock.merkle_leaf(*id)))
+            .collect();
+        merkle::MerkleTree::from_leaf_hashes(leaves).root()
+    }
+
+    /// M30: inclusion proof for the lock with the given `lock_id` against
+    /// [`Self::bridge_merkle_root`]. Returns `None` if the id is unknown.
+    /// Mirrors `account_proof` / `graph_node_proof`.
+    pub fn bridge_lock_proof(&self, lock_id: u64) -> Option<merkle::Proof> {
+        let ids: Vec<u64> = self.bridge_locks.keys().copied().collect();
+        let index = ids.iter().position(|&k| k == lock_id)?;
+        let leaves: Vec<Hash> = self.bridge_locks.iter()
+            .map(|(id, lock)| merkle::leaf_hash(&lock.merkle_leaf(*id)))
+            .collect();
+        merkle::MerkleTree::from_leaf_hashes(leaves).proof(index)
+    }
+
+    /// M30: same pattern as the M27 `*_for_genesis` helpers, but for the
+    /// cert-signed `bridge_root` that ships in `header.bridge_root`. A light
+    /// client anchored on the genesis hash computes this without
+    /// materialising a full `ChainState`, matching what
+    /// `ChainState::genesis` stamps onto the genesis block.
+    pub fn bridge_merkle_root_for_genesis(g: &Genesis) -> Hash {
+        Self::genesis_split(g.clone()).0.bridge_merkle_root()
+    }
+
     /// M28: produce the producer-side graph diff between this state (the
     /// "h₂" side) and `prev_state` (the "h₁" side). Caller must guarantee
     /// `prev_state.height < self.height` and both states share the same
@@ -1373,9 +1588,12 @@ impl ChainState {
     /// of blocks.
     pub fn supply_conserved(&self) -> bool {
         let unbonding: u128 = self.unbonding.iter().map(|u| u.amount as u128).sum();
+        // M30: locked-in-bridge pool is part of `supply` (a redistribution
+        // within supply — the source balance dropped by the same amount).
         let held: u128 = self.accounts.values().map(|a| a.balance as u128).sum::<u128>()
             + self.treasury as u128
             + self.bonded as u128
+            + self.bridge_locked as u128
             + unbonding;
         held == self.supply as u128
     }
@@ -1437,6 +1655,10 @@ impl Chain {
         // M27: stamp the cert-signed sorted-by-cosine graph root alongside
         // `accounts_root`. Same trial, same idempotence contract.
         block.graph_root = trial.graph_merkle_root();
+        // M30: stamp the cert-signed cumulative bridge-locks root alongside
+        // `graph_root` / `accounts_root`. Same trial, same idempotence
+        // contract.
+        block.bridge_root = trial.bridge_merkle_root();
         Ok(())
     }
 
@@ -1479,6 +1701,11 @@ impl Chain {
         // commitment.
         if block.graph_root == [0u8; 32] {
             block.graph_root = trial.graph_merkle_root();
+        }
+        // M30: same auto-stamp fallback for the cert-signed bridge-locks
+        // commitment.
+        if block.bridge_root == [0u8; 32] {
+            block.bridge_root = trial.bridge_merkle_root();
         }
         self.state = trial;
         self.head = receipt.hash;
@@ -1617,10 +1844,12 @@ mod tests {
             state_root: [0u8; 32],
             accounts_root: [0u8; 32],
             graph_root: [0u8; 32],
+            bridge_root: [0u8; 32],
             txs,
             validator_updates: Vec::new(),
             stake_ops: Vec::new(),
             slashing_evidence: Vec::new(),
+            bridge_locks: Vec::new(),
         };
         // best-effort seal: valid blocks get the correct commitments; blocks the
         // negative tests build to fail earlier keep [0;32] and still fail at
@@ -2152,10 +2381,12 @@ mod tests {
             state_root: [0u8; 32],
             accounts_root: [0u8; 32],
             graph_root: [0u8; 32],
+            bridge_root: [0u8; 32],
             txs: vec![novel_tx(2, 2, 2, 2.0)],
             validator_updates: Vec::new(),
             stake_ops: Vec::new(),
             slashing_evidence: Vec::new(),
+            bridge_locks: Vec::new(),
         };
         live.seal(&mut b2).unwrap();
         live.commit(&mut b2).unwrap();
@@ -2502,5 +2733,164 @@ mod tests {
         // And the producer's proof is a Merkle verify against the same root.
         let proof = chain.state.graph_node_proof(0).expect("graph_node_proof(0)");
         assert!(merkle::verify(&chain.state.merkle_root(), &g_leaf, &proof));
+    }
+
+    // ---- M30: cross-chain bridge lock (consensus side) ----
+
+    /// Lock drains the source's balance into `bridge_locked` and appends to the
+    /// cumulative `bridge_locks` map; supply stays conserved (a redistribution
+    /// within supply), and the next block's `bridge_root` commits to the new
+    /// leaf.
+    #[test]
+    fn bridge_lock_drains_balance_into_bridge_locked_and_conserves_supply() {
+        let mut chain = Chain::new(base_genesis());
+        let start_supply = chain.state.supply;
+        let start_balance = chain.state.accounts.get(&1).unwrap().balance;
+        let lock = BridgeLock {
+            account: 1,
+            amount: 5 * MICRO,
+            dest_chain: [0xAA; 32],
+            dest_account: 42,
+            nonce: 0,
+            signature: [0u8; 64],
+        }
+        .signed(&kp(1));
+        let mut b = block(&chain, 1, Vec::new());
+        b.bridge_locks.push(lock);
+        chain.seal(&mut b).unwrap();
+        let _ = chain.commit(&mut b).unwrap();
+
+        assert_eq!(
+            chain.state.accounts.get(&1).unwrap().balance,
+            start_balance - 5 * MICRO,
+            "source balance should drop by lock amount"
+        );
+        assert_eq!(
+            chain.state.bridge_locked, 5 * MICRO,
+            "bridge_locked pool should hold the locked amount"
+        );
+        assert_eq!(
+            chain.state.bridge_locks.len(), 1,
+            "exactly one lock in the cumulative map"
+        );
+        assert_eq!(
+            chain.state.next_lock_id, 1,
+            "lock_id counter should have advanced"
+        );
+        assert_eq!(
+            chain.state.supply, start_supply,
+            "supply must be conserved (lock is a redistribution within supply)"
+        );
+        assert!(
+            chain.state.supply_conserved(),
+            "supply_conserved() must hold after a lock"
+        );
+    }
+
+    /// Two locks (same block) accumulate; cumulative root matches.
+    #[test]
+    fn bridge_merkle_root_changes_when_lock_added_and_stable_across_no_lock_block() {
+        let mut chain = Chain::new(base_genesis());
+        // Empty bridge_root at genesis (no locks).
+        let root_empty = chain.state.bridge_merkle_root();
+        assert_eq!(chain.state.bridge_locks.len(), 0);
+
+        // Lock at height 1.
+        let lock1 = BridgeLock {
+            account: 1,
+            amount: 2 * MICRO,
+            dest_chain: [0xBB; 32],
+            dest_account: 7,
+            nonce: 0,
+            signature: [0u8; 64],
+        }
+        .signed(&kp(1));
+        let mut b = block(&chain, 1, Vec::new());
+        b.bridge_locks.push(lock1);
+        chain.seal(&mut b).unwrap();
+        let _ = chain.commit(&mut b).unwrap();
+        let root_one_lock = chain.state.bridge_merkle_root();
+        assert_ne!(root_one_lock, root_empty, "lock must change the root");
+
+        // No-lock block: root must stay stable (locks are cumulative).
+        let mut b2 = block(&chain, 2, Vec::new());
+        chain.seal(&mut b2).unwrap();
+        let _ = chain.commit(&mut b2).unwrap();
+        assert_eq!(
+            chain.state.bridge_merkle_root(),
+            root_one_lock,
+            "no-lock block must not change bridge_root (cumulative)"
+        );
+
+        // Second lock.
+        let lock2 = BridgeLock {
+            account: 2,
+            amount: 3 * MICRO,
+            dest_chain: [0xCC; 32],
+            dest_account: 8,
+            nonce: 0,
+            signature: [0u8; 64],
+        }
+        .signed(&kp(2));
+        let mut b3 = block(&chain, 3, Vec::new());
+        b3.bridge_locks.push(lock2);
+        chain.seal(&mut b3).unwrap();
+        let _ = chain.commit(&mut b3).unwrap();
+        assert_ne!(
+            chain.state.bridge_merkle_root(),
+            root_one_lock,
+            "second lock must change the root"
+        );
+    }
+
+    /// bridge_lock_proof produces a Merkle proof that verifies against
+    /// header.bridge_root — same shape as the M22/M25/M27 inclusion proofs,
+    /// just on a different cumulative commitment.
+    #[test]
+    fn bridge_lock_proof_verifies_against_header_bridge_root() {
+        let mut chain = Chain::new(base_genesis());
+        let lock = BridgeLock {
+            account: 1,
+            amount: 4 * MICRO,
+            dest_chain: [0xDD; 32],
+            dest_account: 99,
+            nonce: 0,
+            signature: [0u8; 64],
+        }
+        .signed(&kp(1));
+        let mut b = block(&chain, 1, Vec::new());
+        b.bridge_locks.push(lock.clone());
+        chain.seal(&mut b).unwrap();
+        let _ = chain.commit(&mut b).unwrap();
+
+        // Producer side: pull the inclusion proof and verify against the
+        // cert-signed `bridge_root`.
+        let proof = chain.state.bridge_lock_proof(0).expect("lock exists");
+        let leaf = merkle::leaf_hash(&lock.merkle_leaf(0));
+        assert!(merkle::verify(&b.bridge_root, &leaf, &proof));
+    }
+
+    /// Tampered bridge_root on apply → BridgeRootMismatch.
+    #[test]
+    fn bridge_root_mismatch_is_rejected_on_apply() {
+        let mut chain = Chain::new(base_genesis());
+        let lock = BridgeLock {
+            account: 1,
+            amount: MICRO,
+            dest_chain: [0xEE; 32],
+            dest_account: 1,
+            nonce: 0,
+            signature: [0u8; 64],
+        }
+        .signed(&kp(1));
+        let mut b = block(&chain, 1, Vec::new());
+        b.bridge_locks.push(lock);
+        // Re-seal so state_root / accounts_root / graph_root all reflect the
+        // post-apply shape; THEN tamper only bridge_root to exercise the
+        // BridgeRootMismatch path (and not some earlier root check).
+        chain.seal(&mut b).unwrap();
+        b.bridge_root = [0xFFu8; 32];
+        let err = chain.commit(&mut b).unwrap_err();
+        assert!(matches!(err, ChainError::BridgeRootMismatch { height: 1 }));
     }
 }

@@ -148,6 +148,23 @@ pub enum GossipMsg {
     Batch {
         envelope: Box<crate::light::BatchResponseEnvelope>,
     },
+    /// M30: a light/destination-side bridge endpoint asks a full peer of the
+    /// *source* chain for a cert-signed lock inclusion envelope. The full
+    /// peer answers with a single `Lock { envelope }` carrying the
+    /// (header, cert, active set, lock, proof) needed for the destination's
+    /// `BridgeEndpoint::verify_lock` to validate the lock against the
+    /// source chain's cert-signed `bridge_root`.
+    GetLock {
+        /// The lock id on the source chain.
+        lock_id: u64,
+    },
+    /// M30: the lock envelope. Same shape as the M28 `Diff` reply — a
+    /// single length-prefixed, self-contained envelope that opens a single
+    /// lock against the source chain's cert-signed `bridge_root`. Box-wrapped
+    /// to keep the enum size bounded.
+    Lock {
+        envelope: Box<crate::bridge::LockEnvelope>,
+    },
 }
 
 /// M24: maximum items in a single [`GossipMsg::GetProof`] / [`GossipMsg::Proof`]
@@ -176,6 +193,11 @@ pub const TAG_DIFF: u8 = 11;
 pub const TAG_GETBATCH: u8 = 12;
 /// M29: heterogeneous batched proof response envelope.
 pub const TAG_BATCH: u8 = 13;
+/// M30: bridge lock fetch — destination endpoint asks a full source-chain
+/// peer for a cert-signed lock inclusion envelope.
+pub const TAG_GETLOCK: u8 = 14;
+/// M30: bridge lock envelope — the full peer's response.
+pub const TAG_LOCK: u8 = 15;
 
 /// M29: maximum items in a single heterogeneous batched
 /// request/response. Mirrors `MAX_PROOF_BATCH = 32` so the bus caps
@@ -640,6 +662,46 @@ impl GossipNode {
         })
     }
 
+    /// M30: build a `LockEnvelope` for `lock_id` from this node's chain
+    /// state. Returns `None` when the lock does not exist on this chain
+    /// (the lock_id is monotonic, so any gap is a programming error).
+    ///
+    /// The envelope ships (cert-signed header, cert, active validator set,
+    /// lock, inclusion proof) — exactly what the destination-side
+    /// `BridgeEndpoint::verify_lock` needs to verify the lock against the
+    /// source chain's cert-signed `bridge_root`. The lock's height is the
+    /// block height that carried it; we use that height's header and cert.
+    pub fn serve_lock(&self, lock_id: u64) -> Option<crate::bridge::LockEnvelope> {
+        let lock = self.chain.state.bridge_locks.get(&lock_id)?.clone();
+        let proof = self.chain.state.bridge_lock_proof(lock_id)?;
+        let height = *self.chain.state.bridge_lock_heights.get(&lock_id)?;
+        // Heights are 1-indexed: `blocks[i]` corresponds to height `i+1`.
+        let idx = (height - 1) as usize;
+        let block = self.blocks.get(idx)?;
+        let cert = self.certs.get(idx)?;
+        let header = block.header();
+        // Active set that certifies this header (the set the endpoint's
+        // tracker must follow to know the cert). Replay from genesis so we
+        // get the post-apply state for this height, the same way
+        // `serve_diff` builds per-side tracked sets.
+        let tracked_set = crate::Chain::replay(
+            self.genesis.clone(),
+            &self.blocks[..height as usize],
+        )
+        .ok()?
+        .state
+        .validators
+        .clone();
+        Some(crate::bridge::LockEnvelope {
+            source_header: header,
+            source_cert: cert.clone(),
+            source_tracked_set: tracked_set,
+            lock_id,
+            lock,
+            proof,
+        })
+    }
+
     /// The certified blocks from `height` onward (inclusive), capped at
     /// [`MAX_BATCH`] — the payload for a peer's `GetBlocks`.
     fn batch_from(&self, height: u64) -> Vec<(Block, Commit)> {
@@ -838,6 +900,16 @@ impl GossipNode {
                 }
             }
             GossipMsg::Diff { .. } => Vec::new(), // full nodes don't consume diffs
+            // M30: bridge lock fetch. Full peer answers with a cert-signed
+            // lock envelope if the lock exists on its chain; the wallet's
+            // destination-side `BridgeEndpoint::verify_lock` rebinds the
+            // header against its own tracked set (same soundness pattern as
+            // M28).
+            GossipMsg::GetLock { lock_id } => match self.serve_lock(lock_id) {
+                Some(envelope) => vec![(from, GossipMsg::Lock { envelope: Box::new(envelope) })],
+                None => Vec::new(),
+            },
+            GossipMsg::Lock { .. } => Vec::new(), // full nodes don't consume locks
         }
     }
 
@@ -1052,6 +1124,11 @@ pub struct LightGossipNode {
     /// items so we don't need a per-item map. The wallet retrieves via
     /// [`Self::take_batch`].
     batches: Option<crate::light::BatchResponseEnvelope>,
+    /// M30: cached `Lock` envelopes from full peers. Same "most recent"
+    /// discipline as `diffs` / `batches` — one envelope at a time; the
+    /// wallet retrieves via [`Self::take_lock`] to feed its destination
+    /// `BridgeEndpoint::verify_lock`.
+    locks: Option<crate::bridge::LockEnvelope>,
 }
 
 impl LightGossipNode {
@@ -1068,6 +1145,7 @@ impl LightGossipNode {
             proofs: BTreeMap::new(),
             diffs: None,
             batches: None,
+            locks: None,
         }
     }
 
@@ -1097,6 +1175,13 @@ impl LightGossipNode {
     /// batch just pulls again.
     pub fn take_batch(&mut self) -> Option<crate::light::BatchResponseEnvelope> {
         self.batches.take()
+    }
+
+    /// M30: pop the cached lock envelope (consumes the entry — a
+    /// destination-side bridge endpoint pulls once, then verifies
+    /// locally via `BridgeEndpoint::verify_lock`).
+    pub fn take_lock(&mut self) -> Option<crate::bridge::LockEnvelope> {
+        self.locks.take()
     }
 
     pub fn tracker(&self) -> &ValidatorTracker {
@@ -1191,6 +1276,14 @@ impl LightGossipNode {
                 Vec::new()
             }
             GossipMsg::GetBatch { .. } => Vec::new(),
+            // M30: cache incoming lock envelopes for the destination-side
+            // bridge endpoint to verify locally. Light nodes don't serve
+            // lock requests — they have no source chain state to ship.
+            GossipMsg::Lock { envelope } => {
+                self.locks = Some(*envelope);
+                Vec::new()
+            }
+            GossipMsg::GetLock { .. } => Vec::new(),
             // everything else: light clients forward tx gossip but never store it
             // — for the M22 demo we just drop, mirroring the "I don't care about
             // bodies" SPV stance.
@@ -1482,6 +1575,17 @@ pub fn encode_gossip(m: &GossipMsg) -> Vec<u8> {
             out.push(TAG_BATCH);
             put_bytes(&mut out, &encode_batch_envelope(envelope));
         }
+        // M30: bridge lock fetch pair. `GetLock` is a single u64 (the
+        // lock id); `Lock` is a single length-prefixed envelope, mirroring
+        // the M28 `Diff` pair.
+        GossipMsg::GetLock { lock_id } => {
+            out.push(TAG_GETLOCK);
+            out.extend_from_slice(&lock_id.to_be_bytes());
+        }
+        GossipMsg::Lock { envelope } => {
+            out.push(TAG_LOCK);
+            put_bytes(&mut out, &encode_lock_envelope(envelope));
+        }
     }
     out
 }
@@ -1615,6 +1719,13 @@ pub fn decode_gossip(buf: &[u8]) -> Result<GossipMsg, CodecError> {
         TAG_BATCH => GossipMsg::Batch {
             envelope: Box::new(decode_batch_envelope(take_bytes(&mut rest)?)?),
         },
+        // M30: bridge lock fetch pair.
+        TAG_GETLOCK => GossipMsg::GetLock {
+            lock_id: take_u64(&mut rest)?,
+        },
+        TAG_LOCK => GossipMsg::Lock {
+            envelope: Box::new(decode_lock_envelope(take_bytes(&mut rest)?)?),
+        },
         other => return Err(CodecError::BadEnum(other as u32)),
     };
     if !rest.is_empty() {
@@ -1691,6 +1802,48 @@ pub fn decode_diff_envelope(buf: &[u8]) -> Result<crate::light::DiffEnvelope, Co
         diff: crate::DiffClaim { added, dropped },
         tracked_set_h1,
         tracked_set_h2,
+    })
+}
+
+/// M30: encode a `LockEnvelope` as a single length-prefixed blob.
+///
+/// Layout (all multi-byte ints big-endian):
+///   header            (length-prefixed via `put_bytes`)
+///   cert              (length-prefixed)
+///   source_tracked_set (u32_be(|validators|) + for each: codec::encode_validator)
+///   lock_id           u64_be
+///   lock              (length-prefixed via codec::encode_bridge_lock)
+///   proof             (length-prefixed via codec::encode_proof)
+pub fn encode_lock_envelope(env: &crate::bridge::LockEnvelope) -> Vec<u8> {
+    let mut out = Vec::new();
+    put_bytes(&mut out, &crate::codec::encode_header(&env.source_header));
+    put_bytes(&mut out, &crate::codec::encode_commit(&env.source_cert));
+    encode_validator_set(&mut out, &env.source_tracked_set);
+    out.extend_from_slice(&env.lock_id.to_be_bytes());
+    put_bytes(&mut out, &crate::codec::encode_bridge_lock(&env.lock));
+    put_bytes(&mut out, &crate::codec::encode_proof(&env.proof));
+    out
+}
+
+/// M30: decode a `LockEnvelope` produced by [`encode_lock_envelope`].
+pub fn decode_lock_envelope(buf: &[u8]) -> Result<crate::bridge::LockEnvelope, CodecError> {
+    let mut p = buf;
+    let source_header = crate::codec::decode_header(take_bytes(&mut p)?)?;
+    let source_cert = crate::codec::decode_commit(take_bytes(&mut p)?)?;
+    let source_tracked_set = decode_validator_set(&mut p)?;
+    let lock_id = take_u64(&mut p)?;
+    let lock = crate::codec::decode_bridge_lock(take_bytes(&mut p)?)?;
+    let proof = crate::codec::decode_proof(take_bytes(&mut p)?)?;
+    if !p.is_empty() {
+        return Err(CodecError::TrailingBytes);
+    }
+    Ok(crate::bridge::LockEnvelope {
+        source_header,
+        source_cert,
+        source_tracked_set,
+        lock_id,
+        lock,
+        proof,
     })
 }
 
@@ -1816,7 +1969,13 @@ fn encode_validator_set(out: &mut Vec<u8>, vs: &crate::validator::ValidatorSet) 
     let v = vs.validators();
     out.extend_from_slice(&(v.len() as u32).to_be_bytes());
     for val in v {
-        out.extend_from_slice(&crate::codec::encode_validator(val));
+        // Length-prefixed to match `decode_validator_set`, which reads each
+        // validator through `take_bytes`. `encode_validator` returns raw
+        // merkle-leaf bytes; without the prefix, the next validator's first
+        // byte would silently glue onto this one and decoding would either
+        // mis-parse or hit UnexpectedEof. Pre-existing latent bug surfaced
+        // by the M30 lock envelope round-trip.
+        put_bytes(out, &crate::codec::encode_validator(val));
     }
 }
 
@@ -2064,6 +2223,10 @@ mod tests {
                 }),
             ],
         };
+        // M30: build a bridge lock envelope (real, from a chain carrying a
+        // lock) so the wire round-trip exercises the full lock envelope
+        // payload — header, cert, tracker set, lock id, lock, proof.
+        let lock_env = sample_lock_envelope();
         let msgs = vec![
             GossipMsg::Status { height: 7 },
             GossipMsg::GetBlocks { from: 3 },
@@ -2075,6 +2238,10 @@ mod tests {
             GossipMsg::Headers(headers),
             request,
             response,
+            GossipMsg::GetLock { lock_id: 0 },
+            GossipMsg::Lock {
+                envelope: Box::new(lock_env),
+            },
         ];
         for m in &msgs {
             let bytes = encode_gossip(m);
@@ -2083,6 +2250,129 @@ mod tests {
                 Err(e) => panic!("decode failed: {e:?} for {m:?}"),
             }
         }
+    }
+
+    /// Build a real cert-signed `LockEnvelope` for round-trip testing. We
+    /// spin up a single-validator chain, stage one lock, and serve it via
+    /// `GossipNode::serve_lock` — same shape as the production path, just
+    /// minimal.
+    fn sample_lock_envelope() -> crate::bridge::LockEnvelope {
+        use crate::driver::ChainDriver;
+        use crate::{DeltaKParams, Genesis, MICRO};
+        use std::collections::BTreeMap;
+        fn kp(id: u64) -> crate::Keypair {
+            let mut seed = [0u8; 32];
+            seed[..8].copy_from_slice(&id.to_le_bytes());
+            crate::Keypair::from_seed(seed)
+        }
+        let ga = Genesis {
+            accounts: vec![(1, 50 * MICRO, kp(1).public())],
+            reviewers: vec![],
+            seed_nodes: vec![],
+            params: DeltaKParams::default(),
+            base_emission_micro: 0,
+            slash_bps: 10_000,
+            timestamp_days: 0.0,
+            validators: vec![(21, kp(21).public(), 1)],
+        };
+        fn seed_for(id: u64) -> [u8; 32] {
+            let mut s = [0u8; 32];
+            s[..8].copy_from_slice(&id.to_le_bytes());
+            s
+        }
+        let seeds: BTreeMap<u64, [u8; 32]> = [(21u64, seed_for(21))].into_iter().collect();
+        let mut d = ChainDriver::new(ga.clone(), seeds, 16);
+        let lock = crate::BridgeLock {
+            account: 1,
+            amount: 3 * MICRO,
+            dest_chain: [0xAB; 32],
+            dest_account: 9,
+            nonce: 0,
+            signature: [0u8; 64],
+        }
+        .signed(&kp(1));
+        d.stage_bridge_lock(lock.clone());
+        d.produce_until_drained(1.0, 16).expect("produce");
+        let mut node = GossipNode::new(1, ga.clone(), 16, [2u64]);
+        node.load_certified(d.blocks(), d.certificates());
+        node.serve_lock(0).expect("serve_lock")
+    }
+
+    /// End-to-end: chain carries a lock; full peer serves a Lock envelope on
+    /// GetLock; the envelope round-trips through the wire codec and verifies
+    /// at a destination `BridgeEndpoint`.
+    #[test]
+    fn serve_lock_and_lock_envelope_round_trip() {
+        use crate::bridge::{BridgeEndpoint, LockEnvelope};
+        use crate::driver::ChainDriver;
+        use crate::{DeltaKParams, Genesis, MICRO};
+        use std::collections::BTreeMap;
+        fn kp(id: u64) -> crate::Keypair {
+            let mut seed = [0u8; 32];
+            seed[..8].copy_from_slice(&id.to_le_bytes());
+            crate::Keypair::from_seed(seed)
+        }
+        // Two distinct chains → distinct genesis hashes (different timestamp).
+        let ga = Genesis {
+            accounts: vec![(1, 50 * MICRO, kp(1).public())],
+            reviewers: vec![],
+            seed_nodes: vec![],
+            params: DeltaKParams::default(),
+            base_emission_micro: 0,
+            slash_bps: 10_000,
+            timestamp_days: 0.0,
+            validators: vec![(21, kp(21).public(), 1)],
+        };
+        let mut gb = ga.clone();
+        gb.timestamp_days = 1.0;
+        let b_genesis_hash = crate::ChainState::genesis(gb.clone()).1;
+
+        // Chain A: build a chain carrying one bridge lock via the driver
+        // (which sets prev_hash / certs / etc. correctly).
+        fn seed_for(id: u64) -> [u8; 32] {
+            let mut s = [0u8; 32];
+            s[..8].copy_from_slice(&id.to_le_bytes());
+            s
+        }
+        let seeds: BTreeMap<u64, [u8; 32]> = [(21u64, seed_for(21))].into_iter().collect();
+        let mut d = ChainDriver::new(ga.clone(), seeds, 16);
+        let lock = crate::BridgeLock {
+            account: 1,
+            amount: 5 * MICRO,
+            dest_chain: b_genesis_hash,
+            dest_account: 7,
+            nonce: 0,
+            signature: [0u8; 64],
+        }
+        .signed(&kp(1));
+        d.stage_bridge_lock(lock.clone());
+        d.produce_until_drained(1.0, 16).expect("produce");
+        let blocks = d.blocks().to_vec();
+        let certs = d.certificates().to_vec();
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(certs.len(), 1);
+
+        // Hand the certified chain to a full gossip node and serve the lock.
+        let mut node = GossipNode::new(1, ga.clone(), 16, [2u64]);
+        node.load_certified(&blocks, &certs);
+        let env = node.serve_lock(0).expect("serve_lock");
+
+        // Round-trip the envelope through the wire codec.
+        let bytes = encode_lock_envelope(&env);
+        let env2: LockEnvelope = decode_lock_envelope(&bytes).expect("decode");
+        assert_eq!(env.lock_id, env2.lock_id);
+
+        // Destination endpoint on B verifies + credits the envelope we just
+        // decoded.
+        let mut endpoint = BridgeEndpoint::new(&gb, &ga);
+        endpoint
+            .follow_source(&env2.source_header, &env2.source_cert, &env2.source_tracked_set)
+            .expect("follow");
+        let verified = endpoint.verify_lock(&env2).expect("verify");
+        assert_eq!(verified.dest_account, 7);
+        assert_eq!(verified.amount, 5 * MICRO);
+        endpoint.consume(&verified).expect("consume");
+        assert_eq!(endpoint.minted(7), 5 * MICRO);
     }
 
     #[test]

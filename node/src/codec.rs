@@ -56,6 +56,10 @@ pub fn encode_block(b: &Block) -> Vec<u8> {
     // other two M23 commitments so `encode_header` and `encode_block` agree
     // on prefix bytes for the same block.
     e.raw(&b.graph_root);
+    // M30: cumulative bridge-locks root, in the prefix region alongside the
+    // other cert-signed commitments so `encode_header` and `encode_block`
+    // agree on prefix bytes for the same block.
+    e.raw(&b.bridge_root);
     e.u64(b.validator_updates.len() as u64);
     for u in &b.validator_updates {
         e.u64(u.id);
@@ -73,6 +77,12 @@ pub fn encode_block(b: &Block) -> Vec<u8> {
     e.u64(b.slashing_evidence.len() as u64);
     for ev in &b.slashing_evidence {
         enc_evidence(&mut e, ev);
+    }
+    // M30: bridge-lock op list (usually empty), length-prefixed like the
+    // other body sections.
+    e.u64(b.bridge_locks.len() as u64);
+    for lock in &b.bridge_locks {
+        enc_bridge_lock(&mut e, lock, true);
     }
     e.0
 }
@@ -107,6 +117,10 @@ pub fn encode_header(h: &BlockHeader) -> Vec<u8> {
     // `cos_sim ≥ θ` range claims via `verify_range_against_header` without
     // downloading the graph.
     e.raw(&h.graph_root);
+    // M30: cumulative bridge-locks root, kept in the prefix alongside the
+    // other cert-signed state commitments so `encode_header` and
+    // `encode_block` agree on prefix bytes for the same block.
+    e.raw(&h.bridge_root);
     e.u64(h.validator_updates.len() as u64);
     for u in &h.validator_updates {
         e.u64(u.id);
@@ -120,6 +134,8 @@ pub fn encode_header(h: &BlockHeader) -> Vec<u8> {
     e.raw(&h.txs_commitment);
     e.raw(&h.stake_ops_commitment);
     e.raw(&h.evidence_commitment);
+    // M30: fourth body commitment, binding the bridge-lock op list.
+    e.raw(&h.bridge_locks_commitment);
     e.0
 }
 
@@ -144,6 +160,10 @@ pub fn decode_header(buf: &[u8]) -> Result<BlockHeader, CodecError> {
     // `BlockHeader::graph_root` for the cert-signed range-proof contract.
     let mut graph_root = [0u8; 32];
     graph_root.copy_from_slice(d.take(32)?);
+    // M30: cumulative bridge-locks root, placed right after `graph_root`
+    // so it shares the same prefix-stability contract.
+    let mut bridge_root = [0u8; 32];
+    bridge_root.copy_from_slice(d.take(32)?);
     let n_upd = d.count()?;
     let mut validator_updates = Vec::with_capacity(n_upd as usize);
     for _ in 0..n_upd {
@@ -159,6 +179,9 @@ pub fn decode_header(buf: &[u8]) -> Result<BlockHeader, CodecError> {
     stake_ops_commitment.copy_from_slice(d.take(32)?);
     let mut evidence_commitment = [0u8; 32];
     evidence_commitment.copy_from_slice(d.take(32)?);
+    // M30: fourth body commitment (bridge-lock op list).
+    let mut bridge_locks_commitment = [0u8; 32];
+    bridge_locks_commitment.copy_from_slice(d.take(32)?);
     if d.pos != d.buf.len() {
         return Err(CodecError::TrailingBytes);
     }
@@ -170,10 +193,12 @@ pub fn decode_header(buf: &[u8]) -> Result<BlockHeader, CodecError> {
         state_root,
         accounts_root,
         graph_root,
+        bridge_root,
         validator_updates,
         txs_commitment,
         stake_ops_commitment,
         evidence_commitment,
+        bridge_locks_commitment,
     })
 }
 
@@ -194,14 +219,15 @@ pub fn encode_certified_header(ch: &CertifiedHeader) -> Vec<u8> {
 /// trailing bytes, so any padding after the cert is an error).
 pub fn decode_certified_header(buf: &[u8]) -> Result<CertifiedHeader, CodecError> {
     // Header layout: 8 (height) + 32 (prev) + 4 (timestamp) + 32 (next_validators_root)
-    //   + 32 (state_root) + 32 (accounts_root) + 32 (graph_root, M27) + 8 (n_updates u64) = 180-byte fixed prefix ‖
+    //   + 32 (state_root) + 32 (accounts_root) + 32 (graph_root, M27)
+    //   + 32 (bridge_root, M30) + 8 (n_updates u64) = 212-byte fixed prefix ‖
     //   n_updates * 48 bytes (u64 id ‖ 32-byte pubkey ‖ u64 power) ‖
-    //   3 * 32-byte commitments = 96 bytes tail.
-    if buf.len() < 180 {
+    //   4 * 32-byte commitments = 128 bytes tail (M30 adds bridge_locks_commitment).
+    if buf.len() < 212 {
         return Err(CodecError::UnexpectedEof);
     }
-    let n_updates = u64::from_be_bytes(buf[172..180].try_into().unwrap());
-    let header_len = 180 + (n_updates as usize) * 48 + 96; // 276 base + 48 per update
+    let n_updates = u64::from_be_bytes(buf[204..212].try_into().unwrap());
+    let header_len = 212 + (n_updates as usize) * 48 + 128; // 340 base + 48 per update
     if buf.len() < header_len {
         return Err(CodecError::UnexpectedEof);
     }
@@ -246,6 +272,12 @@ pub struct BlockHeader {
     /// than the graph slice inside `accounts_root` (insertion order), so the
     /// two roots carry distinct commitments to the same underlying nodes.
     pub graph_root: crate::Hash,
+    /// M30: Merkle root over the cumulative `bridge_locks` map sorted by
+    /// `lock_id`. Cert-signed. A destination chain's `bridge::BridgeEndpoint`
+    /// opens a single lock-inclusion proof against this root to verify a
+    /// cross-chain lock without replaying the source chain — the same SPV
+    /// shape as `accounts_root` / `graph_root`, on a different commitment.
+    pub bridge_root: crate::Hash,
     pub validator_updates: Vec<ValidatorUpdate>,
     /// SHA-256 over the canonical encoding of the tx list (or zero for empty).
     pub txs_commitment: crate::Hash,
@@ -253,6 +285,8 @@ pub struct BlockHeader {
     pub stake_ops_commitment: crate::Hash,
     /// SHA-256 over the canonical encoding of the evidence list.
     pub evidence_commitment: crate::Hash,
+    /// M30: SHA-256 over the canonical encoding of the bridge-lock op list.
+    pub bridge_locks_commitment: crate::Hash,
 }
 
 impl BlockHeader {
@@ -268,10 +302,12 @@ impl BlockHeader {
             state_root: b.state_root,
             accounts_root: b.accounts_root,
             graph_root: b.graph_root,
+            bridge_root: b.bridge_root,
             validator_updates: b.validator_updates.clone(),
             txs_commitment: list_commitment(&b.txs.iter().map(encode_tx).collect::<Vec<_>>()),
             stake_ops_commitment: list_commitment(&b.stake_ops.iter().map(encode_stakeop).collect::<Vec<_>>()),
             evidence_commitment: list_commitment(&b.slashing_evidence.iter().map(encode_evidence).collect::<Vec<_>>()),
+            bridge_locks_commitment: list_commitment(&b.bridge_locks.iter().map(encode_bridge_lock).collect::<Vec<_>>()),
         }
     }
 
@@ -295,6 +331,7 @@ impl BlockHeader {
         txs: Vec<SubmissionTx>,
         stake_ops: Vec<StakeOp>,
         slashing_evidence: Vec<SlashEvidence>,
+        bridge_locks: Vec<crate::BridgeLock>,
     ) -> Block {
         Block {
             height: self.height,
@@ -304,10 +341,12 @@ impl BlockHeader {
             state_root: self.state_root,
             accounts_root: self.accounts_root,
             graph_root: self.graph_root,
+            bridge_root: self.bridge_root,
             txs,
             validator_updates: self.validator_updates.clone(),
             stake_ops,
             slashing_evidence,
+            bridge_locks,
         }
     }
 }
@@ -430,6 +469,66 @@ fn enc_stakeop(e: &mut Enc, op: &StakeOp, include_sig: bool) {
     if include_sig {
         e.raw(&op.signature);
     }
+}
+
+// --- bridge locks (M30, cross-chain) -----------------------------------------
+
+/// The exact bytes an account signs to authorize a bridge lock: all fields
+/// EXCEPT the signature. Verifying `signature` over these authenticates the op.
+/// Note this is the signing preimage, distinct from `BridgeLock::merkle_leaf`
+/// (which is keyed by the assigned `lock_id` and used for inclusion proofs).
+pub fn bridgelock_signing_bytes(lock: &crate::BridgeLock) -> Vec<u8> {
+    let mut e = Enc(Vec::new());
+    enc_bridge_lock(&mut e, lock, false);
+    e.0
+}
+
+/// Canonical bytes of a full (signed) bridge lock, used for its content-addressed hash.
+pub fn encode_bridge_lock(lock: &crate::BridgeLock) -> Vec<u8> {
+    let mut e = Enc(Vec::new());
+    enc_bridge_lock(&mut e, lock, true);
+    e.0
+}
+
+/// Decode exactly one signed bridge lock (the inverse of [`encode_bridge_lock`]);
+/// trailing bytes are an error.
+pub fn decode_bridge_lock(buf: &[u8]) -> Result<crate::BridgeLock, CodecError> {
+    let mut d = Dec { buf, pos: 0 };
+    let lock = dec_bridge_lock(&mut d)?;
+    if d.pos != d.buf.len() {
+        return Err(CodecError::TrailingBytes);
+    }
+    Ok(lock)
+}
+
+fn enc_bridge_lock(e: &mut Enc, lock: &crate::BridgeLock, include_sig: bool) {
+    e.u64(lock.account);
+    e.u64(lock.amount);
+    e.raw(&lock.dest_chain);
+    e.u64(lock.dest_account);
+    e.u64(lock.nonce);
+    if include_sig {
+        e.raw(&lock.signature);
+    }
+}
+
+fn dec_bridge_lock(d: &mut Dec) -> Result<crate::BridgeLock, CodecError> {
+    let account = d.u64()?;
+    let amount = d.u64()?;
+    let mut dest_chain = [0u8; 32];
+    dest_chain.copy_from_slice(d.take(32)?);
+    let dest_account = d.u64()?;
+    let nonce = d.u64()?;
+    let mut signature = [0u8; 64];
+    signature.copy_from_slice(d.take(64)?);
+    Ok(crate::BridgeLock {
+        account,
+        amount,
+        dest_chain,
+        dest_account,
+        nonce,
+        signature,
+    })
 }
 
 // --- votes & equivocation evidence -------------------------------------------
@@ -919,6 +1018,9 @@ pub fn decode_block(buf: &[u8]) -> Result<Block, CodecError> {
     // `BlockHeader::graph_root` for the cert-signed range-proof contract.
     let mut graph_root = [0u8; 32];
     graph_root.copy_from_slice(d.take(32)?);
+    // M30: cumulative bridge-locks root, right after `graph_root`.
+    let mut bridge_root = [0u8; 32];
+    bridge_root.copy_from_slice(d.take(32)?);
     let n_upd = d.count()?;
     let mut validator_updates = Vec::with_capacity(n_upd as usize);
     for _ in 0..n_upd {
@@ -943,6 +1045,12 @@ pub fn decode_block(buf: &[u8]) -> Result<Block, CodecError> {
     for _ in 0..n_ev {
         slashing_evidence.push(dec_evidence(&mut d)?);
     }
+    // M30: bridge-lock op list.
+    let n_locks = d.count()?;
+    let mut bridge_locks = Vec::with_capacity(n_locks as usize);
+    for _ in 0..n_locks {
+        bridge_locks.push(dec_bridge_lock(&mut d)?);
+    }
     if d.pos != d.buf.len() {
         return Err(CodecError::TrailingBytes);
     }
@@ -954,10 +1062,12 @@ pub fn decode_block(buf: &[u8]) -> Result<Block, CodecError> {
         state_root,
         accounts_root,
         graph_root,
+        bridge_root,
         txs,
         validator_updates,
         stake_ops,
         slashing_evidence,
+        bridge_locks,
     })
 }
 
@@ -1057,6 +1167,7 @@ impl<'a> Dec<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::BridgeLock;
     use crate::MICRO;
     use crate::net::{decode_gossip, encode_gossip, GossipMsg};
 
@@ -1097,6 +1208,7 @@ mod tests {
             state_root: [11u8; 32],
             accounts_root: [12u8; 32],
             graph_root: [13u8; 32],
+            bridge_root: [14u8; 32],
             txs: vec![SubmissionTx {
                 author: 1,
                 embedding: emb,
@@ -1120,6 +1232,16 @@ mod tests {
                 StakeOp { account: 2, kind: BondKind::Unbond, amount: 2 * MICRO, signature: [8u8; 64] },
             ],
             slashing_evidence: vec![sample_evidence(22)],
+            bridge_locks: vec![
+                BridgeLock {
+                    account: 1,
+                    amount: 3 * MICRO,
+                    dest_chain: [77u8; 32],
+                    dest_account: 9,
+                    nonce: 1,
+                    signature: [6u8; 64],
+                },
+            ],
         }
     }
 
@@ -1634,10 +1756,12 @@ mod tests {
                 state_root: [0u8; 32],
                 accounts_root: [0u8; 32],
                 graph_root: [0u8; 32],
+                bridge_root: [0u8; 32],
                 validator_updates: vec![],
                 txs_commitment: [0u8; 32],
                 stake_ops_commitment: [0u8; 32],
                 evidence_commitment: [0u8; 32],
+                bridge_locks_commitment: [0u8; 32],
             },
             cert_prev: crate::consensus::Commit {
                 height: 1,
@@ -1653,10 +1777,12 @@ mod tests {
                 state_root: [0u8; 32],
                 accounts_root: [0u8; 32],
                 graph_root: [0u8; 32],
+                bridge_root: [0u8; 32],
                 validator_updates: vec![],
                 txs_commitment: [0u8; 32],
                 stake_ops_commitment: [0u8; 32],
                 evidence_commitment: [0u8; 32],
+                bridge_locks_commitment: [0u8; 32],
             },
             cert_new: crate::consensus::Commit {
                 height: 2,
@@ -1771,10 +1897,12 @@ mod tests {
                         state_root: [0u8; 32],
                         accounts_root: [0u8; 32],
                         graph_root: [0u8; 32],
+                        bridge_root: [0u8; 32],
                         validator_updates: vec![],
                         txs_commitment: [0u8; 32],
                         stake_ops_commitment: [0u8; 32],
                         evidence_commitment: [0u8; 32],
+                        bridge_locks_commitment: [0u8; 32],
                     },
                     cert_prev: crate::consensus::Commit {
                         height: 1,
@@ -1790,10 +1918,12 @@ mod tests {
                         state_root: [0u8; 32],
                         accounts_root: [0u8; 32],
                         graph_root: [0u8; 32],
+                        bridge_root: [0u8; 32],
                         validator_updates: vec![],
                         txs_commitment: [0u8; 32],
                         stake_ops_commitment: [0u8; 32],
                         evidence_commitment: [0u8; 32],
+                        bridge_locks_commitment: [0u8; 32],
                     },
                     cert_new: crate::consensus::Commit {
                         height: 2,

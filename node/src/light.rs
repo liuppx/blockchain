@@ -489,10 +489,12 @@ impl ValidatorTracker {
             state_root: crate::ChainState::state_root_for_genesis(g),
             accounts_root: crate::ChainState::merkle_root_for_genesis(g),
             graph_root: crate::ChainState::graph_merkle_root_for_genesis(g),
+            bridge_root: crate::ChainState::bridge_merkle_root_for_genesis(g),
             txs: Vec::new(),
             validator_updates: Vec::new(),
             stake_ops: Vec::new(),
             slashing_evidence: Vec::new(),
+            bridge_locks: Vec::new(),
         }
         .hash();
         ValidatorTracker {
