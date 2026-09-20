@@ -9,7 +9,8 @@ use crate::light::{ProofEntry, ProofKind};
 use crate::merkle::{Proof, Step};
 use crate::validator::{Validator, ValidatorUpdate};
 use crate::{
-    Account, Block, BondKind, Embedding, Review, Reviewer, SlashEvidence, StakeOp, SubmissionTx,
+    Account, Block, BondKind, BridgeHeader, BridgeRedeem, Embedding, Review, Reviewer,
+    SlashEvidence, StakeOp, SubmissionTx,
 };
 use zhixing_engine::DIM;
 
@@ -84,6 +85,19 @@ pub fn encode_block(b: &Block) -> Vec<u8> {
     for lock in &b.bridge_locks {
         enc_bridge_lock(&mut e, lock, true);
     }
+    // M31: bridge-follow op list (usually empty). Each entry is the cert-signed
+    // source header + the cert + the next set — self-authenticating, so no
+    // per-op signature. Length-prefixed to match the other body sections.
+    e.u64(b.bridge_headers.len() as u64);
+    for op in &b.bridge_headers {
+        enc_bridge_header(&mut e, op);
+    }
+    // M31: bridge-redeem op list (usually empty). Each carries the source
+    // header + cert + the lock + the inclusion proof. Length-prefixed.
+    e.u64(b.bridge_redeems.len() as u64);
+    for op in &b.bridge_redeems {
+        enc_bridge_redeem(&mut e, op);
+    }
     e.0
 }
 
@@ -136,6 +150,12 @@ pub fn encode_header(h: &BlockHeader) -> Vec<u8> {
     e.raw(&h.evidence_commitment);
     // M30: fourth body commitment, binding the bridge-lock op list.
     e.raw(&h.bridge_locks_commitment);
+    // M31: fifth + sixth body commitments, binding the bridge-follow and
+    // bridge-redeem op lists (usually zero). Same per-body-commitment
+    // discipline: the bodies are NOT in the cert-signed hash directly,
+    // they are bound by SHA-256 commitments the cert signs.
+    e.raw(&h.bridge_headers_commitment);
+    e.raw(&h.bridge_redeems_commitment);
     e.0
 }
 
@@ -182,6 +202,11 @@ pub fn decode_header(buf: &[u8]) -> Result<BlockHeader, CodecError> {
     // M30: fourth body commitment (bridge-lock op list).
     let mut bridge_locks_commitment = [0u8; 32];
     bridge_locks_commitment.copy_from_slice(d.take(32)?);
+    // M31: fifth + sixth body commitments (bridge-follow / bridge-redeem op lists).
+    let mut bridge_headers_commitment = [0u8; 32];
+    bridge_headers_commitment.copy_from_slice(d.take(32)?);
+    let mut bridge_redeems_commitment = [0u8; 32];
+    bridge_redeems_commitment.copy_from_slice(d.take(32)?);
     if d.pos != d.buf.len() {
         return Err(CodecError::TrailingBytes);
     }
@@ -199,6 +224,8 @@ pub fn decode_header(buf: &[u8]) -> Result<BlockHeader, CodecError> {
         stake_ops_commitment,
         evidence_commitment,
         bridge_locks_commitment,
+        bridge_headers_commitment,
+        bridge_redeems_commitment,
     })
 }
 
@@ -222,12 +249,13 @@ pub fn decode_certified_header(buf: &[u8]) -> Result<CertifiedHeader, CodecError
     //   + 32 (state_root) + 32 (accounts_root) + 32 (graph_root, M27)
     //   + 32 (bridge_root, M30) + 8 (n_updates u64) = 212-byte fixed prefix ‖
     //   n_updates * 48 bytes (u64 id ‖ 32-byte pubkey ‖ u64 power) ‖
-    //   4 * 32-byte commitments = 128 bytes tail (M30 adds bridge_locks_commitment).
+    //   6 * 32-byte commitments = 192 bytes tail (M30 adds bridge_locks_commitment;
+    //   M31 adds bridge_headers_commitment + bridge_redeems_commitment).
     if buf.len() < 212 {
         return Err(CodecError::UnexpectedEof);
     }
     let n_updates = u64::from_be_bytes(buf[204..212].try_into().unwrap());
-    let header_len = 212 + (n_updates as usize) * 48 + 128; // 340 base + 48 per update
+    let header_len = 212 + (n_updates as usize) * 48 + 192; // 404 base + 48 per update
     if buf.len() < header_len {
         return Err(CodecError::UnexpectedEof);
     }
@@ -287,6 +315,10 @@ pub struct BlockHeader {
     pub evidence_commitment: crate::Hash,
     /// M30: SHA-256 over the canonical encoding of the bridge-lock op list.
     pub bridge_locks_commitment: crate::Hash,
+    /// M31: SHA-256 over the canonical encoding of the bridge-follow op list.
+    pub bridge_headers_commitment: crate::Hash,
+    /// M31: SHA-256 over the canonical encoding of the bridge-redeem op list.
+    pub bridge_redeems_commitment: crate::Hash,
 }
 
 impl BlockHeader {
@@ -308,6 +340,12 @@ impl BlockHeader {
             stake_ops_commitment: list_commitment(&b.stake_ops.iter().map(encode_stakeop).collect::<Vec<_>>()),
             evidence_commitment: list_commitment(&b.slashing_evidence.iter().map(encode_evidence).collect::<Vec<_>>()),
             bridge_locks_commitment: list_commitment(&b.bridge_locks.iter().map(encode_bridge_lock).collect::<Vec<_>>()),
+            // M31: bridge-follow + bridge-redeem body commitments. Each
+            // op is canonically encoded via the dedicated fn so the
+            // header hash is content-addressed in lockstep with the
+            // corresponding body list.
+            bridge_headers_commitment: list_commitment(&b.bridge_headers.iter().map(encode_bridge_header).collect::<Vec<_>>()),
+            bridge_redeems_commitment: list_commitment(&b.bridge_redeems.iter().map(encode_bridge_redeem).collect::<Vec<_>>()),
         }
     }
 
@@ -322,7 +360,7 @@ impl BlockHeader {
         crate::hash::sha256(&encode_header(self))
     }
 
-    /// Reassemble the full block from this header plus the three body vectors
+    /// Reassemble the full block from this header plus the body vectors
     /// (in canonical order). Used by full nodes; light clients never call it.
     /// Each body MUST match its committed root — otherwise the cert-signed
     /// commitment is broken.
@@ -332,6 +370,8 @@ impl BlockHeader {
         stake_ops: Vec<StakeOp>,
         slashing_evidence: Vec<SlashEvidence>,
         bridge_locks: Vec<crate::BridgeLock>,
+        bridge_headers: Vec<BridgeHeader>,
+        bridge_redeems: Vec<BridgeRedeem>,
     ) -> Block {
         Block {
             height: self.height,
@@ -347,6 +387,8 @@ impl BlockHeader {
             stake_ops,
             slashing_evidence,
             bridge_locks,
+            bridge_headers,
+            bridge_redeems,
         }
     }
 }
@@ -529,6 +571,160 @@ fn dec_bridge_lock(d: &mut Dec) -> Result<crate::BridgeLock, CodecError> {
         nonce,
         signature,
     })
+}
+
+// --- bridge follow / redeem ops (M31, consensus-level redeem mint) ------------
+
+/// M31: helper for length-prefixed `encode_validator_set` calls. Mirrors
+/// the private helper in `node/src/net.rs` — duplicated here so `codec.rs`
+/// can compose the M31 op encoders without a cross-module dependency.
+/// Layout: u32_be(count) ‖ length-prefixed per-validator bytes.
+fn enc_validator_set_inline(e: &mut Enc, vs: &crate::validator::ValidatorSet) {
+    let v = vs.validators();
+    e.u32(v.len() as u32);
+    for val in v {
+        let leaf = encode_validator(val);
+        e.raw(&(leaf.len() as u32).to_be_bytes());
+        e.raw(&leaf);
+    }
+}
+
+fn dec_validator_set_inline(d: &mut Dec) -> Result<crate::validator::ValidatorSet, CodecError> {
+    let n = d.u32()? as usize;
+    let mut vs = Vec::with_capacity(n);
+    for _ in 0..n {
+        let len = d.u32()? as usize;
+        let buf = d.take(len)?;
+        vs.push(decode_validator(buf)?);
+    }
+    Ok(crate::validator::ValidatorSet::new(vs))
+}
+
+/// M31: canonical bytes of one [`BridgeHeader`] op (self-authenticating; no
+/// per-op signature). Layout:
+///   raw(dest_chain, 32 bytes)               — source chain identity
+///   raw(encode_header(op.header))           — cert-signed source header
+///   raw(encode_commit(op.cert))             — > 2/3 finality certificate
+///   enc_validator_set_inline(op.next_set)   — next-height validator set
+///
+/// The header + cert are themselves cert-signed prefixes; the verifier
+/// `apply_bridge_header` re-checks the cert-binding, the next-set root
+/// match, and chains-to-head after parsing.
+pub fn encode_bridge_header(op: &BridgeHeader) -> Vec<u8> {
+    let hdr_bytes = encode_header(&op.header);
+    let cert_bytes = encode_commit(&op.cert);
+    let mut e = Enc(Vec::new());
+    e.raw(&op.source_chain);
+    e.u32(hdr_bytes.len() as u32);
+    e.raw(&hdr_bytes);
+    e.u32(cert_bytes.len() as u32);
+    e.raw(&cert_bytes);
+    enc_validator_set_inline(&mut e, &op.next_set);
+    e.0
+}
+
+/// M31: inverse of [`encode_bridge_header`]. Trailing bytes are an error.
+pub fn decode_bridge_header(buf: &[u8]) -> Result<BridgeHeader, CodecError> {
+    let mut d = Dec { buf, pos: 0 };
+    let mut source_chain = [0u8; 32];
+    source_chain.copy_from_slice(d.take(32)?);
+    let hdr_len = d.u32()? as usize;
+    let hdr_buf = d.take(hdr_len)?;
+    let cert_len = d.u32()? as usize;
+    let cert_buf = d.take(cert_len)?;
+    let header = decode_header(hdr_buf)?;
+    let cert = decode_commit(cert_buf)?;
+    let next_set = dec_validator_set_inline(&mut d)?;
+    if d.pos != d.buf.len() {
+        return Err(CodecError::TrailingBytes);
+    }
+    Ok(BridgeHeader {
+        source_chain,
+        header,
+        cert,
+        next_set,
+    })
+}
+
+fn enc_bridge_header(e: &mut Enc, op: &BridgeHeader) {
+    let bytes = encode_bridge_header(op);
+    e.u32(bytes.len() as u32);
+    e.raw(&bytes);
+}
+
+fn dec_bridge_header(d: &mut Dec) -> Result<BridgeHeader, CodecError> {
+    let n = d.u32()? as usize;
+    let buf = d.take(n)?;
+    decode_bridge_header(buf)
+}
+
+/// M31: canonical bytes of one [`BridgeRedeem`] op (self-authenticating;
+/// no per-op signature — cert + proof + dest match authenticate it).
+/// Layout:
+///   raw(dest_chain, 32 bytes)
+///   u32_be(|encode_header|) ‖ bytes
+///   u32_be(|encode_commit|) ‖ bytes
+///   u64(lock_id)
+///   u32_be(|encode_bridge_lock|) ‖ bytes
+///   u32_be(|encode_proof|)        ‖ bytes
+pub fn encode_bridge_redeem(op: &BridgeRedeem) -> Vec<u8> {
+    let hdr_bytes = encode_header(&op.source_header);
+    let cert_bytes = encode_commit(&op.source_cert);
+    let lock_bytes = encode_bridge_lock(&op.lock);
+    let proof_bytes = encode_proof(&op.proof);
+    let mut e = Enc(Vec::new());
+    e.raw(&op.source_chain);
+    e.u32(hdr_bytes.len() as u32);
+    e.raw(&hdr_bytes);
+    e.u32(cert_bytes.len() as u32);
+    e.raw(&cert_bytes);
+    e.u64(op.lock_id);
+    e.u32(lock_bytes.len() as u32);
+    e.raw(&lock_bytes);
+    e.u32(proof_bytes.len() as u32);
+    e.raw(&proof_bytes);
+    e.0
+}
+
+/// M31: inverse of [`encode_bridge_redeem`]. Trailing bytes are an error.
+pub fn decode_bridge_redeem(buf: &[u8]) -> Result<BridgeRedeem, CodecError> {
+    let mut d = Dec { buf, pos: 0 };
+    let mut source_chain = [0u8; 32];
+    source_chain.copy_from_slice(d.take(32)?);
+    let hdr_len = d.u32()? as usize;
+    let hdr_buf = d.take(hdr_len)?;
+    let cert_len = d.u32()? as usize;
+    let cert_buf = d.take(cert_len)?;
+    let source_header = decode_header(hdr_buf)?;
+    let source_cert = decode_commit(cert_buf)?;
+    let lock_id = d.u64()?;
+    let lock_len = d.u32()? as usize;
+    let lock = decode_bridge_lock(d.take(lock_len)?)?;
+    let proof_len = d.u32()? as usize;
+    let proof = decode_proof(d.take(proof_len)?)?;
+    if d.pos != d.buf.len() {
+        return Err(CodecError::TrailingBytes);
+    }
+    Ok(BridgeRedeem {
+        source_chain,
+        source_header,
+        source_cert,
+        lock_id,
+        lock,
+        proof,
+    })
+}
+
+fn enc_bridge_redeem(e: &mut Enc, op: &BridgeRedeem) {
+    let bytes = encode_bridge_redeem(op);
+    e.u32(bytes.len() as u32);
+    e.raw(&bytes);
+}
+
+fn dec_bridge_redeem(d: &mut Dec) -> Result<BridgeRedeem, CodecError> {
+    let n = d.u32()? as usize;
+    let buf = d.take(n)?;
+    decode_bridge_redeem(buf)
 }
 
 // --- votes & equivocation evidence -------------------------------------------
@@ -1051,6 +1247,18 @@ pub fn decode_block(buf: &[u8]) -> Result<Block, CodecError> {
     for _ in 0..n_locks {
         bridge_locks.push(dec_bridge_lock(&mut d)?);
     }
+    // M31: bridge-follow op list.
+    let n_headers = d.count()?;
+    let mut bridge_headers = Vec::with_capacity(n_headers as usize);
+    for _ in 0..n_headers {
+        bridge_headers.push(dec_bridge_header(&mut d)?);
+    }
+    // M31: bridge-redeem op list.
+    let n_redeems = d.count()?;
+    let mut bridge_redeems = Vec::with_capacity(n_redeems as usize);
+    for _ in 0..n_redeems {
+        bridge_redeems.push(dec_bridge_redeem(&mut d)?);
+    }
     if d.pos != d.buf.len() {
         return Err(CodecError::TrailingBytes);
     }
@@ -1068,6 +1276,8 @@ pub fn decode_block(buf: &[u8]) -> Result<Block, CodecError> {
         stake_ops,
         slashing_evidence,
         bridge_locks,
+        bridge_headers,
+        bridge_redeems,
     })
 }
 
@@ -1242,6 +1452,10 @@ mod tests {
                     signature: [6u8; 64],
                 },
             ],
+            // M31: leave empty in the round-trip fixture; the per-op
+            // encode/decode fns have their own dedicated round-trip tests.
+            bridge_headers: Vec::new(),
+            bridge_redeems: Vec::new(),
         }
     }
 
@@ -1762,6 +1976,8 @@ mod tests {
                 stake_ops_commitment: [0u8; 32],
                 evidence_commitment: [0u8; 32],
                 bridge_locks_commitment: [0u8; 32],
+                bridge_headers_commitment: [0u8; 32],
+                bridge_redeems_commitment: [0u8; 32],
             },
             cert_prev: crate::consensus::Commit {
                 height: 1,
@@ -1783,6 +1999,8 @@ mod tests {
                 stake_ops_commitment: [0u8; 32],
                 evidence_commitment: [0u8; 32],
                 bridge_locks_commitment: [0u8; 32],
+                bridge_headers_commitment: [0u8; 32],
+                bridge_redeems_commitment: [0u8; 32],
             },
             cert_new: crate::consensus::Commit {
                 height: 2,
@@ -1903,6 +2121,8 @@ mod tests {
                         stake_ops_commitment: [0u8; 32],
                         evidence_commitment: [0u8; 32],
                         bridge_locks_commitment: [0u8; 32],
+                        bridge_headers_commitment: [0u8; 32],
+                        bridge_redeems_commitment: [0u8; 32],
                     },
                     cert_prev: crate::consensus::Commit {
                         height: 1,
@@ -1924,6 +2144,8 @@ mod tests {
                         stake_ops_commitment: [0u8; 32],
                         evidence_commitment: [0u8; 32],
                         bridge_locks_commitment: [0u8; 32],
+                        bridge_headers_commitment: [0u8; 32],
+                        bridge_redeems_commitment: [0u8; 32],
                     },
                     cert_new: crate::consensus::Commit {
                         height: 2,
@@ -1995,5 +2217,131 @@ mod tests {
             }
             other => panic!("expected Batch, got {other:?}"),
         }
+    }
+
+    // --- M31: bridge redeem/header op codecs --------------------------------
+
+    fn sample_validator_set() -> crate::validator::ValidatorSet {
+        crate::validator::ValidatorSet::new(vec![
+            Validator { id: 21, pubkey: [1u8; 32], power: 2 },
+            Validator { id: 22, pubkey: [2u8; 32], power: 3 },
+        ])
+    }
+
+    fn sample_cert(header_hash: crate::Hash, height: u64) -> Commit {
+        Commit {
+            height,
+            round: 0,
+            block_hash: header_hash,
+            precommits: vec![Vote {
+                validator: 21,
+                height,
+                round: 0,
+                block_hash: header_hash,
+                vote_type: VoteType::Precommit,
+                signature: [7u8; 64],
+            }],
+        }
+    }
+
+    #[test]
+    fn bridge_header_round_trip() {
+        let b = sample_block();
+        let header = BlockHeader::from_block(&b);
+        let cert = sample_cert(header.hash(), header.height);
+        let op = BridgeHeader {
+            source_chain: [55u8; 32],
+            header,
+            cert,
+            next_set: sample_validator_set(),
+        };
+        let bytes = encode_bridge_header(&op);
+        let back = decode_bridge_header(&bytes).unwrap();
+        assert_eq!(encode_bridge_header(&back), bytes);
+        assert_eq!(back.source_chain, op.source_chain);
+        assert_eq!(back.header.height, op.header.height);
+        assert_eq!(back.header.hash(), op.header.hash());
+        assert_eq!(back.cert.block_hash, op.cert.block_hash);
+        assert_eq!(back.next_set.merkle_root(), op.next_set.merkle_root());
+        // trailing bytes are rejected
+        let mut extra = bytes.clone();
+        extra.push(0);
+        assert!(matches!(decode_bridge_header(&extra), Err(CodecError::TrailingBytes)));
+    }
+
+    #[test]
+    fn bridge_redeem_round_trip() {
+        let b = sample_block();
+        let source_header = BlockHeader::from_block(&b);
+        let source_cert = sample_cert(source_header.hash(), source_header.height);
+        let op = BridgeRedeem {
+            source_chain: [55u8; 32],
+            source_header,
+            source_cert,
+            lock_id: 3,
+            lock: BridgeLock {
+                account: 1,
+                amount: 10 * MICRO,
+                dest_chain: [88u8; 32],
+                dest_account: 5,
+                nonce: 0,
+                signature: [6u8; 64],
+            },
+            proof: Proof {
+                steps: vec![Step::Left([1u8; 32]), Step::Right([2u8; 32])],
+            },
+        };
+        let bytes = encode_bridge_redeem(&op);
+        let back = decode_bridge_redeem(&bytes).unwrap();
+        assert_eq!(encode_bridge_redeem(&back), bytes);
+        assert_eq!(back.source_chain, op.source_chain);
+        assert_eq!(back.lock_id, 3);
+        assert_eq!(back.lock.amount, 10 * MICRO);
+        assert_eq!(back.lock.dest_account, 5);
+        assert_eq!(back.proof.steps, op.proof.steps);
+        // trailing bytes are rejected
+        let mut extra = bytes.clone();
+        extra.push(0);
+        assert!(matches!(decode_bridge_redeem(&extra), Err(CodecError::TrailingBytes)));
+    }
+
+    #[test]
+    fn block_round_trip_with_bridge_headers_and_redeems() {
+        let mut b = sample_block();
+        let header = BlockHeader::from_block(&b);
+        let cert = sample_cert(header.hash(), header.height);
+        b.bridge_headers = vec![BridgeHeader {
+            source_chain: [55u8; 32],
+            header: header.clone(),
+            cert: cert.clone(),
+            next_set: sample_validator_set(),
+        }];
+        b.bridge_redeems = vec![BridgeRedeem {
+            source_chain: [55u8; 32],
+            source_header: header,
+            source_cert: cert,
+            lock_id: 3,
+            lock: BridgeLock {
+                account: 1,
+                amount: 10 * MICRO,
+                dest_chain: [88u8; 32],
+                dest_account: 5,
+                nonce: 0,
+                signature: [6u8; 64],
+            },
+            proof: Proof { steps: vec![Step::Right([9u8; 32])] },
+        }];
+        let bytes = encode_block(&b);
+        let back = decode_block(&bytes).unwrap();
+        assert_eq!(encode_block(&back), bytes);
+        assert_eq!(back.bridge_headers.len(), 1);
+        assert_eq!(back.bridge_redeems.len(), 1);
+        assert_eq!(back.bridge_redeems[0].lock_id, 3);
+        // the two new op vectors are covered by the block hash
+        assert_eq!(back.hash(), b.hash());
+        let mut plain = b.clone();
+        plain.bridge_headers.clear();
+        plain.bridge_redeems.clear();
+        assert_ne!(decode_block(&encode_block(&plain)).unwrap().hash(), b.hash());
     }
 }

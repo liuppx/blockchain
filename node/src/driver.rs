@@ -23,7 +23,7 @@ use crate::consensus::Commit;
 use crate::mempool::Mempool;
 use crate::round::Sim;
 use crate::validator::ValidatorUpdate;
-use crate::{Block, BridgeLock, Chain, ChainError, Genesis, Hash, Keypair, SlashEvidence, StakeOp, SubmissionTx};
+use crate::{Block, BridgeHeader, BridgeLock, BridgeRedeem, Chain, ChainError, Genesis, Hash, Keypair, SlashEvidence, StakeOp, SubmissionTx};
 
 #[derive(Debug)]
 pub enum DriverError {
@@ -73,6 +73,12 @@ pub struct ChainDriver {
     /// M30: cross-chain bridge locks staged to ride along in the next produced
     /// block.
     pending_bridge_locks: Vec<BridgeLock>,
+    /// M31: source-chain follower advances staged to ride along in the next
+    /// produced block.
+    pending_bridge_headers: Vec<BridgeHeader>,
+    /// M31: bridge redeems (verify + mint) staged to ride along in the next
+    /// produced block.
+    pending_bridge_redeems: Vec<BridgeRedeem>,
     /// Each committed block, in height order — retained so the chain can be
     /// persisted (block log) alongside its certificates.
     blocks: Vec<Block>,
@@ -90,6 +96,8 @@ impl ChainDriver {
             pending_stake_ops: Vec::new(),
             pending_slashing_evidence: Vec::new(),
             pending_bridge_locks: Vec::new(),
+            pending_bridge_headers: Vec::new(),
+            pending_bridge_redeems: Vec::new(),
             blocks: Vec::new(),
             certs: Vec::new(),
         }
@@ -126,6 +134,24 @@ impl ChainDriver {
     /// balance into `bridge_locked` on apply (same discipline as a stake op).
     pub fn stage_bridge_lock(&mut self, lock: BridgeLock) {
         self.pending_bridge_locks.push(lock);
+    }
+
+    /// M31: stage a source-chain follower advance to be carried by the next
+    /// block [`Self::produce`] finalizes. Advances
+    /// `chain.state.bridge_sources[source_chain]` by one certified source
+    /// height on apply; required before any redeem against that source
+    /// succeeds (frontier guard).
+    pub fn stage_bridge_header(&mut self, op: BridgeHeader) {
+        self.pending_bridge_headers.push(op);
+    }
+
+    /// M31: stage a bridge redeem (source lock + proof) to be carried by the
+    /// next block [`Self::produce`] finalizes. On apply, verifies the lock
+    /// against the source's cert-signed `bridge_root` (already followed on or
+    /// before this block), mints to `dest_account`, and records the consumed
+    /// `lock_id` to block replay.
+    pub fn stage_bridge_redeem(&mut self, op: BridgeRedeem) {
+        self.pending_bridge_redeems.push(op);
     }
 
     pub fn height(&self) -> u64 {
@@ -175,7 +201,9 @@ impl ChainDriver {
             None if !self.pending_updates.is_empty()
                 || !self.pending_stake_ops.is_empty()
                 || !self.pending_slashing_evidence.is_empty()
-                || !self.pending_bridge_locks.is_empty() =>
+                || !self.pending_bridge_locks.is_empty()
+                || !self.pending_bridge_headers.is_empty()
+                || !self.pending_bridge_redeems.is_empty() =>
             {
                 Block {
                     height: self.chain.state.height + 1,
@@ -193,6 +221,8 @@ impl ChainDriver {
                     stake_ops: Vec::new(),
                     slashing_evidence: Vec::new(),
                     bridge_locks: Vec::new(),
+                    bridge_headers: Vec::new(),
+                    bridge_redeems: Vec::new(),
                 }
             }
             None => return Ok(None),
@@ -201,6 +231,8 @@ impl ChainDriver {
         candidate.stake_ops = self.pending_stake_ops.clone();
         candidate.slashing_evidence = self.pending_slashing_evidence.clone();
         candidate.bridge_locks = self.pending_bridge_locks.clone();
+        candidate.bridge_headers = self.pending_bridge_headers.clone();
+        candidate.bridge_redeems = self.pending_bridge_redeems.clone();
         // seal the validator-set commitment now that the block's contents are
         // final, so consensus votes on (and the post-consensus commit checks)
         // the header a light client will follow.
@@ -233,6 +265,8 @@ impl ChainDriver {
         self.pending_stake_ops.clear();
         self.pending_slashing_evidence.clear();
         self.pending_bridge_locks.clear();
+        self.pending_bridge_headers.clear();
+        self.pending_bridge_redeems.clear();
         self.blocks.push(candidate);
         self.certs.push(commit.clone());
         Ok(Some(commit))
@@ -307,6 +341,7 @@ mod tests {
                 .iter()
                 .map(|&id| (id, kp(id).public(), 1))
                 .collect(),
+            bridge_sources: vec![],
         }
     }
 
@@ -598,5 +633,104 @@ mod tests {
         ];
         let r = Chain::replay_verified(g, d.blocks(), d.certificates());
         assert!(matches!(r, Err(crate::ReplayError::Consensus(_))));
+    }
+
+    /// M31 end-to-end through the driver: chain A locks toward chain B, a
+    /// relayer moves A's certified header + cert + inclusion proof, and B's
+    /// producer follows A then redeems the lock — minting to the destination
+    /// account on-chain, conserving supply, and recording the consumed lock_id.
+    #[test]
+    fn bridge_lock_follow_redeem_end_to_end_across_drivers() {
+        // Source chain A (uses the shared test genesis).
+        let (_vset_a, seeds_a) = validators();
+        let mut a = ChainDriver::new(genesis(), seeds_a, 1);
+
+        // A's identity that B must anchor its follower on.
+        let a_genesis_hash = crate::ChainState::genesis(genesis()).1;
+        let a_genesis_set = crate::ChainState::genesis(genesis()).0.validators.clone();
+
+        // Chain B's genesis: register A as an allowed source, and add the
+        // (zero-balance) destination account 5 the lock mints to.
+        let mut gb = genesis();
+        gb.bridge_sources = vec![(
+            a_genesis_hash,
+            a_genesis_set
+                .validators()
+                .iter()
+                .map(|v| (v.id, v.pubkey, v.power))
+                .collect(),
+        )];
+        gb.accounts.push((5, 0, kp(5).public()));
+        let b_genesis_hash = crate::ChainState::genesis(gb.clone()).1;
+
+        // A locks 10 micro-$COG destined for B, account 5.
+        let lock = BridgeLock {
+            account: 1,
+            amount: 10 * MICRO,
+            dest_chain: b_genesis_hash,
+            dest_account: 5,
+            nonce: 0,
+            signature: [0u8; 64],
+        }
+        .signed(&kp(1));
+        a.stage_bridge_lock(lock.clone());
+        a.produce(1.0, &BTreeSet::new()).unwrap().expect("A lock block commits");
+
+        // Relayer reads A's certified header, its finality cert, and the
+        // inclusion proof of lock 0 against A's bridge_root.
+        let a_header = a.blocks()[0].header();
+        let a_cert = a.certificates()[0].clone();
+        let proof = a.chain.state.bridge_lock_proof(0).expect("inclusion proof");
+
+        // Chain B: follow A's height 1, then redeem lock 0.
+        let (_vset_b, seeds_b) = validators();
+        let mut b = ChainDriver::new(gb, seeds_b, 1);
+
+        b.stage_bridge_header(BridgeHeader {
+            source_chain: a_genesis_hash,
+            header: a_header.clone(),
+            cert: a_cert.clone(),
+            next_set: a_genesis_set.clone(),
+        });
+        b.produce(1.0, &BTreeSet::new()).unwrap().expect("B follow block commits");
+
+        b.stage_bridge_redeem(BridgeRedeem {
+            source_chain: a_genesis_hash,
+            source_header: a_header,
+            source_cert: a_cert,
+            lock_id: 0,
+            lock: lock.clone(),
+            proof,
+        });
+        b.produce(2.0, &BTreeSet::new()).unwrap().expect("B redeem block commits");
+
+        // Destination credited on-chain, supply grew 1:1 with A's locked pool,
+        // and the audit counter + dedup set both record the redemption.
+        assert_eq!(b.chain.state.accounts[&5].balance, lock.amount);
+        assert_eq!(b.chain.state.bridge_minted, lock.amount);
+        assert!(b.chain.state.supply_conserved());
+        let src = b.chain.state.bridge_sources.get(&a_genesis_hash).unwrap();
+        assert!(src.consumed.contains(&0));
+
+        // The certified B chain replays and re-verifies to the same state.
+        let replayed =
+            Chain::replay_verified(gb_for_replay(a_genesis_hash, &a_genesis_set), b.blocks(), b.certificates())
+                .unwrap();
+        assert_eq!(replayed.state.state_root(), b.chain.state.state_root());
+    }
+
+    /// Rebuild B's genesis (same as in the end-to-end test) for replay.
+    fn gb_for_replay(a_genesis_hash: crate::Hash, a_genesis_set: &ValidatorSet) -> Genesis {
+        let mut gb = genesis();
+        gb.bridge_sources = vec![(
+            a_genesis_hash,
+            a_genesis_set
+                .validators()
+                .iter()
+                .map(|v| (v.id, v.pubkey, v.power))
+                .collect(),
+        )];
+        gb.accounts.push((5, 0, kp(5).public()));
+        gb
     }
 }

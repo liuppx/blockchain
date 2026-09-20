@@ -303,6 +303,7 @@ mod tests {
                 (22, kp(22).public(), 1),
                 (23, kp(23).public(), 1),
             ],
+            bridge_sources: vec![],
         }
     }
 
@@ -346,6 +347,8 @@ mod tests {
             stake_ops: Vec::new(),
             slashing_evidence: Vec::new(),
             bridge_locks: locks,
+            bridge_headers: Vec::new(),
+            bridge_redeems: Vec::new(),
         };
         chain.seal(&mut b).expect("seal");
         // Certify the SEALED hash under the active set.

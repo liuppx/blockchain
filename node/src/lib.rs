@@ -58,6 +58,11 @@ pub const MICRO: u64 = 1_000_000;
 pub type Hash = [u8; 32];
 pub type Embedding = [f32; DIM];
 
+/// M31: one bridge-source registration in [`Genesis`] — a source chain's
+/// `genesis_hash` plus the `(id, pubkey, power)` triples of its genesis
+/// validator set (the trust anchor for redeems minted from that source).
+pub type BridgeSourceSeed = (Hash, Vec<(u64, PubKey, u64)>);
+
 // M27: the canonical reference pivot for the cert-signed secondary graph
 // index. The first standard basis vector — a unit vector along axis 0 —
 // is a deterministic, query-independent choice. All peers sort graph
@@ -310,6 +315,81 @@ impl BridgeLock {
     }
 }
 
+/// M31: on-chain follower of one source chain — the destination-side analogue
+/// of M30's off-chain `bridge::BridgeEndpoint::tracker`. Mirrors the shape of
+/// `light::ValidatorTracker` (a cert-signed set + head + height) but stripped
+/// of the bonds / pubkeys mirror because `follow_header` (M22) takes the next
+/// set as a parameter rather than deriving it. Folded into `state_root`.
+#[derive(Clone, Debug)]
+pub struct BridgeSource {
+    /// The active validator set that certifies the *next* source height
+    /// (the set `apply_bridge_header` will check the next incoming cert
+    /// against). Genesis-initialized to the source's declared genesis set.
+    pub set: ValidatorSet,
+    /// Hash of the last-followed source block. At genesis (height 0): the
+    /// source chain's `genesis_hash` — so the first `BridgeHeader` must
+    /// chain to it.
+    pub head: Hash,
+    /// Height of the last-followed source block. At genesis: 0.
+    pub height: u64,
+    /// On-chain replay dedup: which `lock_id`s from this source have already
+    /// been redeemed. Doubly-keyed by the source chain's identity at the
+    /// apply layer (the BTreeMap is keyed by `source_chain`).
+    pub consumed: BTreeSet<u64>,
+}
+
+/// M31: self-authenticating op that advances `ChainState::bridge_sources` for
+/// one source chain by a single cert-signed source header. Not account-signed
+/// — the cert (a > 2/3 quorum of the previous source set) plus the next-set
+/// root check are the proof. Mirrors `bridge::BridgeEndpoint::follow_source`
+/// (M30) but consensus-enforced: a follow that fails the cert-binding check
+/// rolls the whole block back.
+#[derive(Clone, Debug)]
+pub struct BridgeHeader {
+    /// Identity of the source chain (its `genesis_hash`). Must be present
+    /// in `ChainState::bridge_sources` — i.e. declared at our genesis.
+    pub source_chain: Hash,
+    /// The source chain's cert-signed header carrying the `bridge_root` the
+    /// follow adopts. Same wire shape as the BlockHeader a `LockEnvelope`
+    /// ships.
+    pub header: codec::BlockHeader,
+    /// The > 2/3 finality certificate binding `header.hash()`. Verified
+    /// against the on-chain follower's *currently tracked* set, never the
+    /// envelope's — so a relayer cannot substitute a validator set.
+    pub cert: consensus::Commit,
+    /// The validator set that certifies the *next* source height (the set
+    /// `header.next_validators_root` commits to). Adopted on success.
+    pub next_set: ValidatorSet,
+}
+
+/// M31: self-authenticating op that verifies a source lock against the
+/// followed source's cert-signed `bridge_root`, mints new supply to
+/// `dest_account`, and records `lock_id` in `BridgeSource::consumed`.
+/// Mirrors `bridge::BridgeEndpoint::verify_lock` + `consume` (M30) but
+/// consensus-enforced: every step re-runs inside `apply_block`, so a
+/// bad redeem rolls the whole block back.
+#[derive(Clone, Debug)]
+pub struct BridgeRedeem {
+    /// Identity of the source chain. Must match an entry in
+    /// `ChainState::bridge_sources`.
+    pub source_chain: Hash,
+    /// Source chain's cert-signed header carrying the `bridge_root` the
+    /// lock proof opens against. Must have been followed (i.e. is at or
+    /// before the follower's frontier).
+    pub source_header: codec::BlockHeader,
+    /// Cert binding `source_header.hash()` — verified against the same
+    /// tracked set `apply_bridge_header` adopted.
+    pub source_cert: consensus::Commit,
+    /// The lock's id on the source chain (its key in
+    /// `ChainState::bridge_locks`).
+    pub lock_id: u64,
+    /// The lock op itself.
+    pub lock: BridgeLock,
+    /// Merkle proof opening `lock.merkle_leaf(lock_id)` against
+    /// `source_header.bridge_root`.
+    pub proof: merkle::Proof,
+}
+
 /// A block: an ordered batch of submissions applied atomically.
 #[derive(Clone, Debug)]
 pub struct Block {
@@ -387,6 +467,23 @@ pub struct Block {
     /// their cumulative effect folds into both `state_root` and the header's
     /// `bridge_root` Merkle commitment.
     pub bridge_locks: Vec<BridgeLock>,
+    /// M31: bridge-follow ops carried by this block. Each advances
+    /// `ChainState::bridge_sources[op.source_chain]` by one cert-signed
+    /// source header — the destination-side mirror of `bridge::BridgeEndpoint::follow_source`.
+    /// Self-authenticating (cert + next-validators-root check); not
+    /// account-signed. Usually empty; populated only when a relayer
+    /// stages a `BridgeHeader`. Bodies are part of the block hash (via
+    /// `bridge_headers_commitment` in the header projection).
+    pub bridge_headers: Vec<BridgeHeader>,
+    /// M31: bridge-redeem ops carried by this block. Each verifies a
+    /// source lock against the on-chain follower's cert-signed
+    /// `bridge_root` and mints new supply to `lock.dest_account` on this
+    /// chain. Self-authenticating via cert-binding, Merkle inclusion, a
+    /// destination match, and replay dedup; not account-signed. Usually
+    /// empty; populated only when a relayer stages a `BridgeRedeem`.
+    /// Bodies are part of the block hash (via the header projection's
+    /// `bridge_redeems_commitment`).
+    pub bridge_redeems: Vec<BridgeRedeem>,
 }
 
 impl Block {
@@ -520,6 +617,29 @@ pub struct ChainState {
     pub bridge_lock_heights: BTreeMap<u64, u64>,
     /// M30: next `lock_id` to assign. Monotonic; never reused.
     pub next_lock_id: u64,
+    /// M31: cumulative micro-$COG minted on this chain via
+    /// [`BridgeRedeem`] ops. Like `bridge_locked`, an audit counter that
+    /// mirrors the source-side pool; folds into `state_root` so a wallet
+    /// can read its own mint history from cert-signed state. Does NOT
+    /// change the `supply_conserved` invariant — a redeem grows both
+    /// `accounts[dest].balance` and `supply` by the same amount, so the
+    /// total still equals `supply`.
+    pub bridge_minted: u64,
+    /// M31: on-chain followers of every allowed source chain (declared
+    /// at this chain's [`Genesis::bridge_sources`]). Keyed by the source
+    /// chain's `genesis_hash`. Each entry carries the cert-signed state
+    /// needed to verify a [`BridgeHeader`] / [`BridgeRedeem`] op without
+    /// an off-chain sidecar. Folded into `state_root`.
+    pub bridge_sources: BTreeMap<Hash, BridgeSource>,
+    /// M31: this chain's identity (`genesis_hash`). A [`BridgeLock`] names
+    /// it in `dest_chain`; the redeem path checks the match. Set in
+    /// [`Self::genesis_split`] *after* the genesis block hash is computed
+    /// (so it can be folded into apply / replay without circularity — the
+    /// genesis hash is derived *from* a genesis block whose header commits
+    /// to `state_root`). **Excluded from `state_root`** by design: it is
+    /// a constant of this chain's identity, not mutable state, and folding
+    /// it would make the genesis block's hash a self-reference.
+    pub genesis_hash: Hash,
 }
 
 /// Genesis configuration.
@@ -535,6 +655,16 @@ pub struct Genesis {
     /// The initial validator set (id, pubkey, voting power). Consensus over
     /// height 1 uses exactly this set; later heights evolve it on-chain.
     pub validators: Vec<(u64, PubKey, u64)>,
+    /// M31: bridge sources this chain is allowed to follow and redeem
+    /// from. Each entry is `(source_genesis_hash, source_genesis_validators)`:
+    /// the source's identity (its `genesis_hash`) plus its initial
+    /// validator set. The source's own `genesis_hash` is the trust root
+    /// for any [`BridgeRedeem`] minted on this chain, exactly as
+    /// [`Self::validators`] anchors this chain's local BFT. Empty by
+    /// default — a chain that has never opened a bridge carries no
+    /// follower registry. Seeds `ChainState::bridge_sources` in
+    /// [`Self::genesis_split`].
+    pub bridge_sources: Vec<BridgeSourceSeed>,
 }
 
 #[derive(Clone, Debug)]
@@ -585,6 +715,48 @@ pub enum ChainError {
     /// destination chain's bridge endpoint opens a single lock against — same
     /// root-mismatch reasoning as `AccountsRootMismatch` / `GraphRootMismatch`.
     BridgeRootMismatch { height: u64 },
+    /// M31: a `BridgeHeader` / `BridgeRedeem` op named a source chain
+    /// (`source_chain`) that this chain did not declare in
+    /// [`Genesis::bridge_sources`]. The trust root is missing — the chain
+    /// is not following that counterparty. Carries the rejected id for
+    /// diagnostics.
+    UnknownBridgeSource(Hash),
+    /// M31: a `BridgeHeader`'s source header doesn't chain to the
+    /// follower's tracked head (either wrong height or wrong prev_hash).
+    /// The follower's height+1 / prev-chains-to-head check failed; either
+    /// the relayer skipped a height or replayed an old one.
+    BridgeBadFollow { source: Hash, height: u64 },
+    /// M31: cert-binding failed for a `BridgeHeader` or `BridgeRedeem`
+    /// op. The cert is not a valid > 2/3 quorum of the tracked source
+    /// set, or it does not bind the supplied header's hash. The relayer
+    /// cannot forge past this — it's the same cert-binding check the
+    /// off-chain `bridge::BridgeEndpoint` uses (M22/M30), just now run
+    /// inside `apply_block`.
+    BridgeCertInvalid { source: Hash, height: u64 },
+    /// M31: a `BridgeHeader`'s `next_set` does not commit to the
+    /// source header's `next_validators_root` (or is empty). The producer
+    /// shipped a next set the header doesn't actually certify — a
+    /// tampering or seal error. Mirrors the validator-root mismatch
+    /// check on the destination side.
+    BridgeNextSetMismatch { source: Hash, height: u64 },
+    /// M31: a `BridgeRedeem` referenced a source header at a height
+    /// the on-chain follower has not reached yet. The follower must
+    /// advance via a `BridgeHeader` first; minting against an un-followed
+    /// header is rejected.
+    BridgeSourceNotFollowed { source: Hash, height: u64 },
+    /// M31: a `BridgeRedeem`'s Merkle proof did not open
+    /// `lock.merkle_leaf(lock_id)` against `source_header.bridge_root`.
+    /// Either the lock bytes were tampered with, the lock_id was
+    /// changed, or the proof itself is forged.
+    BridgeInclusionInvalid { source: Hash, lock_id: u64 },
+    /// M31: a `BridgeRedeem`'s `lock.dest_chain` is not this chain's
+    /// `genesis_hash`. A lock destined for a *different* chain must not
+    /// mint supply here.
+    BridgeWrongDestination { expected: Hash, got: Hash },
+    /// M31: a `BridgeRedeem` named a `(source_chain, lock_id)` already
+    /// in `BridgeSource::consumed` — replay rejected. Same discipline as
+    /// M30's `BridgeError::AlreadyConsumed`, just on the consensus path.
+    BridgeAlreadyRedeemed { source: Hash, lock_id: u64 },
 }
 
 impl std::fmt::Display for ChainError {
@@ -637,8 +809,59 @@ impl std::fmt::Display for ChainError {
                 f,
                 "block {height} bridge_root does not match the post-apply bridge_locks (sorted-by-lock_id) Merkle root"
             ),
+            ChainError::UnknownBridgeSource(s) => write!(
+                f,
+                "bridge source {} not declared in genesis (not followed by this chain)",
+                short_hex(s)
+            ),
+            ChainError::BridgeBadFollow { source, height } => write!(
+                f,
+                "bridge header at height {height} does not chain to followed head of source {}",
+                short_hex(source)
+            ),
+            ChainError::BridgeCertInvalid { source, height } => write!(
+                f,
+                "bridge cert-binding failed for source {} at height {height}",
+                short_hex(source)
+            ),
+            ChainError::BridgeNextSetMismatch { source, height } => write!(
+                f,
+                "bridge next_set does not match next_validators_root for source {} at height {height}",
+                short_hex(source)
+            ),
+            ChainError::BridgeSourceNotFollowed { source, height } => write!(
+                f,
+                "bridge redeem references source {} at un-followed height {height}",
+                short_hex(source)
+            ),
+            ChainError::BridgeInclusionInvalid { source, lock_id } => write!(
+                f,
+                "bridge redeem inclusion proof invalid for source {} lock_id {lock_id}",
+                short_hex(source)
+            ),
+            ChainError::BridgeWrongDestination { expected, got } => write!(
+                f,
+                "bridge redeem destined for {} but this chain is {}",
+                short_hex(got),
+                short_hex(expected)
+            ),
+            ChainError::BridgeAlreadyRedeemed { source, lock_id } => write!(
+                f,
+                "bridge redeem already consumed for source {} lock_id {lock_id}",
+                short_hex(source)
+            ),
         }
     }
+}
+
+/// First 8 hex chars of a hash — used in ChainError / LightError display
+/// strings to keep messages compact.
+fn short_hex(h: &Hash) -> String {
+    let mut s = String::with_capacity(16);
+    for b in &h[..8] {
+        s.push_str(&format!("{b:02x}"));
+    }
+    s
 }
 
 impl std::error::Error for ChainError {}
@@ -763,7 +986,46 @@ impl ChainState {
                 .map(|(id, pubkey, power)| Validator { id, pubkey, power })
                 .collect(),
         );
-        let state = ChainState {
+        // M31: seed the on-chain bridge source followers from genesis.
+        // Each declared source contributes one entry to bridge_sources,
+        // seeded at height=0 with the source's own genesis validator set
+        // (the set that certifies source height 1). The follower's `head`
+        // is the source's own `genesis_hash` so the first BridgeHeader
+        // for that source must chain to it. The source's genesis_hash
+        // is computable from the same `(Genesis.bridge_sources)` shape —
+        // we derive it via a nested `genesis_split` so the value is
+        // exact (no mirror layout to drift).
+        let mut bridge_sources: BTreeMap<Hash, BridgeSource> = BTreeMap::new();
+        for (source_genesis_hash, source_validators) in g.bridge_sources.iter() {
+            let source_set = ValidatorSet::new(
+                source_validators
+                    .iter()
+                    .map(|&(id, pubkey, power)| Validator { id, pubkey, power })
+                    .collect(),
+            );
+            // Re-derive the source's genesis_hash from its own
+            // (validators, timestamp, …) shape so we don't need to ship
+            // the source's full genesis through this side. The source
+            // Genesis here carries the same validator set + an
+            // authoritative timestamp (the one its own genesis was
+            // computed under) — we leave that to the caller, since
+            // `head` only needs to chain to whatever the source's
+            // height-1 header points at via `prev_hash`. Storing the
+            // caller-supplied `source_genesis_hash` as `head` is the
+            // trust contract: a declared bridge source's identity is
+            // pinned in this chain's genesis, so the very first
+            // BridgeHeader's `header.prev_hash` must equal it.
+            bridge_sources.insert(
+                *source_genesis_hash,
+                BridgeSource {
+                    set: source_set,
+                    head: *source_genesis_hash,
+                    height: 0,
+                    consumed: BTreeSet::new(),
+                },
+            );
+        }
+        let mut state = ChainState {
             accounts,
             reviewers,
             graph,
@@ -782,6 +1044,15 @@ impl ChainState {
             bridge_locks: BTreeMap::new(),
             bridge_lock_heights: BTreeMap::new(),
             next_lock_id: 0,
+            // M31: bridge-redeem audit counter + follower registry.
+            bridge_minted: 0,
+            bridge_sources,
+            // Placeholder — overwritten by the real `gh` below once
+            // computed. We cannot set it to the real value before
+            // constructing the genesis Block (we need to know the
+            // Block's hash to know `gh`), but the value is unused by
+            // `state_root()` (genesis_hash is excluded by design).
+            genesis_hash: [0u8; 32],
         };
         // genesis "block" hash: height 0, zero prev, no txs, no validator updates.
         // Its commitment is the genesis validator set (the set that certifies
@@ -811,8 +1082,14 @@ impl ChainState {
             stake_ops: Vec::new(),
             slashing_evidence: Vec::new(),
             bridge_locks: Vec::new(),
+            bridge_headers: Vec::new(),
+            bridge_redeems: Vec::new(),
         }
         .hash();
+        // M31: now that the genesis block hash is known, store it on
+        // the state so BridgeRedeem's `dest_chain` match has a value to
+        // compare against. Excluded from `state_root` (see field doc).
+        state.genesis_hash = gh;
         (state, gh)
     }
 
@@ -917,6 +1194,19 @@ impl ChainState {
         // block back. Locks do not touch the validator set.
         for lock in &block.bridge_locks {
             self.apply_bridge_lock(lock, new_height)?;
+        }
+
+        // M31: bridge-follow ops. Each advances `bridge_sources[op.source_chain]`
+        // by one certified source header. Order: bridge_headers BEFORE
+        // bridge_redeems, so a redeem in the same block may reference a header
+        // followed in the same block. Validation fully precedes mutation, so
+        // a bad follow rolls the whole block back (the redeem loop then sees
+        // an un-advanced follower and rejects with BridgeSourceNotFollowed).
+        for op in &block.bridge_headers {
+            self.apply_bridge_header(op)?;
+        }
+        for op in &block.bridge_redeems {
+            self.apply_bridge_redeem(op)?;
         }
 
         // on-chain validator-set transition: explicit updates PLUS the changes
@@ -1160,6 +1450,148 @@ impl ChainState {
         Ok(())
     }
 
+    /// M31: advance `bridge_sources[op.source_chain]` by one cert-signed
+    /// source header. Mirrors `bridge::BridgeEndpoint::follow_source` (M30)
+    /// but consensus-enforced: every check runs inside `apply_block`, so a
+    /// bad follow rolls the whole block back. The follower only tracks
+    /// `{set, head, height}` — `follow_header` (M22) takes `next_set` as a
+    /// parameter rather than deriving it from bonds / pubkeys, so no bond
+    /// mirror is needed (BridgeSource lacks bonds on purpose).
+    ///
+    /// Steps:
+    /// 1. source known (declared at our genesis).
+    /// 2. header chains to the follower's tracked head (height+1,
+    ///    prev_hash == head) — a relayer cannot skip or replay a source height.
+    /// 3. cert-binding: a > 2/3 quorum of the tracked source set binds
+    ///    `header.hash()`. Reuses [`ValidatorTracker::verify_state_root_against_header`].
+    /// 4. `op.next_set.merkle_root() == op.header.next_validators_root`
+    ///    (and non-empty) — the cert signed the next-set commitment.
+    /// 5. mutate: adopt the new set + head + height.
+    fn apply_bridge_header(&mut self, op: &BridgeHeader) -> Result<(), ChainError> {
+        let s = self
+            .bridge_sources
+            .get_mut(&op.source_chain)
+            .ok_or(ChainError::UnknownBridgeSource(op.source_chain))?;
+        // 2. chains to head
+        if op.header.height != s.height + 1 || op.header.prev_hash != s.head {
+            return Err(ChainError::BridgeBadFollow {
+                source: op.source_chain,
+                height: op.header.height,
+            });
+        }
+        // 3. cert-binding against the *currently tracked* source set (NOT
+        //    the op's own set — a relayer cannot substitute one).
+        ValidatorTracker::verify_state_root_against_header(
+            &op.header,
+            &op.cert,
+            &s.set,
+        )
+        .map_err(|_| ChainError::BridgeCertInvalid {
+            source: op.source_chain,
+            height: op.header.height,
+        })?;
+        // 4. next_set root check (mirrors the destination-side check in
+        //    `ValidatorTracker::follow_header`).
+        if op.next_set.is_empty()
+            || op.next_set.merkle_root() != op.header.next_validators_root
+        {
+            return Err(ChainError::BridgeNextSetMismatch {
+                source: op.source_chain,
+                height: op.header.height,
+            });
+        }
+        // 5. mutate (all checks above passed)
+        s.set = op.next_set.clone();
+        s.head = op.header.hash();
+        s.height = op.header.height;
+        Ok(())
+    }
+
+    /// M31: verify a source lock against the on-chain follower's
+    /// cert-signed `bridge_root` and mint new supply to `dest_account`.
+    /// Mirrors `bridge::BridgeEndpoint::verify_lock` + `consume` (M30)
+    /// but consensus-enforced. Every step re-runs inside `apply_block`,
+    /// so a bad redeem rolls the whole block back. After all checks pass
+    /// the chain credits the destination and marks the lock consumed in
+    /// the follower's `consumed` set — the on-chain dedup.
+    ///
+    /// Steps:
+    /// 1. source known.
+    /// 2. frontier guard: `source_header.height <= follower.height`
+    ///    (mirrors M30's `<=` — a redeem at the exact height the follower
+    ///    has reached is allowed).
+    /// 3. cert-binding against the tracked source set.
+    /// 4. inclusion: `merkle::verify(&source_header.bridge_root, leaf, proof)`.
+    /// 5. dest match: `lock.dest_chain == self.genesis_hash`.
+    /// 6. replay: `(source_chain, lock_id) ∉ consumed`.
+    /// 7. dest account exists.
+    /// 8. MINT: balance += amount, supply += amount, bridge_minted += amount,
+    ///    `consumed.insert(lock_id)`. The supply invariant is preserved
+    ///    (a redeem grows BOTH sides by the same amount).
+    fn apply_bridge_redeem(&mut self, op: &BridgeRedeem) -> Result<(), ChainError> {
+        let s_ref = self
+            .bridge_sources
+            .get(&op.source_chain)
+            .ok_or(ChainError::UnknownBridgeSource(op.source_chain))?;
+        // 2. frontier guard
+        if op.source_header.height > s_ref.height {
+            return Err(ChainError::BridgeSourceNotFollowed {
+                source: op.source_chain,
+                height: op.source_header.height,
+            });
+        }
+        // 3. cert-binding
+        ValidatorTracker::verify_state_root_against_header(
+            &op.source_header,
+            &op.source_cert,
+            &s_ref.set,
+        )
+        .map_err(|_| ChainError::BridgeCertInvalid {
+            source: op.source_chain,
+            height: op.source_header.height,
+        })?;
+        // 4. Merkle inclusion against the cert-signed bridge_root.
+        let leaf_hash = merkle::leaf_hash(&op.lock.merkle_leaf(op.lock_id));
+        if !merkle::verify(&op.source_header.bridge_root, &leaf_hash, &op.proof) {
+            return Err(ChainError::BridgeInclusionInvalid {
+                source: op.source_chain,
+                lock_id: op.lock_id,
+            });
+        }
+        // 5. dest match
+        if op.lock.dest_chain != self.genesis_hash {
+            return Err(ChainError::BridgeWrongDestination {
+                expected: self.genesis_hash,
+                got: op.lock.dest_chain,
+            });
+        }
+        // 6. replay
+        if s_ref.consumed.contains(&op.lock_id) {
+            return Err(ChainError::BridgeAlreadyRedeemed {
+                source: op.source_chain,
+                lock_id: op.lock_id,
+            });
+        }
+        // 7. dest account known
+        if !self.accounts.contains_key(&op.lock.dest_account) {
+            return Err(ChainError::UnknownAccount(op.lock.dest_account));
+        }
+        // 8. MINT — validation fully preceded mutation, so a bad op would
+        //    have returned above and the chain rolls back. The redeem grows
+        //    BOTH `accounts[dest].balance` and `supply` by the same amount,
+        //    preserving `supply_conserved()`; `bridge_minted` is the
+        //    audit counter mirroring `bridge_locked`.
+        self.accounts.get_mut(&op.lock.dest_account).unwrap().balance += op.lock.amount;
+        self.supply += op.lock.amount;
+        self.bridge_minted += op.lock.amount;
+        self.bridge_sources
+            .get_mut(&op.source_chain)
+            .unwrap()
+            .consumed
+            .insert(op.lock_id);
+        Ok(())
+    }
+
     /// Static validity checks that do NOT depend on ΔK or mutate state: reviews
     /// well-formed, reviewers/account known, signature authentic, stake covered.
     /// The mempool uses this for admission; `apply_tx` runs it first, so a tx
@@ -1349,6 +1781,31 @@ impl ChainState {
             e.u64(*h);
         }
         e.u64(self.next_lock_id);
+        // M31: bridge-redeem audit counter + on-chain source follower
+        // registry. Folded into the same digest so a tampered redeem or
+        // follower state (set / head / height / consumed) flips
+        // `state_root`. `genesis_hash` is **deliberately excluded** — it
+        // is a constant of this chain's identity, and folding it would
+        // make the genesis block's hash a self-reference (it is derived
+        // from a block whose header commits to `state_root`).
+        e.u64(self.bridge_minted);
+        e.u64(self.bridge_sources.len() as u64);
+        for (source_chain, src) in &self.bridge_sources {
+            e.raw(source_chain);
+            let vs = src.set.validators();
+            e.u64(vs.len() as u64);
+            for v in vs {
+                e.u64(v.id);
+                e.raw(&v.pubkey);
+                e.u64(v.power);
+            }
+            e.raw(&src.head);
+            e.u64(src.height);
+            e.u64(src.consumed.len() as u64);
+            for id in &src.consumed {
+                e.u64(*id);
+            }
+        }
         sha256(&e.0)
     }
 
@@ -1777,6 +2234,7 @@ impl Chain {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::consensus::Commit;
 
     fn unit(x: f32, d: usize) -> Embedding {
         let mut e = [0.0f32; DIM];
@@ -1809,6 +2267,7 @@ mod tests {
                 (22, kp(22).public(), 1),
                 (23, kp(23).public(), 1),
             ],
+            bridge_sources: vec![],
         }
     }
 
@@ -1850,6 +2309,8 @@ mod tests {
             stake_ops: Vec::new(),
             slashing_evidence: Vec::new(),
             bridge_locks: Vec::new(),
+            bridge_headers: Vec::new(),
+            bridge_redeems: Vec::new(),
         };
         // best-effort seal: valid blocks get the correct commitments; blocks the
         // negative tests build to fail earlier keep [0;32] and still fail at
@@ -2387,6 +2848,8 @@ mod tests {
             stake_ops: Vec::new(),
             slashing_evidence: Vec::new(),
             bridge_locks: Vec::new(),
+            bridge_headers: Vec::new(),
+            bridge_redeems: Vec::new(),
         };
         live.seal(&mut b2).unwrap();
         live.commit(&mut b2).unwrap();
@@ -2892,5 +3355,532 @@ mod tests {
         b.bridge_root = [0xFFu8; 32];
         let err = chain.commit(&mut b).unwrap_err();
         assert!(matches!(err, ChainError::BridgeRootMismatch { height: 1 }));
+    }
+
+    // ---- M31: on-chain follow + redeem ----
+
+    /// M31 helper: the source-chain identity a destination chain's genesis
+    /// registers as an allowed `bridge_source` (genesis_hash + genesis set).
+    fn source_identity(g: &Genesis) -> (Hash, ValidatorSet) {
+        let h = ChainState::genesis(g.clone()).1;
+        let s = ChainState::genesis(g.clone()).0.validators.clone();
+        (h, s)
+    }
+
+    /// M31 helper: seal `b` on `chain`, certify it under the active set
+    /// (using the matching keypairs), and commit it. Returns the cert so a
+    /// relayer can use it for `BridgeHeader.cert` / `BridgeRedeem.source_cert`.
+    fn seal_certify_commit(chain: &mut Chain, b: &mut Block) -> Commit {
+        chain.seal(b).expect("seal");
+        let set = chain.state.validators.clone();
+        let kps: BTreeMap<u64, Keypair> = set
+            .validators()
+            .iter()
+            .map(|v| (v.id, kp(v.id)))
+            .collect();
+        let voters: Vec<u64> = set.validators().iter().map(|v| v.id).collect();
+        let cert = consensus::commit_block(&set, &kps, b, 0, &voters).expect("certify");
+        chain.commit(b).expect("commit");
+        cert
+    }
+
+    /// M31 helper: build a destination chain B whose genesis registers
+    /// `source_genesis_hash` as an allowed bridge source, anchored on
+    /// `source_genesis_set`. Returns the live chain and B's own
+    /// `genesis_hash` (which the source lock's `dest_chain` must equal).
+    fn dest_chain_b(
+        source_genesis_hash: Hash,
+        source_genesis_set: ValidatorSet,
+    ) -> (Chain, Hash) {
+        let mut g = base_genesis();
+        g.bridge_sources = vec![(
+            source_genesis_hash,
+            source_genesis_set
+                .validators()
+                .iter()
+                .map(|v| (v.id, v.pubkey, v.power))
+                .collect(),
+        )];
+        // M31 demo convention: every destination chain mints bridged supply
+        // to account 5 — add it to B's genesis if base_genesis doesn't.
+        let has_5 = g.accounts.iter().any(|(id, _, _)| *id == 5);
+        if !has_5 {
+            g.accounts.push((5, 0, kp(5).public()));
+        }
+        let b_genesis_hash = ChainState::genesis(g.clone()).1;
+        (Chain::new(g), b_genesis_hash)
+    }
+
+    /// M31 helper: build a single-block source chain A carrying one
+    /// `BridgeLock` destined for `dest_genesis_hash`. Returns everything a
+    /// relayer needs to assemble `BridgeHeader` + `BridgeRedeem` on chain B.
+    fn build_source_lock_envelope(
+        dest_genesis_hash: Hash,
+    ) -> (Block, Commit, merkle::Proof, BridgeLock) {
+        let mut chain_a = Chain::new(base_genesis());
+        let lock = BridgeLock {
+            account: 1,
+            amount: 10 * MICRO,
+            dest_chain: dest_genesis_hash,
+            dest_account: 5,
+            nonce: 0,
+            signature: [0u8; 64],
+        }
+        .signed(&kp(1));
+        let mut ab1 = block(&chain_a, 1, Vec::new());
+        ab1.bridge_locks.push(lock.clone());
+        let cert = seal_certify_commit(&mut chain_a, &mut ab1);
+        let proof = chain_a.state.bridge_lock_proof(0).expect("proof");
+        (ab1, cert, proof, lock)
+    }
+
+    /// End-to-end: chain A locks → chain B follows A's header in one
+    /// block, then redeems the lock in the next block. The destination
+    /// account is credited on-chain, supply grows by the same amount
+    /// (invariant preserved), and `bridge_minted` records the audit counter.
+    #[test]
+    fn bridge_redeem_mints_to_dest_and_conserves_supply() {
+        let ga = base_genesis();
+        let (a_genesis_hash, a_genesis_set) = source_identity(&ga);
+
+        let (mut chain_b, b_genesis_hash) =
+            dest_chain_b(a_genesis_hash, a_genesis_set.clone());
+
+        let (a_block_1, a_cert_1, proof, lock) =
+            build_source_lock_envelope(b_genesis_hash);
+        let header_a1 = a_block_1.header();
+
+        // Block on B at height 1: follow A's height 1 (next_set = a_genesis_set
+        // since A has no validator changes).
+        let follow = BridgeHeader {
+            source_chain: a_genesis_hash,
+            header: header_a1.clone(),
+            cert: a_cert_1.clone(),
+            next_set: a_genesis_set.clone(),
+        };
+        let mut b_b1 = block(&chain_b, 1, Vec::new());
+        b_b1.bridge_headers.push(follow);
+        chain_b.seal(&mut b_b1).unwrap();
+        chain_b.commit(&mut b_b1).expect("B height 1 follow commits");
+
+        // Block on B at height 2: redeem lock 0.
+        let dest_before = chain_b.state.accounts.get(&5).unwrap().balance;
+        let supply_before = chain_b.state.supply;
+        let redeem = BridgeRedeem {
+            source_chain: a_genesis_hash,
+            source_header: header_a1.clone(),
+            source_cert: a_cert_1.clone(),
+            lock_id: 0,
+            lock: lock.clone(),
+            proof,
+        };
+        let mut b_b2 = block(&chain_b, 2, Vec::new());
+        b_b2.bridge_redeems.push(redeem);
+        chain_b.seal(&mut b_b2).unwrap();
+        chain_b.commit(&mut b_b2).expect("B height 2 redeem commits");
+
+        let amount = lock.amount;
+        assert_eq!(
+            chain_b.state.accounts.get(&5).unwrap().balance,
+            dest_before + amount
+        );
+        assert_eq!(chain_b.state.supply, supply_before + amount);
+        assert_eq!(chain_b.state.bridge_minted, amount);
+        assert!(chain_b.state.supply_conserved());
+
+        // And the consumed set recorded the lock_id (so a replay would
+        // now fail — tested separately below).
+        let src = chain_b
+            .state
+            .bridge_sources
+            .get(&a_genesis_hash)
+            .expect("source");
+        assert!(src.consumed.contains(&0));
+    }
+
+    /// `apply_bridge_header` advances the follower: height++, head moves to
+    /// the new header hash, set adopts the next_set.
+    #[test]
+    fn bridge_follow_advances_source_follower() {
+        let ga = base_genesis();
+        let (a_genesis_hash, a_genesis_set) = source_identity(&ga);
+
+        // B with A as a registered source.
+        let (mut chain_b, _) = dest_chain_b(a_genesis_hash, a_genesis_set.clone());
+
+        // Build A's height-1 block (empty — we only need the certified
+        // header + cert for the follower-advance test).
+        let mut chain_a = Chain::new(ga);
+        let mut a_b1 = block(&chain_a, 1, Vec::new());
+        let cert = seal_certify_commit(&mut chain_a, &mut a_b1);
+        let header_a1 = a_b1.header();
+
+        // Before follow: follower at height 0, head = a_genesis_hash.
+        let s0 = chain_b
+            .state
+            .bridge_sources
+            .get(&a_genesis_hash)
+            .expect("seeded");
+        assert_eq!(s0.height, 0);
+        assert_eq!(s0.head, a_genesis_hash);
+        assert_eq!(s0.set.merkle_root(), a_genesis_set.merkle_root());
+
+        // Apply follow in a block on B.
+        let follow = BridgeHeader {
+            source_chain: a_genesis_hash,
+            header: header_a1.clone(),
+            cert: cert.clone(),
+            next_set: a_genesis_set.clone(),
+        };
+        let mut b1 = block(&chain_b, 1, Vec::new());
+        b1.bridge_headers.push(follow);
+        chain_b.seal(&mut b1).unwrap();
+        chain_b.commit(&mut b1).expect("follow commits");
+
+        // After follow: height=1, head=A's block-1 hash, set unchanged.
+        let s1 = chain_b
+            .state
+            .bridge_sources
+            .get(&a_genesis_hash)
+            .expect("tracked");
+        assert_eq!(s1.height, 1);
+        assert_eq!(s1.head, a_b1.hash());
+        assert_eq!(s1.set.merkle_root(), a_genesis_set.merkle_root());
+    }
+
+    /// Redeem against an un-registered source → UnknownBridgeSource.
+    #[test]
+    fn bridge_redeem_unknown_source_is_rejected() {
+        // Build a real certified lock on A; we won't register A on B.
+        let ga = base_genesis();
+        let (a_genesis_hash, _) = source_identity(&ga);
+        let mut chain_a = Chain::new(ga);
+        let lock = BridgeLock {
+            account: 1,
+            amount: 5 * MICRO,
+            dest_chain: [0xCC; 32],
+            dest_account: 5,
+            nonce: 0,
+            signature: [0u8; 64],
+        }
+        .signed(&kp(1));
+        let mut ab1 = block(&chain_a, 1, Vec::new());
+        ab1.bridge_locks.push(lock.clone());
+        let cert = seal_certify_commit(&mut chain_a, &mut ab1);
+        let proof = chain_a.state.bridge_lock_proof(0).expect("proof");
+
+        // B has NO bridge_sources declared.
+        let mut chain_b = Chain::new(base_genesis());
+        let bad = BridgeRedeem {
+            source_chain: a_genesis_hash,
+            source_header: ab1.header(),
+            source_cert: cert,
+            lock_id: 0,
+            lock,
+            proof,
+        };
+        let mut bb = block(&chain_b, 1, Vec::new());
+        bb.bridge_redeems.push(bad);
+        // Don't seal — `commit` does its own trial apply; a bad redeem
+        // surfaces as an `Err` from `commit` (no state change).
+        let err = chain_b.commit(&mut bb).unwrap_err();
+        assert!(matches!(err, ChainError::UnknownBridgeSource(s) if s == a_genesis_hash));
+    }
+
+    /// Redeem before the follower has reached that height →
+    /// BridgeSourceNotFollowed.
+    #[test]
+    fn bridge_redeem_before_follow_is_rejected() {
+        let ga = base_genesis();
+        let (a_genesis_hash, a_genesis_set) = source_identity(&ga);
+
+        // B with A registered, follower still at height 0 (no follow yet).
+        let (mut chain_b, b_genesis_hash) =
+            dest_chain_b(a_genesis_hash, a_genesis_set.clone());
+
+        // Build A's lock at height 1 (cert + proof).
+        let (a_block, cert, proof, lock) =
+            build_source_lock_envelope(b_genesis_hash);
+        // Try to redeem WITHOUT staging a BridgeHeader first.
+        let redeem = BridgeRedeem {
+            source_chain: a_genesis_hash,
+            source_header: a_block.header(),
+            source_cert: cert,
+            lock_id: 0,
+            lock,
+            proof,
+        };
+        let mut bb = block(&chain_b, 1, Vec::new());
+        bb.bridge_redeems.push(redeem);
+        let err = chain_b.commit(&mut bb).unwrap_err();
+        assert!(matches!(err, ChainError::BridgeSourceNotFollowed { .. }));
+    }
+
+    /// Tampered `lock.amount` → leaf no longer matches the cert-signed
+    /// bridge_root → BridgeInclusionInvalid.
+    #[test]
+    fn bridge_redeem_tampered_amount_fails_inclusion() {
+        let ga = base_genesis();
+        let (a_genesis_hash, a_genesis_set) = source_identity(&ga);
+
+        let (mut chain_b, b_genesis_hash) =
+            dest_chain_b(a_genesis_hash, a_genesis_set.clone());
+
+        let (a_block, cert, proof, lock) =
+            build_source_lock_envelope(b_genesis_hash);
+
+        // Follow A's height 1 first.
+        let follow = BridgeHeader {
+            source_chain: a_genesis_hash,
+            header: a_block.header(),
+            cert: cert.clone(),
+            next_set: a_genesis_set.clone(),
+        };
+        let mut bb1 = block(&chain_b, 1, Vec::new());
+        bb1.bridge_headers.push(follow);
+        chain_b.seal(&mut bb1).unwrap();
+        chain_b.commit(&mut bb1).expect("follow commits");
+
+        // Redeem with TAMPERED amount.
+        let mut tampered = lock.clone();
+        tampered.amount += 1;
+        let redeem = BridgeRedeem {
+            source_chain: a_genesis_hash,
+            source_header: a_block.header(),
+            source_cert: cert,
+            lock_id: 0,
+            lock: tampered,
+            proof,
+        };
+        let mut bb2 = block(&chain_b, 2, Vec::new());
+        bb2.bridge_redeems.push(redeem);
+        let err = chain_b.commit(&mut bb2).unwrap_err();
+        assert!(matches!(err, ChainError::BridgeInclusionInvalid { .. }));
+    }
+
+    /// Tampered source_header.bridge_root → cert-binding check fails first
+    /// (since the tampered root invalidates the header hash and the
+    /// cert-signed state_root no longer matches) → BridgeCertInvalid.
+    #[test]
+    fn bridge_redeem_tampered_bridge_root_fails_cert() {
+        let ga = base_genesis();
+        let (a_genesis_hash, a_genesis_set) = source_identity(&ga);
+
+        let (mut chain_b, b_genesis_hash) =
+            dest_chain_b(a_genesis_hash, a_genesis_set.clone());
+
+        let (a_block, cert, proof, lock) =
+            build_source_lock_envelope(b_genesis_hash);
+
+        let follow = BridgeHeader {
+            source_chain: a_genesis_hash,
+            header: a_block.header(),
+            cert: cert.clone(),
+            next_set: a_genesis_set.clone(),
+        };
+        let mut bb1 = block(&chain_b, 1, Vec::new());
+        bb1.bridge_headers.push(follow);
+        chain_b.seal(&mut bb1).unwrap();
+        chain_b.commit(&mut bb1).expect("follow commits");
+
+        // Redeem with a TAMPERED bridge_root in the source header.
+        let mut tampered_header = a_block.header();
+        tampered_header.bridge_root = [0xFFu8; 32];
+        let redeem = BridgeRedeem {
+            source_chain: a_genesis_hash,
+            source_header: tampered_header,
+            source_cert: cert,
+            lock_id: 0,
+            lock,
+            proof,
+        };
+        let mut bb2 = block(&chain_b, 2, Vec::new());
+        bb2.bridge_redeems.push(redeem);
+        let err = chain_b.commit(&mut bb2).unwrap_err();
+        assert!(matches!(err, ChainError::BridgeCertInvalid { .. }));
+    }
+
+    /// Lock destined for a different chain → BridgeWrongDestination.
+    #[test]
+    fn bridge_redeem_wrong_destination_is_rejected() {
+        let ga = base_genesis();
+        let (a_genesis_hash, a_genesis_set) = source_identity(&ga);
+        let c_genesis_hash = [0xCC; 32];
+
+        let (mut chain_b, _) =
+            dest_chain_b(a_genesis_hash, a_genesis_set.clone());
+
+        // Build a lock on A destined for chain C, NOT B.
+        let mut chain_a = Chain::new(ga);
+        let lock = BridgeLock {
+            account: 1,
+            amount: 2 * MICRO,
+            dest_chain: c_genesis_hash,
+            dest_account: 5,
+            nonce: 0,
+            signature: [0u8; 64],
+        }
+        .signed(&kp(1));
+        let mut ab1 = block(&chain_a, 1, Vec::new());
+        ab1.bridge_locks.push(lock.clone());
+        let cert = seal_certify_commit(&mut chain_a, &mut ab1);
+        let proof = chain_a.state.bridge_lock_proof(0).expect("proof");
+
+        let follow = BridgeHeader {
+            source_chain: a_genesis_hash,
+            header: ab1.header(),
+            cert: cert.clone(),
+            next_set: a_genesis_set.clone(),
+        };
+        let mut bb1 = block(&chain_b, 1, Vec::new());
+        bb1.bridge_headers.push(follow);
+        chain_b.seal(&mut bb1).unwrap();
+        chain_b.commit(&mut bb1).expect("follow commits");
+
+        let redeem = BridgeRedeem {
+            source_chain: a_genesis_hash,
+            source_header: ab1.header(),
+            source_cert: cert,
+            lock_id: 0,
+            lock,
+            proof,
+        };
+        let mut bb2 = block(&chain_b, 2, Vec::new());
+        bb2.bridge_redeems.push(redeem);
+        let err = chain_b.commit(&mut bb2).unwrap_err();
+        match err {
+            ChainError::BridgeWrongDestination { expected, got } => {
+                assert_eq!(got, c_genesis_hash);
+                assert_eq!(expected, chain_b.state.genesis_hash);
+            }
+            other => panic!("expected BridgeWrongDestination, got {:?}", other),
+        }
+    }
+
+    /// Replay (same lock_id redeemed twice in two different blocks) →
+    /// BridgeAlreadyRedeemed.
+    #[test]
+    fn bridge_replay_is_rejected() {
+        let ga = base_genesis();
+        let (a_genesis_hash, a_genesis_set) = source_identity(&ga);
+
+        let (mut chain_b, b_genesis_hash) =
+            dest_chain_b(a_genesis_hash, a_genesis_set.clone());
+
+        let (a_block, cert, proof, lock) =
+            build_source_lock_envelope(b_genesis_hash);
+
+        let follow = BridgeHeader {
+            source_chain: a_genesis_hash,
+            header: a_block.header(),
+            cert: cert.clone(),
+            next_set: a_genesis_set.clone(),
+        };
+        let mut bb1 = block(&chain_b, 1, Vec::new());
+        bb1.bridge_headers.push(follow);
+        chain_b.seal(&mut bb1).unwrap();
+        chain_b.commit(&mut bb1).expect("follow commits");
+
+        // First redeem: ok.
+        let redeem1 = BridgeRedeem {
+            source_chain: a_genesis_hash,
+            source_header: a_block.header(),
+            source_cert: cert.clone(),
+            lock_id: 0,
+            lock: lock.clone(),
+            proof: proof.clone(),
+        };
+        let mut bb2 = block(&chain_b, 2, Vec::new());
+        bb2.bridge_redeems.push(redeem1);
+        chain_b.seal(&mut bb2).unwrap();
+        chain_b.commit(&mut bb2).expect("first redeem commits");
+
+        // Replay same lock_id in a later block.
+        let redeem2 = BridgeRedeem {
+            source_chain: a_genesis_hash,
+            source_header: a_block.header(),
+            source_cert: cert,
+            lock_id: 0,
+            lock,
+            proof,
+        };
+        let mut bb3 = block(&chain_b, 3, Vec::new());
+        bb3.bridge_redeems.push(redeem2);
+        let err = chain_b.commit(&mut bb3).unwrap_err();
+        assert!(matches!(err, ChainError::BridgeAlreadyRedeemed { .. }));
+    }
+
+    /// state_root advances on every block (it folds `self.height`); the
+    /// height-independent commitments — accounts_root, bridge_root — must
+    /// stay stable across a no-op block on top of a redeem.
+    #[test]
+    fn bridge_redeem_changes_state_root_and_accounts_root_stable_across_no_op() {
+        let ga = base_genesis();
+        let (a_genesis_hash, a_genesis_set) = source_identity(&ga);
+
+        let (mut chain_b, b_genesis_hash) =
+            dest_chain_b(a_genesis_hash, a_genesis_set.clone());
+
+        let (a_block, cert, proof, lock) =
+            build_source_lock_envelope(b_genesis_hash);
+
+        let root_initial = chain_b.state.state_root();
+
+        let follow = BridgeHeader {
+            source_chain: a_genesis_hash,
+            header: a_block.header(),
+            cert: cert.clone(),
+            next_set: a_genesis_set.clone(),
+        };
+        let mut bb1 = block(&chain_b, 1, Vec::new());
+        bb1.bridge_headers.push(follow);
+        chain_b.seal(&mut bb1).unwrap();
+        chain_b.commit(&mut bb1).expect("follow");
+        let root_after_follow = chain_b.state.state_root();
+        assert_ne!(root_after_follow, root_initial);
+
+        let redeem = BridgeRedeem {
+            source_chain: a_genesis_hash,
+            source_header: a_block.header(),
+            source_cert: cert,
+            lock_id: 0,
+            lock,
+            proof,
+        };
+        let mut bb2 = block(&chain_b, 2, Vec::new());
+        bb2.bridge_redeems.push(redeem);
+        chain_b.seal(&mut bb2).unwrap();
+        chain_b.commit(&mut bb2).expect("redeem");
+        let root_after_redeem = chain_b.state.state_root();
+        let accounts_root_after_redeem = chain_b.state.merkle_root();
+        let bridge_root_after_redeem = chain_b.state.bridge_merkle_root();
+        assert_ne!(root_after_redeem, root_after_follow);
+
+        // No-op block: state_root advances (height++), but the
+        // height-independent commitments stay stable — the redeem's
+        // balance credit and bridge_root persist into the no-op block.
+        let mut bb3 = block(&chain_b, 3, Vec::new());
+        chain_b.seal(&mut bb3).unwrap();
+        chain_b.commit(&mut bb3).expect("no-op commits");
+        assert_ne!(
+            chain_b.state.state_root(),
+            root_after_redeem,
+            "state_root folds height so it must advance",
+        );
+        assert_eq!(
+            chain_b.state.merkle_root(),
+            accounts_root_after_redeem,
+            "accounts_root must be stable across a no-op block",
+        );
+        assert_eq!(
+            chain_b.state.bridge_merkle_root(),
+            bridge_root_after_redeem,
+            "bridge_root must be stable across a no-op block",
+        );
+        // And the minted balance from the redeem survives the no-op block.
+        assert_eq!(
+            chain_b.state.accounts.get(&5).unwrap().balance,
+            10 * MICRO
+        );
     }
 }

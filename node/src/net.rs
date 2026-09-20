@@ -2151,6 +2151,7 @@ mod tests {
             slash_bps: 10_000,
             timestamp_days: 0.0,
             validators: [21u64, 22, 23, 24].iter().map(|&id| (id, kp(id).public(), 1)).collect(),
+            bridge_sources: vec![],
         }
     }
 
@@ -2274,6 +2275,7 @@ mod tests {
             slash_bps: 10_000,
             timestamp_days: 0.0,
             validators: vec![(21, kp(21).public(), 1)],
+            bridge_sources: vec![],
         };
         fn seed_for(id: u64) -> [u8; 32] {
             let mut s = [0u8; 32];
@@ -2322,6 +2324,7 @@ mod tests {
             slash_bps: 10_000,
             timestamp_days: 0.0,
             validators: vec![(21, kp(21).public(), 1)],
+            bridge_sources: vec![],
         };
         let mut gb = ga.clone();
         gb.timestamp_days = 1.0;

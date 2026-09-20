@@ -37,8 +37,8 @@ use zhixing_node::round::Sim;
 use zhixing_node::store::{BlockLog, CertLog};
 use zhixing_node::validator::{Validator, ValidatorSet, ValidatorUpdate};
 use zhixing_node::{
-    hex, Block, BondKind, BridgeLock, Chain, ChainState, Genesis, Keypair, Review, SlashEvidence,
-    StakeOp, SubmissionTx, Vote, VoteType, MICRO,
+    hex, Block, BondKind, BridgeHeader, BridgeLock, BridgeRedeem, Chain, ChainError, ChainState,
+    Genesis, Keypair, Review, SlashEvidence, StakeOp, SubmissionTx, Vote, VoteType, MICRO,
 };
 
 type Emb = [f32; DIM];
@@ -109,6 +109,7 @@ fn demo_genesis() -> Genesis {
             .iter()
             .map(|v| (v.id, v.pubkey, v.power))
             .collect(),
+        bridge_sources: vec![],
     }
 }
 
@@ -169,6 +170,8 @@ fn demo_blocks(chain: &Chain) -> Vec<Block> {
         stake_ops: Vec::new(),
         slashing_evidence: Vec::new(),
         bridge_locks: Vec::new(),
+        bridge_headers: Vec::new(),
+        bridge_redeems: Vec::new(),
     };
     trial.seal(&mut b1).expect("seal b1");
     trial.commit(&mut b1).expect("commit b1 on trial");
@@ -191,6 +194,8 @@ fn demo_blocks(chain: &Chain) -> Vec<Block> {
         stake_ops: Vec::new(),
         slashing_evidence: Vec::new(),
         bridge_locks: Vec::new(),
+        bridge_headers: Vec::new(),
+        bridge_redeems: Vec::new(),
     };
     trial.seal(&mut b2).expect("seal b2");
     vec![b1, b2]
@@ -220,6 +225,7 @@ fn main() {
         "diff" => cmd_diff(),
         "batch" => cmd_batch(),
         "bridge" => cmd_bridge(),
+        "redeem" => cmd_redeem(),
         "run" => cmd_run(dir_arg(&args)),
         "status" => cmd_status(dir_arg(&args)),
         "certs" => cmd_certs(dir_arg(&args)),
@@ -266,6 +272,7 @@ fn usage() {
     eprintln!("  node diff               cert-signed temporal graph diff between two cert-signed heights: added/dropped, wallet re-derives via partial replay");
     eprintln!("  node batch              heterogeneous batched proof transport: Inclusion + kNN + Range + Diff in a single round-trip");
     eprintln!("  node bridge             trustless bridge: chain A locks to chain B, relayer ferries a cert-signed envelope, B's endpoint verifies + credits — no relayer trust");
+    eprintln!("  node redeem             consensus-level redeem: B's producer follows A on-chain and mints from a source lock inside its state machine — the mint is BFT-enforced, not off-chain");
     eprintln!("  node run    --dir DIR   persistent chain (seeds demo blocks once, then replays)");
     eprintln!("  node status --dir DIR   replay the block log and print state");
     eprintln!("  node certs  --dir DIR   persist a certified chain (blocks+certs) and re-verify finality on reload");
@@ -2276,7 +2283,235 @@ fn cmd_bridge() {
     );
 }
 
-/// M25 demo: light wallet proves a single cognitive-graph node (kernel of
+/// M31 demo: consensus-level bridge redeem + mint. Where `cmd_bridge` (M30)
+/// verified and credited a relayed lock in an *off-chain* endpoint, here chain
+/// B's producer advances an *on-chain* follower of chain A (`BridgeHeader`) and
+/// redeems a source lock (`BridgeRedeem`) inside its own state machine — so the
+/// mint is BFT-enforced by B's validators, and replay-dedup lives in cert-signed
+/// state. The relayer stays trustless: it only moves A's cert-signed bytes.
+fn cmd_redeem() {
+    println!("M31 — consensus-level bridge redeem + mint (destination side on-chain)");
+    println!();
+
+    let ga = demo_genesis();
+    let a_genesis_hash = ChainState::genesis(ga.clone()).1;
+    let a_genesis_set = ChainState::genesis(ga.clone()).0.validators.clone();
+
+    // Chain B: register A as an allowed bridge source (its genesis hash + set is
+    // the trust anchor), and fund a zero-balance destination account 5.
+    let mut gb = demo_genesis_b();
+    gb.bridge_sources = vec![(
+        a_genesis_hash,
+        a_genesis_set
+            .validators()
+            .iter()
+            .map(|v| (v.id, v.pubkey, v.power))
+            .collect(),
+    )];
+    gb.accounts.push((5, 0, kp(5).public()));
+    let b_genesis_hash = ChainState::genesis(gb.clone()).1;
+    let c_genesis_hash = [0xCCu8; 32]; // a third chain neither A nor B follows
+
+    // Chain A locks twice in one block: lock 0 → B (redeemable), lock 1 → C
+    // (a decoy for the wrong-destination case).
+    let mut driver_a = ChainDriver::new(ga.clone(), demo_driver_seeds(), 4);
+    let lock0 = BridgeLock {
+        account: 1,
+        amount: 10 * MICRO,
+        dest_chain: b_genesis_hash,
+        dest_account: 5,
+        nonce: 0,
+        signature: [0u8; 64],
+    }
+    .signed(&kp(1));
+    let lock1 = BridgeLock {
+        account: 1,
+        amount: 5 * MICRO,
+        dest_chain: c_genesis_hash,
+        dest_account: 5,
+        nonce: 1,
+        signature: [0u8; 64],
+    }
+    .signed(&kp(1));
+    driver_a.stage_bridge_lock(lock0.clone());
+    driver_a.stage_bridge_lock(lock1.clone());
+    driver_a.produce(1.0, &BTreeSet::new()).unwrap().expect("A locks");
+    let a_header = driver_a.blocks()[0].header();
+    let a_cert = driver_a.certificates()[0].clone();
+    let proof0 = driver_a.chain.state.bridge_lock_proof(0).expect("proof for lock 0");
+    let proof1 = driver_a.chain.state.bridge_lock_proof(1).expect("proof for lock 1");
+    println!(
+        "chain A: locked {} → B (lock 0) and {} → C (lock 1); bridge_locked={}",
+        cog(lock0.amount),
+        cog(lock1.amount),
+        cog(driver_a.chain.state.bridge_locked)
+    );
+
+    // Chain B follows A's height 1 on-chain, then redeems lock 0.
+    let mut driver_b = ChainDriver::new(gb.clone(), demo_driver_seeds(), 4);
+    driver_b.stage_bridge_header(BridgeHeader {
+        source_chain: a_genesis_hash,
+        header: a_header.clone(),
+        cert: a_cert.clone(),
+        next_set: a_genesis_set.clone(),
+    });
+    driver_b.produce(1.0, &BTreeSet::new()).unwrap().expect("B follows A");
+    // Snapshot B at the followed-but-unredeemed state, for the negative cases.
+    let followed = driver_b.chain.clone();
+    println!(
+        "chain B: followed A → source follower at height {}",
+        driver_b.chain.state.bridge_sources.get(&a_genesis_hash).unwrap().height
+    );
+
+    driver_b.stage_bridge_redeem(BridgeRedeem {
+        source_chain: a_genesis_hash,
+        source_header: a_header.clone(),
+        source_cert: a_cert.clone(),
+        lock_id: 0,
+        lock: lock0.clone(),
+        proof: proof0.clone(),
+    });
+    driver_b.produce(2.0, &BTreeSet::new()).unwrap().expect("B redeems lock 0");
+
+    let minted = driver_b.chain.state.accounts.get(&5).unwrap().balance;
+    assert_eq!(minted, 10 * MICRO, "destination credited on-chain");
+    assert_eq!(driver_b.chain.state.bridge_minted, 10 * MICRO, "audit counter");
+    assert!(driver_b.chain.state.supply_conserved(), "supply invariant holds");
+    println!(
+        "Ok: redeemed lock 0 in B's state machine → minted {} to account 5, \
+         bridge_minted={}, supply conserved ✓",
+        cog(minted),
+        cog(driver_b.chain.state.bridge_minted)
+    );
+    println!();
+
+    // Each negative builds an unsealed block carrying one bad redeem and commits
+    // it directly to a fresh clone — `commit` re-runs apply with checks and the
+    // whole block rolls back on the distinct `ChainError`.
+    let try_redeem = |mut chain: Chain, redeem: BridgeRedeem, ts: f32| -> ChainError {
+        let mut blk = empty_next_block(&chain, ts);
+        blk.bridge_redeems.push(redeem);
+        chain.commit(&mut blk).expect_err("bad redeem must be rejected")
+    };
+
+    // Negative 1: tamper lock.amount → leaf no longer opens under bridge_root.
+    let mut bad_amount = lock0.clone();
+    bad_amount.amount += 1;
+    let e = try_redeem(
+        followed.clone(),
+        BridgeRedeem {
+            source_chain: a_genesis_hash,
+            source_header: a_header.clone(),
+            source_cert: a_cert.clone(),
+            lock_id: 0,
+            lock: bad_amount,
+            proof: proof0.clone(),
+        },
+        2.0,
+    );
+    assert!(matches!(e, ChainError::BridgeInclusionInvalid { .. }));
+    println!("✓ tampered lock.amount → {e}");
+
+    // Negative 2: tamper source_header.bridge_root → cert-binding fails first.
+    let mut bad_header = a_header.clone();
+    bad_header.bridge_root = [0xFFu8; 32];
+    let e = try_redeem(
+        followed.clone(),
+        BridgeRedeem {
+            source_chain: a_genesis_hash,
+            source_header: bad_header,
+            source_cert: a_cert.clone(),
+            lock_id: 0,
+            lock: lock0.clone(),
+            proof: proof0.clone(),
+        },
+        2.0,
+    );
+    assert!(matches!(e, ChainError::BridgeCertInvalid { .. }));
+    println!("✓ tampered source_header.bridge_root → {e}");
+
+    // Negative 3: redeem lock 1, which is destined for chain C, not B.
+    let e = try_redeem(
+        followed.clone(),
+        BridgeRedeem {
+            source_chain: a_genesis_hash,
+            source_header: a_header.clone(),
+            source_cert: a_cert.clone(),
+            lock_id: 1,
+            lock: lock1.clone(),
+            proof: proof1,
+        },
+        2.0,
+    );
+    assert!(matches!(e, ChainError::BridgeWrongDestination { .. }));
+    println!("✓ lock destined for chain C → {e}");
+
+    // Negative 4: replay lock 0 on the chain that already redeemed it.
+    let e = try_redeem(
+        driver_b.chain.clone(),
+        BridgeRedeem {
+            source_chain: a_genesis_hash,
+            source_header: a_header.clone(),
+            source_cert: a_cert.clone(),
+            lock_id: 0,
+            lock: lock0.clone(),
+            proof: proof0.clone(),
+        },
+        3.0,
+    );
+    assert!(matches!(e, ChainError::BridgeAlreadyRedeemed { .. }));
+    println!("✓ replay redeemed lock 0 → {e}");
+
+    // Negative 5: redeem before following A (fresh B, follower still at height 0).
+    let e = try_redeem(
+        Chain::new(gb.clone()),
+        BridgeRedeem {
+            source_chain: a_genesis_hash,
+            source_header: a_header.clone(),
+            source_cert: a_cert.clone(),
+            lock_id: 0,
+            lock: lock0.clone(),
+            proof: proof0.clone(),
+        },
+        1.0,
+    );
+    assert!(matches!(e, ChainError::BridgeSourceNotFollowed { .. }));
+    println!("✓ redeem before follow → {e}");
+
+    println!();
+    println!(
+        "M31 — consensus-level bridge: B's producer followed A's cert-signed \
+         header and redeemed a source lock *inside its state machine*, minting \
+         new supply to the destination account (1:1-backed by A's permanently \
+         locked pool) — the mint and replay-dedup are BFT-enforced, not \
+         off-chain; a forged proof, forged root, wrong destination, replay, or \
+         un-followed source are each rejected by consensus."
+    );
+}
+
+/// An empty block at `chain`'s next height (all commitments zero — `commit`
+/// stamps them). Used by demos that carry a single body op.
+fn empty_next_block(chain: &Chain, timestamp_days: f32) -> Block {
+    Block {
+        height: chain.state.height + 1,
+        prev_hash: chain.head,
+        timestamp_days,
+        next_validators_root: [0u8; 32],
+        state_root: [0u8; 32],
+        accounts_root: [0u8; 32],
+        graph_root: [0u8; 32],
+        bridge_root: [0u8; 32],
+        txs: Vec::new(),
+        validator_updates: Vec::new(),
+        stake_ops: Vec::new(),
+        slashing_evidence: Vec::new(),
+        bridge_locks: Vec::new(),
+        bridge_headers: Vec::new(),
+        bridge_redeems: Vec::new(),
+    }
+}
+
+
 /// a concept) against a cert-signed header via the unified GetProof bus —
 /// no replay, no graph download, no tx bodies. The graph node lives in the
 /// same `accounts_root` tree as accounts and reviewers; the wallet

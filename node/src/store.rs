@@ -183,6 +183,8 @@ mod tests {
             stake_ops: Vec::new(),
             slashing_evidence: Vec::new(),
             bridge_locks: Vec::new(),
+            bridge_headers: Vec::new(),
+            bridge_redeems: Vec::new(),
         }
     }
 

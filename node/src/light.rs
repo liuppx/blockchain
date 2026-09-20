@@ -495,6 +495,8 @@ impl ValidatorTracker {
             stake_ops: Vec::new(),
             slashing_evidence: Vec::new(),
             bridge_locks: Vec::new(),
+            bridge_headers: Vec::new(),
+            bridge_redeems: Vec::new(),
         }
         .hash();
         ValidatorTracker {
@@ -1298,6 +1300,7 @@ mod tests {
                 (22, kp(22).public(), 1),
                 (23, kp(23).public(), 1),
             ],
+            bridge_sources: vec![],
         }
     }
 
