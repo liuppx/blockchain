@@ -183,6 +183,16 @@ impl RoundState {
         self.decided.as_ref()
     }
 
+    /// M33: the block this machine decided on, if any. `decided()` returns only
+    /// the [`Commit`] certificate (which binds the block by hash); the agreed
+    /// block body lives in the proposal for the deciding round. A networked host
+    /// needs the body to `apply_certified` it — the decided block's hash equals
+    /// `commit.block_hash`, so this is exactly the block the certificate proves.
+    pub fn decided_block(&self) -> Option<&Block> {
+        let d = self.decided.as_ref()?;
+        self.proposals.get(&d.round).map(|p| &p.block)
+    }
+
     /// Enter the machine at round 0.
     pub fn start(&mut self, kp: &Keypair) -> Vec<Action> {
         let mut out = Vec::new();
@@ -753,6 +763,34 @@ mod tests {
             !acts.iter().any(|a| matches!(a, Action::Broadcast(Msg::Vote(_)))),
             "a proposal from the wrong proposer must be dropped"
         );
+    }
+
+    #[test]
+    fn decided_block_returns_the_agreed_block() {
+        // M33: a networked host reads the decided block body (to apply_certified
+        // it) via `decided_block`; it must be exactly the block the commit binds.
+        let ids = [1u64, 2, 3, 4];
+        let vs = vset(&ids);
+        let b = block(1);
+        let proposer = vs.proposer_for_round(1, 0).unwrap();
+        let mut node = RoundState::new(vs.clone(), proposer, 1, b.clone());
+        let _ = node.start(&kp(proposer)); // proposes + self-prevotes
+        for &v in ids.iter().filter(|&&x| x != proposer) {
+            node.on_message(
+                &kp(proposer),
+                Msg::Vote(Vote::signed(v, 1, 0, b.hash(), VoteType::Prevote, &kp(v))),
+            );
+        }
+        for &v in ids.iter().filter(|&&x| x != proposer) {
+            node.on_message(
+                &kp(proposer),
+                Msg::Vote(Vote::signed(v, 1, 0, b.hash(), VoteType::Precommit, &kp(v))),
+            );
+        }
+        let commit = node.decided().expect("node decided").clone();
+        let decided = node.decided_block().expect("decided block available");
+        assert_eq!(decided.hash(), b.hash());
+        assert_eq!(commit.block_hash, decided.hash());
     }
 
     #[test]

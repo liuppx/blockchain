@@ -165,6 +165,14 @@ pub enum GossipMsg {
     Lock {
         envelope: Box<crate::bridge::LockEnvelope>,
     },
+    /// M33: a distributed BFT consensus message — a signed proposal or a
+    /// prevote/precommit vote for one height. The daemon [`crate::daemon`] Actor
+    /// owns the per-process [`crate::round::RoundState`] and handles these; the
+    /// pure `GossipNode` / `LightGossipNode` cores drop them (a consensus message
+    /// yields no `GossipMsg` reply and its side effects — signing, arming
+    /// wall-clock timers, `apply_certified` — live in the Actor). Boxed because a
+    /// `Proposal` carries a whole `Block`.
+    Consensus(Box<crate::round::Msg>),
 }
 
 /// M24: maximum items in a single [`GossipMsg::GetProof`] / [`GossipMsg::Proof`]
@@ -198,6 +206,9 @@ pub const TAG_BATCH: u8 = 13;
 pub const TAG_GETLOCK: u8 = 14;
 /// M30: bridge lock envelope — the full peer's response.
 pub const TAG_LOCK: u8 = 15;
+/// M33: distributed BFT consensus message (proposal / prevote / precommit).
+/// Handled by the daemon Actor, not the pure gossip cores.
+pub const TAG_CONSENSUS: u8 = 16;
 
 /// M29: maximum items in a single heterogeneous batched
 /// request/response. Mirrors `MAX_PROOF_BATCH = 32` so the bus caps
@@ -761,9 +772,63 @@ impl GossipNode {
             return false;
         }
         self.mempool.remove_included(&block);
+        // M33: every validator builds candidates from its own pending pools, so
+        // once a block commits we must drop the evidence / stake ops it carried —
+        // otherwise this node would re-propose already-applied ops at the next
+        // height and the candidate would fail to apply. (Pre-M33 only the single
+        // sequencer drained these, via take_pending_*; distributed proposing
+        // needs every node to reconcile against committed blocks.)
+        if !block.slashing_evidence.is_empty() {
+            let committed: std::collections::HashSet<[u8; 32]> =
+                block.slashing_evidence.iter().map(|ev| ev.hash()).collect();
+            self.pending_evidence.retain(|ev| !committed.contains(&ev.hash()));
+        }
+        if !block.stake_ops.is_empty() {
+            let committed: std::collections::HashSet<[u8; 32]> =
+                block.stake_ops.iter().map(|op| op.hash()).collect();
+            self.pending_stake_ops.retain(|op| !committed.contains(&op.hash()));
+        }
         self.blocks.push(block);
         self.certs.push(cert);
         true
+    }
+
+    /// M33: assemble and seal this node's candidate block for the next height,
+    /// mirroring [`crate::driver::ChainDriver::produce`]'s block-building step but
+    /// stopping short of consensus (the daemon Actor drives voting). Pulls txs
+    /// from the mempool and attaches the staged evidence / stake-op pools by clone
+    /// (non-proposers keep theirs). When there is nothing to include it still
+    /// returns a well-formed empty block: M33 runs an empty-block heartbeat so all
+    /// validators start each height together (a `create_empty_blocks=false`
+    /// optimization is a documented follow-up). The header is sealed so validators
+    /// vote on — and the post-consensus commit checks — the exact bytes a light
+    /// client will follow. `None` only when the sealed candidate fails its trial
+    /// apply (unproposable); honest nodes then time out rather than propose it.
+    pub fn build_candidate(&self, timestamp_days: f32) -> Option<Block> {
+        let mut candidate = self.mempool.build_block(&self.chain, timestamp_days).unwrap_or(Block {
+            height: self.chain.state.height + 1,
+            prev_hash: self.chain.head,
+            timestamp_days,
+            next_validators_root: [0u8; 32],
+            state_root: [0u8; 32],
+            accounts_root: [0u8; 32],
+            graph_root: [0u8; 32],
+            bridge_root: [0u8; 32],
+            txs: Vec::new(),
+            validator_updates: Vec::new(),
+            stake_ops: Vec::new(),
+            slashing_evidence: Vec::new(),
+            bridge_locks: Vec::new(),
+            bridge_headers: Vec::new(),
+            bridge_redeems: Vec::new(),
+        });
+        candidate.stake_ops = self.pending_stake_ops.clone();
+        candidate.slashing_evidence = self.pending_evidence.clone();
+        // Seal on a best-effort basis: if the staged contents fail the trial
+        // apply the candidate is unproposable, so drop it (honest nodes then time
+        // out rather than propose a block that cannot commit).
+        self.chain.seal(&mut candidate).ok()?;
+        Some(candidate)
     }
 
     /// Submit a locally-originated transaction: admit it to the mempool and return
@@ -910,6 +975,10 @@ impl GossipNode {
                 None => Vec::new(),
             },
             GossipMsg::Lock { .. } => Vec::new(), // full nodes don't consume locks
+            // M33: distributed consensus is driven by the daemon Actor (it owns
+            // the Keypair, wall-clock timers, and apply_certified side effects);
+            // the pure core never handles it.
+            GossipMsg::Consensus(_) => Vec::new(),
         }
     }
 
@@ -1291,7 +1360,9 @@ impl LightGossipNode {
             | GossipMsg::GetBlocks { .. }
             | GossipMsg::Tx(_)
             | GossipMsg::Evidence(_)
-            | GossipMsg::StakeOp(_) => Vec::new(),
+            | GossipMsg::StakeOp(_)
+            // M33: consensus is an Actor concern; light clients never vote.
+            | GossipMsg::Consensus(_) => Vec::new(),
         }
     }
 
@@ -1586,6 +1657,10 @@ pub fn encode_gossip(m: &GossipMsg) -> Vec<u8> {
             out.push(TAG_LOCK);
             put_bytes(&mut out, &encode_lock_envelope(envelope));
         }
+        GossipMsg::Consensus(m) => {
+            out.push(TAG_CONSENSUS);
+            put_bytes(&mut out, &crate::codec::encode_consensus_msg(m));
+        }
     }
     out
 }
@@ -1726,6 +1801,9 @@ pub fn decode_gossip(buf: &[u8]) -> Result<GossipMsg, CodecError> {
         TAG_LOCK => GossipMsg::Lock {
             envelope: Box::new(decode_lock_envelope(take_bytes(&mut rest)?)?),
         },
+        TAG_CONSENSUS => GossipMsg::Consensus(Box::new(
+            crate::codec::decode_consensus_msg(take_bytes(&mut rest)?)?,
+        )),
         other => return Err(CodecError::BadEnum(other as u32)),
     };
     if !rest.is_empty() {
@@ -2243,6 +2321,26 @@ mod tests {
             GossipMsg::Lock {
                 envelope: Box::new(lock_env),
             },
+            // M33: distributed consensus messages — a signed proposal carrying a
+            // real sealed block, and a prevote for its hash.
+            GossipMsg::Consensus(Box::new(crate::round::Msg::Proposal(
+                crate::round::Proposal::signed(
+                    blocks[0].height,
+                    2,
+                    blocks[0].clone(),
+                    -1,
+                    21,
+                    &kp(21),
+                ),
+            ))),
+            GossipMsg::Consensus(Box::new(crate::round::Msg::Vote(Vote::signed(
+                22,
+                blocks[0].height,
+                2,
+                blocks[0].hash(),
+                VoteType::Precommit,
+                &kp(22),
+            )))),
         ];
         for m in &msgs {
             let bytes = encode_gossip(m);

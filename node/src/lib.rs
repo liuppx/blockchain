@@ -25,8 +25,10 @@
 
 pub mod bridge;
 pub mod codec;
+pub mod config;
 pub mod consensus;
 pub mod crypto;
+pub mod daemon;
 pub mod driver;
 pub mod hash;
 pub mod light;
@@ -2168,6 +2170,22 @@ impl Chain {
         self.head = receipt.hash;
         self.block_hashes.push(receipt.hash);
         Ok(receipt)
+    }
+
+    /// M33: trial-check whether `block` would commit cleanly on top of the
+    /// current head, without mutating `self`. A distributed validator uses this
+    /// to pre-validate a received consensus proposal before prevoting: the round
+    /// state machine only checks that a proposed block is for the right height
+    /// (`RoundState::valid_block`), so a byzantine proposer could otherwise get
+    /// honest nodes to prevote a well-formed-but-unapplicable block. Dropping
+    /// such a proposal here makes honest nodes time out and prevote nil, handing
+    /// the round to the next proposer — no validator ever locks onto a block that
+    /// can never commit.
+    pub fn would_accept(&self, block: &Block) -> bool {
+        if block.prev_hash != self.head || block.height != self.state.height + 1 {
+            return false;
+        }
+        self.state.clone().apply_block_inner(block, true).is_ok()
     }
 
     /// Rebuild a chain by replaying `blocks` on top of `genesis` (e.g. from a

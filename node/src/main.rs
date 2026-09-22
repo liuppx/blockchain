@@ -10,13 +10,18 @@
 //!   cargo run --release --bin node -- account          # account-membership SPV for a wallet: prove your balance against a cert-signed header
 //!   cargo run --release --bin node -- staking          # bond/unbond: stake-bound validator power + unbonding
 //!   cargo run --release --bin node -- slashing         # slash an equivocating validator's bonded stake to the treasury
-//!   cargo run --release --bin node -- run  --dir DIR   # persistent chain (block log)
+//!   cargo run --release --bin node -- run  --config F # networked tokio daemon (TCP P2P gossip)
+//!   cargo run --release --bin node -- localnet         # in-process tokio testnet converges over real sockets
 //!   cargo run --release --bin node -- status --dir DIR # replay log, print state
 //!   cargo run --release --bin node -- certs  --dir DIR # persist certified chain, re-verify finality
 //!
-//! `run` is durable: the first invocation seeds a few demo blocks into
-//! DIR/blocks.log; every later `run`/`status` replays that log and reconstructs
-//! byte-identical state (same state_root) — the point of the persistence layer.
+//! `run` is the real M33 daemon: it loads a node/genesis/validator config, binds a
+//! TCP listener, dials configured peers, and runs both the gossip anti-entropy
+//! protocol and distributed BFT voting over real sockets. There is no sequencer —
+//! every node with `[validator] enabled = true` owns one key, gossips
+//! proposals/prevotes/precommits, and drives round changes with wall-clock
+//! timeouts; nodes without a validator key are pure followers that sync + verify
+//! certificates over the wire. `status`/`certs --dir` remain offline replay tools.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::net::{TcpListener, TcpStream};
@@ -25,7 +30,9 @@ use std::sync::mpsc;
 use std::thread;
 
 use zhixing_engine::{DeltaKParams, DIM};
+use zhixing_node::config::{self, NodeConfig, NodeSection, PeerConfig};
 use zhixing_node::consensus::{commit_block, detect_equivocation, Commit};
+use zhixing_node::daemon;
 use zhixing_node::driver::ChainDriver;
 use zhixing_node::codec::BlockHeader;
 use zhixing_node::bridge::{BridgeEndpoint, BridgeError};
@@ -226,7 +233,8 @@ fn main() {
         "batch" => cmd_batch(),
         "bridge" => cmd_bridge(),
         "redeem" => cmd_redeem(),
-        "run" => cmd_run(dir_arg(&args)),
+        "run" => cmd_run(config_arg(&args)),
+        "localnet" => cmd_localnet(),
         "status" => cmd_status(dir_arg(&args)),
         "certs" => cmd_certs(dir_arg(&args)),
         "-h" | "--help" | "help" => usage(),
@@ -247,6 +255,18 @@ fn dir_arg(args: &[String]) -> String {
         i += 1;
     }
     eprintln!("this command requires --dir <path>");
+    exit(2);
+}
+
+fn config_arg(args: &[String]) -> String {
+    let mut i = 0;
+    while i < args.len() {
+        if args[i] == "--config" && i + 1 < args.len() {
+            return args[i + 1].clone();
+        }
+        i += 1;
+    }
+    eprintln!("this command requires --config <path>");
     exit(2);
 }
 
@@ -273,7 +293,8 @@ fn usage() {
     eprintln!("  node batch              heterogeneous batched proof transport: Inclusion + kNN + Range + Diff in a single round-trip");
     eprintln!("  node bridge             trustless bridge: chain A locks to chain B, relayer ferries a cert-signed envelope, B's endpoint verifies + credits — no relayer trust");
     eprintln!("  node redeem             consensus-level redeem: B's producer follows A on-chain and mints from a source lock inside its state machine — the mint is BFT-enforced, not off-chain");
-    eprintln!("  node run    --dir DIR   persistent chain (seeds demo blocks once, then replays)");
+    eprintln!("  node run    --config F  run the networked BFT daemon (tokio TCP P2P): load config/genesis/validator key, gossip votes + sync/verify over sockets");
+    eprintln!("  node localnet           spin up an in-process tokio testnet (4 validators, no sequencer) and show all nodes converge via distributed BFT voting over real sockets");
     eprintln!("  node status --dir DIR   replay the block log and print state");
     eprintln!("  node certs  --dir DIR   persist a certified chain (blocks+certs) and re-verify finality on reload");
 }
@@ -2673,28 +2694,122 @@ use zhixing_node::light::ProofKind;
 }
 
 
-fn cmd_run(dir: String) {
-    let path = format!("{dir}/blocks.log");
-    let log = BlockLog::open(&path).unwrap_or_else(|e| fail("open log", e));
-    let blocks = log.read_all().unwrap_or_else(|e| fail("read log", e));
+/// Run the real networked daemon. Loads the node config and its referenced
+/// genesis, derives this process's single validator key (M33: one key per node,
+/// no sequencer) from the `[validator]` section, builds a multi-thread tokio
+/// runtime, and blocks on `daemon::run` until Ctrl-C. `main()` stays sync so the
+/// ~20 in-memory demo commands are unaffected by the async runtime.
+fn cmd_run(config_path: String) {
+    let cfg = config::load_node_config(&config_path)
+        .unwrap_or_else(|e| fail_msg("load node config", &e));
+    let gcfg = config::load_genesis(&cfg.genesis)
+        .unwrap_or_else(|e| fail_msg("load genesis", &e));
+    let genesis = gcfg.to_genesis().unwrap_or_else(|e| fail_msg("build genesis", &e));
 
-    let mut chain = Chain::replay(demo_genesis(), &blocks)
-        .unwrap_or_else(|e| fail_chain("replay log", e));
-
-    if chain.state.height == 0 {
-        println!("empty log at {path} — seeding demo blocks\n");
-        for blk in demo_blocks(&chain) {
-            let label = format!("block {}", blk.height);
-            commit_print(&mut chain, Some(&log), &label, blk);
+    // M33: an enabled `[validator]` section makes this node a voting validator;
+    // absent or disabled ⇒ a pure follower that syncs + verifies but never votes.
+    let validator_key = match cfg.validator.as_ref() {
+        Some(vc) if vc.enabled => {
+            Some(vc.keypair().unwrap_or_else(|e| fail_msg("validator key", &e)))
         }
-    } else {
-        println!(
-            "replayed {} block(s) from {path} (head={})\n",
-            chain.state.height,
-            short(&chain.head)
-        );
-    }
-    print_summary(&chain);
+        _ => None,
+    };
+
+    let rt = tokio::runtime::Runtime::new().unwrap_or_else(|e| fail("tokio runtime", e));
+    rt.block_on(async move {
+        if let Err(e) = daemon::run(cfg, genesis, validator_key).await {
+            fail("daemon", e);
+        }
+    });
+}
+
+/// End-to-end showcase on the production path: launch a small tokio testnet
+/// entirely in-process — **four validators (21..24), no sequencer** — wired over
+/// the **real** TCP transport on loopback. Each node owns one signing key and
+/// votes; blocks are finalized by distributed prevote/precommit gossip with
+/// wall-clock timeouts. Submit a few transactions to one node (they flood) and
+/// poll until every node has synced + verified the same head.
+fn cmd_localnet() {
+    let ids = [21u64, 22, 23, 24];
+    let base_port = 19021u16;
+    let genesis = demo_genesis();
+
+    // one private data dir per node so their logs never collide
+    let root = std::env::temp_dir().join(format!("zhixing-localnet-{}", std::process::id()));
+
+    // build a config per node; every node lists all the others as peers. The
+    // signing key is supplied directly to `Node::start` below (not via config).
+    let addr = |id: u64| format!("127.0.0.1:{}", base_port + (id as u16 - 21));
+    let node_cfg = |id: u64| -> NodeConfig {
+        let peers = ids
+            .iter()
+            .filter(|&&p| p != id)
+            .map(|&p| PeerConfig { id: p, addr: addr(p) })
+            .collect();
+        NodeConfig {
+            node: NodeSection {
+                id,
+                listen: addr(id),
+                data_dir: root.join(format!("n{id}")).to_string_lossy().into_owned(),
+            },
+            peers,
+            genesis: String::new(), // supplied directly to Node::start below
+            validator: None,
+        }
+    };
+
+    println!("localnet: starting 4 validators (21..24), no sequencer, over loopback TCP\n");
+
+    let rt = tokio::runtime::Runtime::new().unwrap_or_else(|e| fail("tokio runtime", e));
+    rt.block_on(async move {
+        let mut nodes = Vec::new();
+        for &id in &ids {
+            let node = daemon::Node::start(node_cfg(id), genesis.clone(), Some(kp(id)))
+                .await
+                .unwrap_or_else(|e| fail("start node", e));
+            nodes.push((id, node));
+        }
+
+        // give the mesh a moment to dial + handshake, then feed txs to one node
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        let any = &nodes[0].1;
+        for t in [
+            tx(1, unit(1), 1, reviews(&[(10, 0.9), (11, 0.85), (12, 0.9)]), (3, 3), 1.0),
+            tx(2, unit(2), 2, reviews(&[(10, 0.88), (11, 0.9), (12, 0.86)]), (3, 3), 1.0),
+            tx(3, blend(1, 2), 3, reviews(&[(10, 0.9), (11, 0.9), (12, 0.85)]), (3, 3), 1.0),
+        ] {
+            any.submit(t);
+        }
+        let target = 3u64;
+
+        // poll until every node reports the same height >= target (or time out)
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(40);
+        loop {
+            let mut heights = Vec::new();
+            for (id, node) in &nodes {
+                heights.push((*id, node.status().await.unwrap_or((0, [0u8; 32]))));
+            }
+            let converged = heights.iter().all(|(_, (h, _))| *h >= target)
+                && heights.windows(2).all(|w| w[0].1 == w[1].1);
+            if converged || std::time::Instant::now() >= deadline {
+                println!("final node states:");
+                for (id, (h, head)) in &heights {
+                    println!("  node {id} (validator)  height {h}  head {}", short(head));
+                }
+                if converged {
+                    println!("\n✓ all 4 validators converged on the same cert-verified head via distributed voting (no sequencer)");
+                } else {
+                    eprintln!("\n✗ nodes did not converge before the deadline");
+                    exit(1);
+                }
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        }
+    });
+
+    // best-effort cleanup of the scratch dirs
+    let _ = std::fs::remove_dir_all(root);
 }
 
 fn cmd_status(dir: String) {

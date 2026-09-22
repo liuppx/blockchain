@@ -23,12 +23,41 @@ cargo run --release --bin node -- vprove           # 验证人 Merkle 证明：�
 cargo run --release --bin node -- staking          # 质押：绑定 $COG 获得验证人权重；解绑经时间锁提款到期返还
 cargo run --release --bin node -- slashing         # 罚没：验证人双签 → 提交证据 → 绑定质押罚没入 treasury、移出验证人集
 cargo run --release --bin node -- certs  --dir DIR # 证书落盘：产出认证链→落盘 blocks/certs→重放复验最终性
-cargo run --release --bin node -- run  --dir DIR   # 持久化链：首次落盘演示块，之后重放
+cargo run --release --bin node -- localnet         # M33：进程内 tokio 测试网（4 验证人，无定序器）经真实 socket BFT 收敛
+cargo run --release --bin node -- run  --config F  # M33：联网 tokio 守护进程（TCP P2P gossip + 分布式 BFT 投票）
 cargo run --release --bin node -- status --dir DIR # 重放区块日志并打印状态
-cargo test --release                               # 242 项单元测试（见下）
+cargo test --release                               # 259 项单元测试（见下）
 ```
 
 演示链展示：新颖提交铸造 $COG、跨域桥接拿到 novelty+bonus（ΔK>1）、近重复/低质提交被**罚没入 treasury**、供应守恒、评审声誉按链上结果升降。
+
+## 联网 tokio 守护进程与分布式 BFT 测试网（Milestone 33）
+
+到 M32 为止 P2P transport 已搬到真实 socket，但**共识仍中心化**——一个 `[producer] enabled = true` 节点持**全部验证人 seeds**、在进程内 `Sim`/`ChainDriver` 里独力定稿证书块；其他节点只同步 + 逐块复验证书。`prevote`/`precommit` 投票从不出进程。
+
+M33 把共识**真正分布式化**：每个验证人节点各持**一把** ed25519 `Keypair` + 一个 `round::RoundState` FSM，proposal / prevote / precommit 经同一条 TCP 总线 gossip 出去，round 推进由 wall-clock timeout 驱动——没有 `[producer]`、没有指定定序器。`ChainDriver`/`round::Sim` 保留给 `bft` / `live` / `chain` 离线 demo + 单元测试，不进守护进程。
+
+进程内一键演示（4 验证人、零定序器、真实 loopback socket 收敛）：
+
+```bash
+cargo run --release --bin node -- localnet
+# [node 21] listening on 127.0.0.1:19021 … role=validator
+# [node 22] listening on 127.0.0.1:19022 … role=validator
+# [node 23] listening on 127.0.0.1:19023 … role=validator
+# [node 24] listening on 127.0.0.1:19024 … role=validator
+# ✓ all 4 validators converged on the same cert-verified head via distributed voting (no sequencer)
+```
+
+真实多终端测试网（`testnet/` 已含样例：`genesis.toml` + `node21..24.toml`，**每个** nodeXX.toml 自带 `[validator] enabled=true, seed_hex=<其本地 seed>`——genesis pubkey 与本地公钥不匹配时启动直接 fail-fast）：
+
+```bash
+cargo run --release --bin node -- run --config testnet/node21.toml   # 验证人（终端 1）
+cargo run --release --bin node -- run --config testnet/node22.toml   # 验证人（终端 2）
+cargo run --release --bin node -- run --config testnet/node23.toml   # 验证人（终端 3）
+cargo run --release --bin node -- run --config testnet/node24.toml   # 验证人（终端 4）
+```
+
+要点：`src/daemon.rs` 单属主 actor（`GossipNode` 独占一个 task、per-peer mpsc 出站、无 `Arc<Mutex>`），现在**也独占**一对 `Keypair`（follower 为 `None`）+ `Option<RoundState>` + tokio timer 句柄；帧 = `u32` BE 长度前缀 + `encode_gossip`，加 `MAX_FRAME = 16 MiB` 上限（阻塞版 `read_msg` 无上限）；8 字节 BE id 握手在 `GossipMsg` 之外（wire tag 0..=15 范围不动，新增 `TAG_CONSENSUS=16` 装 `GossipMsg::Consensus(Box<round::Msg>)`，proposal 字节 = 编码后 `Block`，接收端哈希与 proposer 端哈希逐字节相同）；只向 id 更大的 peer 拨号 → 每对恰一条连接；actor 是本节点日志唯一写者（任何命令后 `append node.blocks()[appended..]`），boot 经 `load_certified` 复验最终性恢复；纯 `GossipNode::on_message` 不收共识消息——它既不知道本节点的密钥，也没法触达 tokio 定时器；共识消息在 actor 主循环里被 `Cmd::Inbound` 直接路由到 `RoundState::on_message`/`on_timeout`。**同步永远赢**：验证人只对 `node.height()+1` 跑共识，`reconcile_after_sync()` 在任何高度推进之后立即弃旧 round + arm 下一高度——anti-entropy 永远优先于尚未决的 round。**Byzantine-proposer 活性保护**：`on_consensus` 在 prevote 之前用 `Chain::would_accept` 试跑 apply，把不能 apply 的 proposal 当成"proposer 缺席"处理（→ prevote nil → 下一 honest proposer）。**空块心跳**：每 `BLOCK_INTERVAL=1000ms` 由 `build_candidate` 出一空 sealed block 推进高度（`create_empty_blocks=false` 是后续优化）。超时常量 `PROPOSE/PREVOTE/PRECOMMIT_TIMEOUT_BASE=1000ms` + `TIMEOUT_DELTA=500ms`（每 round 线性回退，落入最终同步性）；4 等权验证人 quorum=3，所以 3-of-4 持续推进、2-of-4 安全停摆。配置在 `src/config.rs`，serde + toml **镜像结构**转换成引擎类型，共识核心 `lib.rs` 仍 serde-free。**依赖变化**：node 自 M32 起引入 `tokio`/`serde`/`toml`（引擎仍纯 std 零依赖）。
 
 ## 持久化与重放（Milestone 7）
 
@@ -526,6 +555,21 @@ verify_diff_rejects_an_omitted_added_node           prover 漏报 added leaf →
 verify_diff_rejects_degenerate_ranges               h₁=0 / h₁≥h₂ → InvalidDiffRange
 serve_diff_returns_a_typed_envelope_for_a_height_range  2-block 链 serve_diff → envelope 每叶对 h₂ accounts_root 验证 + wallet Ok + wire 回环后仍 Ok
 serve_diff_returns_none_for_degenerate_ranges       h₁=0/h₁≥h₂/h₂ 越界/头高错配 → None
+# 文件化配置（M32→M33，config.rs）
+node_config_round_trip                         NodeConfig toml 往返 + listen/peer 地址解析
+genesis_config_converts_to_demo_genesis        GenesisConfig::to_genesis() 复刻 demo_genesis 字段
+validator_section_defaults_to_disabled         [validator] 缺省 = enabled=false（纯 follower）
+checked_in_testnet_samples_load                testnet/*.toml 样例载入 + 4 个 node seed 复刻验证人 pubkey
+validator_pubkey_mismatch_is_detectable        cfg 的种子与 genesis pubkey 不匹配 → typed ConfigError
+# 联网 tokio 守护进程（M33，daemon.rs）
+frame_round_trip_over_duplex                   write_frame/read_frame 经 tokio duplex 往返（扩展含 Consensus 帧）
+oversized_frame_is_rejected                    超帧长度头 > MAX_FRAME → 分配前拒绝
+hello_handshake_round_trip                     8 字节 BE id 握手往返
+four_validators_converge_over_tcp              4 验证人、无定序器，loopback TCP 收敛到同一 head + 重放复验证书
+one_crashed_validator_still_makes_progress     3/4 活（quorum=3）：连返几高度、round change 拉动
+two_crashed_validators_stall_safely            2/4 活（quorum 不可达）：8s 内高度不动、安全停摆
+late_joiner_syncs_then_participates            3 验证人先 commit，第 4 个晚启动 → 抗熵追平 + 一起推进 + 重放复验
+pure_follower_syncs_certified_chain            4 验证人 + 1 follower（kp=None）→ 仅同步 + 持久化、不投票 + 重放复验
 ```
 
 ## 文件
@@ -545,8 +589,10 @@ serve_diff_returns_none_for_degenerate_ranges       h₁=0/h₁≥h₂/h₂ 越�
 | `src/crypto.rs` | ed25519 身份：`Keypair`/`verify`（封装 `ed25519-dalek`）+ 测试 |
 | `src/codec.rs` | 区块的规范二进制编解码（哈希与落盘共用，含 `validator_updates`、`stake_ops` 与 `slashing_evidence`；M22 增 `BlockHeader`（含 `txs_commitment`/`stake_ops_commitment`/`evidence_commitment` 三份 SHA-256 承诺）+ `CertifiedHeader` + `encode_header`/`decode_header` + `encode_certified_header`/`decode_certified_header` + **M23 头再加 `state_root`/`accounts_root` 两根、`Block`/`BlockHeader` 同步增两字段、`decode_certified_header` 长度算术从 `84 + n*48 + 96` 改为 `148 + n*48 + 96 = 244 + n*48`** + **M27 头再加 `graph_root` 根、`Block`/`BlockHeader` 同步增字段、`decode_certified_header` 长度算术从 `148` 改为 `180 + n*48 + 96 = 276 + n*48`，prefix 仍与 `encode_block` 字节对齐** + **M30 头再加 `bridge_root` 根 + 尾部 `bridge_locks_commitment` 承诺、`Block.bridge_locks: Vec<BridgeLock>`、`decode_certified_header` 长度算术从 `180` 改为 `212 + n*48 + 128 = 340 + n*48`**）+ `tx_signing_bytes`/`encode_tx`/`decode_tx`（签名/tx 哈希/gossip wire 字节）+ `stakeop_signing_bytes`/`encode_stakeop`/`decode_stakeop`（bond/unbond 签名与哈希）+ `encode_evidence`/`decode_evidence`（双签证据）+ `encode_commit`/`decode_commit`（证书落盘）+ **`encode_account`/`decode_account`/`encode_proof`/`decode_proof`（M23 AccountProof 的 wire 字节）** + **M28 `encode_diff_envelope`/`decode_diff_envelope`** + **M29 `encode_knn_request`/`decode_knn_request`（32-byte query + u32 k）+ `encode_range_request`/`decode_range_request`（32-byte query + f32 min_sim）+ `encode_knn_claim`/`decode_knn_claim` + `encode_range_claim`/`decode_range_claim` + `encode_batch_envelope`/`decode_batch_envelope`（u32 len + 每 slot 1-byte kind tag + per-variant body）+ `encode_batch_response_kind`/`decode_batch_response_kind`** + **M30 `encode_bridge_lock`/`decode_bridge_lock`（account/amount/dest_chain/dest_account/nonce/sig wire）+ `bridgelock_signing_bytes`** + 测试 |
 | `src/store.rs` | 追加式日志（长度前缀记录、残缺尾检测）：`BlockLog`（区块）+ `CertLog`（证书）+ 测试 |
+| `src/config.rs` | **M32 文件化配置（serde + toml 镜像结构，共识类型仍 serde-free）；M33 用 `[validator]{enabled, seed_hex}` 替换 `[producer]`**：`NodeConfig`（id/listen/data_dir + 静态 peer 表 + 可选 `[validator]`）/ `GenesisConfig`（`to_genesis()` hex 解码 pubkey）+ `load_node_config`/`load_genesis` + `decode_seed` 自带严格 hex 解码（`hash.rs` 只编码）+ `ConfigError` typed 错误 + 测试（往返 / 载入 `testnet/` 样例 / pubkey-mismatch fail-fast / typed 错误 / 样例生成器） |
+| `src/daemon.rs` | **M33 联网 tokio 守护进程（TCP P2P + 分布式 BFT 投票）**：单属主 actor（`GossipNode` 独占 task、per-peer mpsc 出站、无 `Arc<Mutex>`）——actor 现在**也独占** `Keypair: Option<Keypair>` + `Option<RoundState>` + tokio timer 句柄；`write_frame`/`read_frame`（`u32` BE 长度 + `encode_gossip`，`MAX_FRAME = 16 MiB` 上限）+ 8 字节 BE id 握手（在 `GossipMsg` 之外）+ 只拨 id 更大 peer（每对一连接）+ 监听/连接/反熵心跳任务 + **`Cmd::{StartHeight, Timeout}`（tokio sleep → self_tx）**；**`GossipNode::on_message` 仍纯**（把 `GossipMsg::Consensus` 直接 drop 掉——它既没密钥也触不到 timer），共识消息在 actor 主循环里路由到 `RoundState::on_message`/`on_timeout`；**`build_candidate` 永远出一 sealed block**（空块心跳），`on_consensus` 在 prevote 之前用 `Chain::would_accept` 试跑 apply（Byzantine-proposer 保护），`reconcile_after_sync` 让 sync 永远赢；actor 是本节点日志唯一写者（`append node.blocks()[appended..]`）；`Node::start`/`run(cfg, genesis, Option<Keypair>)`——boot 经 `load_certified` 复验最终性、validator 键与 genesis pubkey 不匹配即 fail-fast；测试（分帧往返 / 超帧拒绝 / 握手 / **4 验证人收敛 / 1-fault 持续推进 / 2-fault 安全停摆 / 晚加入 / 纯 follower 跟随**） |
 | `src/hash.rs` | 纯 std SHA-256（FIPS 180-4，含已知向量测试）——离线零依赖 |
-| `src/main.rs` | 节点 CLI：`demo` / `build` / `prove` / `bft` / `live` / `chain` / `validators` / `gossip`（含 M19 证据 flood 演示） / `light`（M20 跟随 + M21 免迁移 `follow_committed` 演示） / `vprove`（M21 验证人 Merkle 成员证明） / `lsync`（M22 头部轻同步演示：全+光节点同总线、光端 0 笔交易入眼即够到全节点高度，附线缆字节节省 + `verify_membership_against_header`） / **`account`（M23 钱包账户-成员 SPV 演示：光端经 `GetAccountProof` 取账户、本地重算 leaf 对头里的 `accounts_root` 验证，含双根对比）** / **`graph`（M25 图节点 cert-signed 包含证明演示：单次 GetProof 拿图节点 + 账户，光端对 accounts_root 重算 leaf、零信任 prover）** / **`knn`（M26 cert-signed 邻域证明演示：full peer 本地 kNN → KnnClaim，wallet 端 verify_knn_against_header 重排 + cut）** / **`range`（M27 cert-signed 范围查询演示：full peer 本地 cosine cutoff → RangeClaim，wallet 端 verify_range_against_header 对 graph_root 重排 + cut，含 cut/根/cutoff 三类负测）** / **`diff`（M28 cert-signed 时序 diff 演示：full peer 本地 h₁→h₂ diff → DiffEnvelope，wallet 端 verify_diff_against_headers 局部重放等比 + 每 leaf 对各自 accounts_root 验，含 leaf-proof / accounts_root / dropped-added 三类负测）** / **`batch`（M29 异构批 SPV 演示：full peer 一次性出 `(Inclusion, Knn, Range, Diff)` 四 slot 的 `BatchResponseEnvelope`，wallet 端 `verify_batch` 派回四个 per-primitive 验证器，含 inclusion/knn-ordering/diff 三类负测）** / **`bridge`（M30 信任无关跨链桥演示：两条不同创世 A↔B，A 锁 12 µ$COG 到 B 账户 7，relayer 从 A 拿 `LockEnvelope` 投到 B 的 `BridgeEndpoint`，B 端 `verify_lock` → Ok → `minted(7)=12`，含 tampered-proof / wrong-destination / replay / tampered-root 四类 `BridgeError` 负测）** / `staking` / `slashing` / `certs` / `run` / `status`（含确定性演示密钥） |
+| `src/main.rs` | 节点 CLI：`demo` / `build` / `prove` / `bft` / `live` / `chain` / `validators` / `gossip`（含 M19 证据 flood 演示） / `light`（M20 跟随 + M21 免迁移 `follow_committed` 演示） / `vprove`（M21 验证人 Merkle 成员证明） / `lsync`（M22 头部轻同步演示：全+光节点同总线、光端 0 笔交易入眼即够到全节点高度，附线缆字节节省 + `verify_membership_against_header`） / **`account`（M23 钱包账户-成员 SPV 演示：光端经 `GetAccountProof` 取账户、本地重算 leaf 对头里的 `accounts_root` 验证，含双根对比）** / **`graph`（M25 图节点 cert-signed 包含证明演示：单次 GetProof 拿图节点 + 账户，光端对 accounts_root 重算 leaf、零信任 prover）** / **`knn`（M26 cert-signed 邻域证明演示：full peer 本地 kNN → KnnClaim，wallet 端 verify_knn_against_header 重排 + cut）** / **`range`（M27 cert-signed 范围查询演示：full peer 本地 cosine cutoff → RangeClaim，wallet 端 verify_range_against_header 对 graph_root 重排 + cut，含 cut/根/cutoff 三类负测）** / **`diff`（M28 cert-signed 时序 diff 演示：full peer 本地 h₁→h₂ diff → DiffEnvelope，wallet 端 verify_diff_against_headers 局部重放等比 + 每 leaf 对各自 accounts_root 验，含 leaf-proof / accounts_root / dropped-added 三类负测）** / **`batch`（M29 异构批 SPV 演示：full peer 一次性出 `(Inclusion, Knn, Range, Diff)` 四 slot 的 `BatchResponseEnvelope`，wallet 端 `verify_batch` 派回四个 per-primitive 验证器，含 inclusion/knn-ordering/diff 三类负测）** / **`bridge`（M30 信任无关跨链桥演示：两条不同创世 A↔B，A 锁 12 µ$COG 到 B 账户 7，relayer 从 A 拿 `LockEnvelope` 投到 B 的 `BridgeEndpoint`，B 端 `verify_lock` → Ok → `minted(7)=12`，含 tampered-proof / wrong-destination / replay / tampered-root 四类 `BridgeError` 负测）** / `staking` / `slashing` / `certs` / **`localnet`（M33 进程内 tokio 4 验证人测试网经真实 loopback socket BFT 收敛）** / `run`（**M33 起 `--config` 联网 tokio 守护进程 + 分布式 BFT 投票；旧 `--dir` 播种语义由 `localnet` 取代**） / `status`（含确定性演示密钥） |
 
 ## 局限与后续（离生产还差什么）
 
@@ -572,5 +618,7 @@ serve_diff_returns_none_for_degenerate_ranges       h₁=0/h₁≥h₂/h₂ 越�
 - **~~Merkle 化状态树~~**：✅ 已完成（M10，二叉 Merkle 树 + 账户包含证明）。后续：非成员证明、增量更新的 Merkle-Patricia trie、把 graph/头字段也纳入根。
 - **手写 SHA-256** 仅为离线零依赖演示，**生产必须换审计实现**（`sha2`）。
 - **kNN 暴力扫描**：随图谱增长需换 HNSW/IVF（见 engine 局限）。
+- **~~联网 tokio 守护进程（单定序器测试网）~~**：✅ 已完成（M32，参见上节）。**~~M33 分布式 BFT 投票~~**：✅ 已完成——用一进程一 `RoundState` + 一 `Keypair` 替换 `Sim`/全密钥，proposal/prevote/precommit 经同 TCP 总线 gossip 出去、wall-clock 超时驱动 `on_timeout`；`GossipNode::on_message` 仍纯，把 `Consensus` 直接 drop（actor 主循环按 `Cmd::Inbound` 路由到 `RoundState`），纯 follower 节点 `kp=None` 永不跑共识；`localnet` 是 4 验证人、零定序器，每个 `[validator]` 节点自带 seed_hex，seed 与 genesis pubkey 不匹配即 fail-fast；测试：4 验证人收敛、1-fault 持续推进、2-fault 安全停摆、晚加入同步、纯 follower 跟随、配置往返 + 载入样例 + pubkey-mismatch。**后续 M34**：运维成熟度——`tracing` 结构化日志、metrics/health 端点、更完善的关停与错误恢复、`create_empty_blocks=false`、配置驱动的超时、peer discovery、TLS/auth。
+- **依赖策略变化**：M32 起 node（应用层）新增三个依赖——异步运行时 `tokio` + 配置的 `serde`/`toml`；共识核心（`lib.rs`）仍 serde-free（`config.rs` 用镜像结构转换），`engine`（可嵌入/WASM）仍纯 std 零依赖。“节点纯 std / 零外部依赖”的旧表述自 M32 起仅适用于引擎。
 
-这些构成后续里程碑（~~M7 持久化~~ ✅、~~M8 签名~~ ✅、~~M9 mempool 出块~~ ✅、~~M10 Merkle 认证状态~~ ✅、~~M11 BFT 最终性内核~~ ✅、~~M12 BFT 轮次状态机/活性~~ ✅、~~M13 认证链驱动~~ ✅、~~M14 证书落盘 + 重放复验~~ ✅、~~M15 P2P + gossip~~ ✅、~~M16 动态验证人集~~ ✅、~~M17 质押绑定权重 + 解绑期~~ ✅、~~M18 按证据罚没绑定质押~~ ✅、~~M19 P2P 传播块级 ops~~ ✅、~~M20 验证人集变更的轻客户端跟随协议~~ ✅、~~M21 验证人集 Merkle 承诺入区块头~~ ✅、~~M22 只拉头部的 SPV 轻同步传输~~ ✅、~~M23 钱包的账户-成员 SPV（双根承诺）~~ ✅、~~M24 批量化、类型化 SPV 原语（统一 GetProof/Proof 对 + 单一 verify_proof_against_header）~~ ✅、~~M25 单点图节点 cert-signed 包含证明~~ ✅、~~M26 图节点 cert-signed kNN 邻域证明~~ ✅、~~M27 图节点 cert-signed cosine 范围证明~~ ✅、~~M28 图节点 cert-signed 时序 diff 证明~~ ✅、~~M29 异构批 SPV 传输（一次性 inclusion + kNN + range + diff）~~ ✅、~~M30 信任无关跨链桥（relay + verify-from-counterparty）~~ ✅……），每步仍遵循"可运行、可测试、契约一致"。
+这些构成后续里程碑（~~M7 持久化~~ ✅、~~M8 签名~~ ✅、~~M9 mempool 出块~~ ✅、~~M10 Merkle 认证状态~~ ✅、~~M11 BFT 最终性内核~~ ✅、~~M12 BFT 轮次状态机/活性~~ ✅、~~M13 认证链驱动~~ ✅、~~M14 证书落盘 + 重放复验~~ ✅、~~M15 P2P + gossip~~ ✅、~~M16 动态验证人集~~ ✅、~~M17 质押绑定权重 + 解绑期~~ ✅、~~M18 按证据罚没绑定质押~~ ✅、~~M19 P2P 传播块级 ops~~ ✅、~~M20 验证人集变更的轻客户端跟随协议~~ ✅、~~M21 验证人集 Merkle 承诺入区块头~~ ✅、~~M22 只拉头部的 SPV 轻同步传输~~ ✅、~~M23 钱包的账户-成员 SPV（双根承诺）~~ ✅、~~M24 批量化、类型化 SPV 原语（统一 GetProof/Proof 对 + 单一 verify_proof_against_header）~~ ✅、~~M25 单点图节点 cert-signed 包含证明~~ ✅、~~M26 图节点 cert-signed kNN 邻域证明~~ ✅、~~M27 图节点 cert-signed cosine 范围证明~~ ✅、~~M28 图节点 cert-signed 时序 diff 证明~~ ✅、~~M29 异构批 SPV 传输（一次性 inclusion + kNN + range + diff）~~ ✅、~~M30 信任无关跨链桥（relay + verify-from-counterparty）~~ ✅、~~M31 共识级跨链赎回 + 铸造（目的链链上）~~ ✅、~~M32 联网 tokio 守护进程（单定序器测试网：真实 TCP gossip + 文件化 config/genesis/keystore）~~ ✅、~~M33 分布式 BFT 投票（一进程一密钥，proposal/prevote/precommit 经真实 socket gossip + wall-clock 超时，无指定定序器）~~ ✅……），每步仍遵循"可运行、可测试、契约一致"。

@@ -16,9 +16,18 @@ path = "src/main.rs"
 # The engine is reused as a plain rlib (no `python` feature, no pyo3). The node
 # is an *application*, so it takes an audited crypto dependency for signatures
 # (hand-rolling ed25519 would be irresponsible); the engine itself stays zero-dep.
+#
+# M32 adds three application-level dependencies for the real networked daemon
+# (`node run`): an async runtime (tokio) for the TCP P2P transport, and
+# serde+toml for file-based node/genesis/keystore config. The consensus core
+# (lib.rs) stays serde-free — config.rs holds serde *mirror* structs that
+# convert into the plain engine types.
 [dependencies]
 zhixing-engine = { path = "../engine" }
 ed25519-dalek = "2"
+tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "macros", "time", "sync", "signal"] }
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
 
 [profile.release]
 lto = true

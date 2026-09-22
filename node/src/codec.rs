@@ -762,6 +762,70 @@ fn dec_vote(d: &mut Dec) -> Result<Vote, CodecError> {
     })
 }
 
+/// M33: encode one consensus message ([`crate::round::Msg`]) for the wire. A
+/// 1-byte discriminant selects the variant (0 = Proposal, 1 = Vote); votes reuse
+/// the canonical [`enc_vote`] layout, and a proposal's block is written
+/// length-prefixed via [`encode_block`] so the bytes a proposer signs over
+/// (`proposal_signing_bytes`, which binds the block by hash) and the bytes a
+/// receiver hashes are the same block encoding.
+pub fn encode_consensus_msg(m: &crate::round::Msg) -> Vec<u8> {
+    let mut e = Enc(Vec::new());
+    match m {
+        crate::round::Msg::Proposal(p) => {
+            e.raw(&[0u8]);
+            enc_proposal(&mut e, p);
+        }
+        crate::round::Msg::Vote(v) => {
+            e.raw(&[1u8]);
+            enc_vote(&mut e, v);
+        }
+    }
+    e.0
+}
+
+/// M33: decode one consensus message (inverse of [`encode_consensus_msg`]).
+pub fn decode_consensus_msg(buf: &[u8]) -> Result<crate::round::Msg, CodecError> {
+    let mut d = Dec { buf, pos: 0 };
+    let tag = d.u8()?;
+    let msg = match tag {
+        0 => crate::round::Msg::Proposal(dec_proposal(&mut d)?),
+        1 => crate::round::Msg::Vote(dec_vote(&mut d)?),
+        other => return Err(CodecError::BadEnum(other as u32)),
+    };
+    if d.pos != d.buf.len() {
+        return Err(CodecError::TrailingBytes);
+    }
+    Ok(msg)
+}
+
+/// Encode one proposal: height, round, valid_round, proposer, signature, then the
+/// length-prefixed block body. `valid_round` is written as its `u64`
+/// two's-complement (matching `proposal_signing_bytes`), so a fresh proposal's
+/// `-1` round-trips exactly.
+fn enc_proposal(e: &mut Enc, p: &crate::round::Proposal) {
+    e.u64(p.height);
+    e.u32(p.round);
+    e.u64(p.valid_round as u64);
+    e.u64(p.proposer);
+    e.raw(&p.signature);
+    let body = encode_block(&p.block);
+    e.u64(body.len() as u64);
+    e.raw(&body);
+}
+
+/// Decode one proposal from the cursor (inverse of [`enc_proposal`]).
+fn dec_proposal(d: &mut Dec) -> Result<crate::round::Proposal, CodecError> {
+    let height = d.u64()?;
+    let round = d.u32()?;
+    let valid_round = d.u64()? as i64;
+    let proposer = d.u64()?;
+    let mut signature = [0u8; 64];
+    signature.copy_from_slice(d.take(64)?);
+    let n = d.u64()? as usize;
+    let block = decode_block(d.take(n)?)?;
+    Ok(crate::round::Proposal { height, round, block, valid_round, proposer, signature })
+}
+
 /// Canonical bytes of one [`SlashEvidence`] (two conflicting votes), used inside
 /// blocks and for a standalone round-trip. Trailing bytes are an error on decode.
 pub fn encode_evidence(ev: &SlashEvidence) -> Vec<u8> {
@@ -1466,6 +1530,76 @@ mod tests {
         let back = decode_block(&bytes).unwrap();
         assert_eq!(encode_block(&back), bytes);
         assert_eq!(back.hash(), b.hash());
+    }
+
+    #[test]
+    fn consensus_msg_round_trip() {
+        use crate::round::{Msg, Proposal};
+        // proposal with valid_round = -1 (a fresh proposal)
+        let prop = Proposal {
+            height: 7,
+            round: 2,
+            block: sample_block(),
+            valid_round: -1,
+            proposer: 21,
+            signature: [5u8; 64],
+        };
+        match decode_consensus_msg(&encode_consensus_msg(&Msg::Proposal(prop))).unwrap() {
+            Msg::Proposal(p) => {
+                assert_eq!((p.height, p.round, p.valid_round, p.proposer), (7, 2, -1, 21));
+                assert_eq!(p.signature, [5u8; 64]);
+                assert_eq!(p.block.hash(), sample_block().hash());
+            }
+            _ => panic!("expected a proposal"),
+        }
+
+        // proposal re-proposing a locked value (valid_round >= 0) round-trips too
+        let prop2 = Proposal {
+            height: 7,
+            round: 5,
+            block: sample_block(),
+            valid_round: 3,
+            proposer: 22,
+            signature: [6u8; 64],
+        };
+        match decode_consensus_msg(&encode_consensus_msg(&Msg::Proposal(prop2))).unwrap() {
+            Msg::Proposal(p) => assert_eq!(p.valid_round, 3),
+            _ => panic!("expected a proposal"),
+        }
+
+        // both vote types
+        for vt in [VoteType::Prevote, VoteType::Precommit] {
+            let v = Vote {
+                validator: 21,
+                height: 7,
+                round: 2,
+                block_hash: [1u8; 32],
+                vote_type: vt,
+                signature: [2u8; 64],
+            };
+            match decode_consensus_msg(&encode_consensus_msg(&Msg::Vote(v))).unwrap() {
+                Msg::Vote(gv) => {
+                    assert_eq!(gv.validator, 21);
+                    assert_eq!(gv.vote_type, vt);
+                    assert_eq!(gv.block_hash, [1u8; 32]);
+                }
+                _ => panic!("expected a vote"),
+            }
+        }
+
+        // framing errors: trailing byte and empty buffer are both rejected
+        let prop = Proposal {
+            height: 1,
+            round: 0,
+            block: sample_block(),
+            valid_round: -1,
+            proposer: 21,
+            signature: [0u8; 64],
+        };
+        let mut bytes = encode_consensus_msg(&Msg::Proposal(prop));
+        bytes.push(0);
+        assert!(matches!(decode_consensus_msg(&bytes), Err(CodecError::TrailingBytes)));
+        assert!(decode_consensus_msg(&[]).is_err());
     }
 
     #[test]

@@ -108,6 +108,38 @@ impl ChainDriver {
         self.mempool.insert(&self.chain, tx)
     }
 
+    /// M32: rebuild a driver at a persisted height by replaying a certified log.
+    ///
+    /// The networked daemon uses this to resume production after a restart: it
+    /// reloads `blocks.log` + `certs.log` and hands them here. Replay re-verifies
+    /// every height's > 2/3 finality certificate (the same path as
+    /// [`Chain::replay_verified`]), so a torn or tampered log fails fast rather
+    /// than resuming on top of an unproven chain. The mempool starts empty; the
+    /// retained `blocks`/`certs` are seeded from the log so the next append lands
+    /// at the right height.
+    pub fn resume(
+        genesis: Genesis,
+        seeds: BTreeMap<u64, [u8; 32]>,
+        max_txs: usize,
+        blocks: Vec<Block>,
+        certs: Vec<Commit>,
+    ) -> Result<Self, crate::ReplayError> {
+        let chain = Chain::replay_verified(genesis, &blocks, &certs)?;
+        Ok(ChainDriver {
+            chain,
+            mempool: Mempool::new(max_txs),
+            seeds,
+            pending_updates: Vec::new(),
+            pending_stake_ops: Vec::new(),
+            pending_slashing_evidence: Vec::new(),
+            pending_bridge_locks: Vec::new(),
+            pending_bridge_headers: Vec::new(),
+            pending_bridge_redeems: Vec::new(),
+            blocks,
+            certs,
+        })
+    }
+
     /// Stage an on-chain validator-set change to be carried by the next block
     /// [`Self::produce`] finalizes. The change is certified by the *current*
     /// validator set and takes effect from the following height.
