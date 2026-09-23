@@ -70,27 +70,34 @@ pub const MAX_FRAME: usize = 16 * 1024 * 1024;
 /// Seconds between anti-entropy `Status` broadcasts.
 const ANNOUNCE_SECS: u64 = 2;
 
-// M33 consensus timing (milliseconds). Linear back-off `base + round*delta`
-// gives eventual synchrony: rounds lengthen until they outlast message delay.
-const PROPOSE_TIMEOUT_BASE: u64 = 1000;
-const PREVOTE_TIMEOUT_BASE: u64 = 1000;
-const PRECOMMIT_TIMEOUT_BASE: u64 = 1000;
-const TIMEOUT_DELTA: u64 = 500;
-/// Pacing between committing one height and starting the next — the empty-block
-/// heartbeat interval (M33 always creates blocks; `create_empty_blocks=false` is
-/// a documented follow-up).
-const BLOCK_INTERVAL: u64 = 1000;
 /// Grace period after boot before starting the first height, so the mesh has time
 /// to dial + handshake.
 const STARTUP_DELAY: u64 = 1000;
 
-fn timeout_for(step: Step, round: u32) -> Duration {
+/// M35: per-node consensus timing + empty-block policy, resolved from
+/// [`crate::config::ConsensusConfig`] at boot (was hard-coded module consts
+/// pre-M35). Linear back-off `base + round*delta` gives eventual synchrony:
+/// rounds lengthen until they outlast message delay.
+#[derive(Clone, Copy)]
+struct Timing {
+    propose_ms: u64,
+    prevote_ms: u64,
+    precommit_ms: u64,
+    delta_ms: u64,
+    /// Pacing between committing one height and starting the next (the empty-block
+    /// heartbeat interval when `create_empty_blocks` is true).
+    block_interval_ms: u64,
+    /// When false, a height is started only when there is pending work.
+    create_empty_blocks: bool,
+}
+
+fn timeout_for(t: &Timing, step: Step, round: u32) -> Duration {
     let base = match step {
-        Step::Propose => PROPOSE_TIMEOUT_BASE,
-        Step::Prevote => PREVOTE_TIMEOUT_BASE,
-        Step::Precommit => PRECOMMIT_TIMEOUT_BASE,
+        Step::Propose => t.propose_ms,
+        Step::Prevote => t.prevote_ms,
+        Step::Precommit => t.precommit_ms,
     };
-    Duration::from_millis(base + round as u64 * TIMEOUT_DELTA)
+    Duration::from_millis(base + round as u64 * t.delta_ms)
 }
 
 // ----------------------------------------------------------------------------
@@ -209,6 +216,8 @@ struct Actor {
     clog: CertLog,
     /// Number of blocks already persisted (index into `node.blocks()`).
     appended: usize,
+    /// M35: consensus timing + empty-block policy, resolved from config at boot.
+    timing: Timing,
 }
 
 impl Actor {
@@ -256,7 +265,7 @@ impl Actor {
     /// M33: arm a wall-clock timeout; when it elapses, self-send a `Timeout`.
     fn arm_timer(&self, height: u64, step: Step, round: u32) {
         let tx = self.self_tx.clone();
-        let d = timeout_for(step, round);
+        let d = timeout_for(&self.timing, step, round);
         tokio::spawn(async move {
             tokio::time::sleep(d).await;
             let _ = tx.send(Cmd::Timeout { height, step, round });
@@ -296,8 +305,28 @@ impl Actor {
         self.route(out);
     }
 
+    /// M35: scheduled entry point for a height (heartbeat / next-height pacing /
+    /// boot). When `create_empty_blocks` is false and there is no pending work,
+    /// we do NOT start a round — an idle chain simply pauses at the current height
+    /// and re-polls after `block_interval_ms`. When work arrives (gossiped in), the
+    /// next tick opens the gate; peers that receive the resulting proposal join via
+    /// `on_consensus`'s ungated lazy-start, so liveness holds without every node
+    /// independently observing the work first (see `on_consensus`).
+    fn on_start_tick(&mut self, height: u64) {
+        if self.timing.create_empty_blocks || self.node.has_pending_work() {
+            self.start_height(height);
+        } else if self.kp.is_some() && self.node.height() + 1 == height {
+            // Nothing to propose yet: hold the height and check again later.
+            self.schedule_start(height, self.timing.block_interval_ms);
+        }
+    }
+
     /// M33: begin consensus for `height`, if we are an eligible in-set validator
     /// and this is exactly our next height. Idempotent and self-guarding.
+    ///
+    /// This is the ungated core: `on_start_tick` applies the `create_empty_blocks`
+    /// gate before calling here, while `on_consensus` calls here directly (a peer's
+    /// proposal already implies work).
     fn start_height(&mut self, height: u64) {
         if self.kp.is_none() {
             return; // pure follower
@@ -317,7 +346,7 @@ impl Actor {
             Some(b) => b,
             None => {
                 // unproposable candidate (staged op fails to apply); retry shortly
-                self.schedule_start(height, BLOCK_INTERVAL);
+                self.schedule_start(height, self.timing.block_interval_ms);
                 return;
             }
         };
@@ -388,7 +417,7 @@ impl Actor {
             self.broadcast_status();
         }
         self.cons = None;
-        self.schedule_start(self.node.height() + 1, BLOCK_INTERVAL);
+        self.schedule_start(self.node.height() + 1, self.timing.block_interval_ms);
     }
 
     /// M33: sync always wins. Called after an inbound advanced our height: any
@@ -401,7 +430,7 @@ impl Actor {
         let stale = self.cons.as_ref().is_none_or(|c| self.node.height() >= c.height);
         if stale {
             self.cons = None;
-            self.schedule_start(self.node.height() + 1, BLOCK_INTERVAL);
+            self.schedule_start(self.node.height() + 1, self.timing.block_interval_ms);
         }
     }
 }
@@ -438,7 +467,7 @@ async fn run_actor(mut actor: Actor, mut rx: mpsc::UnboundedReceiver<Cmd>) {
                 let out = actor.node.submit_local(*tx);
                 actor.route(out);
             }
-            Cmd::StartHeight { height } => actor.start_height(height),
+            Cmd::StartHeight { height } => actor.on_start_tick(height),
             Cmd::Timeout { height, step, round } => actor.on_timeout(height, step, round),
             Cmd::Announce => actor.broadcast_status(),
             Cmd::Query(reply) => {
@@ -583,6 +612,14 @@ impl Node {
         let (cmd_tx, cmd_rx) = mpsc::unbounded_channel::<Cmd>();
 
         let is_validator = validator_key.is_some();
+        let timing = Timing {
+            propose_ms: cfg.consensus.propose_timeout_ms,
+            prevote_ms: cfg.consensus.prevote_timeout_ms,
+            precommit_ms: cfg.consensus.precommit_timeout_ms,
+            delta_ms: cfg.consensus.timeout_delta_ms,
+            block_interval_ms: cfg.consensus.block_interval_ms,
+            create_empty_blocks: cfg.consensus.create_empty_blocks,
+        };
         let actor = Actor {
             node,
             outbound: HashMap::new(),
@@ -592,6 +629,7 @@ impl Node {
             blog,
             clog,
             appended,
+            timing,
         };
         tokio::spawn(run_actor(actor, cmd_rx));
 
@@ -796,6 +834,7 @@ mod tests {
             // own `[validator]` section is irrelevant here (it's read only by the
             // `node run` CLI in main.rs).
             validator: None,
+            consensus: crate::config::ConsensusConfig::default(),
         }
     }
 
@@ -1122,6 +1161,77 @@ mod tests {
         assert!(
             chain.state.validators.get(21).is_none(),
             "validator 21 must be removed after being slashed for equivocation"
+        );
+
+        cleanup(&data_dirs);
+    }
+
+    // --- M35: config-driven timing + create_empty_blocks ------------------------
+
+    #[test]
+    fn timeout_for_uses_configured_bases_and_delta() {
+        // Per-step bases and the linear back-off delta are read straight from the
+        // Timing struct (no hard-coded consts), so operator config flows through.
+        let t = Timing {
+            propose_ms: 200,
+            prevote_ms: 300,
+            precommit_ms: 400,
+            delta_ms: 50,
+            block_interval_ms: 1000,
+            create_empty_blocks: true,
+        };
+        // round 0 → base only
+        assert_eq!(timeout_for(&t, Step::Propose, 0), Duration::from_millis(200));
+        assert_eq!(timeout_for(&t, Step::Prevote, 0), Duration::from_millis(300));
+        assert_eq!(timeout_for(&t, Step::Precommit, 0), Duration::from_millis(400));
+        // round 2 → base + 2*delta
+        assert_eq!(timeout_for(&t, Step::Propose, 2), Duration::from_millis(300));
+        assert_eq!(timeout_for(&t, Step::Prevote, 2), Duration::from_millis(400));
+        assert_eq!(timeout_for(&t, Step::Precommit, 2), Duration::from_millis(500));
+    }
+
+    #[tokio::test]
+    async fn create_empty_blocks_false_pauses_then_advances_on_work() {
+        // With empty-block heartbeats disabled, an idle chain must hold its height
+        // (no blocks produced), then advance exactly on demand when real work is
+        // gossiped in — proving the on_start_tick gate over real sockets.
+        let ids = [22u64, 23, 24];
+        let port_base = 19651u16;
+        let genesis = test_genesis();
+
+        let mut nodes = Vec::new();
+        let mut data_dirs = BTreeMap::new();
+        for &id in &ids {
+            let dir = tmp_dir(&format!("ceb-n{id}"));
+            data_dirs.insert(id, dir.clone());
+            let mut cfg = node_config(id, port_base, &ids, dir);
+            cfg.consensus.create_empty_blocks = false;
+            let node = Node::start(cfg, genesis.clone(), Some(kp(id))).await.expect("start node");
+            nodes.push((id, node));
+        }
+
+        // Let the mesh dial + handshake, then sit idle: no work ⇒ no blocks.
+        tokio::time::sleep(Duration::from_millis(2500)).await;
+        for (_id, node) in &nodes {
+            let (h, _) = node.status().await.expect("status");
+            assert_eq!(h, 0, "idle chain must not produce empty heartbeat blocks");
+        }
+
+        // Submit one real tx to a single node; it floods to the mesh and unblocks
+        // consensus for exactly one non-empty block.
+        nodes[0].1.submit(test_tx(1, 1, 1));
+
+        let states = await_converged(&nodes, 1, Duration::from_secs(40)).await;
+        let (h0, head0) = states[0];
+        assert!(h0 >= 1);
+        assert!(states.iter().all(|&(h, head)| h == h0 && head == head0));
+
+        // The committed height-1 block must carry the submitted tx (not empty).
+        let (blocks, _certs) = read_prefix(&data_dirs[&22], 1, Duration::from_secs(5)).await;
+        assert_eq!(blocks[0].height, 1);
+        assert!(
+            !blocks[0].txs.is_empty(),
+            "the block that broke the idle pause must carry the submitted work"
         );
 
         cleanup(&data_dirs);

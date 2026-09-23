@@ -81,6 +81,11 @@ pub struct NodeConfig {
     /// follower that syncs and verifies certs but never votes.
     #[serde(default)]
     pub validator: Option<ValidatorKeyConfig>,
+    /// M35: operator-tunable consensus timing + empty-block policy. Absent (or a
+    /// partial `[consensus]` table) falls back field-by-field to defaults that
+    /// equal the pre-M35 hard-coded constants, so old configs behave identically.
+    #[serde(default)]
+    pub consensus: ConsensusConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -116,6 +121,47 @@ impl ValidatorKeyConfig {
     pub fn keypair(&self) -> Result<crate::Keypair, ConfigError> {
         let seed = decode_seed(&self.seed_hex, "validator.seed_hex")?;
         Ok(crate::Keypair::from_seed(seed))
+    }
+}
+
+/// M35: consensus timing (milliseconds) + empty-block policy. Every field is
+/// optional in TOML — the struct-level `#[serde(default)]` fills any missing key
+/// from [`ConsensusConfig::default`], whose values are exactly the constants the
+/// daemon hard-coded before M35. So a config with no `[consensus]` section, or a
+/// partial one, reproduces the pre-M35 behavior verbatim.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ConsensusConfig {
+    /// Round-0 propose-step timeout base.
+    pub propose_timeout_ms: u64,
+    /// Round-0 prevote-step timeout base.
+    pub prevote_timeout_ms: u64,
+    /// Round-0 precommit-step timeout base.
+    pub precommit_timeout_ms: u64,
+    /// Per-round linear back-off added to each step base (`base + round*delta`).
+    pub timeout_delta_ms: u64,
+    /// Pacing between committing one height and starting the next.
+    pub block_interval_ms: u64,
+    /// When false, a validator only starts a height (proposes) when there is
+    /// pending work (txs / staged stake ops / slashing evidence) — an idle chain
+    /// stops growing instead of sealing empty heartbeat blocks. Default true
+    /// keeps the M33 heartbeat.
+    pub create_empty_blocks: bool,
+}
+
+impl Default for ConsensusConfig {
+    fn default() -> Self {
+        // These values MUST equal the pre-M35 daemon constants (single source of
+        // truth now lives here): PROPOSE/PREVOTE/PRECOMMIT_TIMEOUT_BASE=1000,
+        // TIMEOUT_DELTA=500, BLOCK_INTERVAL=1000.
+        Self {
+            propose_timeout_ms: 1000,
+            prevote_timeout_ms: 1000,
+            precommit_timeout_ms: 1000,
+            timeout_delta_ms: 500,
+            block_interval_ms: 1000,
+            create_empty_blocks: true,
+        }
     }
 }
 
@@ -377,6 +423,7 @@ mod tests {
                 enabled: true,
                 seed_hex: hex(&demo_seed(21)),
             }),
+            consensus: ConsensusConfig::default(),
         };
         let s = toml::to_string(&cfg).unwrap();
         let back: NodeConfig = toml::from_str(&s).unwrap();
@@ -388,6 +435,56 @@ mod tests {
         assert!(vc.enabled);
         // the seed decodes to the id-21 demo keypair
         assert_eq!(vc.keypair().unwrap().public(), crate::Keypair::from_seed(demo_seed(21)).public());
+    }
+
+    #[test]
+    fn consensus_config_defaults_match_legacy_constants() {
+        // The Default is now the single source of truth for the timing numbers the
+        // daemon used to hard-code — guard them so a drift is caught here.
+        let c = ConsensusConfig::default();
+        assert_eq!(c.propose_timeout_ms, 1000);
+        assert_eq!(c.prevote_timeout_ms, 1000);
+        assert_eq!(c.precommit_timeout_ms, 1000);
+        assert_eq!(c.timeout_delta_ms, 500);
+        assert_eq!(c.block_interval_ms, 1000);
+        assert!(c.create_empty_blocks, "empty-block heartbeat on by default (M33 behavior)");
+    }
+
+    #[test]
+    fn node_config_without_consensus_section_uses_defaults() {
+        // Back-compat: a pre-M35 config (no `[consensus]`) must parse and yield the
+        // exact legacy timing + heartbeat.
+        let s = r#"
+            genesis = "genesis.toml"
+            [node]
+            id = 21
+            listen = "0.0.0.0:9021"
+            data_dir = "./data/n21"
+        "#;
+        let cfg: NodeConfig = toml::from_str(s).unwrap();
+        assert_eq!(cfg.consensus, ConsensusConfig::default());
+    }
+
+    #[test]
+    fn consensus_section_partial_override_fills_from_default() {
+        // A `[consensus]` table that sets only some keys: overridden keys take,
+        // every unset key falls back to Default (struct-level serde default).
+        let s = r#"
+            genesis = "genesis.toml"
+            [node]
+            id = 21
+            listen = "0.0.0.0:9021"
+            data_dir = "./data/n21"
+            [consensus]
+            block_interval_ms = 250
+            create_empty_blocks = false
+        "#;
+        let cfg: NodeConfig = toml::from_str(s).unwrap();
+        assert_eq!(cfg.consensus.block_interval_ms, 250);
+        assert!(!cfg.consensus.create_empty_blocks);
+        // untouched keys keep their defaults
+        assert_eq!(cfg.consensus.propose_timeout_ms, 1000);
+        assert_eq!(cfg.consensus.timeout_delta_ms, 500);
     }
 
     #[test]
@@ -578,6 +675,7 @@ mod tests {
                     enabled: true,
                     seed_hex: hex(&demo_seed(id)),
                 }),
+                consensus: ConsensusConfig::default(),
             };
             std::fs::write(dir.join(format!("node{id}.toml")), toml::to_string_pretty(&cfg).unwrap()).unwrap();
         }

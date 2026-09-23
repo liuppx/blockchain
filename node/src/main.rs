@@ -2755,6 +2755,7 @@ fn cmd_localnet() {
             peers,
             genesis: String::new(), // supplied directly to Node::start below
             validator: None,
+            consensus: crate::config::ConsensusConfig::default(),
         }
     };
 

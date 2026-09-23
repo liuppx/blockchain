@@ -298,6 +298,19 @@ impl GossipNode {
         &self.pending_stake_ops
     }
 
+    /// M35: is there any block-worthy pending work — mempool txs or staged
+    /// block-level ops (stake ops / slashing evidence)? Used by the daemon to
+    /// suppress empty heartbeat blocks when `create_empty_blocks=false`.
+    ///
+    /// Bridge locks are intentionally excluded: they have no pending pool here
+    /// (they enter committed state via the M31 on-chain redeem path, not the
+    /// mempool). A future bridge mempool would extend this predicate.
+    pub fn has_pending_work(&self) -> bool {
+        !self.mempool.is_empty()
+            || !self.pending_stake_ops.is_empty()
+            || !self.pending_evidence.is_empty()
+    }
+
     /// Drain staged evidence, transferring it to a block builder (e.g. a
     /// `ChainDriver`'s `stage_slashing_evidence`). After this call the
     /// gossip node's pending pool is empty, and the `seen_evidence` set
