@@ -86,6 +86,12 @@ pub struct NodeConfig {
     /// equal the pre-M35 hard-coded constants, so old configs behave identically.
     #[serde(default)]
     pub consensus: ConsensusConfig,
+    /// M36: operator-tunable daemon-lifecycle/network timing (anti-entropy
+    /// heartbeat + validator startup grace). Absent (or a partial `[network]`
+    /// table) falls back field-by-field to defaults that equal the pre-M36
+    /// hard-coded constants, so old configs behave identically.
+    #[serde(default)]
+    pub network: NetworkConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -161,6 +167,34 @@ impl Default for ConsensusConfig {
             timeout_delta_ms: 500,
             block_interval_ms: 1000,
             create_empty_blocks: true,
+        }
+    }
+}
+
+/// M36 network/daemon-lifecycle timing. Every field is optional in TOML — the
+/// struct-level `#[serde(default)]` fills any missing key from
+/// [`NetworkConfig::default`], whose values equal the constants the daemon
+/// hard-coded before M36. So a config with no `[network]` section, or a partial
+/// one, reproduces the pre-M36 behavior verbatim.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct NetworkConfig {
+    /// Anti-entropy heartbeat interval — how often the node broadcasts a
+    /// `Status` announce to pull missing certified blocks (was const
+    /// `ANNOUNCE_SECS = 2`, i.e. 2000 ms).
+    pub announce_interval_ms: u64,
+    /// Boot grace before a validator kicks off its first height, letting the
+    /// mesh dial + handshake first (was const `STARTUP_DELAY = 1000`).
+    pub startup_delay_ms: u64,
+}
+
+impl Default for NetworkConfig {
+    fn default() -> Self {
+        // These values MUST equal the pre-M36 daemon constants (single source of
+        // truth now lives here): ANNOUNCE_SECS=2 (→ 2000 ms), STARTUP_DELAY=1000.
+        Self {
+            announce_interval_ms: 2000,
+            startup_delay_ms: 1000,
         }
     }
 }
@@ -424,6 +458,7 @@ mod tests {
                 seed_hex: hex(&demo_seed(21)),
             }),
             consensus: ConsensusConfig::default(),
+            network: NetworkConfig::default(),
         };
         let s = toml::to_string(&cfg).unwrap();
         let back: NodeConfig = toml::from_str(&s).unwrap();
@@ -485,6 +520,50 @@ mod tests {
         // untouched keys keep their defaults
         assert_eq!(cfg.consensus.propose_timeout_ms, 1000);
         assert_eq!(cfg.consensus.timeout_delta_ms, 500);
+    }
+
+    #[test]
+    fn network_config_defaults_match_legacy_constants() {
+        // The Default is now the single source of truth for the daemon's
+        // network-timing constants — guard them so a drift is caught here.
+        // ANNOUNCE_SECS=2 became announce_interval_ms=2000 (same duration).
+        let n = NetworkConfig::default();
+        assert_eq!(n.announce_interval_ms, 2000);
+        assert_eq!(n.startup_delay_ms, 1000);
+    }
+
+    #[test]
+    fn node_config_without_network_section_uses_defaults() {
+        // Back-compat: a pre-M36 config (no `[network]`) must parse and yield the
+        // exact legacy heartbeat + startup grace.
+        let s = r#"
+            genesis = "genesis.toml"
+            [node]
+            id = 21
+            listen = "0.0.0.0:9021"
+            data_dir = "./data/n21"
+        "#;
+        let cfg: NodeConfig = toml::from_str(s).unwrap();
+        assert_eq!(cfg.network, NetworkConfig::default());
+    }
+
+    #[test]
+    fn network_section_partial_override_fills_from_default() {
+        // A `[network]` table that sets only one key: the overridden key takes,
+        // the unset key falls back to Default (struct-level serde default).
+        let s = r#"
+            genesis = "genesis.toml"
+            [node]
+            id = 21
+            listen = "0.0.0.0:9021"
+            data_dir = "./data/n21"
+            [network]
+            announce_interval_ms = 500
+        "#;
+        let cfg: NodeConfig = toml::from_str(s).unwrap();
+        assert_eq!(cfg.network.announce_interval_ms, 500);
+        // untouched key keeps its default
+        assert_eq!(cfg.network.startup_delay_ms, 1000);
     }
 
     #[test]
@@ -676,6 +755,7 @@ mod tests {
                     seed_hex: hex(&demo_seed(id)),
                 }),
                 consensus: ConsensusConfig::default(),
+                network: NetworkConfig::default(),
             };
             std::fs::write(dir.join(format!("node{id}.toml")), toml::to_string_pretty(&cfg).unwrap()).unwrap();
         }

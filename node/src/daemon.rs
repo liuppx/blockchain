@@ -67,13 +67,6 @@ use crate::{Genesis, Hash, Keypair, SlashEvidence, SubmissionTx};
 /// (a hostile `u32` length would allocate up to 4 GiB); a real transport must.
 pub const MAX_FRAME: usize = 16 * 1024 * 1024;
 
-/// Seconds between anti-entropy `Status` broadcasts.
-const ANNOUNCE_SECS: u64 = 2;
-
-/// Grace period after boot before starting the first height, so the mesh has time
-/// to dial + handshake.
-const STARTUP_DELAY: u64 = 1000;
-
 /// M35: per-node consensus timing + empty-block policy, resolved from
 /// [`crate::config::ConsensusConfig`] at boot (was hard-coded module consts
 /// pre-M35). Linear back-off `base + round*delta` gives eventual synchrony:
@@ -655,8 +648,9 @@ impl Node {
         // periodic anti-entropy heartbeat
         {
             let cmd = cmd_tx.clone();
+            let announce_ms = cfg.network.announce_interval_ms;
             tokio::spawn(async move {
-                let mut tick = tokio::time::interval(Duration::from_secs(ANNOUNCE_SECS));
+                let mut tick = tokio::time::interval(Duration::from_millis(announce_ms));
                 loop {
                     tick.tick().await;
                     if cmd.send(Cmd::Announce).is_err() {
@@ -672,8 +666,9 @@ impl Node {
         if is_validator {
             let cmd = cmd_tx.clone();
             let next = appended as u64 + 1;
+            let startup_ms = cfg.network.startup_delay_ms;
             tokio::spawn(async move {
-                tokio::time::sleep(Duration::from_millis(STARTUP_DELAY)).await;
+                tokio::time::sleep(Duration::from_millis(startup_ms)).await;
                 let _ = cmd.send(Cmd::StartHeight { height: next });
             });
         }
@@ -835,6 +830,7 @@ mod tests {
             // `node run` CLI in main.rs).
             validator: None,
             consensus: crate::config::ConsensusConfig::default(),
+            network: crate::config::NetworkConfig::default(),
         }
     }
 
