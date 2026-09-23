@@ -61,7 +61,7 @@ use crate::config::{ConfigError, NodeConfig};
 use crate::net::{decode_gossip, encode_gossip, GossipMsg, GossipNode};
 use crate::round::{Action, Msg, RoundState, Step};
 use crate::store::{BlockLog, CertLog};
-use crate::{Genesis, Hash, Keypair, SubmissionTx};
+use crate::{Genesis, Hash, Keypair, SlashEvidence, SubmissionTx};
 
 /// Hard cap on a single wire frame (16 MiB). The blocking `read_msg` has no cap
 /// (a hostile `u32` length would allocate up to 4 GiB); a real transport must.
@@ -280,8 +280,20 @@ impl Actor {
                 Action::Broadcast(m) => self.broadcast_consensus(&m),
                 Action::Schedule(step, round) => self.arm_timer(height, step, round),
                 Action::Decided(commit) => self.on_decided(commit),
+                Action::Equivocation(ev) => self.on_equivocation(ev),
             }
         }
+    }
+
+    /// M34: we observed two conflicting precommits from the same validator over
+    /// gossip. Turn them into slashing evidence, stage it locally (so our own
+    /// next proposal carries it), and flood it — the existing M19 evidence
+    /// pipeline delivers it into the next block, where `Chain::apply_evidence`
+    /// re-verifies both signatures and burns the offender's bond. Repeated
+    /// detections are idempotent (`submit_local_evidence` dedups on `hash()`).
+    fn on_equivocation(&mut self, ev: SlashEvidence) {
+        let out = self.node.submit_local_evidence(ev);
+        self.route(out);
     }
 
     /// M33: begin consensus for `height`, if we are an eligible in-set validator
@@ -1024,6 +1036,93 @@ mod tests {
         // produce.
         let (blocks, certs) = read_prefix(&data_dirs[&25], target as usize, Duration::from_secs(5)).await;
         crate::Chain::replay_verified(genesis.clone(), &blocks, &certs).expect("follower finality");
+
+        cleanup(&data_dirs);
+    }
+
+    // --- integration: active slashing on observed equivocation (M34) -------------
+
+    #[tokio::test]
+    async fn equivocation_over_tcp_slashes_the_offender() {
+        // Genesis has validators 21-24, but only 22/23/24 run honestly (quorum 3,
+        // so 3-of-4 still progresses). Validator 21 is Byzantine: a raw TCP peer
+        // signs *two* conflicting precommits per height under 21's key and floods
+        // them. The honest nodes must observe the double-sign, originate slashing
+        // evidence, carry it into a block, and burn/remove validator 21 — all over
+        // real sockets, with no coordinator.
+        use crate::consensus::{Vote, VoteType};
+
+        let live = [22u64, 23, 24];
+        let port_base = 19631u16;
+        let genesis = test_genesis(); // validators = 21,22,23,24
+
+        let mut nodes = Vec::new();
+        let mut data_dirs = BTreeMap::new();
+        for &id in &live {
+            let dir = tmp_dir(&format!("equiv-n{id}"));
+            data_dirs.insert(id, dir.clone());
+            let cfg = node_config(id, port_base, &live, dir);
+            let node = Node::start(cfg, genesis.clone(), Some(kp(id))).await.expect("start node");
+            nodes.push((id, node));
+        }
+
+        // Open a Byzantine connection to each honest node, presenting as id 21.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let mut injectors = Vec::new();
+        for &id in &live {
+            let addr = format!("127.0.0.1:{}", port_base + (id - 21) as u16);
+            let stream = TcpStream::connect(&addr).await.expect("byzantine connect");
+            let _ = stream.set_nodelay(true);
+            let (mut rd, mut wr) = stream.into_split();
+            write_hello(&mut wr, 21).await.expect("hello");
+            let _ = read_hello(&mut rd).await;
+            // Drain (and discard) everything the honest node sends us.
+            tokio::spawn(async move { while read_frame(&mut rd).await.is_ok() {} });
+            injectors.push(wr);
+        }
+
+        // Flood two conflicting precommits for the live consensus height until an
+        // honest node commits a block carrying evidence against validator 21.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(50);
+        let mut ev_height: Option<u64> = None;
+        while tokio::time::Instant::now() < deadline {
+            let h = nodes[0].1.status().await.map(|(h, _)| h).unwrap_or(0);
+            let target = h + 1; // the height the honest nodes are voting on now
+            let va = Vote::signed(21, target, 0, [1u8; 32], VoteType::Precommit, &kp(21));
+            let vb = Vote::signed(21, target, 0, [2u8; 32], VoteType::Precommit, &kp(21));
+            let ma = GossipMsg::Consensus(Box::new(Msg::Vote(va)));
+            let mb = GossipMsg::Consensus(Box::new(Msg::Vote(vb)));
+            for wr in injectors.iter_mut() {
+                let _ = write_frame(wr, &ma).await;
+                let _ = write_frame(wr, &mb).await;
+            }
+
+            // Has any committed block admitted evidence against 21 yet?
+            if let Ok(blocks) =
+                BlockLog::open(format!("{}/blocks.log", data_dirs[&22])).and_then(|l| l.read_all())
+            {
+                if let Some(b) = blocks
+                    .iter()
+                    .find(|b| b.slashing_evidence.iter().any(|e| e.vote_a.validator == 21))
+                {
+                    ev_height = Some(b.height);
+                    break;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(150)).await;
+        }
+
+        let ev_height = ev_height.expect("evidence against validator 21 was committed on-chain");
+
+        // Replay the certified chain through the slashing block and confirm the
+        // offender is gone from the active set — the double-sign was punished.
+        let (blocks, certs) =
+            read_prefix(&data_dirs[&22], ev_height as usize, Duration::from_secs(5)).await;
+        let chain = crate::Chain::replay_verified(genesis.clone(), &blocks, &certs).expect("finality");
+        assert!(
+            chain.state.validators.get(21).is_none(),
+            "validator 21 must be removed after being slashed for equivocation"
+        );
 
         cleanup(&data_dirs);
     }

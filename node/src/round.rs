@@ -23,7 +23,7 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use crate::consensus::{vote_signing_bytes, Commit, Vote, VoteType};
 use crate::validator::ValidatorSet;
-use crate::{codec, crypto, Block, Hash, Keypair, PubKey, Sig};
+use crate::{codec, crypto, Block, Hash, Keypair, PubKey, Sig, SlashEvidence};
 
 /// The vote target meaning "no value" (a prevote/precommit for nil). A real
 /// block hash colliding with this is cryptographically negligible.
@@ -130,6 +130,10 @@ pub enum Action {
     Schedule(Step, u32),
     /// Consensus finalized a block: here is the verifiable certificate.
     Decided(Commit),
+    /// M34: we ingested a precommit that conflicts with one already held from
+    /// the same validator at the same `(height, round)` — an attributable
+    /// double-sign. The host floods this as slashing evidence.
+    Equivocation(SlashEvidence),
 }
 
 /// One validator's consensus state machine for a single height.
@@ -204,7 +208,9 @@ impl RoundState {
     /// Feed one received message, then re-evaluate.
     pub fn on_message(&mut self, kp: &Keypair, msg: Msg) -> Vec<Action> {
         let mut out = Vec::new();
-        self.ingest(msg);
+        if let Some(ev) = self.ingest(msg) {
+            out.push(Action::Equivocation(ev));
+        }
         self.evaluate(kp, &mut out);
         out
     }
@@ -299,39 +305,68 @@ impl RoundState {
         ids.iter().map(|&id| self.power_of(id)).sum()
     }
 
-    fn ingest(&mut self, msg: Msg) {
+    /// Absorb one message into the vote/proposal maps. Returns `Some(evidence)`
+    /// iff the message is a precommit that conflicts with one already held from
+    /// the same validator at the same round (a slashable double-sign). All other
+    /// cases — including prevote conflicts (not slashable in this chain's model)
+    /// and identical retransmits — return `None`.
+    fn ingest(&mut self, msg: Msg) -> Option<SlashEvidence> {
         match msg {
             Msg::Proposal(p) => {
                 if p.height != self.height {
-                    return;
+                    return None;
                 }
                 if self.proposer(p.round) != p.proposer {
-                    return; // only the round's proposer may propose
+                    return None; // only the round's proposer may propose
                 }
-                let Some(v) = self.vset.get(p.proposer) else { return };
+                let v = self.vset.get(p.proposer)?;
                 let pk = v.pubkey;
                 if !p.verify_sig(&pk) {
-                    return;
+                    return None;
                 }
                 self.proposals.entry(p.round).or_insert(p);
+                None
             }
             Msg::Vote(v) => {
                 if v.height != self.height {
-                    return;
+                    return None;
                 }
-                let Some(val) = self.vset.get(v.validator) else { return };
+                let val = self.vset.get(v.validator)?;
                 let pk = val.pubkey;
                 let bytes = vote_signing_bytes(v.validator, v.height, v.round, &v.block_hash, v.vote_type);
                 if !crypto::verify(&pk, &bytes, &v.signature) {
-                    return;
+                    return None;
                 }
-                let map = match v.vote_type {
-                    VoteType::Prevote => &mut self.prevotes,
-                    VoteType::Precommit => &mut self.precommits,
-                };
-                // first vote per (round, validator) wins; a conflicting later one
-                // is ignored here (equivocation is caught by detect_equivocation).
-                map.entry(v.round).or_default().entry(v.validator).or_insert(v);
+                match v.vote_type {
+                    VoteType::Prevote => {
+                        // Prevote equivocation is not slashable here; first-wins.
+                        self.prevotes.entry(v.round).or_default().entry(v.validator).or_insert(v);
+                        None
+                    }
+                    VoteType::Precommit => {
+                        let slot = self.precommits.entry(v.round).or_default();
+                        // A second, *different* precommit from the same validator
+                        // at this round is a double-sign. Build canonically-ordered
+                        // evidence (by block_hash) so every honest detector produces
+                        // the same `hash()` and the flood dedups cleanly.
+                        let ev = match slot.get(&v.validator) {
+                            Some(prev) if prev.block_hash != v.block_hash => {
+                                let (a, b) = if prev.block_hash <= v.block_hash {
+                                    (prev.clone(), v.clone())
+                                } else {
+                                    (v.clone(), prev.clone())
+                                };
+                                Some(SlashEvidence { vote_a: a, vote_b: b })
+                            }
+                            _ => None,
+                        };
+                        // first vote per (round, validator) wins; the conflicting
+                        // later one is not stored (the FSM is unaffected — detection
+                        // above is a pure side-observation).
+                        slot.entry(v.validator).or_insert(v);
+                        ev
+                    }
+                }
             }
         }
     }
@@ -551,6 +586,7 @@ impl Sim {
                     self.timeouts.insert((id, step_tag(step), round));
                 }
                 Action::Decided(_) => {} // recorded inside the node; read via decided()
+                Action::Equivocation(_) => {} // offline sim: all nodes honest unless a test injects a conflict
             }
         }
     }
@@ -805,5 +841,114 @@ mod tests {
         let hc: Vec<Hash> = dc.values().map(|x| x.block_hash).collect();
         assert_eq!(ha, hc);
         assert_eq!(a.max_round(), c.max_round());
+    }
+
+    // ---- M34: active equivocation detection ----
+
+    fn find_equiv(acts: &[Action]) -> Option<&SlashEvidence> {
+        acts.iter().find_map(|a| match a {
+            Action::Equivocation(ev) => Some(ev),
+            _ => None,
+        })
+    }
+
+    #[test]
+    fn precommit_equivocation_yields_evidence() {
+        // Validator 2 double-signs round 0: two precommits, different blocks.
+        // An honest observer must surface well-formed slashing evidence.
+        let ids = [1u64, 2, 3, 4];
+        let mut node = RoundState::new(vset(&ids), 1, 1, block(1));
+        let _ = node.start(&kp(1));
+        let (ha, hb) = ([1u8; 32], [2u8; 32]);
+        let first = node.on_message(
+            &kp(1),
+            Msg::Vote(Vote::signed(2, 1, 0, ha, VoteType::Precommit, &kp(2))),
+        );
+        assert!(find_equiv(&first).is_none(), "first precommit is not evidence");
+        let second = node.on_message(
+            &kp(1),
+            Msg::Vote(Vote::signed(2, 1, 0, hb, VoteType::Precommit, &kp(2))),
+        );
+        let ev = find_equiv(&second).expect("conflicting precommit detected");
+        assert!(ev.is_well_formed());
+        assert_eq!(ev.vote_a.validator, 2);
+        assert_eq!(ev.vote_b.validator, 2);
+    }
+
+    #[test]
+    fn duplicate_precommit_is_not_equivocation() {
+        // The same precommit twice (retransmit) is not a double-sign.
+        let ids = [1u64, 2, 3, 4];
+        let mut node = RoundState::new(vset(&ids), 1, 1, block(1));
+        let _ = node.start(&kp(1));
+        let h = [7u8; 32];
+        node.on_message(&kp(1), Msg::Vote(Vote::signed(2, 1, 0, h, VoteType::Precommit, &kp(2))));
+        let again = node.on_message(
+            &kp(1),
+            Msg::Vote(Vote::signed(2, 1, 0, h, VoteType::Precommit, &kp(2))),
+        );
+        assert!(find_equiv(&again).is_none(), "identical precommit is not evidence");
+    }
+
+    #[test]
+    fn precommits_in_different_rounds_are_not_equivocation() {
+        // Precommitting different blocks across *different* rounds is legal
+        // (a validator unlocks and re-locks as rounds advance).
+        let ids = [1u64, 2, 3, 4];
+        let mut node = RoundState::new(vset(&ids), 1, 1, block(1));
+        let _ = node.start(&kp(1));
+        node.on_message(
+            &kp(1),
+            Msg::Vote(Vote::signed(2, 1, 0, [1u8; 32], VoteType::Precommit, &kp(2))),
+        );
+        let r1 = node.on_message(
+            &kp(1),
+            Msg::Vote(Vote::signed(2, 1, 1, [2u8; 32], VoteType::Precommit, &kp(2))),
+        );
+        assert!(find_equiv(&r1).is_none(), "cross-round precommits are not a double-sign");
+    }
+
+    #[test]
+    fn prevote_equivocation_is_not_slashable() {
+        // This chain slashes precommit double-signs only; conflicting prevotes
+        // are dropped first-wins and produce no evidence.
+        let ids = [1u64, 2, 3, 4];
+        let mut node = RoundState::new(vset(&ids), 1, 1, block(1));
+        let _ = node.start(&kp(1));
+        node.on_message(
+            &kp(1),
+            Msg::Vote(Vote::signed(2, 1, 0, [1u8; 32], VoteType::Prevote, &kp(2))),
+        );
+        let second = node.on_message(
+            &kp(1),
+            Msg::Vote(Vote::signed(2, 1, 0, [2u8; 32], VoteType::Prevote, &kp(2))),
+        );
+        assert!(find_equiv(&second).is_none(), "prevote conflicts are not slashable here");
+    }
+
+    #[test]
+    fn equivocation_evidence_is_canonically_ordered() {
+        // Two detectors that ingest the same pair of votes in opposite orders
+        // must produce byte-identical evidence (same hash) so the flood dedups.
+        let ids = [1u64, 2, 3, 4];
+        let (ha, hb) = ([1u8; 32], [2u8; 32]);
+        let va = Vote::signed(2, 1, 0, ha, VoteType::Precommit, &kp(2));
+        let vb = Vote::signed(2, 1, 0, hb, VoteType::Precommit, &kp(2));
+
+        let mut n1 = RoundState::new(vset(&ids), 1, 1, block(1));
+        let _ = n1.start(&kp(1));
+        n1.on_message(&kp(1), Msg::Vote(va.clone()));
+        let e1 = find_equiv(&n1.on_message(&kp(1), Msg::Vote(vb.clone())))
+            .expect("n1 detects")
+            .clone();
+
+        let mut n2 = RoundState::new(vset(&ids), 1, 1, block(1));
+        let _ = n2.start(&kp(1));
+        n2.on_message(&kp(1), Msg::Vote(vb));
+        let e2 = find_equiv(&n2.on_message(&kp(1), Msg::Vote(va)))
+            .expect("n2 detects")
+            .clone();
+
+        assert_eq!(e1.hash(), e2.hash(), "canonical ordering makes evidence dedup-stable");
     }
 }
