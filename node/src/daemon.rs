@@ -56,6 +56,7 @@ use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, oneshot};
+use tracing::{debug, error, info, warn};
 
 use crate::config::{ConfigError, NodeConfig};
 use crate::net::{decode_gossip, encode_gossip, GossipMsg, GossipNode};
@@ -244,14 +245,15 @@ impl Actor {
         let certs = self.node.certificates();
         while self.appended < blocks.len() {
             if let Err(e) = self.blog.append(&blocks[self.appended]) {
-                eprintln!("[node {}] append block failed: {e}", self.node.id);
+                error!(node = self.node.id, error = %e, "append block failed");
                 return;
             }
             if let Err(e) = self.clog.append(&certs[self.appended]) {
-                eprintln!("[node {}] append cert failed: {e}", self.node.id);
+                error!(node = self.node.id, error = %e, "append cert failed");
                 return;
             }
             self.appended += 1;
+            debug!(node = self.node.id, height = self.appended as u64, "block committed");
         }
     }
 
@@ -488,6 +490,7 @@ async fn handle_conn(stream: TcpStream, my_id: u64, cmd: mpsc::UnboundedSender<C
         Ok(id) => id,
         Err(_) => return,
     };
+    info!(node = my_id, peer = peer_id, "peer connected");
 
     let (out_tx, mut out_rx) = mpsc::unbounded_channel::<GossipMsg>();
     if cmd.send(Cmd::Register { id: peer_id, tx: out_tx }).is_err() {
@@ -509,6 +512,7 @@ async fn handle_conn(stream: TcpStream, my_id: u64, cmd: mpsc::UnboundedSender<C
     }
 
     let _ = cmd.send(Cmd::Unregister { id: peer_id });
+    info!(node = my_id, peer = peer_id, "peer disconnected");
     writer.abort();
 }
 
@@ -518,7 +522,7 @@ async fn run_listener(listener: TcpListener, my_id: u64, cmd: mpsc::UnboundedSen
             Ok((stream, _addr)) => {
                 tokio::spawn(handle_conn(stream, my_id, cmd.clone()));
             }
-            Err(e) => eprintln!("[node {my_id}] accept error: {e}"),
+            Err(e) => warn!(node = my_id, error = %e, "accept error"),
         }
     }
 }
@@ -629,11 +633,13 @@ impl Node {
         // inbound listener
         let listener = TcpListener::bind(listen).await?;
         let actual = listener.local_addr()?;
-        eprintln!(
-            "[node {my_id}] listening on {actual}  peers={}  height={}  role={}",
-            peer_ids.len(),
-            appended,
-            if is_validator { "validator" } else { "follower" },
+        info!(
+            node = my_id,
+            addr = %actual,
+            peers = peer_ids.len(),
+            height = appended,
+            role = if is_validator { "validator" } else { "follower" },
+            "listening",
         );
         tokio::spawn(run_listener(listener, my_id, cmd_tx.clone()));
 
@@ -685,8 +691,17 @@ pub async fn run(
 ) -> io::Result<()> {
     let _node = Node::start(cfg, genesis, validator_key).await?;
     tokio::signal::ctrl_c().await?;
-    eprintln!("shutdown requested — exiting (logs are fsync'd per append)");
+    info!("shutdown requested — exiting (logs are fsync'd per append)");
     Ok(())
+}
+
+/// M37: install a process-global `tracing` subscriber (stderr, `RUST_LOG`-filtered,
+/// default `info`). Idempotent — safe to call from either entry point, twice, or
+/// after a test has already set a global default (`try_init` error is swallowed).
+pub fn init_tracing() {
+    use tracing_subscriber::{fmt, EnvFilter};
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+    let _ = fmt().with_env_filter(filter).with_writer(std::io::stderr).try_init();
 }
 
 #[cfg(test)]

@@ -2700,6 +2700,7 @@ use zhixing_node::light::ProofKind;
 /// runtime, and blocks on `daemon::run` until Ctrl-C. `main()` stays sync so the
 /// ~20 in-memory demo commands are unaffected by the async runtime.
 fn cmd_run(config_path: String) {
+    daemon::init_tracing();
     let cfg = config::load_node_config(&config_path)
         .unwrap_or_else(|e| fail_msg("load node config", &e));
     let gcfg = config::load_genesis(&cfg.genesis)
@@ -2730,6 +2731,7 @@ fn cmd_run(config_path: String) {
 /// wall-clock timeouts. Submit a few transactions to one node (they flood) and
 /// poll until every node has synced + verified the same head.
 fn cmd_localnet() {
+    daemon::init_tracing();
     let ids = [21u64, 22, 23, 24];
     let base_port = 19021u16;
     let genesis = demo_genesis();
