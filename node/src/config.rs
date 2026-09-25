@@ -92,6 +92,12 @@ pub struct NodeConfig {
     /// hard-coded constants, so old configs behave identically.
     #[serde(default)]
     pub network: NetworkConfig,
+    /// M38: opt-in read-only metrics/health endpoint. Absent ⇒ `None` ⇒ no
+    /// endpoint is bound (behavior-preserving default), so old configs behave
+    /// identically. A bare `[metrics]` table is inert (`enabled` defaults false),
+    /// mirroring `[validator]`.
+    #[serde(default)]
+    pub metrics: Option<MetricsConfig>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -186,6 +192,19 @@ pub struct NetworkConfig {
     /// Boot grace before a validator kicks off its first height, letting the
     /// mesh dial + handshake first (was const `STARTUP_DELAY = 1000`).
     pub startup_delay_ms: u64,
+    /// M39: gossip a peer address book and auto-dial discovered higher-id
+    /// peers, so a connected-but-incomplete `[[peers]]` seed set self-completes
+    /// into a full mesh. `false` pins the node to its static seed set (no
+    /// discovery). Default `true`.
+    pub enable_peer_exchange: bool,
+    /// M40: require a mutually-authenticated ed25519 handshake before a peer is
+    /// admitted — the peer must prove possession of the genesis signing key for
+    /// the validator id it claims (replay-proof via per-session nonces). This is
+    /// a network-wide policy: a node with this on won't complete a handshake with
+    /// one that has it off. Default `false` keeps the pre-M40 cleartext 8-byte-id
+    /// hello (byte-identical back-compat). A node with no validator signing key
+    /// cannot run with this on (it could never prove its own identity).
+    pub require_peer_auth: bool,
 }
 
 impl Default for NetworkConfig {
@@ -195,7 +214,39 @@ impl Default for NetworkConfig {
         Self {
             announce_interval_ms: 2000,
             startup_delay_ms: 1000,
+            enable_peer_exchange: true,
+            require_peer_auth: false,
         }
+    }
+}
+
+/// M38: opt-in read-only metrics/health endpoint config. When present and
+/// `enabled`, the daemon binds a second TCP listener that answers a minimal HTTP
+/// `GET` with a Prometheus text-exposition body (a `200` also serving as a
+/// health check). Defaults are inert: a bare `[metrics]` table (or the whole
+/// `NodeConfig.metrics` being absent) leaves the endpoint off.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct MetricsConfig {
+    /// Off by default — the endpoint is opt-in and behavior-preserving.
+    pub enabled: bool,
+    /// Address the metrics HTTP listener binds, e.g. `"127.0.0.1:9600"`.
+    pub listen: String,
+}
+
+impl Default for MetricsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            listen: "127.0.0.1:9600".into(),
+        }
+    }
+}
+
+impl MetricsConfig {
+    /// Parse `listen` into a `SocketAddr`.
+    pub fn listen_addr(&self) -> Result<SocketAddr, ConfigError> {
+        parse_addr(&self.listen)
     }
 }
 
@@ -459,6 +510,7 @@ mod tests {
             }),
             consensus: ConsensusConfig::default(),
             network: NetworkConfig::default(),
+            metrics: None,
         };
         let s = toml::to_string(&cfg).unwrap();
         let back: NodeConfig = toml::from_str(&s).unwrap();
@@ -530,6 +582,52 @@ mod tests {
         let n = NetworkConfig::default();
         assert_eq!(n.announce_interval_ms, 2000);
         assert_eq!(n.startup_delay_ms, 1000);
+        // M39: peer discovery is on by default (fully-meshed configs are inert).
+        assert!(n.enable_peer_exchange);
+        // M40: peer auth is off by default (byte-identical pre-M40 hello).
+        assert!(!n.require_peer_auth);
+    }
+
+    #[test]
+    fn peer_exchange_can_be_disabled() {
+        // The M39 opt-out: `enable_peer_exchange = false` pins the node to its
+        // static `[[peers]]` seed set (no address-book gossip / auto-dial).
+        let s = r#"
+            genesis = "genesis.toml"
+            [node]
+            id = 21
+            listen = "0.0.0.0:9021"
+            data_dir = "./data/n21"
+            [network]
+            enable_peer_exchange = false
+        "#;
+        let cfg: NodeConfig = toml::from_str(s).unwrap();
+        assert!(!cfg.network.enable_peer_exchange);
+        // untouched keys keep their defaults
+        assert_eq!(cfg.network.announce_interval_ms, 2000);
+        assert_eq!(cfg.network.startup_delay_ms, 1000);
+    }
+
+    #[test]
+    fn require_peer_auth_defaults_off_and_parses() {
+        // M40: the authenticated handshake is opt-in. Default off ⇒ the pre-M40
+        // cleartext hello (back-compat); `require_peer_auth = true` opts in while
+        // every untouched key still falls back to its default.
+        assert!(!NetworkConfig::default().require_peer_auth);
+        let s = r#"
+            genesis = "genesis.toml"
+            [node]
+            id = 21
+            listen = "0.0.0.0:9021"
+            data_dir = "./data/n21"
+            [network]
+            require_peer_auth = true
+        "#;
+        let cfg: NodeConfig = toml::from_str(s).unwrap();
+        assert!(cfg.network.require_peer_auth);
+        // untouched keys keep their defaults
+        assert_eq!(cfg.network.announce_interval_ms, 2000);
+        assert!(cfg.network.enable_peer_exchange);
     }
 
     #[test]
@@ -564,6 +662,48 @@ mod tests {
         assert_eq!(cfg.network.announce_interval_ms, 500);
         // untouched key keeps its default
         assert_eq!(cfg.network.startup_delay_ms, 1000);
+    }
+
+    #[test]
+    fn metrics_config_default_is_disabled() {
+        // The metrics endpoint is opt-in: the Default must be inert so a bare
+        // `[metrics]` table (or an absent one) never binds a listener.
+        let m = MetricsConfig::default();
+        assert!(!m.enabled);
+        assert_eq!(m.listen, "127.0.0.1:9600");
+    }
+
+    #[test]
+    fn node_config_without_metrics_section_is_none() {
+        // Back-compat: a config with no `[metrics]` yields `None` ⇒ endpoint off.
+        let s = r#"
+            genesis = "genesis.toml"
+            [node]
+            id = 21
+            listen = "0.0.0.0:9021"
+            data_dir = "./data/n21"
+        "#;
+        let cfg: NodeConfig = toml::from_str(s).unwrap();
+        assert!(cfg.metrics.is_none());
+    }
+
+    #[test]
+    fn metrics_section_enables_endpoint() {
+        // A bare `[metrics] enabled = true` opts in; `listen` falls back to the
+        // struct-level serde default.
+        let s = r#"
+            genesis = "genesis.toml"
+            [node]
+            id = 21
+            listen = "0.0.0.0:9021"
+            data_dir = "./data/n21"
+            [metrics]
+            enabled = true
+        "#;
+        let cfg: NodeConfig = toml::from_str(s).unwrap();
+        let m = cfg.metrics.expect("metrics section present");
+        assert!(m.enabled);
+        assert_eq!(m.listen, "127.0.0.1:9600");
     }
 
     #[test]
@@ -756,6 +896,7 @@ mod tests {
                 }),
                 consensus: ConsensusConfig::default(),
                 network: NetworkConfig::default(),
+                metrics: None,
             };
             std::fs::write(dir.join(format!("node{id}.toml")), toml::to_string_pretty(&cfg).unwrap()).unwrap();
         }

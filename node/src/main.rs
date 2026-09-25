@@ -2759,6 +2759,7 @@ fn cmd_localnet() {
             validator: None,
             consensus: crate::config::ConsensusConfig::default(),
             network: crate::config::NetworkConfig::default(),
+            metrics: None,
         }
     };
 

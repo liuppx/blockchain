@@ -1,0 +1,22 @@
+genesis = "testnet/genesis.toml"
+
+[node]
+id = 24
+listen = "0.0.0.0:9024"
+data_dir = "./data/n24"
+
+[[peers]]
+id = 21
+addr = "127.0.0.1:9021"
+
+[[peers]]
+id = 22
+addr = "127.0.0.1:9022"
+
+[[peers]]
+id = 23
+addr = "127.0.0.1:9023"
+
+[validator]
+enabled = true
+seed_hex = "1800000000000000000000000000000000000000000000000000000000000000"

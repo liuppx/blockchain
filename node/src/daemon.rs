@@ -48,9 +48,10 @@
 //! To avoid duplicate links, a node only dials peers with a **higher id**; the
 //! lower-id side accepts. Every pair thus forms exactly one connection.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io;
 use std::net::SocketAddr;
+use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -59,10 +60,11 @@ use tokio::sync::{mpsc, oneshot};
 use tracing::{debug, error, info, warn};
 
 use crate::config::{ConfigError, NodeConfig};
+use crate::crypto::verify;
 use crate::net::{decode_gossip, encode_gossip, GossipMsg, GossipNode};
 use crate::round::{Action, Msg, RoundState, Step};
 use crate::store::{BlockLog, CertLog};
-use crate::{Genesis, Hash, Keypair, SlashEvidence, SubmissionTx};
+use crate::{Genesis, Hash, Keypair, PubKey, SlashEvidence, SubmissionTx};
 
 /// Hard cap on a single wire frame (16 MiB). The blocking `read_msg` has no cap
 /// (a hostile `u32` length would allocate up to 4 GiB); a real transport must.
@@ -138,6 +140,111 @@ async fn read_hello<R: AsyncReadExt + Unpin>(r: &mut R) -> io::Result<u64> {
 }
 
 // ----------------------------------------------------------------------------
+// M40: authenticated handshake (opt-in `[network] require_peer_auth`)
+// ----------------------------------------------------------------------------
+
+/// Domain-separation tag for the authenticated handshake. Prefixing every signed
+/// handshake transcript with this ensures a handshake signature can never be
+/// mistaken for (or replayed as) a consensus vote / transaction signature — those
+/// sign different, non-prefixed byte layouts.
+const AUTH_DOMAIN: &[u8] = b"zhixing-node-auth-v1";
+
+/// M40: the exact bytes a peer signs to prove it holds the genesis key for
+/// `signer_id`. Binding *both* sides' fresh per-session nonces makes a captured
+/// `(nonce, signature)` pair non-replayable and stops a relay from splicing two
+/// sessions: `AUTH_DOMAIN || signer_id(8 BE) || signer_nonce || peer_id(8 BE) ||
+/// peer_nonce`. Each side signs with itself as `signer`; the verifier reconstructs
+/// the peer's transcript with the peer as `signer`.
+fn auth_transcript(signer_id: u64, signer_nonce: &[u8; 32], peer_id: u64, peer_nonce: &[u8; 32]) -> Vec<u8> {
+    let mut t = Vec::with_capacity(AUTH_DOMAIN.len() + 8 + 32 + 8 + 32);
+    t.extend_from_slice(AUTH_DOMAIN);
+    t.extend_from_slice(&signer_id.to_be_bytes());
+    t.extend_from_slice(signer_nonce);
+    t.extend_from_slice(&peer_id.to_be_bytes());
+    t.extend_from_slice(peer_nonce);
+    t
+}
+
+/// M40: read-only handshake auth context, shared (`Arc`) across every connection
+/// task and built once in [`Node::start`]. `kp` is a *clone* of the validator
+/// signing key used only to sign handshake transcripts (consensus keeps its own
+/// owned copy in the [`Actor`]); `validators` is the genesis id→pubkey registry;
+/// `require` is the `[network] require_peer_auth` toggle.
+struct AuthContext {
+    my_id: u64,
+    kp: Option<Keypair>,
+    validators: HashMap<u64, PubKey>,
+    require: bool,
+}
+
+/// M40: run the mutually-authenticated handshake and return the authenticated
+/// peer id. Both sides send a `HelloInit` (`id(8) || pubkey(32) || nonce(32)`),
+/// then each signs the transcript binding both nonces and sends the 64-byte
+/// signature. Any I/O failure, an unknown/non-genesis peer id, a pubkey that
+/// doesn't match genesis, or a bad signature yields `Err` — the caller then drops
+/// the connection. Symmetric (write-then-read for both messages), so two peers
+/// dialing each other never deadlock; the payloads (72 B, 64 B) are tiny.
+async fn auth_handshake<R, W>(rd: &mut R, wr: &mut W, ctx: &AuthContext) -> io::Result<u64>
+where
+    R: AsyncReadExt + Unpin,
+    W: AsyncWriteExt + Unpin,
+{
+    let kp = ctx.kp.as_ref().ok_or_else(|| {
+        io::Error::new(io::ErrorKind::InvalidInput, "peer auth required but this node has no signing key")
+    })?;
+    let my_pk = kp.public();
+    let mut my_nonce = [0u8; 32];
+    getrandom::getrandom(&mut my_nonce)
+        .map_err(|e| io::Error::other(format!("handshake nonce rng failed: {e}")))?;
+
+    // send our HelloInit
+    let mut init = Vec::with_capacity(72);
+    init.extend_from_slice(&ctx.my_id.to_be_bytes());
+    init.extend_from_slice(&my_pk);
+    init.extend_from_slice(&my_nonce);
+    wr.write_all(&init).await?;
+    wr.flush().await?;
+
+    // read the peer's HelloInit
+    let mut pi = [0u8; 72];
+    rd.read_exact(&mut pi).await?;
+    let peer_id = u64::from_be_bytes(pi[..8].try_into().unwrap());
+    let mut peer_pk = [0u8; 32];
+    peer_pk.copy_from_slice(&pi[8..40]);
+    let mut peer_nonce = [0u8; 32];
+    peer_nonce.copy_from_slice(&pi[40..72]);
+
+    // sign our transcript and send the signature
+    let sig = kp.sign(&auth_transcript(ctx.my_id, &my_nonce, peer_id, &peer_nonce));
+    wr.write_all(&sig).await?;
+    wr.flush().await?;
+
+    // read the peer's signature
+    let mut peer_sig = [0u8; 64];
+    rd.read_exact(&mut peer_sig).await?;
+
+    // verify: the peer must be a genesis validator, present the pubkey genesis
+    // binds to its id, and sign its own transcript with that key.
+    let expected = ctx.validators.get(&peer_id).ok_or_else(|| {
+        io::Error::new(io::ErrorKind::InvalidData, format!("peer {peer_id} is not a genesis validator"))
+    })?;
+    if peer_pk != *expected {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("peer {peer_id} pubkey does not match its genesis validator key"),
+        ));
+    }
+    let transcript = auth_transcript(peer_id, &peer_nonce, ctx.my_id, &my_nonce);
+    if !verify(&peer_pk, &transcript, &peer_sig) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("peer {peer_id} handshake signature invalid"),
+        ));
+    }
+    Ok(peer_id)
+}
+
+// ----------------------------------------------------------------------------
 // actor commands + handle
 // ----------------------------------------------------------------------------
 
@@ -160,6 +267,31 @@ enum Cmd {
     Announce,
     /// Read this node's (height, head) — used by the demo/tests.
     Query(oneshot::Sender<(u64, Hash)>),
+    /// M38: read a richer runtime snapshot for the metrics/health endpoint.
+    Metrics(oneshot::Sender<Metrics>),
+}
+
+/// M38: a read-only snapshot of the daemon's runtime state, rendered to the
+/// Prometheus text-exposition format by [`render_prometheus`]. Built inside the
+/// actor (the single owner of all this state) in response to [`Cmd::Metrics`].
+#[derive(Debug, Clone)]
+pub struct Metrics {
+    /// Certified chain height.
+    pub height: u64,
+    /// Certified chain head hash.
+    pub head: Hash,
+    /// Number of connected peers (outbound queues).
+    pub peers: usize,
+    /// This process owns a signing key (in-set validator).
+    pub is_validator: bool,
+    /// A consensus instance is in flight for `height+1`.
+    pub consensus_active: bool,
+    /// Pending transactions in the mempool.
+    pub mempool: usize,
+    /// Pending stake operations awaiting inclusion.
+    pub pending_stake_ops: usize,
+    /// Pending slashing evidence awaiting inclusion.
+    pub pending_evidence: usize,
 }
 
 /// A handle to a running node (for the in-process `localnet` demo and tests).
@@ -179,6 +311,14 @@ impl Node {
     pub async fn status(&self) -> Option<(u64, Hash)> {
         let (tx, rx) = oneshot::channel();
         self.cmd.send(Cmd::Query(tx)).ok()?;
+        rx.await.ok()
+    }
+
+    /// M38: a read-only runtime snapshot for the metrics/health endpoint.
+    /// Returns `None` if the actor has stopped.
+    pub async fn metrics(&self) -> Option<Metrics> {
+        let (tx, rx) = oneshot::channel();
+        self.cmd.send(Cmd::Metrics(tx)).ok()?;
         rx.await.ok()
     }
 }
@@ -212,6 +352,19 @@ struct Actor {
     appended: usize,
     /// M35: consensus timing + empty-block policy, resolved from config at boot.
     timing: Timing,
+    /// M39: known peer listen addresses (id → "host:port"), seeded from config
+    /// (self + configured peers) and grown by address-book gossip. First-wins:
+    /// a configured/self addr is authoritative and can't be overwritten by a
+    /// peer's claim.
+    addrs: HashMap<u64, String>,
+    /// M39: ids we've already spawned a connector for (dedup — at most one
+    /// outbound dial per peer, whether from config boot or discovery).
+    dialing: HashSet<u64>,
+    /// M39: whether peer discovery is on (config `[network] enable_peer_exchange`).
+    peer_exchange: bool,
+    /// M40: shared read-only handshake auth context. Cloned into each connector
+    /// (boot + discovered) and the listener so every link runs the same policy.
+    auth: Arc<AuthContext>,
 }
 
 impl Actor {
@@ -236,6 +389,52 @@ impl Actor {
     fn broadcast_consensus(&self, m: &Msg) {
         for tx in self.outbound.values() {
             let _ = tx.send(GossipMsg::Consensus(Box::new(m.clone())));
+        }
+    }
+
+    /// M39: snapshot our address book (id → listen) as a gossip message. Includes
+    /// our own `(id, my_listen)` so neighbors learn how to dial us — that's what
+    /// lets discovery work without changing the hello handshake.
+    fn peers_msg(&self) -> GossipMsg {
+        GossipMsg::Peers(self.addrs.iter().map(|(id, a)| (*id, a.clone())).collect())
+    }
+
+    /// M39: propagate the address book to every connected peer (periodic, so a
+    /// newly-learned entry reaches the whole mesh transitively). No-op if peer
+    /// exchange is disabled.
+    fn gossip_peers(&self) {
+        if !self.peer_exchange {
+            return;
+        }
+        let msg = self.peers_msg();
+        for tx in self.outbound.values() {
+            let _ = tx.send(msg.clone());
+        }
+    }
+
+    /// M39: ingest a peer's address book. First-wins on the book (config/self
+    /// addrs stay authoritative), and any newly-learned higher-id peer we're not
+    /// already dialing gets an auto-dial connector — preserving the dial-higher-id
+    /// invariant (the lower-id side learns *our* addr from the same gossip and
+    /// dials us). No-op if peer exchange is disabled.
+    fn on_peers(&mut self, book: Vec<(u64, String)>) {
+        if !self.peer_exchange {
+            return;
+        }
+        let my_id = self.node.id;
+        for (id, addr) in book {
+            if id == my_id {
+                continue;
+            }
+            self.addrs.entry(id).or_insert_with(|| addr.clone());
+            if id > my_id && !self.dialing.contains(&id) {
+                if let Ok(sa) = addr.parse::<SocketAddr>() {
+                    self.dialing.insert(id);
+                    let tx = self.self_tx.clone();
+                    tokio::spawn(run_connector(sa, self.auth.clone(), tx));
+                    info!(node = my_id, peer = id, %addr, "discovered peer, dialing");
+                }
+            }
         }
     }
 
@@ -436,6 +635,11 @@ async fn run_actor(mut actor: Actor, mut rx: mpsc::UnboundedReceiver<Cmd>) {
             Cmd::Register { id, tx } => {
                 // Kick anti-entropy: tell the new peer our height immediately.
                 let _ = tx.send(GossipMsg::Status { height: actor.node.height() });
+                // M39: kick discovery — hand the new peer our address book (incl.
+                // our own listen addr) so it can learn + dial the rest of the mesh.
+                if actor.peer_exchange {
+                    let _ = tx.send(actor.peers_msg());
+                }
                 actor.outbound.insert(id, tx);
             }
             Cmd::Unregister { id } => {
@@ -447,6 +651,12 @@ async fn run_actor(mut actor: Actor, mut rx: mpsc::UnboundedReceiver<Cmd>) {
                 // them) and drive this node's RoundState directly.
                 if let GossipMsg::Consensus(m) = msg {
                     actor.on_consensus(*m);
+                    continue;
+                }
+                // M39: address-book gossip is likewise Actor-handled (the pure
+                // core drops it); it drives peer discovery + auto-dial.
+                if let GossipMsg::Peers(book) = msg {
+                    actor.on_peers(book);
                     continue;
                 }
                 let before = actor.node.height();
@@ -464,9 +674,26 @@ async fn run_actor(mut actor: Actor, mut rx: mpsc::UnboundedReceiver<Cmd>) {
             }
             Cmd::StartHeight { height } => actor.on_start_tick(height),
             Cmd::Timeout { height, step, round } => actor.on_timeout(height, step, round),
-            Cmd::Announce => actor.broadcast_status(),
+            Cmd::Announce => {
+                actor.broadcast_status();
+                // M39: re-propagate the address book so newly-learned peers reach
+                // the whole mesh transitively (no-op when exchange is disabled).
+                actor.gossip_peers();
+            }
             Cmd::Query(reply) => {
                 let _ = reply.send((actor.node.height(), actor.node.head()));
+            }
+            Cmd::Metrics(reply) => {
+                let _ = reply.send(Metrics {
+                    height: actor.node.height(),
+                    head: actor.node.head(),
+                    peers: actor.outbound.len(),
+                    is_validator: actor.kp.is_some(),
+                    consensus_active: actor.cons.is_some(),
+                    mempool: actor.node.mempool.len(),
+                    pending_stake_ops: actor.node.pending_stake_ops().len(),
+                    pending_evidence: actor.node.pending_evidence().len(),
+                });
             }
         }
     }
@@ -478,17 +705,30 @@ async fn run_actor(mut actor: Actor, mut rx: mpsc::UnboundedReceiver<Cmd>) {
 
 /// Drive one TCP connection: handshake, then split into a reader loop (forwards
 /// `Inbound` to the actor) and a writer task (drains a per-peer queue). Returns
-/// when the connection ends.
-async fn handle_conn(stream: TcpStream, my_id: u64, cmd: mpsc::UnboundedSender<Cmd>) {
+/// when the connection ends. M40: when `ctx.require` is set the handshake is the
+/// mutually-authenticated [`auth_handshake`]; otherwise it is the pre-M40
+/// cleartext [`write_hello`]/[`read_hello`] (byte-identical back-compat).
+async fn handle_conn(stream: TcpStream, ctx: Arc<AuthContext>, cmd: mpsc::UnboundedSender<Cmd>) {
+    let my_id = ctx.my_id;
     let _ = stream.set_nodelay(true);
     let (mut rd, mut wr) = stream.into_split();
 
-    if write_hello(&mut wr, my_id).await.is_err() {
-        return;
-    }
-    let peer_id = match read_hello(&mut rd).await {
-        Ok(id) => id,
-        Err(_) => return,
+    let peer_id = if ctx.require {
+        match auth_handshake(&mut rd, &mut wr, &ctx).await {
+            Ok(id) => id,
+            Err(e) => {
+                warn!(node = my_id, error = %e, "authenticated handshake rejected");
+                return;
+            }
+        }
+    } else {
+        if write_hello(&mut wr, my_id).await.is_err() {
+            return;
+        }
+        match read_hello(&mut rd).await {
+            Ok(id) => id,
+            Err(_) => return,
+        }
     };
     info!(node = my_id, peer = peer_id, "peer connected");
 
@@ -516,11 +756,12 @@ async fn handle_conn(stream: TcpStream, my_id: u64, cmd: mpsc::UnboundedSender<C
     writer.abort();
 }
 
-async fn run_listener(listener: TcpListener, my_id: u64, cmd: mpsc::UnboundedSender<Cmd>) {
+async fn run_listener(listener: TcpListener, ctx: Arc<AuthContext>, cmd: mpsc::UnboundedSender<Cmd>) {
+    let my_id = ctx.my_id;
     loop {
         match listener.accept().await {
             Ok((stream, _addr)) => {
-                tokio::spawn(handle_conn(stream, my_id, cmd.clone()));
+                tokio::spawn(handle_conn(stream, ctx.clone(), cmd.clone()));
             }
             Err(e) => warn!(node = my_id, error = %e, "accept error"),
         }
@@ -528,16 +769,124 @@ async fn run_listener(listener: TcpListener, my_id: u64, cmd: mpsc::UnboundedSen
 }
 
 /// Dial a higher-id peer, reconnecting with capped backoff after any drop.
-async fn run_connector(addr: SocketAddr, my_id: u64, cmd: mpsc::UnboundedSender<Cmd>) {
+async fn run_connector(addr: SocketAddr, ctx: Arc<AuthContext>, cmd: mpsc::UnboundedSender<Cmd>) {
     let mut backoff = Duration::from_millis(500);
     loop {
         if let Ok(stream) = TcpStream::connect(addr).await {
             backoff = Duration::from_millis(500);
-            handle_conn(stream, my_id, cmd.clone()).await; // returns on disconnect
+            handle_conn(stream, ctx.clone(), cmd.clone()).await; // returns on disconnect
         }
         tokio::time::sleep(backoff).await;
         backoff = (backoff * 2).min(Duration::from_secs(8));
     }
+}
+
+// ----------------------------------------------------------------------------
+// M38: metrics / health endpoint
+// ----------------------------------------------------------------------------
+
+/// Render a [`Metrics`] snapshot to the Prometheus text-exposition format
+/// (v0.0.4). Pure — this is the unit-testable core of the endpoint. Every gauge
+/// gets a `# HELP`/`# TYPE` pair; the head hash rides a `zhixing_head_info`
+/// info-gauge label so it is queryable without being a numeric metric.
+fn render_prometheus(m: &Metrics) -> String {
+    let head = crate::hash::hex(&m.head);
+    let mut s = String::with_capacity(1024);
+    let gauge = |s: &mut String, name: &str, help: &str, value: u64| {
+        s.push_str(&format!("# HELP {name} {help}\n"));
+        s.push_str(&format!("# TYPE {name} gauge\n"));
+        s.push_str(&format!("{name} {value}\n"));
+    };
+    gauge(&mut s, "zhixing_height", "Certified chain height.", m.height);
+    gauge(&mut s, "zhixing_peers_connected", "Connected peers.", m.peers as u64);
+    gauge(
+        &mut s,
+        "zhixing_is_validator",
+        "1 if this node owns a signing key (in-set validator), else 0.",
+        m.is_validator as u64,
+    );
+    gauge(
+        &mut s,
+        "zhixing_consensus_active",
+        "1 if a consensus instance is in flight, else 0.",
+        m.consensus_active as u64,
+    );
+    gauge(&mut s, "zhixing_mempool_txs", "Pending transactions in the mempool.", m.mempool as u64);
+    gauge(
+        &mut s,
+        "zhixing_pending_stake_ops",
+        "Pending stake operations awaiting inclusion.",
+        m.pending_stake_ops as u64,
+    );
+    gauge(
+        &mut s,
+        "zhixing_pending_evidence",
+        "Pending slashing evidence awaiting inclusion.",
+        m.pending_evidence as u64,
+    );
+    s.push_str("# HELP zhixing_head_info Certified chain head hash (as a label).\n");
+    s.push_str("# TYPE zhixing_head_info gauge\n");
+    s.push_str(&format!("zhixing_head_info{{head=\"{head}\"}} 1\n"));
+    s
+}
+
+/// Accept loop for the metrics/health endpoint. Mirrors [`run_listener`]: each
+/// connection is handled on its own task; an accept error is logged and the loop
+/// continues (a transient error must not take the endpoint down).
+async fn run_metrics(listener: TcpListener, my_id: u64, cmd: mpsc::UnboundedSender<Cmd>) {
+    loop {
+        match listener.accept().await {
+            Ok((stream, _addr)) => {
+                tokio::spawn(serve_metrics_conn(stream, cmd.clone()));
+            }
+            Err(e) => warn!(node = my_id, error = %e, "metrics accept error"),
+        }
+    }
+}
+
+/// Serve one metrics request: best-effort discard the HTTP request (bounded), ask
+/// the actor for a snapshot, and write a fixed-shape `HTTP/1.1 200 OK` reply whose
+/// body is the Prometheus exposition. Any path returns metrics, so a bare `GET /`
+/// doubles as a health check (`200` ⇒ alive). Errors are swallowed — a broken
+/// client connection must never affect the node.
+async fn serve_metrics_conn(mut stream: TcpStream, cmd: mpsc::UnboundedSender<Cmd>) {
+    // Drain the request headers so the client's write side is satisfied, but cap
+    // the read so a malformed/never-terminated request can't hang or grow the
+    // buffer without bound. We don't parse it — every request returns metrics.
+    let mut buf = [0u8; 1024];
+    let mut total = 0usize;
+    loop {
+        match stream.read(&mut buf).await {
+            Ok(0) => break, // client closed
+            Ok(n) => {
+                total += n;
+                // End of request headers, or the read cap — stop reading either way.
+                if buf[..n].windows(4).any(|w| w == b"\r\n\r\n") || total >= 8192 {
+                    break;
+                }
+            }
+            Err(_) => return,
+        }
+    }
+
+    let (tx, rx) = oneshot::channel();
+    if cmd.send(Cmd::Metrics(tx)).is_err() {
+        return; // actor gone
+    }
+    let Ok(snapshot) = rx.await else { return };
+    let body = render_prometheus(&snapshot);
+    let resp = format!(
+        "HTTP/1.1 200 OK\r\n\
+         Content-Type: text/plain; version=0.0.4\r\n\
+         Content-Length: {}\r\n\
+         Connection: close\r\n\
+         \r\n\
+         {}",
+        body.len(),
+        body,
+    );
+    let _ = stream.write_all(resp.as_bytes()).await;
+    let _ = stream.flush().await;
 }
 
 // ----------------------------------------------------------------------------
@@ -587,6 +936,17 @@ impl Node {
             }
         }
 
+        // M40: strict peer auth requires this node to prove its own identity in the
+        // handshake, which it can only do with a signing key. A keyless follower
+        // could never complete an authenticated handshake, so refuse to start
+        // rather than silently fail every dial (fail-fast, mirrors the check above).
+        if cfg.network.require_peer_auth && validator_key.is_none() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("node {my_id} sets require_peer_auth but has no validator signing key"),
+            ));
+        }
+
         // logs + boot recovery
         let bpath = format!("{}/blocks.log", cfg.node.data_dir);
         let cpath = format!("{}/certs.log", cfg.node.data_dir);
@@ -617,6 +977,31 @@ impl Node {
             block_interval_ms: cfg.consensus.block_interval_ms,
             create_empty_blocks: cfg.consensus.create_empty_blocks,
         };
+        // M39: seed the address book with our own listen addr + every configured
+        // peer, and mark the higher-id peers as already-dialing (the boot
+        // connectors below cover them — don't let discovery re-dial). Discovery
+        // grows both sets as address-book gossip arrives.
+        let mut addrs: HashMap<u64, String> = HashMap::new();
+        addrs.insert(my_id, cfg.node.listen.clone());
+        let mut dialing: HashSet<u64> = HashSet::new();
+        for p in &cfg.peers {
+            addrs.entry(p.id).or_insert_with(|| p.addr.clone());
+            if p.id > my_id {
+                dialing.insert(p.id);
+            }
+        }
+        // M40: build the shared handshake auth context. Clone the signing key
+        // (the consensus actor keeps its own owned copy below), snapshot the
+        // genesis id→pubkey registry, and carry the `require_peer_auth` policy.
+        let validators: HashMap<u64, PubKey> =
+            genesis.validators.iter().map(|(id, pk, _)| (*id, *pk)).collect();
+        let auth = Arc::new(AuthContext {
+            my_id,
+            kp: validator_key.clone(),
+            validators,
+            require: cfg.network.require_peer_auth,
+        });
+
         let actor = Actor {
             node,
             outbound: HashMap::new(),
@@ -627,6 +1012,10 @@ impl Node {
             clog,
             appended,
             timing,
+            addrs,
+            dialing,
+            peer_exchange: cfg.network.enable_peer_exchange,
+            auth: auth.clone(),
         };
         tokio::spawn(run_actor(actor, cmd_rx));
 
@@ -641,13 +1030,13 @@ impl Node {
             role = if is_validator { "validator" } else { "follower" },
             "listening",
         );
-        tokio::spawn(run_listener(listener, my_id, cmd_tx.clone()));
+        tokio::spawn(run_listener(listener, auth.clone(), cmd_tx.clone()));
 
         // outbound connectors (dial higher ids only → one link per pair)
         for p in &cfg.peers {
             if p.id > my_id {
                 let addr = p.socket_addr().map_err(cfg_io)?;
-                tokio::spawn(run_connector(addr, my_id, cmd_tx.clone()));
+                tokio::spawn(run_connector(addr, auth.clone(), cmd_tx.clone()));
             }
         }
 
@@ -664,6 +1053,16 @@ impl Node {
                     }
                 }
             });
+        }
+
+        // M38: opt-in read-only metrics/health endpoint. Bound only when the
+        // `[metrics]` section is present and `enabled = true`; otherwise this is a
+        // no-op and the daemon behaves exactly as before.
+        if let Some(mc) = cfg.metrics.as_ref().filter(|m| m.enabled) {
+            let addr = mc.listen_addr().map_err(cfg_io)?;
+            let mlistener = TcpListener::bind(addr).await?;
+            info!(node = my_id, addr = %mlistener.local_addr()?, "metrics listening");
+            tokio::spawn(run_metrics(mlistener, my_id, cmd_tx.clone()));
         }
 
         // M33: kick off consensus for the first height after the mesh has had a
@@ -759,6 +1158,36 @@ mod tests {
         writer.await.unwrap();
     }
 
+    // --- M40: authenticated handshake (pure core) -------------------------------
+
+    #[test]
+    fn auth_transcript_is_deterministic_and_order_sensitive() {
+        let n1 = [1u8; 32];
+        let n2 = [2u8; 32];
+        let a = auth_transcript(21, &n1, 22, &n2);
+        assert_eq!(a, auth_transcript(21, &n1, 22, &n2), "same inputs ⇒ identical bytes");
+        // Swapping the signer/peer roles must change the bytes: each side signs a
+        // *distinct* transcript, so one side's signature can't be replayed as the
+        // other's.
+        assert_ne!(a, auth_transcript(22, &n2, 21, &n1));
+        // The domain tag is a prefix (cross-protocol signature separation).
+        assert!(a.starts_with(AUTH_DOMAIN));
+        assert_eq!(a.len(), AUTH_DOMAIN.len() + 8 + 32 + 8 + 32);
+    }
+
+    #[test]
+    fn auth_sign_verify_round_trip() {
+        let n1 = [3u8; 32];
+        let n2 = [4u8; 32];
+        let t = auth_transcript(21, &n1, 22, &n2);
+        let sig = kp(21).sign(&t);
+        assert!(verify(&kp(21).public(), &t, &sig), "the correct genesis key verifies");
+        // A different validator's signature over the same transcript must fail —
+        // exactly what stops an impostor from authenticating as validator 21.
+        let forged = kp(22).sign(&t);
+        assert!(!verify(&kp(21).public(), &t, &forged));
+    }
+
     // --- integration: three in-process nodes over loopback TCP converge --------
 
     use crate::validator::{Validator, ValidatorSet};
@@ -846,6 +1275,7 @@ mod tests {
             validator: None,
             consensus: crate::config::ConsensusConfig::default(),
             network: crate::config::NetworkConfig::default(),
+            metrics: None,
         }
     }
 
@@ -1244,6 +1674,278 @@ mod tests {
             !blocks[0].txs.is_empty(),
             "the block that broke the idle pause must carry the submitted work"
         );
+
+        cleanup(&data_dirs);
+    }
+
+    // ------------------------------------------------------------------------
+    // M38: metrics / health endpoint
+    // ------------------------------------------------------------------------
+
+    fn sample_metrics() -> Metrics {
+        Metrics {
+            height: 7,
+            head: [0xab; 32],
+            peers: 3,
+            is_validator: true,
+            consensus_active: false,
+            mempool: 5,
+            pending_stake_ops: 2,
+            pending_evidence: 1,
+        }
+    }
+
+    #[test]
+    fn render_prometheus_emits_all_gauges() {
+        let out = render_prometheus(&sample_metrics());
+        // Every gauge carries its value and a `# TYPE … gauge` declaration.
+        for (name, value) in [
+            ("zhixing_height", 7),
+            ("zhixing_peers_connected", 3),
+            ("zhixing_is_validator", 1),
+            ("zhixing_consensus_active", 0),
+            ("zhixing_mempool_txs", 5),
+            ("zhixing_pending_stake_ops", 2),
+            ("zhixing_pending_evidence", 1),
+        ] {
+            assert!(out.contains(&format!("# TYPE {name} gauge")), "missing TYPE for {name}");
+            assert!(out.contains(&format!("\n{name} {value}\n")), "missing `{name} {value}`");
+        }
+    }
+
+    #[test]
+    fn render_prometheus_encodes_role_and_head() {
+        // Follower with a live consensus round: role 0, consensus 1.
+        let m = Metrics { is_validator: false, consensus_active: true, ..sample_metrics() };
+        let out = render_prometheus(&m);
+        assert!(out.contains("\nzhixing_is_validator 0\n"));
+        assert!(out.contains("\nzhixing_consensus_active 1\n"));
+        // The full head hex rides the info-gauge label.
+        let head = crate::hash::hex(&m.head);
+        assert!(out.contains(&format!("zhixing_head_info{{head=\"{head}\"}} 1")));
+    }
+
+    #[tokio::test]
+    async fn metrics_handle_reports_snapshot() {
+        // A single fresh validator: genesis height 0, no peers dialed, has a key.
+        let dir = tmp_dir("metrics-handle");
+        let cfg = node_config(21, 19671, &[21], dir.clone());
+        let node = Node::start(cfg, test_genesis(), Some(kp(21))).await.expect("start node");
+
+        let m = node.metrics().await.expect("metrics snapshot");
+        assert_eq!(m.height, 0);
+        assert!(m.is_validator);
+        assert_eq!(m.peers, 0);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn metrics_endpoint_serves_prometheus_over_tcp() {
+        // Enable the endpoint on a fixed loopback port, then scrape it over TCP.
+        let dir = tmp_dir("metrics-endpoint");
+        let mut cfg = node_config(21, 19691, &[21], dir.clone());
+        let metrics_addr = "127.0.0.1:19791";
+        cfg.metrics = Some(crate::config::MetricsConfig {
+            enabled: true,
+            listen: metrics_addr.into(),
+        });
+        let _node = Node::start(cfg, test_genesis(), Some(kp(21))).await.expect("start node");
+
+        // The listener binds during start(), but give the accept task a beat.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        let mut stream = TcpStream::connect(metrics_addr).await.expect("connect metrics");
+        stream
+            .write_all(b"GET /metrics HTTP/1.1\r\nHost: localhost\r\n\r\n")
+            .await
+            .expect("send request");
+
+        let mut resp = Vec::new();
+        stream.read_to_end(&mut resp).await.expect("read response");
+        let text = String::from_utf8_lossy(&resp);
+
+        assert!(text.starts_with("HTTP/1.1 200 OK"), "expected 200, got: {text}");
+        assert!(text.contains("zhixing_height 0"), "missing height gauge: {text}");
+        assert!(text.contains("# TYPE zhixing_height gauge"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // --- integration: peer discovery / address gossip (M39) ---------------------
+
+    /// Build a node config with an explicit (partial) peer list, so a test can
+    /// seed a topology that is *not* a full mesh.
+    fn discovery_config(
+        id: u64,
+        port_base: u16,
+        peers: &[u64],
+        data_dir: String,
+        enable_peer_exchange: bool,
+    ) -> NodeConfig {
+        let addr = |i: u64| format!("127.0.0.1:{}", port_base + (i - 21) as u16);
+        NodeConfig {
+            node: crate::config::NodeSection { id, listen: addr(id), data_dir },
+            peers: peers
+                .iter()
+                .map(|&p| crate::config::PeerConfig { id: p, addr: addr(p) })
+                .collect(),
+            genesis: String::new(),
+            validator: None,
+            consensus: crate::config::ConsensusConfig::default(),
+            network: crate::config::NetworkConfig {
+                enable_peer_exchange,
+                ..crate::config::NetworkConfig::default()
+            },
+            metrics: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn discovery_completes_partial_mesh() {
+        // Seed a CHAIN topology (not a full mesh): 21 knows only 22; 22 knows
+        // 21+23; 23 knows only 22. With peer exchange on (default), 22's address
+        // book must propagate 23's listen addr to 21, which then auto-dials it —
+        // a link that was never in 21's config. Node 21's peer count reaching 2
+        // proves address-book propagation + auto-dial.
+        let port_base = 19711u16;
+        let genesis = test_genesis();
+        let seeds: [(u64, Vec<u64>); 3] = [(21, vec![22]), (22, vec![21, 23]), (23, vec![22])];
+
+        let mut nodes = Vec::new();
+        let mut data_dirs = BTreeMap::new();
+        for (id, peers) in seeds {
+            let dir = tmp_dir(&format!("disc-n{id}"));
+            data_dirs.insert(id, dir.clone());
+            let cfg = discovery_config(id, port_base, &peers, dir, true);
+            let node = Node::start(cfg, genesis.clone(), Some(kp(id))).await.expect("start node");
+            nodes.push((id, node));
+        }
+
+        // Poll node 21's peer count until it reaches 2 — it dialed 23, which was
+        // never in its own config.
+        let node21 = &nodes[0].1;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+        loop {
+            let peers = node21.metrics().await.map(|m| m.peers).unwrap_or(0);
+            if peers >= 2 {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "node 21 never discovered a 2nd peer (peers={peers})"
+            );
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+
+        cleanup(&data_dirs);
+    }
+
+    #[tokio::test]
+    async fn peer_exchange_disabled_stays_seeded() {
+        // Same chain seed, but with `enable_peer_exchange = false`: node 21 must
+        // stay pinned to its single configured peer (22). No address-book gossip
+        // is sent (not even on the periodic announce), so it never learns 23. This
+        // both guards the opt-out toggle and proves the previous test genuinely
+        // depends on discovery.
+        let port_base = 19731u16;
+        let genesis = test_genesis();
+        let seeds: [(u64, Vec<u64>); 3] = [(21, vec![22]), (22, vec![21, 23]), (23, vec![22])];
+
+        let mut nodes = Vec::new();
+        let mut data_dirs = BTreeMap::new();
+        for (id, peers) in seeds {
+            let dir = tmp_dir(&format!("noexch-n{id}"));
+            data_dirs.insert(id, dir.clone());
+            let cfg = discovery_config(id, port_base, &peers, dir, false);
+            let node = Node::start(cfg, genesis.clone(), Some(kp(id))).await.expect("start node");
+            nodes.push((id, node));
+        }
+
+        // Wait past one announce tick (default 2000 ms) to prove even the heartbeat
+        // path doesn't leak an address book when exchange is off.
+        tokio::time::sleep(Duration::from_millis(2500)).await;
+        let peers = nodes[0].1.metrics().await.map(|m| m.peers).unwrap_or(0);
+        assert_eq!(peers, 1, "with exchange off, node 21 must stay at its 1 seeded peer");
+
+        cleanup(&data_dirs);
+    }
+
+    // --- integration: authenticated handshake / peer auth (M40) ------------------
+
+    #[tokio::test]
+    async fn authenticated_mesh_converges() {
+        // Three validators with `require_peer_auth = true` and their genesis keys.
+        // The mutually-authenticated handshake must succeed end-to-end over real
+        // sockets, so consensus still runs and they converge to a shared head
+        // (quorum 3-of-4). This proves the authenticated path is fully functional.
+        let ids = [22u64, 23, 24];
+        let port_base = 19751u16;
+        let genesis = test_genesis();
+
+        let mut nodes = Vec::new();
+        let mut data_dirs = BTreeMap::new();
+        for &id in &ids {
+            let dir = tmp_dir(&format!("auth-n{id}"));
+            data_dirs.insert(id, dir.clone());
+            let mut cfg = node_config(id, port_base, &ids, dir);
+            cfg.network.require_peer_auth = true;
+            let node = Node::start(cfg, genesis.clone(), Some(kp(id))).await.expect("start node");
+            nodes.push((id, node));
+        }
+
+        // If authentication works, consensus proceeds and heads agree.
+        let states = await_converged(&nodes, 2, Duration::from_secs(30)).await;
+        assert!(states.windows(2).all(|w| w[0] == w[1]), "authenticated mesh converged");
+
+        cleanup(&data_dirs);
+    }
+
+    #[tokio::test]
+    async fn impostor_without_key_is_rejected() {
+        // One honest validator with peer auth on. A raw TCP peer completes the
+        // handshake *shape* but claims validator id 22 while presenting a pubkey
+        // that isn't 22's genesis key. The honest node must reject it — its peer
+        // count stays 0 (no Register), so an unauthenticated impostor never lands
+        // on the vote path.
+        let port_base = 19771u16;
+        let genesis = test_genesis();
+        let dir = tmp_dir("impostor-n21");
+        let mut data_dirs = BTreeMap::new();
+        data_dirs.insert(21u64, dir.clone());
+
+        let mut cfg = node_config(21, port_base, &[21], dir);
+        cfg.network.require_peer_auth = true;
+        let node = Node::start(cfg, genesis.clone(), Some(kp(21))).await.expect("start node");
+
+        // Give the listener a moment, then connect as a bogus peer.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let addr = format!("127.0.0.1:{port_base}");
+        let stream = TcpStream::connect(&addr).await.expect("connect");
+        let _ = stream.set_nodelay(true);
+        let (mut rd, mut wr) = stream.into_split();
+
+        // HelloInit: claim id 22, but present kp(99) — not 22's genesis key.
+        let claimed_id = 22u64;
+        let wrong = kp(99);
+        let mut init = Vec::with_capacity(72);
+        init.extend_from_slice(&claimed_id.to_be_bytes());
+        init.extend_from_slice(&wrong.public());
+        init.extend_from_slice(&[7u8; 32]); // our nonce
+        wr.write_all(&init).await.expect("send hello init");
+        wr.flush().await.expect("flush");
+        // Read the honest node's HelloInit (confirms it spoke auth, not plain hello).
+        let mut hi = [0u8; 72];
+        rd.read_exact(&mut hi).await.expect("honest hello init");
+        // Send a signature; it fails the pubkey/genesis check regardless.
+        let sig = wrong.sign(b"bogus");
+        let _ = wr.write_all(&sig).await;
+        let _ = wr.flush().await;
+
+        // The honest node must never register this peer.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let peers = node.metrics().await.map(|m| m.peers).unwrap_or(99);
+        assert_eq!(peers, 0, "impostor without the genesis key must be rejected");
 
         cleanup(&data_dirs);
     }

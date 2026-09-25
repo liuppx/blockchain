@@ -1,0 +1,63 @@
+base_emission_micro = 8000000
+slash_bps = 10000
+timestamp_days = 0.0
+
+[[accounts]]
+id = 1
+balance_micro = 30000000
+pubkey_hex = "cecc1507dc1ddd7295951c290888f095adb9044d1b73d696e6df065d683bd4fc"
+
+[[accounts]]
+id = 2
+balance_micro = 30000000
+pubkey_hex = "6b79c57e6a095239282c04818e96112f3f03a4001ba97a564c23852a3f1ea5fc"
+
+[[accounts]]
+id = 3
+balance_micro = 30000000
+pubkey_hex = "dadbd184a2d526f1ebdd5c06fdad9359b228759b4d7f79d66689fa254aad8546"
+
+[[reviewers]]
+id = 10
+weight = 1.0
+
+[[reviewers]]
+id = 11
+weight = 1.0
+
+[[reviewers]]
+id = 12
+weight = 1.0
+
+[[seed_nodes]]
+embedding = [
+    1.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+]
+domain = 0
+
+[[validators]]
+id = 21
+pubkey_hex = "3e55e9643a89e218d9015c1bad3826c7e25bdedaecdbd35e28f49cffb036900c"
+power = 1
+
+[[validators]]
+id = 22
+pubkey_hex = "2eb8a0b367663669983548a2efbec9e374e12292269133ad4ff23ceca96082bf"
+power = 1
+
+[[validators]]
+id = 23
+pubkey_hex = "551918e0e5f9efcdd4c081283151cfad5cb51a02eb3bec60d252bc03d59e87b0"
+power = 1
+
+[[validators]]
+id = 24
+pubkey_hex = "f59a736de10e003f94d8666adbc9956dd4d4edec234fc3b928e1d64a1d582c5e"
+power = 1

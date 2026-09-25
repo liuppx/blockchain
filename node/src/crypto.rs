@@ -12,6 +12,11 @@ pub type Sig = [u8; 64];
 
 /// A signing keypair. `from_seed` is deterministic (no RNG), which keeps demos
 /// and tests reproducible; production keys come from a CSPRNG / HSM.
+///
+/// `Clone` (M40): the daemon hands a signing clone to the authenticated-handshake
+/// context while the consensus actor keeps its own owned copy — a `SigningKey` is
+/// itself `Clone`, so this is a cheap, sound copy of the secret scalar.
+#[derive(Clone)]
 pub struct Keypair(SigningKey);
 
 impl Keypair {

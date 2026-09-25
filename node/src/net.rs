@@ -173,7 +173,19 @@ pub enum GossipMsg {
     /// wall-clock timers, `apply_certified` — live in the Actor). Boxed because a
     /// `Proposal` carries a whole `Block`.
     Consensus(Box<crate::round::Msg>),
+    /// M39: a peer address book for discovery — `(node_id, "host:port")` hints.
+    /// A node self-advertises its own `(id, listen)` here (so neighbors learn its
+    /// listen address without a handshake change) and re-gossips what it knows.
+    /// The daemon Actor merges these into its book and auto-dials any discovered
+    /// higher-id peer; the pure `GossipNode` / `LightGossipNode` cores drop it (no
+    /// I/O, no dialing). Capped at [`MAX_PEERS`] entries per message.
+    Peers(Vec<(u64, String)>),
 }
+
+/// M39: maximum entries in a single [`GossipMsg::Peers`] address book — over the
+/// cap is a codec error ([`CodecError::TooManyItems`]). Bounds a hostile peer's
+/// book so decoding can't fan out unboundedly.
+pub const MAX_PEERS: usize = 1024;
 
 /// M24: maximum items in a single [`GossipMsg::GetProof`] / [`GossipMsg::Proof`]
 /// — over the cap is a codec error (`TooManyItems`). Keeps a single request
@@ -209,6 +221,10 @@ pub const TAG_LOCK: u8 = 15;
 /// M33: distributed BFT consensus message (proposal / prevote / precommit).
 /// Handled by the daemon Actor, not the pure gossip cores.
 pub const TAG_CONSENSUS: u8 = 16;
+/// M39: peer address book — a list of `(node_id, listen_addr)` hints gossiped
+/// for peer discovery. Handled by the daemon Actor (auto-dials discovered
+/// higher-id peers); the pure gossip cores drop it.
+pub const TAG_PEERS: u8 = 17;
 
 /// M29: maximum items in a single heterogeneous batched
 /// request/response. Mirrors `MAX_PROOF_BATCH = 32` so the bus caps
@@ -992,6 +1008,9 @@ impl GossipNode {
             // the Keypair, wall-clock timers, and apply_certified side effects);
             // the pure core never handles it.
             GossipMsg::Consensus(_) => Vec::new(),
+            // M39: peer discovery is driven by the daemon Actor (it owns the
+            // address book and dialing); the pure core does no I/O.
+            GossipMsg::Peers(_) => Vec::new(),
         }
     }
 
@@ -1375,7 +1394,9 @@ impl LightGossipNode {
             | GossipMsg::Evidence(_)
             | GossipMsg::StakeOp(_)
             // M33: consensus is an Actor concern; light clients never vote.
-            | GossipMsg::Consensus(_) => Vec::new(),
+            | GossipMsg::Consensus(_)
+            // M39: peer discovery is an Actor concern; the pure core does no I/O.
+            | GossipMsg::Peers(_) => Vec::new(),
         }
     }
 
@@ -1674,6 +1695,16 @@ pub fn encode_gossip(m: &GossipMsg) -> Vec<u8> {
             out.push(TAG_CONSENSUS);
             put_bytes(&mut out, &crate::codec::encode_consensus_msg(m));
         }
+        // M39: peer address book — u32 count then per-entry (u64 id + length-
+        // prefixed utf8 addr).
+        GossipMsg::Peers(entries) => {
+            out.push(TAG_PEERS);
+            out.extend_from_slice(&(entries.len() as u32).to_be_bytes());
+            for (id, addr) in entries.iter() {
+                out.extend_from_slice(&id.to_be_bytes());
+                put_bytes(&mut out, addr.as_bytes());
+            }
+        }
     }
     out
 }
@@ -1817,6 +1848,22 @@ pub fn decode_gossip(buf: &[u8]) -> Result<GossipMsg, CodecError> {
         TAG_CONSENSUS => GossipMsg::Consensus(Box::new(
             crate::codec::decode_consensus_msg(take_bytes(&mut rest)?)?,
         )),
+        // M39: peer address book — u32 count then per-entry (u64 id + length-
+        // prefixed utf8 addr). Addrs are best-effort hints (parse-checked before
+        // dialing), so a non-utf8 addr decodes lossily rather than failing.
+        TAG_PEERS => {
+            let n = take_u32(&mut rest)?;
+            if n as usize > MAX_PEERS {
+                return Err(CodecError::TooManyItems(n as u64));
+            }
+            let mut entries = Vec::with_capacity(n as usize);
+            for _ in 0..n {
+                let id = take_u64(&mut rest)?;
+                let addr = String::from_utf8_lossy(take_bytes(&mut rest)?).into_owned();
+                entries.push((id, addr));
+            }
+            GossipMsg::Peers(entries)
+        }
         other => return Err(CodecError::BadEnum(other as u32)),
     };
     if !rest.is_empty() {
@@ -2361,6 +2408,38 @@ mod tests {
                 Ok(back) => assert_eq!(encode_gossip(&back), bytes, "re-encoding is stable"),
                 Err(e) => panic!("decode failed: {e:?} for {m:?}"),
             }
+        }
+    }
+
+    /// M39: a `Peers` address book round-trips exactly, and a book claiming
+    /// more than `MAX_PEERS` entries is rejected at decode (bounded so a
+    /// hostile peer can't ship an unbounded book).
+    #[test]
+    fn peers_gossip_round_trips() {
+        let entries = vec![
+            (21u64, "127.0.0.1:19711".to_string()),
+            (22, "127.0.0.1:19712".to_string()),
+            (23, "10.0.0.7:30303".to_string()),
+        ];
+        let book = GossipMsg::Peers(entries.clone());
+        let bytes = encode_gossip(&book);
+        match decode_gossip(&bytes) {
+            Ok(GossipMsg::Peers(back)) => assert_eq!(back, entries),
+            other => panic!("expected Peers, got {other:?}"),
+        }
+        // An empty book is legal (a node with no known peers).
+        let empty = encode_gossip(&GossipMsg::Peers(vec![]));
+        match decode_gossip(&empty) {
+            Ok(GossipMsg::Peers(back)) => assert!(back.is_empty()),
+            other => panic!("expected empty Peers, got {other:?}"),
+        }
+        // A book that claims more than MAX_PEERS entries is rejected before it
+        // can allocate: hand-craft the wire header with an over-cap count.
+        let mut evil = vec![TAG_PEERS];
+        evil.extend_from_slice(&((MAX_PEERS as u32) + 1).to_be_bytes());
+        match decode_gossip(&evil) {
+            Err(CodecError::TooManyItems(n)) => assert_eq!(n, MAX_PEERS as u64 + 1),
+            other => panic!("expected TooManyItems, got {other:?}"),
         }
     }
 
