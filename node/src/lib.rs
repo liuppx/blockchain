@@ -759,6 +759,16 @@ pub enum ChainError {
     /// in `BridgeSource::consumed` — replay rejected. Same discipline as
     /// M30's `BridgeError::AlreadyConsumed`, just on the consensus path.
     BridgeAlreadyRedeemed { source: Hash, lock_id: u64 },
+    /// M54: the pending mempool is at its configured capacity bound, so a new
+    /// transaction cannot be admitted. A node-local resource condition (not a
+    /// consensus-validity error) — the submitter should retry later.
+    MempoolFull { capacity: usize },
+    /// M57: `author` already holds the configured per-account pending-tx limit, so
+    /// a new transaction from them cannot be admitted. Like `MempoolFull`, a
+    /// node-local admission backpressure condition (not a consensus-validity
+    /// error) — the submitter should wait for their pending txs to be included,
+    /// then retry.
+    AccountQuotaFull { author: u64, limit: usize },
 }
 
 impl std::fmt::Display for ChainError {
@@ -852,6 +862,12 @@ impl std::fmt::Display for ChainError {
                 "bridge redeem already consumed for source {} lock_id {lock_id}",
                 short_hex(source)
             ),
+            ChainError::MempoolFull { capacity } => {
+                write!(f, "mempool full (capacity {capacity})")
+            }
+            ChainError::AccountQuotaFull { author, limit } => {
+                write!(f, "account {author} over pending quota (limit {limit})")
+            }
         }
     }
 }

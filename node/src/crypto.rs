@@ -31,6 +31,16 @@ impl Keypair {
     pub fn sign(&self, msg: &[u8]) -> Sig {
         self.0.sign(msg).to_bytes()
     }
+
+    /// The raw 32-byte ed25519 seed, round-tripping with `from_seed`.
+    ///
+    /// Used (M43) to derive a PKCS#8 encoding for the genesis-pinned mTLS
+    /// credential, so a node's TLS identity *is* its consensus key. Kept crate-
+    /// internal in spirit — it exposes secret material, so only the daemon's
+    /// TLS setup calls it.
+    pub fn secret_seed(&self) -> [u8; 32] {
+        self.0.to_bytes()
+    }
 }
 
 /// Verify `sig` over `msg` against `pk`. Returns false on any malformed input
@@ -71,5 +81,16 @@ mod tests {
         let msg = b"x";
         let sig = kp.sign(msg);
         assert!(!verify(&other, msg, &sig));
+    }
+
+    #[test]
+    fn secret_seed_round_trips() {
+        // The seed is exactly what `from_seed` consumes, so a round trip through
+        // `secret_seed` reproduces the same key (M43 mTLS derives its credential
+        // from this seed and must land on the same public key as consensus).
+        let seed = [42u8; 32];
+        let kp = Keypair::from_seed(seed);
+        assert_eq!(kp.secret_seed(), seed);
+        assert_eq!(Keypair::from_seed(kp.secret_seed()).public(), kp.public());
     }
 }

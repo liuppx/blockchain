@@ -25,6 +25,19 @@ pub struct Mempool {
     pending: BTreeMap<Hash, SubmissionTx>,
     /// Maximum transactions the builder will place in a single block.
     max_txs: usize,
+    /// M54: maximum transactions held pending at once. `usize::MAX` ⇒ unbounded
+    /// (the default; production opts into a real bound via [`set_capacity`]).
+    capacity: usize,
+    /// M57: author → current pending-tx count. The per-account quota index; an
+    /// entry is removed when it hits 0 so the map stays bounded by distinct live
+    /// authors, not by all authors ever seen.
+    per_author: BTreeMap<u64, usize>,
+    /// M57: max pending txs one author may hold at once. `usize::MAX` ⇒ unbounded
+    /// (the default; production opts in via [`set_per_account_limit`]).
+    per_account_limit: usize,
+    /// M57: cumulative admissions rejected by the per-account quota (observability;
+    /// surfaced as a metrics counter).
+    rejected_quota: u64,
 }
 
 impl Mempool {
@@ -32,7 +45,40 @@ impl Mempool {
         Mempool {
             pending: BTreeMap::new(),
             max_txs,
+            capacity: usize::MAX,
+            per_author: BTreeMap::new(),
+            per_account_limit: usize::MAX,
+            rejected_quota: 0,
         }
+    }
+
+    /// M54: bound the number of pending transactions. Admission past this is
+    /// rejected with [`ChainError::MempoolFull`]. Lowering it below the current
+    /// `len()` does not evict — it only blocks further growth.
+    pub fn set_capacity(&mut self, capacity: usize) {
+        self.capacity = capacity;
+    }
+
+    /// M54: the configured pending-pool capacity bound (`usize::MAX` ⇒ unbounded).
+    pub fn capacity(&self) -> usize {
+        self.capacity
+    }
+
+    /// M57: bound how many pending transactions a single account (`author`) may
+    /// hold at once. Admission past this is rejected with
+    /// [`ChainError::AccountQuotaFull`]. `usize::MAX` ⇒ unbounded (the default).
+    pub fn set_per_account_limit(&mut self, limit: usize) {
+        self.per_account_limit = limit;
+    }
+
+    /// M57: the configured per-account pending-tx bound (`usize::MAX` ⇒ unbounded).
+    pub fn per_account_limit(&self) -> usize {
+        self.per_account_limit
+    }
+
+    /// M57: cumulative admissions rejected by the per-account quota since boot.
+    pub fn rejected_quota(&self) -> u64 {
+        self.rejected_quota
     }
 
     pub fn len(&self) -> usize {
@@ -53,9 +99,35 @@ impl Mempool {
     /// covered). Returns the tx hash on success. Duplicates (same content hash)
     /// are idempotent. Admission does **not** guarantee inclusion: balances can
     /// change before the tx is built into a block, and the builder re-checks.
+    ///
+    /// M54: once the pool holds `capacity` transactions, admitting a *new* hash is
+    /// rejected with [`ChainError::MempoolFull`]; re-inserting an already-pending
+    /// hash stays idempotent (it does not grow the pool).
+    ///
+    /// M57: a *new* hash is also rejected with [`ChainError::AccountQuotaFull`] once
+    /// the tx's `author` already holds `per_account_limit` pending txs — so one
+    /// account cannot monopolize the pool. Checked after `validate_tx` (the author
+    /// is signature-authenticated first) and after the global capacity gate.
     pub fn insert(&mut self, chain: &Chain, tx: SubmissionTx) -> Result<Hash, ChainError> {
         chain.state.validate_tx(&tx)?;
         let h = tx.hash();
+        let is_new = !self.pending.contains_key(&h);
+        if is_new {
+            if self.pending.len() >= self.capacity {
+                return Err(ChainError::MempoolFull {
+                    capacity: self.capacity,
+                });
+            }
+            let held = self.per_author.get(&tx.author).copied().unwrap_or(0);
+            if held >= self.per_account_limit {
+                self.rejected_quota += 1;
+                return Err(ChainError::AccountQuotaFull {
+                    author: tx.author,
+                    limit: self.per_account_limit,
+                });
+            }
+            *self.per_author.entry(tx.author).or_insert(0) += 1;
+        }
         self.pending.insert(h, tx);
         Ok(h)
     }
@@ -108,9 +180,19 @@ impl Mempool {
 
     /// Drop every transaction carried by `block` from the pool (call after the
     /// block commits). Transactions the builder skipped remain pending.
+    ///
+    /// M57: each removed tx releases its author's quota slot; an author whose count
+    /// reaches 0 is dropped from the index so it cannot grow unbounded.
     pub fn remove_included(&mut self, block: &Block) {
         for tx in &block.txs {
-            self.pending.remove(&tx.hash());
+            if self.pending.remove(&tx.hash()).is_some() {
+                if let Some(count) = self.per_author.get_mut(&tx.author) {
+                    *count -= 1;
+                    if *count == 0 {
+                        self.per_author.remove(&tx.author);
+                    }
+                }
+            }
         }
     }
 }
@@ -266,5 +348,115 @@ mod tests {
             Err(ChainError::BadSignature(1))
         ));
         assert!(mp.is_empty());
+    }
+
+    #[test]
+    fn insert_rejects_when_at_capacity() {
+        // M54: with a capacity of 1, the first distinct tx is admitted and the
+        // second (a different hash) is rejected with MempoolFull.
+        let chain = Chain::new(genesis());
+        let mut mp = Mempool::new(16);
+        mp.set_capacity(1);
+        assert!(mp.insert(&chain, tx(1, 1, 1, 2 * MICRO)).is_ok());
+        assert!(matches!(
+            mp.insert(&chain, tx(2, 2, 2, 2 * MICRO)),
+            Err(ChainError::MempoolFull { capacity: 1 })
+        ));
+        assert_eq!(mp.len(), 1);
+    }
+
+    #[test]
+    fn at_capacity_still_allows_idempotent_reinsert() {
+        // Re-inserting an already-pending hash at capacity is a no-op that still
+        // succeeds — it does not grow the pool, so the bound is not violated.
+        let chain = Chain::new(genesis());
+        let mut mp = Mempool::new(16);
+        mp.set_capacity(1);
+        let t = tx(1, 1, 1, 2 * MICRO);
+        let h = mp.insert(&chain, t.clone()).unwrap();
+        assert_eq!(mp.insert(&chain, t).unwrap(), h);
+        assert_eq!(mp.len(), 1);
+    }
+
+    #[test]
+    fn insert_rejects_when_author_over_quota() {
+        // M57: with a per-account limit of 2, author 1's first two distinct txs are
+        // admitted; a third (a new hash from the same author) is rejected.
+        let chain = Chain::new(genesis());
+        let mut mp = Mempool::new(16);
+        mp.set_per_account_limit(2);
+        assert!(mp.insert(&chain, tx(1, 1, 1, 2 * MICRO)).is_ok());
+        assert!(mp.insert(&chain, tx(1, 2, 2, 2 * MICRO)).is_ok());
+        assert!(matches!(
+            mp.insert(&chain, tx(1, 3, 3, 2 * MICRO)),
+            Err(ChainError::AccountQuotaFull { author: 1, limit: 2 })
+        ));
+        assert_eq!(mp.len(), 2);
+        assert_eq!(mp.rejected_quota(), 1);
+    }
+
+    #[test]
+    fn quota_is_per_author_not_global() {
+        // M57: the bound is per account — with a limit of 1, two *different* authors
+        // each admit one tx (the pool holds both); the limit is not a global cap.
+        let chain = Chain::new(genesis());
+        let mut mp = Mempool::new(16);
+        mp.set_per_account_limit(1);
+        assert!(mp.insert(&chain, tx(1, 1, 1, 2 * MICRO)).is_ok());
+        assert!(mp.insert(&chain, tx(2, 2, 2, 2 * MICRO)).is_ok());
+        assert_eq!(mp.len(), 2);
+    }
+
+    #[test]
+    fn idempotent_reinsert_does_not_consume_quota() {
+        // M57: re-inserting an already-pending hash must not spend a second quota
+        // slot; a *different* tx from the same author is what trips the limit.
+        let chain = Chain::new(genesis());
+        let mut mp = Mempool::new(16);
+        mp.set_per_account_limit(1);
+        let t = tx(1, 1, 1, 2 * MICRO);
+        let h = mp.insert(&chain, t.clone()).unwrap();
+        assert_eq!(mp.insert(&chain, t).unwrap(), h); // reinsert: still Ok, no double-count
+        assert_eq!(mp.len(), 1);
+        assert!(matches!(
+            mp.insert(&chain, tx(1, 2, 2, 2 * MICRO)),
+            Err(ChainError::AccountQuotaFull { author: 1, limit: 1 })
+        ));
+    }
+
+    #[test]
+    fn remove_included_frees_author_quota() {
+        // M57: once an author's tx is committed and dropped from the pool, their
+        // quota slot is released so a fresh tx from them is admitted again.
+        let chain = Chain::new(genesis());
+        let mut mp = Mempool::new(16);
+        mp.set_per_account_limit(1);
+        mp.insert(&chain, tx(1, 1, 1, 2 * MICRO)).unwrap();
+        // at the limit: a second distinct tx from author 1 is rejected
+        assert!(mp.insert(&chain, tx(1, 2, 2, 2 * MICRO)).is_err());
+
+        let mut blk = mp.build_block(&chain, 1.0).unwrap();
+        let mut c = chain.clone();
+        c.seal(&mut blk).unwrap();
+        c.commit(&mut blk).unwrap();
+        mp.remove_included(&blk);
+        assert!(mp.is_empty());
+
+        // slot freed: author 1 can be admitted again
+        assert!(mp.insert(&c, tx(1, 2, 2, 2 * MICRO)).is_ok());
+    }
+
+    #[test]
+    fn quota_off_by_default_admits_many() {
+        // M57: the default limit is unbounded (off), so one author may hold many
+        // pending txs — this guards the head-safe, behavior-preserving default.
+        let chain = Chain::new(genesis());
+        let mut mp = Mempool::new(16);
+        assert_eq!(mp.per_account_limit(), usize::MAX);
+        for d in 0..5 {
+            mp.insert(&chain, tx(1, d, d as u32, 2 * MICRO)).unwrap();
+        }
+        assert_eq!(mp.len(), 5);
+        assert_eq!(mp.rejected_quota(), 0);
     }
 }

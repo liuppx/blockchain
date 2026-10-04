@@ -36,6 +36,12 @@ pub enum ConfigError {
     BadAddr { value: String },
     /// A seed-node embedding did not have exactly `DIM` components.
     BadEmbedding { got: usize },
+    /// M44: `[logging] format` was neither `"text"` nor `"json"`.
+    BadLogFormat { value: String },
+    /// M45: `[logging] rotation` was not one of daily/hourly/minutely/never.
+    BadLogRotation { value: String },
+    /// M54: a `[mempool]` tuning value was out of range (e.g. zero capacity).
+    BadMempool { detail: String },
 }
 
 impl std::fmt::Display for ConfigError {
@@ -50,6 +56,16 @@ impl std::fmt::Display for ConfigError {
             ConfigError::BadEmbedding { got } => {
                 write!(f, "config seed embedding has {got} dims, expected {DIM}")
             }
+            ConfigError::BadLogFormat { value } => {
+                write!(f, "config bad log format: `{value}` (expected \"text\" or \"json\")")
+            }
+            ConfigError::BadLogRotation { value } => {
+                write!(
+                    f,
+                    "config bad log rotation: `{value}` (expected \"daily\", \"hourly\", \"minutely\", or \"never\")"
+                )
+            }
+            ConfigError::BadMempool { detail } => write!(f, "config bad mempool: {detail}"),
         }
     }
 }
@@ -98,6 +114,25 @@ pub struct NodeConfig {
     /// mirroring `[validator]`.
     #[serde(default)]
     pub metrics: Option<MetricsConfig>,
+    /// M53: opt-in external transaction-ingress RPC. Absent ⇒ `None` ⇒ no
+    /// endpoint is bound (behavior-preserving default), so old configs behave
+    /// identically. A bare `[rpc]` table is inert (`enabled` defaults false),
+    /// mirroring `[metrics]`.
+    #[serde(default)]
+    pub rpc: Option<RpcConfig>,
+    /// M44: opt-in logging config. Absent ⇒ `None` ⇒ the M37 default
+    /// (RUST_LOG-filtered, `info` fallback, text, stderr) — byte-identical to
+    /// pre-M44. A bare `[logging]` table falls back field-by-field to those
+    /// defaults, mirroring `[consensus]`/`[network]`.
+    #[serde(default)]
+    pub logging: Option<LoggingConfig>,
+    /// M54: mempool DoS-hardening knobs — pending-pool capacity bound, per-block
+    /// build cap, and per-peer gossip rate limiting. Every field is optional in
+    /// TOML; the struct-level `#[serde(default)]` fills missing keys from
+    /// [`MempoolConfig::default`], whose values preserve pre-M54 behavior (ample
+    /// capacity, `max_block_txs = 64`, rate limiting disabled).
+    #[serde(default)]
+    pub mempool: MempoolConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -205,6 +240,42 @@ pub struct NetworkConfig {
     /// hello (byte-identical back-compat). A node with no validator signing key
     /// cannot run with this on (it could never prove its own identity).
     pub require_peer_auth: bool,
+    /// M41: wrap every P2P connection in TLS 1.3 (encryption-only: an ephemeral
+    /// self-signed cert, accept-any peer cert). This gives confidentiality +
+    /// integrity on the wire; peer *authentication* is still `require_peer_auth`'s
+    /// job (the M40 handshake runs inside the TLS tunnel). Network-wide policy: a
+    /// TLS node and a plaintext node fail to handshake. Default `false` keeps the
+    /// pre-M41 raw-TCP path (byte-identical back-compat).
+    pub enable_tls: bool,
+    /// M42: fold the TLS keying-material exporter (RFC 5705/8446) into the M40 auth
+    /// transcript, binding the authenticated identity to *this* TLS channel. This
+    /// defeats an active MITM that terminates TLS on both sides and relays the inner
+    /// handshake (its two TLS legs derive different exporters, so a relayed signature
+    /// no longer verifies). Requires `enable_tls` + `require_peer_auth` (the daemon
+    /// fails fast otherwise). Network-wide policy: a bound node and an unbound node
+    /// produce different transcripts and fail to authenticate. Default `false` keeps
+    /// the pre-M42 transcript (byte-identical back-compat).
+    pub bind_channel: bool,
+    /// M43: genesis-pinned mutual TLS. Each node presents its genesis ed25519 key
+    /// as its TLS credential (RFC 7250 raw public key), and accepts a connection
+    /// only if the peer's presented key is a genesis validator — both directions.
+    /// This gives real TLS-layer authentication (M41 alone is encryption-only with
+    /// accept-any certs), so a non-validator can no longer even establish the
+    /// tunnel. Requires `enable_tls` and a validator signing key (a keyless
+    /// follower cannot present a genesis credential, so mTLS restricts the network
+    /// to genesis validators); the daemon fails fast otherwise. Network-wide
+    /// policy: an mTLS node and a non-mTLS node fail to handshake. Default `false`
+    /// keeps the pre-M43 accept-any TLS path (byte-identical back-compat).
+    pub require_peer_certs: bool,
+    /// M51: the address this node advertises for itself in M39 peer exchange —
+    /// the dialable `IP:port` other nodes should reach it on. Set this when the
+    /// bind `listen` isn't reachable as-is (NAT, a port map, or a `0.0.0.0`
+    /// wildcard bind): the node keeps *binding* `listen` but *gossips* this
+    /// address so discovered peers dial a working target. Must parse as a
+    /// `SocketAddr` (a DNS hostname is rejected — the dial path needs a literal
+    /// address). Empty (the default) ⇒ advertise the bind `listen`, exactly the
+    /// M39 behavior (byte-identical back-compat).
+    pub advertise_addr: String,
 }
 
 impl Default for NetworkConfig {
@@ -216,6 +287,10 @@ impl Default for NetworkConfig {
             startup_delay_ms: 1000,
             enable_peer_exchange: true,
             require_peer_auth: false,
+            enable_tls: false,
+            bind_channel: false,
+            require_peer_certs: false,
+            advertise_addr: String::new(),
         }
     }
 }
@@ -247,6 +322,258 @@ impl MetricsConfig {
     /// Parse `listen` into a `SocketAddr`.
     pub fn listen_addr(&self) -> Result<SocketAddr, ConfigError> {
         parse_addr(&self.listen)
+    }
+}
+
+/// M53: opt-in external transaction-ingress RPC config. When present and
+/// `enabled`, the daemon binds a third TCP listener that answers a minimal HTTP
+/// `POST /submit_tx` whose body is raw `codec::encode_tx` bytes: the tx is decoded,
+/// run through the normal mempool-admission path, and the response reports accept
+/// (with the tx hash) or reject (with a reason). A `GET`/`HEAD` doubles as a
+/// health probe. Defaults are inert: a bare `[rpc]` table (or the whole
+/// `NodeConfig.rpc` being absent) leaves the endpoint off. Bind default is
+/// loopback — do not expose publicly without a front proxy (no auth / rate
+/// limiting yet; see M54 anti-spam slice).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct RpcConfig {
+    /// Off by default — the endpoint is opt-in and behavior-preserving.
+    pub enabled: bool,
+    /// Address the RPC HTTP listener binds, e.g. `"127.0.0.1:9700"`.
+    pub listen: String,
+}
+
+impl Default for RpcConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            listen: "127.0.0.1:9700".into(),
+        }
+    }
+}
+
+impl RpcConfig {
+    /// Parse `listen` into a `SocketAddr`.
+    pub fn listen_addr(&self) -> Result<SocketAddr, ConfigError> {
+        parse_addr(&self.listen)
+    }
+}
+
+/// M54: mempool DoS-hardening tuning. Every field is optional in TOML — the
+/// struct-level `#[serde(default)]` fills any missing key from
+/// [`MempoolConfig::default`], whose values preserve pre-M54 behavior: an ample
+/// pending-pool `capacity` that localnet never hits, the historical per-block
+/// build cap `max_block_txs = 64`, and per-peer gossip rate limiting **disabled**
+/// (`per_peer_tx_per_sec = 0.0`). So an absent `[mempool]` section (or a partial
+/// one) behaves exactly as pre-M54. Derives `PartialEq` but not `Eq`/`Hash` — the
+/// rate/burst fields are `f64`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct MempoolConfig {
+    /// Maximum transactions held in the pending pool. Admission past this bound
+    /// is rejected with [`crate::ChainError::MempoolFull`] (distinct from
+    /// `max_block_txs`, which only caps how many land in a single block).
+    pub capacity: usize,
+    /// Per-block build cap — the most txs the builder places in one block (was the
+    /// daemon's hard-coded `64`).
+    pub max_block_txs: usize,
+    /// Per-peer gossip token-bucket refill rate (tx/sec). `0.0` disables rate
+    /// limiting entirely (the behavior-preserving default).
+    pub per_peer_tx_per_sec: f64,
+    /// Per-peer gossip token-bucket capacity (max burst). Ignored when
+    /// `per_peer_tx_per_sec == 0.0`.
+    pub per_peer_tx_burst: f64,
+    /// M55: per-set capacity for the gossip flood-dedup sets (`seen_tx` /
+    /// `seen_evidence` / `seen_stake_op`), FIFO-evicting once full. `0` ⇒
+    /// **unbounded** (the behavior-preserving default) — note the deliberate
+    /// sentinel asymmetry vs `capacity` above, where `0` is *rejected*: a
+    /// zero-size dedup cache would defeat flood suppression, so `0` is reserved
+    /// as the off switch (mirroring `per_peer_tx_per_sec = 0.0`).
+    pub seen_cache: usize,
+    /// M57: max pending txs a single account (`author`) may hold at once; admission
+    /// past it is rejected with [`crate::ChainError::AccountQuotaFull`], so one
+    /// account cannot monopolize the pool. `0` ⇒ **unbounded** (the
+    /// behavior-preserving default — no per-account cap), the same off-switch
+    /// sentinel as `seen_cache`. A value above `capacity` is legal but never binds
+    /// (the global cap trips first).
+    pub per_account_limit: usize,
+}
+
+impl Default for MempoolConfig {
+    fn default() -> Self {
+        // capacity: ample headroom localnet never reaches (head invariant intact);
+        // max_block_txs: the pre-M54 daemon literal; rate limiting: off.
+        Self {
+            capacity: 4096,
+            max_block_txs: 64,
+            per_peer_tx_per_sec: 0.0,
+            per_peer_tx_burst: 256.0,
+            seen_cache: 0,
+            per_account_limit: 0,
+        }
+    }
+}
+
+impl MempoolConfig {
+    /// Reject nonsensical tuning at load time: a zero pool capacity or zero
+    /// per-block cap would stall all admission/production, and negative
+    /// rate/burst values are meaningless.
+    pub fn validate(&self) -> Result<(), ConfigError> {
+        if self.capacity == 0 {
+            return Err(ConfigError::BadMempool {
+                detail: "capacity must be > 0".into(),
+            });
+        }
+        if self.max_block_txs == 0 {
+            return Err(ConfigError::BadMempool {
+                detail: "max_block_txs must be > 0".into(),
+            });
+        }
+        if self.per_peer_tx_per_sec < 0.0 || self.per_peer_tx_burst < 0.0 {
+            return Err(ConfigError::BadMempool {
+                detail: "per_peer_tx_per_sec / per_peer_tx_burst must be >= 0".into(),
+            });
+        }
+        Ok(())
+    }
+}
+
+/// M44: operator-tunable daemon logging. Every field is optional in TOML — the
+/// struct-level `#[serde(default)]` fills any missing key from
+/// [`LoggingConfig::default`], whose values reproduce the M37 subscriber
+/// (RUST_LOG-filtered, `info` fallback, text, stderr). So an absent `[logging]`
+/// section (or a partial one) behaves exactly as pre-M44.
+///
+/// M45: adds a rolling-file target. `file` empty (the default) keeps the M37/M44
+/// stderr writer verbatim; a non-empty path switches the writer to a rolling log
+/// file at the `rotation` schedule.
+///
+/// M46: adds `stderr` — when a `file` is configured, also mirror lines to stderr
+/// (a tee). Default `false` keeps the M45 single-sink behavior byte-identical.
+///
+/// M47: adds `stderr_level`/`file_level` — per-sink filter overrides for the tee.
+/// Both empty (the default) ⇒ both sinks share `level` (the M46 tee, byte-identical).
+///
+/// M48: adds `levels`/`stderr_levels`/`file_levels` — array forms of the three
+/// scalar filter knobs; a non-empty array (joined by `,`) overrides its scalar. All
+/// empty (the default) ⇒ the scalars are used verbatim (byte-identical to M47).
+///
+/// M49: adds `stderr_format`/`file_format` — per-sink formatter overrides for the
+/// tee. Both empty (the default) ⇒ both sinks share `format` (the M48/M46 tee,
+/// byte-identical). Validated like `format` (`text`/`json`; empty ⇒ inherit).
+///
+/// M50: adds `max_files` — a cap on retained rotated log files (oldest pruned).
+/// `0` (the default) ⇒ unbounded, exactly the M49/M45 `RollingFileAppender::new`
+/// path (byte-identical). Applies only to a `file` target.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct LoggingConfig {
+    /// Default `EnvFilter` directive used only when `RUST_LOG` is unset — a plain
+    /// level (`"info"`, `"debug"`) or a full directive string. `RUST_LOG` still
+    /// wins when set, matching M37.
+    pub level: String,
+    /// Output formatter: `"text"` (the M37 default human-readable `fmt`) or
+    /// `"json"` (machine-parseable one-object-per-line). Validated at load time.
+    pub format: String,
+    /// M45: destination. Empty (default) ⇒ stderr, exactly the M37/M44 behavior.
+    /// A non-empty path (e.g. `"data/logs/node.log"`) ⇒ a rolling log file; the
+    /// parent directory is created at init and the file name is used as the
+    /// rotation prefix.
+    pub file: String,
+    /// M45: rotation schedule for a file target: `"daily"` (default), `"hourly"`,
+    /// `"minutely"`, or `"never"`. Ignored when `file` is empty. Validated at load.
+    pub rotation: String,
+    /// M46: when a `file` target is set, also mirror log lines to stderr (a tee).
+    /// Default `false` ⇒ file only (M45 behavior). Takes effect **only** when
+    /// `file` is non-empty — with no file, output always goes to stderr regardless.
+    pub stderr: bool,
+    /// M47: per-sink filter override for the stderr side of the tee. A free-form
+    /// `EnvFilter` directive (like `level`); empty (default) ⇒ inherit `level`.
+    /// Applies **only** in the tee (`file` set + `stderr = true`) and only when
+    /// `RUST_LOG` is unset — `RUST_LOG` still wins globally.
+    pub stderr_level: String,
+    /// M47: per-sink filter override for the file side of the tee. Same rules as
+    /// [`stderr_level`](Self::stderr_level): free-form directive, empty ⇒ inherit
+    /// `level`, tee-only, `RUST_LOG` overrides.
+    pub file_level: String,
+    /// M48: array form of [`level`](Self::level). A non-empty array is joined by
+    /// `,` into one multi-directive filter string (e.g.
+    /// `["info", "tokio=warn", "zhixing_node::daemon=debug"]`) and overrides the
+    /// scalar `level`; empty (default) ⇒ the scalar is used verbatim. Empty/whitespace
+    /// entries are dropped. `RUST_LOG` still wins globally.
+    pub levels: Vec<String>,
+    /// M48: array form of [`stderr_level`](Self::stderr_level) — joined by `,`,
+    /// overrides the scalar when non-empty. Empty (default) ⇒ inherit the resolved
+    /// base `level`/`levels`. Tee-only, `RUST_LOG` overrides.
+    pub stderr_levels: Vec<String>,
+    /// M48: array form of [`file_level`](Self::file_level) — same rules as
+    /// [`stderr_levels`](Self::stderr_levels).
+    pub file_levels: Vec<String>,
+    /// M49: per-sink formatter override for the stderr side of the tee: `"text"`
+    /// or `"json"`; empty (default) ⇒ inherit `format`. Applies **only** in the tee
+    /// (`file` set + `stderr = true`); independent of `RUST_LOG` (which governs
+    /// filtering, not formatting). Validated at load like `format`.
+    pub stderr_format: String,
+    /// M49: per-sink formatter override for the file side of the tee. Same rules as
+    /// [`stderr_format`](Self::stderr_format): `"text"`/`"json"`, empty ⇒ inherit
+    /// `format`, tee-only.
+    pub file_format: String,
+    /// M50: cap on retained rotated log files — the appender keeps the `max_files`
+    /// most recent and deletes the oldest. `0` (default) ⇒ unbounded (keep every
+    /// rotated file), the M49/M45 behavior byte-for-byte. Applies **only** to a
+    /// `file` target (ignored when `file` is empty); harmless with `rotation =
+    /// "never"` (a single file, nothing to prune).
+    pub max_files: usize,
+}
+
+impl Default for LoggingConfig {
+    fn default() -> Self {
+        // These MUST reproduce the M37 hard-coded subscriber: an `info` default
+        // filter and the text formatter. `file` empty ⇒ stderr (M45), `stderr`
+        // false ⇒ no tee (M46), the per-sink levels empty ⇒ inherit `level` (M47),
+        // the directive arrays empty ⇒ scalars used verbatim (M48), and the per-sink
+        // formats empty ⇒ inherit `format` (M49), so the default LoggingConfig is
+        // byte-identical to pre-M44 behavior.
+        // byte-identical to pre-M44 behavior. M50: `max_files: 0` ⇒ unbounded, the
+        // M45 `RollingFileAppender::new` path unchanged.
+        Self {
+            level: "info".into(),
+            format: "text".into(),
+            file: String::new(),
+            rotation: "daily".into(),
+            stderr: false,
+            stderr_level: String::new(),
+            file_level: String::new(),
+            levels: Vec::new(),
+            stderr_levels: Vec::new(),
+            file_levels: Vec::new(),
+            stderr_format: String::new(),
+            file_format: String::new(),
+            max_files: 0,
+        }
+    }
+}
+
+impl LoggingConfig {
+    /// Reject an unknown `format`/`rotation` up front (typed errors at config-load
+    /// time) rather than silently falling back at subscriber-init.
+    pub fn validate(&self) -> Result<(), ConfigError> {
+        match self.format.as_str() {
+            "text" | "json" => {}
+            _ => return Err(ConfigError::BadLogFormat { value: self.format.clone() }),
+        }
+        match self.rotation.as_str() {
+            "daily" | "hourly" | "minutely" | "never" => {}
+            _ => return Err(ConfigError::BadLogRotation { value: self.rotation.clone() }),
+        }
+        // M49: per-sink formats are validated like `format`; empty ⇒ inherit `format`.
+        for fmt in [&self.stderr_format, &self.file_format] {
+            match fmt.as_str() {
+                "" | "text" | "json" => {}
+                _ => return Err(ConfigError::BadLogFormat { value: fmt.clone() }),
+            }
+        }
+        Ok(())
     }
 }
 
@@ -401,7 +728,24 @@ impl KeystoreConfig {
 /// Read + parse a node config TOML.
 pub fn load_node_config(path: &str) -> Result<NodeConfig, ConfigError> {
     let s = std::fs::read_to_string(path)?;
-    toml::from_str(&s).map_err(|e| ConfigError::Toml(e.to_string()))
+    let cfg: NodeConfig = toml::from_str(&s).map_err(|e| ConfigError::Toml(e.to_string()))?;
+    // M44: reject an unknown `[logging] format` at load time.
+    if let Some(l) = &cfg.logging {
+        l.validate()?;
+    }
+    // M51: a non-empty advertised address must be a dialable `SocketAddr`
+    // (the M39 dial path parses it as one; a hostname would be un-dialable).
+    if !cfg.network.advertise_addr.is_empty() {
+        parse_addr(&cfg.network.advertise_addr)?;
+    }
+    // M53: a present `[rpc]` section must carry a dialable `listen` address so a
+    // typo fails fast at load rather than at bind time.
+    if let Some(r) = &cfg.rpc {
+        r.listen_addr()?;
+    }
+    // M54: reject out-of-range `[mempool]` tuning (zero capacity/cap, negatives).
+    cfg.mempool.validate()?;
+    Ok(cfg)
 }
 
 /// Read + parse a genesis TOML.
@@ -442,7 +786,10 @@ fn decode_pubkey(s: &str, field: &str) -> Result<PubKey, ConfigError> {
     decode_hex_n::<32>(s, field)
 }
 
-fn decode_seed(s: &str, field: &str) -> Result<[u8; 32], ConfigError> {
+/// Decode a 64-char lowercase/uppercase hex string into a 32-byte ed25519 seed.
+/// Public so the `encode-tx` CLI parses a `--key-file` with the exact same format
+/// and `ConfigError::BadHex` errors as a validator's `seed_hex`.
+pub fn decode_seed(s: &str, field: &str) -> Result<[u8; 32], ConfigError> {
     decode_hex_n::<32>(s, field)
 }
 
@@ -511,6 +858,9 @@ mod tests {
             consensus: ConsensusConfig::default(),
             network: NetworkConfig::default(),
             metrics: None,
+            rpc: None,
+            logging: None,
+            mempool: MempoolConfig::default(),
         };
         let s = toml::to_string(&cfg).unwrap();
         let back: NodeConfig = toml::from_str(&s).unwrap();
@@ -586,6 +936,12 @@ mod tests {
         assert!(n.enable_peer_exchange);
         // M40: peer auth is off by default (byte-identical pre-M40 hello).
         assert!(!n.require_peer_auth);
+        // M41: TLS is off by default (byte-identical pre-M41 raw-TCP path).
+        assert!(!n.enable_tls);
+        // M42: channel binding is off by default (byte-identical pre-M42 transcript).
+        assert!(!n.bind_channel);
+        // M43: genesis-pinned mTLS is off by default (byte-identical pre-M43 TLS path).
+        assert!(!n.require_peer_certs);
     }
 
     #[test]
@@ -628,6 +984,117 @@ mod tests {
         // untouched keys keep their defaults
         assert_eq!(cfg.network.announce_interval_ms, 2000);
         assert!(cfg.network.enable_peer_exchange);
+    }
+
+    #[test]
+    fn enable_tls_defaults_off_and_parses() {
+        // M41: TLS transport encryption is opt-in. Default off ⇒ the pre-M41
+        // raw-TCP path (back-compat); `enable_tls = true` opts in while every
+        // untouched key still falls back to its default.
+        assert!(!NetworkConfig::default().enable_tls);
+        let s = r#"
+            genesis = "genesis.toml"
+            [node]
+            id = 21
+            listen = "0.0.0.0:9021"
+            data_dir = "./data/n21"
+            [network]
+            enable_tls = true
+        "#;
+        let cfg: NodeConfig = toml::from_str(s).unwrap();
+        assert!(cfg.network.enable_tls);
+        // untouched keys keep their defaults
+        assert_eq!(cfg.network.announce_interval_ms, 2000);
+        assert!(cfg.network.enable_peer_exchange);
+        assert!(!cfg.network.require_peer_auth);
+    }
+
+    #[test]
+    fn bind_channel_defaults_off_and_parses() {
+        // M42: channel binding is opt-in. Default off ⇒ the pre-M42 transcript
+        // (back-compat); `bind_channel = true` opts in while every untouched key
+        // still falls back to its default.
+        assert!(!NetworkConfig::default().bind_channel);
+        let s = r#"
+            genesis = "genesis.toml"
+            [node]
+            id = 21
+            listen = "0.0.0.0:9021"
+            data_dir = "./data/n21"
+            [network]
+            bind_channel = true
+        "#;
+        let cfg: NodeConfig = toml::from_str(s).unwrap();
+        assert!(cfg.network.bind_channel);
+        // untouched keys keep their defaults
+        assert_eq!(cfg.network.announce_interval_ms, 2000);
+        assert!(cfg.network.enable_peer_exchange);
+        assert!(!cfg.network.require_peer_auth);
+        assert!(!cfg.network.enable_tls);
+    }
+
+    #[test]
+    fn require_peer_certs_defaults_off_and_parses() {
+        // M43: genesis-pinned mTLS is opt-in. Default off ⇒ the pre-M43 accept-any
+        // TLS path (back-compat); `require_peer_certs = true` opts in while every
+        // untouched key still falls back to its default.
+        assert!(!NetworkConfig::default().require_peer_certs);
+        let s = r#"
+            genesis = "genesis.toml"
+            [node]
+            id = 21
+            listen = "0.0.0.0:9021"
+            data_dir = "./data/n21"
+            [network]
+            require_peer_certs = true
+        "#;
+        let cfg: NodeConfig = toml::from_str(s).unwrap();
+        assert!(cfg.network.require_peer_certs);
+        // untouched keys keep their defaults
+        assert_eq!(cfg.network.announce_interval_ms, 2000);
+        assert!(cfg.network.enable_peer_exchange);
+        assert!(!cfg.network.require_peer_auth);
+        assert!(!cfg.network.enable_tls);
+        assert!(!cfg.network.bind_channel);
+    }
+
+    #[test]
+    fn network_advertise_addr_parses_and_validates() {
+        // M51: `advertise_addr` is off by default (empty ⇒ advertise the bind
+        // `listen`, the M39 behavior). A literal `IP:port` parses and every
+        // untouched key falls back to its default.
+        assert_eq!(NetworkConfig::default().advertise_addr, "");
+        let s = r#"
+            genesis = "genesis.toml"
+            [node]
+            id = 21
+            listen = "0.0.0.0:9021"
+            data_dir = "./data/n21"
+            [network]
+            advertise_addr = "203.0.113.7:9021"
+        "#;
+        let cfg: NodeConfig = toml::from_str(s).unwrap();
+        assert_eq!(cfg.network.advertise_addr, "203.0.113.7:9021");
+        assert_eq!(cfg.network.announce_interval_ms, 2000);
+        assert!(cfg.network.enable_peer_exchange);
+
+        // And `load_node_config` rejects a non-`SocketAddr` value end-to-end
+        // (a DNS hostname would be un-dialable by the M39 dial path).
+        let bad = r#"
+            genesis = "genesis.toml"
+            [node]
+            id = 21
+            listen = "0.0.0.0:9021"
+            data_dir = "./data/n21"
+            [network]
+            advertise_addr = "not-an-address"
+        "#;
+        let path =
+            std::env::temp_dir().join(format!("zhixing-m51-badadv-{}.toml", std::process::id()));
+        std::fs::write(&path, bad).unwrap();
+        let got = load_node_config(path.to_str().unwrap());
+        let _ = std::fs::remove_file(&path);
+        assert!(matches!(got, Err(ConfigError::BadAddr { .. })));
     }
 
     #[test]
@@ -704,6 +1171,555 @@ mod tests {
         let m = cfg.metrics.expect("metrics section present");
         assert!(m.enabled);
         assert_eq!(m.listen, "127.0.0.1:9600");
+    }
+
+    #[test]
+    fn rpc_config_default_is_disabled() {
+        // M53: the ingress RPC is opt-in — the Default must be inert so a bare
+        // `[rpc]` table (or an absent one) never binds a listener.
+        let r = RpcConfig::default();
+        assert!(!r.enabled);
+        assert_eq!(r.listen, "127.0.0.1:9700");
+    }
+
+    #[test]
+    fn node_config_without_rpc_section_is_none() {
+        // Back-compat: a config with no `[rpc]` yields `None` ⇒ endpoint off.
+        let s = r#"
+            genesis = "genesis.toml"
+            [node]
+            id = 21
+            listen = "0.0.0.0:9021"
+            data_dir = "./data/n21"
+        "#;
+        let cfg: NodeConfig = toml::from_str(s).unwrap();
+        assert!(cfg.rpc.is_none());
+    }
+
+    #[test]
+    fn rpc_section_enables_endpoint() {
+        // A bare `[rpc] enabled = true` opts in; `listen` falls back to the
+        // struct-level serde default.
+        let s = r#"
+            genesis = "genesis.toml"
+            [node]
+            id = 21
+            listen = "0.0.0.0:9021"
+            data_dir = "./data/n21"
+            [rpc]
+            enabled = true
+        "#;
+        let cfg: NodeConfig = toml::from_str(s).unwrap();
+        let r = cfg.rpc.expect("rpc section present");
+        assert!(r.enabled);
+        assert_eq!(r.listen, "127.0.0.1:9700");
+        // A valid listen address parses to a SocketAddr.
+        assert!(r.listen_addr().is_ok());
+    }
+
+    #[test]
+    fn rpc_bad_listen_is_rejected_by_loader() {
+        // M53: load_node_config validates a present `[rpc]` listen up front so a
+        // typo fails fast with BadAddr rather than at bind time.
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!("zhixing_rpc_badaddr_{}.toml", std::process::id()));
+        let s = r#"
+            genesis = "genesis.toml"
+            [node]
+            id = 21
+            listen = "0.0.0.0:9021"
+            data_dir = "./data/n21"
+            [rpc]
+            enabled = true
+            listen = "not-an-addr"
+        "#;
+        std::fs::write(&path, s).unwrap();
+        let err = load_node_config(path.to_str().unwrap()).unwrap_err();
+        let _ = std::fs::remove_file(&path);
+        assert!(matches!(err, ConfigError::BadAddr { .. }), "got {err:?}");
+    }
+
+    #[test]
+    fn mempool_config_has_safe_defaults() {
+        // M54: an absent `[mempool]` section must reproduce pre-M54 behavior —
+        // ample capacity, the historical per-block cap, rate limiting disabled.
+        let m = MempoolConfig::default();
+        assert_eq!(m.capacity, 4096);
+        assert_eq!(m.max_block_txs, 64);
+        assert_eq!(m.per_peer_tx_per_sec, 0.0);
+        assert_eq!(m.per_peer_tx_burst, 256.0);
+        assert_eq!(m.seen_cache, 0); // M55: 0 ⇒ dedup sets unbounded (pre-M55)
+        assert_eq!(m.per_account_limit, 0); // M57: 0 ⇒ per-account quota off (pre-M57)
+        // And a config with no `[mempool]` table yields exactly those defaults.
+        let s = r#"
+            genesis = "genesis.toml"
+            [node]
+            id = 21
+            listen = "0.0.0.0:9021"
+            data_dir = "./data/n21"
+        "#;
+        let cfg: NodeConfig = toml::from_str(s).unwrap();
+        assert_eq!(cfg.mempool, MempoolConfig::default());
+    }
+
+    #[test]
+    fn mempool_section_overrides_defaults() {
+        // A partial `[mempool]` table overrides field-by-field; unset keys fall
+        // back to the struct-level serde default.
+        let s = r#"
+            genesis = "genesis.toml"
+            [node]
+            id = 21
+            listen = "0.0.0.0:9021"
+            data_dir = "./data/n21"
+            [mempool]
+            capacity = 10
+            per_peer_tx_per_sec = 50.0
+        "#;
+        let cfg: NodeConfig = toml::from_str(s).unwrap();
+        assert_eq!(cfg.mempool.capacity, 10);
+        assert_eq!(cfg.mempool.per_peer_tx_per_sec, 50.0);
+        assert_eq!(cfg.mempool.max_block_txs, 64); // untouched default
+        assert_eq!(cfg.mempool.per_peer_tx_burst, 256.0); // untouched default
+    }
+
+    #[test]
+    fn mempool_seen_cache_overrides_defaults() {
+        // M55: `seen_cache` defaults to 0 (unbounded dedup sets) and is overridable
+        // field-by-field like the other `[mempool]` knobs.
+        assert_eq!(MempoolConfig::default().seen_cache, 0);
+        let s = r#"
+            genesis = "genesis.toml"
+            [node]
+            id = 21
+            listen = "0.0.0.0:9021"
+            data_dir = "./data/n21"
+            [mempool]
+            seen_cache = 1024
+        "#;
+        let cfg: NodeConfig = toml::from_str(s).unwrap();
+        assert_eq!(cfg.mempool.seen_cache, 1024);
+        assert_eq!(cfg.mempool.capacity, 4096); // untouched default
+    }
+
+    #[test]
+    fn mempool_per_account_limit_overrides_defaults() {
+        // M57: `per_account_limit` defaults to 0 (quota off) and is overridable
+        // field-by-field like the other `[mempool]` knobs.
+        assert_eq!(MempoolConfig::default().per_account_limit, 0);
+        let s = r#"
+            genesis = "genesis.toml"
+            [node]
+            id = 21
+            listen = "0.0.0.0:9021"
+            data_dir = "./data/n21"
+            [mempool]
+            per_account_limit = 32
+        "#;
+        let cfg: NodeConfig = toml::from_str(s).unwrap();
+        assert_eq!(cfg.mempool.per_account_limit, 32);
+        assert_eq!(cfg.mempool.capacity, 4096); // untouched default
+        assert_eq!(cfg.mempool.seen_cache, 0); // untouched default
+    }
+
+    #[test]
+    fn mempool_zero_capacity_rejected_by_loader() {
+        // M54: load_node_config validates `[mempool]` up front so a nonsensical
+        // zero capacity fails fast with BadMempool rather than stalling admission.
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!("zhixing_mempool_zero_{}.toml", std::process::id()));
+        let s = r#"
+            genesis = "genesis.toml"
+            [node]
+            id = 21
+            listen = "0.0.0.0:9021"
+            data_dir = "./data/n21"
+            [mempool]
+            capacity = 0
+        "#;
+        std::fs::write(&path, s).unwrap();
+        let err = load_node_config(path.to_str().unwrap()).unwrap_err();
+        let _ = std::fs::remove_file(&path);
+        assert!(matches!(err, ConfigError::BadMempool { .. }), "got {err:?}");
+    }
+
+    #[test]
+    fn logging_defaults_off_and_parses() {
+        // M44: the `[logging]` section is opt-in. Absent ⇒ `None` ⇒ the daemon's
+        // subscriber init uses the M37 default (info/text/stderr). The Default
+        // MUST reproduce that (info + text) so a bare/absent section is byte-
+        // identical to pre-M44. A present section parses both knobs.
+        let d = LoggingConfig::default();
+        assert_eq!(d.level, "info");
+        assert_eq!(d.format, "text");
+        // M45: the file target is off by default (stderr), rotation defaults daily.
+        assert_eq!(d.file, "");
+        assert_eq!(d.rotation, "daily");
+
+        let absent = r#"
+            genesis = "genesis.toml"
+            [node]
+            id = 21
+            listen = "0.0.0.0:9021"
+            data_dir = "./data/n21"
+        "#;
+        let cfg: NodeConfig = toml::from_str(absent).unwrap();
+        assert!(cfg.logging.is_none());
+
+        let present = r#"
+            genesis = "genesis.toml"
+            [node]
+            id = 21
+            listen = "0.0.0.0:9021"
+            data_dir = "./data/n21"
+            [logging]
+            level = "debug"
+            format = "json"
+        "#;
+        let cfg: NodeConfig = toml::from_str(present).unwrap();
+        let l = cfg.logging.expect("logging section present");
+        assert_eq!(l.level, "debug");
+        assert_eq!(l.format, "json");
+
+        // a bare `[logging]` table falls back field-by-field to the defaults
+        let bare = r#"
+            genesis = "genesis.toml"
+            [node]
+            id = 21
+            listen = "0.0.0.0:9021"
+            data_dir = "./data/n21"
+            [logging]
+        "#;
+        let cfg: NodeConfig = toml::from_str(bare).unwrap();
+        assert_eq!(cfg.logging.expect("present"), LoggingConfig::default());
+    }
+
+    #[test]
+    fn logging_rejects_bad_format() {
+        // Valid formats pass `validate`; anything else is a typed error.
+        assert!(LoggingConfig { format: "text".into(), ..Default::default() }.validate().is_ok());
+        assert!(LoggingConfig { format: "json".into(), ..Default::default() }.validate().is_ok());
+        assert!(matches!(
+            LoggingConfig { format: "yaml".into(), ..Default::default() }.validate(),
+            Err(ConfigError::BadLogFormat { .. })
+        ));
+
+        // And `load_node_config` surfaces the rejection end-to-end (validation
+        // runs after the TOML parse).
+        let s = r#"
+            genesis = "genesis.toml"
+            [node]
+            id = 21
+            listen = "0.0.0.0:9021"
+            data_dir = "./data/n21"
+            [logging]
+            format = "yaml"
+        "#;
+        let path = std::env::temp_dir().join(format!("zhixing-m44-badfmt-{}.toml", std::process::id()));
+        std::fs::write(&path, s).unwrap();
+        let got = load_node_config(path.to_str().unwrap());
+        let _ = std::fs::remove_file(&path);
+        assert!(matches!(got, Err(ConfigError::BadLogFormat { .. })));
+    }
+
+    #[test]
+    fn logging_file_rotation_parses_and_defaults() {
+        // M45: file/rotation are two more `[logging]` knobs. The Default keeps the
+        // file target off (empty ⇒ stderr) with a daily rotation, so an
+        // absent/bare section is still byte-identical to M44/M37.
+        let d = LoggingConfig::default();
+        assert_eq!(d.file, "");
+        assert_eq!(d.rotation, "daily");
+        assert!(!d.stderr); // M46: tee off by default
+        assert_eq!(d.stderr_level, ""); // M47: per-sink levels inherit `level`
+        assert_eq!(d.file_level, "");
+        assert!(d.levels.is_empty()); // M48: directive arrays default empty
+        assert!(d.stderr_levels.is_empty());
+        assert!(d.file_levels.is_empty());
+        assert_eq!(d.stderr_format, ""); // M49: per-sink formats inherit `format`
+        assert_eq!(d.file_format, "");
+        assert_eq!(d.max_files, 0); // M50: retention unbounded by default
+
+        let present = r#"
+            genesis = "genesis.toml"
+            [node]
+            id = 21
+            listen = "0.0.0.0:9021"
+            data_dir = "./data/n21"
+            [logging]
+            file = "data/logs/node.log"
+            rotation = "hourly"
+            format = "json"
+        "#;
+        let cfg: NodeConfig = toml::from_str(present).unwrap();
+        let l = cfg.logging.expect("logging section present");
+        assert_eq!(l.file, "data/logs/node.log");
+        assert_eq!(l.rotation, "hourly");
+        assert_eq!(l.format, "json");
+        // level unspecified ⇒ field-level default fills it
+        assert_eq!(l.level, "info");
+        l.validate().expect("file + hourly + json is valid");
+
+        // a bare `[logging]` table still falls back to the (stderr) defaults
+        let bare = r#"
+            genesis = "genesis.toml"
+            [node]
+            id = 21
+            listen = "0.0.0.0:9021"
+            data_dir = "./data/n21"
+            [logging]
+        "#;
+        let cfg: NodeConfig = toml::from_str(bare).unwrap();
+        assert_eq!(cfg.logging.expect("present"), LoggingConfig::default());
+    }
+
+    #[test]
+    fn logging_rejects_bad_rotation() {
+        // Every valid rotation passes `validate`; anything else is a typed error.
+        for r in ["daily", "hourly", "minutely", "never"] {
+            assert!(
+                LoggingConfig { rotation: r.into(), ..Default::default() }.validate().is_ok(),
+                "rotation {r} should be valid"
+            );
+        }
+        assert!(matches!(
+            LoggingConfig { rotation: "weekly".into(), ..Default::default() }.validate(),
+            Err(ConfigError::BadLogRotation { .. })
+        ));
+
+        // And `load_node_config` surfaces the rejection end-to-end.
+        let s = r#"
+            genesis = "genesis.toml"
+            [node]
+            id = 21
+            listen = "0.0.0.0:9021"
+            data_dir = "./data/n21"
+            [logging]
+            file = "data/logs/node.log"
+            rotation = "weekly"
+        "#;
+        let path = std::env::temp_dir().join(format!("zhixing-m45-badrot-{}.toml", std::process::id()));
+        std::fs::write(&path, s).unwrap();
+        let got = load_node_config(path.to_str().unwrap());
+        let _ = std::fs::remove_file(&path);
+        assert!(matches!(got, Err(ConfigError::BadLogRotation { .. })));
+    }
+
+    #[test]
+    fn logging_stderr_tee_parses_and_defaults() {
+        // M46: `stderr` is one more `[logging]` knob — a tee that mirrors a file
+        // target to stderr. Default `false` keeps M45's single-sink behavior, so an
+        // absent/bare section stays byte-identical to M45/M44/M37.
+        assert!(!LoggingConfig::default().stderr);
+
+        let present = r#"
+            genesis = "genesis.toml"
+            [node]
+            id = 21
+            listen = "0.0.0.0:9021"
+            data_dir = "./data/n21"
+            [logging]
+            file = "data/logs/node.log"
+            rotation = "hourly"
+            stderr = true
+        "#;
+        let cfg: NodeConfig = toml::from_str(present).unwrap();
+        let l = cfg.logging.expect("logging section present");
+        assert!(l.stderr);
+        // the other knobs parse alongside `stderr`
+        assert_eq!(l.file, "data/logs/node.log");
+        assert_eq!(l.rotation, "hourly");
+        assert_eq!(l.format, "text"); // unspecified ⇒ field default
+        l.validate().expect("file + hourly + tee is valid");
+
+        // a bare `[logging]` table ⇒ tee off (single-sink, back-compat)
+        let bare = r#"
+            genesis = "genesis.toml"
+            [node]
+            id = 21
+            listen = "0.0.0.0:9021"
+            data_dir = "./data/n21"
+            [logging]
+        "#;
+        let cfg: NodeConfig = toml::from_str(bare).unwrap();
+        assert!(!cfg.logging.expect("present").stderr);
+    }
+
+    #[test]
+    fn logging_per_sink_levels_parse_and_default() {
+        // M47: `stderr_level`/`file_level` are per-sink filter overrides for the tee.
+        // Both empty by default ⇒ both sinks share `level` (the M46 tee), so an
+        // absent/bare section stays byte-identical to M46/M45/M44/M37.
+        let d = LoggingConfig::default();
+        assert_eq!(d.stderr_level, "");
+        assert_eq!(d.file_level, "");
+
+        let present = r#"
+            genesis = "genesis.toml"
+            [node]
+            id = 21
+            listen = "0.0.0.0:9021"
+            data_dir = "./data/n21"
+            [logging]
+            file = "data/logs/node.log"
+            stderr = true
+            stderr_level = "info"
+            file_level = "debug"
+        "#;
+        let cfg: NodeConfig = toml::from_str(present).unwrap();
+        let l = cfg.logging.expect("logging section present");
+        assert_eq!(l.stderr_level, "info");
+        assert_eq!(l.file_level, "debug");
+        // per-sink levels are free-form (like `level`) ⇒ no validate rejection
+        l.validate().expect("per-sink levels are not validated");
+
+        // a bare `[logging]` table ⇒ both empty (⇒ shared-filter tee, back-compat)
+        let bare = r#"
+            genesis = "genesis.toml"
+            [node]
+            id = 21
+            listen = "0.0.0.0:9021"
+            data_dir = "./data/n21"
+            [logging]
+        "#;
+        let cfg: NodeConfig = toml::from_str(bare).unwrap();
+        let l = cfg.logging.expect("present");
+        assert_eq!(l.stderr_level, "");
+        assert_eq!(l.file_level, "");
+    }
+
+    #[test]
+    fn logging_directive_arrays_parse_and_default() {
+        // M48: `levels`/`stderr_levels`/`file_levels` are array forms of the three
+        // scalar filter knobs. All empty by default ⇒ the scalars are used verbatim,
+        // so an absent/bare section stays byte-identical to M47/M46/M45/M44/M37.
+        let d = LoggingConfig::default();
+        assert!(d.levels.is_empty());
+        assert!(d.stderr_levels.is_empty());
+        assert!(d.file_levels.is_empty());
+
+        let present = r#"
+            genesis = "genesis.toml"
+            [node]
+            id = 21
+            listen = "0.0.0.0:9021"
+            data_dir = "./data/n21"
+            [logging]
+            file = "data/logs/node.log"
+            stderr = true
+            levels = ["info", "tokio=warn"]
+            file_levels = ["debug"]
+        "#;
+        let cfg: NodeConfig = toml::from_str(present).unwrap();
+        let l = cfg.logging.expect("logging section present");
+        assert_eq!(l.levels, vec!["info", "tokio=warn"]);
+        assert_eq!(l.file_levels, vec!["debug"]);
+        assert!(l.stderr_levels.is_empty()); // unspecified ⇒ empty
+        // arrays are free-form directives (like `level`) ⇒ no validate rejection
+        l.validate().expect("directive arrays are not validated");
+
+        // a bare `[logging]` table ⇒ all arrays empty (⇒ scalars verbatim, back-compat)
+        let bare = r#"
+            genesis = "genesis.toml"
+            [node]
+            id = 21
+            listen = "0.0.0.0:9021"
+            data_dir = "./data/n21"
+            [logging]
+        "#;
+        let cfg: NodeConfig = toml::from_str(bare).unwrap();
+        let l = cfg.logging.expect("present");
+        assert!(l.levels.is_empty());
+        assert!(l.stderr_levels.is_empty());
+        assert!(l.file_levels.is_empty());
+    }
+
+    #[test]
+    fn logging_per_sink_formats_parse_and_default() {
+        // M49: `stderr_format`/`file_format` are per-sink formatter overrides for the
+        // tee. Both empty by default ⇒ both sinks inherit `format`, so an absent/bare
+        // section stays byte-identical to M48/M47/M46/M45/M44/M37.
+        let d = LoggingConfig::default();
+        assert_eq!(d.stderr_format, "");
+        assert_eq!(d.file_format, "");
+
+        let present = r#"
+            genesis = "genesis.toml"
+            [node]
+            id = 21
+            listen = "0.0.0.0:9021"
+            data_dir = "./data/n21"
+            [logging]
+            file = "data/logs/node.log"
+            stderr = true
+            stderr_format = "text"
+            file_format = "json"
+        "#;
+        let cfg: NodeConfig = toml::from_str(present).unwrap();
+        let l = cfg.logging.expect("logging section present");
+        assert_eq!(l.stderr_format, "text");
+        assert_eq!(l.file_format, "json");
+        // per-sink formats are enum-like (like `format`) ⇒ validated, both valid here
+        l.validate().expect("text + json per-sink formats are valid");
+
+        // empty per-sink formats pass validate (inherit `format`)
+        LoggingConfig::default().validate().expect("empty per-sink formats inherit");
+        // an unknown per-sink format is a typed rejection, like the scalar `format`
+        assert!(matches!(
+            LoggingConfig { stderr_format: "yaml".into(), ..Default::default() }.validate(),
+            Err(ConfigError::BadLogFormat { .. })
+        ));
+
+        // a bare `[logging]` table ⇒ both per-sink formats empty (⇒ inherit, back-compat)
+        let bare = r#"
+            genesis = "genesis.toml"
+            [node]
+            id = 21
+            listen = "0.0.0.0:9021"
+            data_dir = "./data/n21"
+            [logging]
+        "#;
+        let cfg: NodeConfig = toml::from_str(bare).unwrap();
+        let l = cfg.logging.expect("present");
+        assert_eq!(l.stderr_format, "");
+        assert_eq!(l.file_format, "");
+    }
+
+    #[test]
+    fn logging_max_files_parses_and_defaults() {
+        // M50: `max_files` caps retained rotated files. `0` (default) ⇒ unbounded,
+        // so an absent/bare section stays byte-identical to M49/…/M37.
+        let d = LoggingConfig::default();
+        assert_eq!(d.max_files, 0);
+
+        let present = r#"
+            genesis = "genesis.toml"
+            [node]
+            id = 21
+            listen = "0.0.0.0:9021"
+            data_dir = "./data/n21"
+            [logging]
+            file = "data/logs/node.log"
+            rotation = "daily"
+            max_files = 7
+        "#;
+        let cfg: NodeConfig = toml::from_str(present).unwrap();
+        let l = cfg.logging.expect("logging section present");
+        assert_eq!(l.max_files, 7);
+        // `max_files` is a plain count, so it needs no enum validation.
+        l.validate().expect("a numeric max_files is always valid");
+
+        // a bare `[logging]` table ⇒ max_files 0 (⇒ unbounded, back-compat)
+        let bare = r#"
+            genesis = "genesis.toml"
+            [node]
+            id = 21
+            listen = "0.0.0.0:9021"
+            data_dir = "./data/n21"
+            [logging]
+        "#;
+        let cfg: NodeConfig = toml::from_str(bare).unwrap();
+        assert_eq!(cfg.logging.expect("present").max_files, 0);
     }
 
     #[test]
@@ -897,6 +1913,9 @@ mod tests {
                 consensus: ConsensusConfig::default(),
                 network: NetworkConfig::default(),
                 metrics: None,
+                rpc: None,
+                logging: None,
+                mempool: MempoolConfig::default(),
             };
             std::fs::write(dir.join(format!("node{id}.toml")), toml::to_string_pretty(&cfg).unwrap()).unwrap();
         }

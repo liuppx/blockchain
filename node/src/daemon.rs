@@ -53,10 +53,12 @@ use std::io;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
+use std::time::Instant;
 
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, oneshot};
+use tokio_rustls::{rustls, TlsAcceptor, TlsConnector};
 use tracing::{debug, error, info, warn};
 
 use crate::config::{ConfigError, NodeConfig};
@@ -64,7 +66,7 @@ use crate::crypto::verify;
 use crate::net::{decode_gossip, encode_gossip, GossipMsg, GossipNode};
 use crate::round::{Action, Msg, RoundState, Step};
 use crate::store::{BlockLog, CertLog};
-use crate::{Genesis, Hash, Keypair, PubKey, SlashEvidence, SubmissionTx};
+use crate::{Account, Genesis, Hash, Keypair, PubKey, SlashEvidence, SubmissionTx};
 
 /// Hard cap on a single wire frame (16 MiB). The blocking `read_msg` has no cap
 /// (a hostile `u32` length would allocate up to 4 GiB); a real transport must.
@@ -149,19 +151,57 @@ async fn read_hello<R: AsyncReadExt + Unpin>(r: &mut R) -> io::Result<u64> {
 /// sign different, non-prefixed byte layouts.
 const AUTH_DOMAIN: &[u8] = b"zhixing-node-auth-v1";
 
+/// M42: RFC 5705/8446 exporter label for the channel-binding value mixed into the
+/// auth transcript when `[network] bind_channel` is on. Domain-separated from
+/// `AUTH_DOMAIN` so the exported secret can never collide with any signed layout.
+const CHANNEL_BINDING_LABEL: &[u8] = b"zhixing-node-channel-binding-v1";
+
+/// M43: fixed DER prefix of an ed25519 private key in PKCS#8 v1 form. The full
+/// encoding is this 16-byte header followed by the 32-byte seed — exactly what
+/// `ring`'s `Ed25519KeyPair::from_pkcs8_maybe_unchecked` (reached via rustls's
+/// `any_eddsa_type`) parses. Lets a node build its TLS credential straight from
+/// its genesis seed, so its TLS identity *is* its consensus key.
+const ED25519_PKCS8_PREFIX: [u8; 16] = [
+    0x30, 0x2e, 0x02, 0x01, 0x00, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70, 0x04, 0x22, 0x04, 0x20,
+];
+
+/// M43: fixed DER prefix of an ed25519 SubjectPublicKeyInfo. A full SPKI is this
+/// 12-byte header followed by the 32-byte public key (44 bytes total). With RFC
+/// 7250 raw public keys the TLS "certificate" *is* this SPKI, so a genesis-pinned
+/// verifier extracts the peer's ed25519 key by validating this prefix and slicing
+/// off the trailing 32 bytes.
+const ED25519_SPKI_PREFIX: [u8; 12] = [
+    0x30, 0x2a, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70, 0x03, 0x21, 0x00,
+];
+
 /// M40: the exact bytes a peer signs to prove it holds the genesis key for
 /// `signer_id`. Binding *both* sides' fresh per-session nonces makes a captured
 /// `(nonce, signature)` pair non-replayable and stops a relay from splicing two
 /// sessions: `AUTH_DOMAIN || signer_id(8 BE) || signer_nonce || peer_id(8 BE) ||
 /// peer_nonce`. Each side signs with itself as `signer`; the verifier reconstructs
 /// the peer's transcript with the peer as `signer`.
-fn auth_transcript(signer_id: u64, signer_nonce: &[u8; 32], peer_id: u64, peer_nonce: &[u8; 32]) -> Vec<u8> {
-    let mut t = Vec::with_capacity(AUTH_DOMAIN.len() + 8 + 32 + 8 + 32);
+///
+/// M42: when `channel_binding` is `Some`, the 32-byte TLS keying-material exporter
+/// is appended, tying the signature to *this* TLS channel. Both endpoints of one
+/// TLS session derive the identical exporter (RFC 5705/8446), so the transcript
+/// stays symmetric; a MITM's two distinct TLS legs derive different exporters, so a
+/// relayed signature no longer verifies. `None` ⇒ byte-identical to the M40 layout.
+fn auth_transcript(
+    signer_id: u64,
+    signer_nonce: &[u8; 32],
+    peer_id: u64,
+    peer_nonce: &[u8; 32],
+    channel_binding: Option<&[u8; 32]>,
+) -> Vec<u8> {
+    let mut t = Vec::with_capacity(AUTH_DOMAIN.len() + 8 + 32 + 8 + 32 + 32);
     t.extend_from_slice(AUTH_DOMAIN);
     t.extend_from_slice(&signer_id.to_be_bytes());
     t.extend_from_slice(signer_nonce);
     t.extend_from_slice(&peer_id.to_be_bytes());
     t.extend_from_slice(peer_nonce);
+    if let Some(cb) = channel_binding {
+        t.extend_from_slice(cb);
+    }
     t
 }
 
@@ -170,12 +210,53 @@ fn auth_transcript(signer_id: u64, signer_nonce: &[u8; 32], peer_id: u64, peer_n
 /// signing key used only to sign handshake transcripts (consensus keeps its own
 /// owned copy in the [`Actor`]); `validators` is the genesis id→pubkey registry;
 /// `require` is the `[network] require_peer_auth` toggle.
+///
+/// M41: `tls` (built from `[network] enable_tls`) is `Some` when every connection
+/// must be wrapped in TLS 1.3 before the handshake runs. Encryption-only: the
+/// same `TlsAcceptor`/`TlsConnector` (cheap `Arc`-backed clones) serve inbound and
+/// outbound links; peer *authentication* remains `require`/`auth_handshake`.
+///
+/// M42: `bind_channel` (from `[network] bind_channel`) folds each connection's TLS
+/// keying-material exporter into the auth transcript, binding the authenticated
+/// identity to that TLS channel. It presupposes `tls.is_some()` && `require` — the
+/// daemon fails fast at boot otherwise.
 struct AuthContext {
     my_id: u64,
     kp: Option<Keypair>,
     validators: HashMap<u64, PubKey>,
     require: bool,
+    tls: Option<TlsSetup>,
+    bind_channel: bool,
 }
+
+/// M41: TLS material for the P2P transport, built once in [`Node::start`]. Both
+/// handles are `Arc`-backed inside `tokio-rustls`, so cloning into each connection
+/// task is cheap. The acceptor serves inbound links; the connector dials outbound
+/// links. With `[network] require_peer_certs` off (M41) it presents an ephemeral
+/// self-signed cert and accepts any peer cert ([`AcceptAnyServerCert`]); with it on
+/// (M43) both sides present their genesis ed25519 key and require the peer's to be a
+/// genesis validator ([`GenesisPinnedVerifier`]).
+#[derive(Clone)]
+struct TlsSetup {
+    acceptor: TlsAcceptor,
+    connector: TlsConnector,
+}
+
+/// M43: inputs for building the genesis-pinned mTLS [`TlsSetup`] (present only when
+/// `[network] require_peer_certs` is on). `seed` is this node's genesis ed25519 seed
+/// (its TLS credential is derived from it, RFC 7250 raw public key); `validators` is
+/// the set of genesis validator pubkeys a presented peer key is checked against.
+struct MtlsMaterial {
+    seed: [u8; 32],
+    validators: Arc<HashSet<PubKey>>,
+}
+
+/// M41: any byte stream a peer connection can run over — a raw [`TcpStream`] (TLS
+/// off) or a `tokio_rustls` TLS stream (TLS on). Boxing behind this trait lets
+/// [`handle_conn`] and the framing/handshake helpers stay a single, non-generic
+/// code path regardless of transport.
+trait PeerStream: AsyncRead + AsyncWrite + Unpin + Send {}
+impl<T: AsyncRead + AsyncWrite + Unpin + Send> PeerStream for T {}
 
 /// M40: run the mutually-authenticated handshake and return the authenticated
 /// peer id. Both sides send a `HelloInit` (`id(8) || pubkey(32) || nonce(32)`),
@@ -184,7 +265,17 @@ struct AuthContext {
 /// doesn't match genesis, or a bad signature yields `Err` — the caller then drops
 /// the connection. Symmetric (write-then-read for both messages), so two peers
 /// dialing each other never deadlock; the payloads (72 B, 64 B) are tiny.
-async fn auth_handshake<R, W>(rd: &mut R, wr: &mut W, ctx: &AuthContext) -> io::Result<u64>
+///
+/// M42: when `ctx.bind_channel` is set, `binding` (this connection's TLS exporter)
+/// is mixed into both the signed and verified transcripts. `Err` if the flag is on
+/// but no binding was supplied (no TLS) — the boot-time fail-fast normally prevents
+/// this, so it is a defensive guard.
+async fn auth_handshake<R, W>(
+    rd: &mut R,
+    wr: &mut W,
+    ctx: &AuthContext,
+    binding: Option<&[u8; 32]>,
+) -> io::Result<u64>
 where
     R: AsyncReadExt + Unpin,
     W: AsyncWriteExt + Unpin,
@@ -192,6 +283,14 @@ where
     let kp = ctx.kp.as_ref().ok_or_else(|| {
         io::Error::new(io::ErrorKind::InvalidInput, "peer auth required but this node has no signing key")
     })?;
+    if ctx.bind_channel && binding.is_none() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "channel binding required but the connection has no TLS exporter",
+        ));
+    }
+    // Only fold the binding in when the policy is on (byte-identical to M40 otherwise).
+    let cb = if ctx.bind_channel { binding } else { None };
     let my_pk = kp.public();
     let mut my_nonce = [0u8; 32];
     getrandom::getrandom(&mut my_nonce)
@@ -215,7 +314,7 @@ where
     peer_nonce.copy_from_slice(&pi[40..72]);
 
     // sign our transcript and send the signature
-    let sig = kp.sign(&auth_transcript(ctx.my_id, &my_nonce, peer_id, &peer_nonce));
+    let sig = kp.sign(&auth_transcript(ctx.my_id, &my_nonce, peer_id, &peer_nonce, cb));
     wr.write_all(&sig).await?;
     wr.flush().await?;
 
@@ -234,7 +333,7 @@ where
             format!("peer {peer_id} pubkey does not match its genesis validator key"),
         ));
     }
-    let transcript = auth_transcript(peer_id, &peer_nonce, ctx.my_id, &my_nonce);
+    let transcript = auth_transcript(peer_id, &peer_nonce, ctx.my_id, &my_nonce, cb);
     if !verify(&peer_pk, &transcript, &peer_sig) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -263,10 +362,22 @@ enum Cmd {
     Timeout { height: u64, step: Step, round: u32 },
     /// A locally-submitted transaction (from the CLI/demo handle).
     LocalTx(Box<SubmissionTx>),
+    /// M53: a transaction submitted via the external ingress RPC. Unlike
+    /// `LocalTx` this carries a oneshot ack so the HTTP handler can report accept
+    /// (with the tx hash) or reject (with the `ChainError`).
+    SubmitTx {
+        tx: Box<SubmissionTx>,
+        reply: oneshot::Sender<Result<Hash, crate::ChainError>>,
+    },
     /// Periodic anti-entropy heartbeat.
     Announce,
     /// Read this node's (height, head) — used by the demo/tests.
     Query(oneshot::Sender<(u64, Hash)>),
+    /// M58: read one account snapshot for the read-class RPC. `None` ⇒ unknown id.
+    QueryAccount {
+        id: u64,
+        reply: oneshot::Sender<Option<Account>>,
+    },
     /// M38: read a richer runtime snapshot for the metrics/health endpoint.
     Metrics(oneshot::Sender<Metrics>),
 }
@@ -288,10 +399,40 @@ pub struct Metrics {
     pub consensus_active: bool,
     /// Pending transactions in the mempool.
     pub mempool: usize,
+    /// M54: configured mempool pending-pool capacity bound (`usize::MAX` ⇒
+    /// unbounded). Reported so saturation (`mempool` vs `mempool_capacity`) is
+    /// observable.
+    pub mempool_capacity: usize,
+    /// M57: configured per-account pending-tx bound (`usize::MAX` ⇒ unbounded).
+    /// Reported alongside `mempool` so per-account saturation policy is observable.
+    pub mempool_per_account_limit: usize,
+    /// M55: current entries in the gossip tx dedup set (`seen_tx`), the set under
+    /// flood pressure. Reported so saturation (`seen_tx` vs `seen_tx_capacity`) is
+    /// observable.
+    pub seen_tx: usize,
+    /// M55: configured per-set dedup bound (`usize::MAX` ⇒ unbounded). Renders as a
+    /// large number when unbounded — the honest "no bound" signal.
+    pub seen_tx_capacity: usize,
     /// Pending stake operations awaiting inclusion.
     pub pending_stake_ops: usize,
     /// Pending slashing evidence awaiting inclusion.
     pub pending_evidence: usize,
+    /// M52: cumulative peer registrations since boot (monotonic counter).
+    pub peer_connects: u64,
+    /// M52: cumulative txs submitted to this node's local API (monotonic counter).
+    pub local_txs: u64,
+    /// M52: cumulative blocks this node finalized via its own consensus round
+    /// (monotonic counter; anti-entropy-synced blocks are not counted here).
+    pub blocks_committed: u64,
+    /// M52: cumulative equivocation events this node observed + submitted
+    /// (monotonic counter).
+    pub slashing_events: u64,
+    /// M54: cumulative gossip txs dropped by the per-peer rate limiter
+    /// (monotonic counter; `0` when rate limiting is disabled).
+    pub txs_rate_limited: u64,
+    /// M57: cumulative admissions rejected by the per-account mempool quota
+    /// (monotonic counter; `0` when the quota is disabled).
+    pub txs_quota_rejected: u64,
 }
 
 /// A handle to a running node (for the in-process `localnet` demo and tests).
@@ -319,6 +460,24 @@ impl Node {
     pub async fn metrics(&self) -> Option<Metrics> {
         let (tx, rx) = oneshot::channel();
         self.cmd.send(Cmd::Metrics(tx)).ok()?;
+        rx.await.ok()
+    }
+
+    /// M53: submit a transaction through the external-ingress path, awaiting the
+    /// actor's admission result: `Ok(hash)` if it entered the mempool (and was
+    /// flooded to peers), `Err(ChainError)` if it failed validation. Returns
+    /// `None` if the actor has stopped.
+    pub async fn submit_tx(&self, tx: SubmissionTx) -> Option<Result<Hash, crate::ChainError>> {
+        let (reply, rx) = oneshot::channel();
+        self.cmd.send(Cmd::SubmitTx { tx: Box::new(tx), reply }).ok()?;
+        rx.await.ok()
+    }
+
+    /// M58: read one account snapshot via the read-class query path. The outer
+    /// `None` means the actor has stopped; the inner `None` means no such account.
+    pub async fn account(&self, id: u64) -> Option<Option<Account>> {
+        let (reply, rx) = oneshot::channel();
+        self.cmd.send(Cmd::QueryAccount { id, reply }).ok()?;
         rx.await.ok()
     }
 }
@@ -365,6 +524,42 @@ struct Actor {
     /// M40: shared read-only handshake auth context. Cloned into each connector
     /// (boot + discovered) and the listener so every link runs the same policy.
     auth: Arc<AuthContext>,
+    /// M52: monotonic metrics counters (actor-owned — the actor task is the sole
+    /// writer, so plain `+= 1` needs no atomics). Surfaced via `Cmd::Metrics`.
+    peer_connects: u64,
+    local_txs: u64,
+    blocks_committed: u64,
+    slashing_events: u64,
+    /// M54: per-peer gossip-tx token buckets (DoS hardening). Keyed by peer id;
+    /// the actor task is the sole writer. Empty when rate limiting is disabled.
+    peer_tx_buckets: HashMap<u64, TokenBucket>,
+    /// M54: token refill rate (tx/sec) and bucket capacity, from `[mempool]`.
+    /// `tx_rate <= 0.0` ⇒ rate limiting disabled (all gossip txs admitted).
+    tx_rate: f64,
+    tx_burst: f64,
+    /// M54: count of gossip txs dropped by the per-peer rate limiter.
+    txs_rate_limited: u64,
+}
+
+/// M54: a minimal token bucket for per-peer gossip rate limiting. Refills
+/// continuously at `rate` tokens/sec up to `burst`; `allow` consumes one token.
+struct TokenBucket {
+    tokens: f64,
+    last: Instant,
+}
+
+impl TokenBucket {
+    fn allow(&mut self, now: Instant, rate: f64, burst: f64) -> bool {
+        let dt = now.saturating_duration_since(self.last).as_secs_f64();
+        self.tokens = (self.tokens + dt * rate).min(burst);
+        self.last = now;
+        if self.tokens >= 1.0 {
+            self.tokens -= 1.0;
+            true
+        } else {
+            false
+        }
+    }
 }
 
 impl Actor {
@@ -374,6 +569,23 @@ impl Actor {
                 let _ = tx.send(msg);
             }
         }
+    }
+
+    /// M54: per-peer gossip-tx admission gate. Returns `true` (admit) when rate
+    /// limiting is disabled (`tx_rate <= 0.0`); otherwise refills and consumes one
+    /// token from `from`'s bucket (seeded full on first sight), returning whether
+    /// a token was available.
+    fn allow_peer_tx(&mut self, from: u64) -> bool {
+        if self.tx_rate <= 0.0 {
+            return true;
+        }
+        let now = Instant::now();
+        let burst = self.tx_burst;
+        let bucket = self
+            .peer_tx_buckets
+            .entry(from)
+            .or_insert_with(|| TokenBucket { tokens: burst, last: now });
+        bucket.allow(now, self.tx_rate, burst)
     }
 
     /// Broadcast a fresh `Status` to every connected peer (kicks anti-entropy).
@@ -495,6 +707,7 @@ impl Actor {
     /// re-verifies both signatures and burns the offender's bond. Repeated
     /// detections are idempotent (`submit_local_evidence` dedups on `hash()`).
     fn on_equivocation(&mut self, ev: SlashEvidence) {
+        self.slashing_events += 1; // M52
         let out = self.node.submit_local_evidence(ev);
         self.route(out);
     }
@@ -607,6 +820,7 @@ impl Actor {
         // hash is unchanged by commit (block was sealed), so the certificate still
         // verifies against the active set inside apply_certified.
         if self.node.apply_certified(block, commit) {
+            self.blocks_committed += 1; // M52
             self.persist();
             self.broadcast_status();
         }
@@ -641,6 +855,7 @@ async fn run_actor(mut actor: Actor, mut rx: mpsc::UnboundedReceiver<Cmd>) {
                     let _ = tx.send(actor.peers_msg());
                 }
                 actor.outbound.insert(id, tx);
+                actor.peer_connects += 1; // M52
             }
             Cmd::Unregister { id } => {
                 actor.outbound.remove(&id);
@@ -659,6 +874,16 @@ async fn run_actor(mut actor: Actor, mut rx: mpsc::UnboundedReceiver<Cmd>) {
                     actor.on_peers(book);
                     continue;
                 }
+                // M54: per-peer rate limiting applies only to gossip-flooded txs
+                // (the operator's own LocalTx/SubmitTx ingress is never throttled).
+                // Disabled by default (`tx_rate <= 0.0`), so this is a no-op gate
+                // unless an operator opts in via `[mempool]`.
+                if let GossipMsg::Tx(_) = &msg {
+                    if !actor.allow_peer_tx(from) {
+                        actor.txs_rate_limited += 1;
+                        continue;
+                    }
+                }
                 let before = actor.node.height();
                 let out = actor.node.on_message(from, msg);
                 actor.route(out);
@@ -669,8 +894,24 @@ async fn run_actor(mut actor: Actor, mut rx: mpsc::UnboundedReceiver<Cmd>) {
                 }
             }
             Cmd::LocalTx(tx) => {
+                actor.local_txs += 1; // M52
                 let out = actor.node.submit_local(*tx);
                 actor.route(out);
+            }
+            Cmd::SubmitTx { tx, reply } => {
+                // M53: an RPC submit is a local-API submit — bump the M52 counter
+                // unconditionally, then admit-or-reject and ack the caller either
+                // way (flooding to peers only on admission).
+                actor.local_txs += 1;
+                match actor.node.submit_local_checked(*tx) {
+                    Ok((h, out)) => {
+                        actor.route(out);
+                        let _ = reply.send(Ok(h));
+                    }
+                    Err(e) => {
+                        let _ = reply.send(Err(e));
+                    }
+                }
             }
             Cmd::StartHeight { height } => actor.on_start_tick(height),
             Cmd::Timeout { height, step, round } => actor.on_timeout(height, step, round),
@@ -683,6 +924,9 @@ async fn run_actor(mut actor: Actor, mut rx: mpsc::UnboundedReceiver<Cmd>) {
             Cmd::Query(reply) => {
                 let _ = reply.send((actor.node.height(), actor.node.head()));
             }
+            Cmd::QueryAccount { id, reply } => {
+                let _ = reply.send(actor.node.chain.state.accounts.get(&id).cloned());
+            }
             Cmd::Metrics(reply) => {
                 let _ = reply.send(Metrics {
                     height: actor.node.height(),
@@ -691,8 +935,18 @@ async fn run_actor(mut actor: Actor, mut rx: mpsc::UnboundedReceiver<Cmd>) {
                     is_validator: actor.kp.is_some(),
                     consensus_active: actor.cons.is_some(),
                     mempool: actor.node.mempool.len(),
+                    mempool_capacity: actor.node.mempool.capacity(),
+                    mempool_per_account_limit: actor.node.mempool.per_account_limit(),
+                    seen_tx: actor.node.seen_tx_len(),
+                    seen_tx_capacity: actor.node.seen_tx_capacity(),
                     pending_stake_ops: actor.node.pending_stake_ops().len(),
                     pending_evidence: actor.node.pending_evidence().len(),
+                    peer_connects: actor.peer_connects,
+                    local_txs: actor.local_txs,
+                    blocks_committed: actor.blocks_committed,
+                    slashing_events: actor.slashing_events,
+                    txs_rate_limited: actor.txs_rate_limited,
+                    txs_quota_rejected: actor.node.mempool.rejected_quota(),
                 });
             }
         }
@@ -703,18 +957,27 @@ async fn run_actor(mut actor: Actor, mut rx: mpsc::UnboundedReceiver<Cmd>) {
 // connection tasks
 // ----------------------------------------------------------------------------
 
-/// Drive one TCP connection: handshake, then split into a reader loop (forwards
+/// Drive one peer connection: handshake, then split into a reader loop (forwards
 /// `Inbound` to the actor) and a writer task (drains a per-peer queue). Returns
 /// when the connection ends. M40: when `ctx.require` is set the handshake is the
 /// mutually-authenticated [`auth_handshake`]; otherwise it is the pre-M40
-/// cleartext [`write_hello`]/[`read_hello`] (byte-identical back-compat).
-async fn handle_conn(stream: TcpStream, ctx: Arc<AuthContext>, cmd: mpsc::UnboundedSender<Cmd>) {
+/// cleartext [`write_hello`]/[`read_hello`] (byte-identical back-compat). M41: the
+/// `stream` is already TLS-wrapped by the caller when `[network] enable_tls` is on,
+/// so the handshake and all framing run unchanged over the encrypted transport.
+/// M42: `binding` carries this connection's TLS keying-material exporter (`Some`
+/// only when TLS is on and `[network] bind_channel` is set); it is folded into the
+/// authenticated handshake to defeat a MITM relay.
+async fn handle_conn(
+    stream: Box<dyn PeerStream>,
+    binding: Option<[u8; 32]>,
+    ctx: Arc<AuthContext>,
+    cmd: mpsc::UnboundedSender<Cmd>,
+) {
     let my_id = ctx.my_id;
-    let _ = stream.set_nodelay(true);
-    let (mut rd, mut wr) = stream.into_split();
+    let (mut rd, mut wr) = tokio::io::split(stream);
 
     let peer_id = if ctx.require {
-        match auth_handshake(&mut rd, &mut wr, &ctx).await {
+        match auth_handshake(&mut rd, &mut wr, &ctx, binding.as_ref()).await {
             Ok(id) => id,
             Err(e) => {
                 warn!(node = my_id, error = %e, "authenticated handshake rejected");
@@ -761,7 +1024,17 @@ async fn run_listener(listener: TcpListener, ctx: Arc<AuthContext>, cmd: mpsc::U
     loop {
         match listener.accept().await {
             Ok((stream, _addr)) => {
-                tokio::spawn(handle_conn(stream, ctx.clone(), cmd.clone()));
+                let ctx = ctx.clone();
+                let cmd = cmd.clone();
+                // Wrap (TLS accept) inside the spawned task so a slow or hostile
+                // TLS handshake never blocks the accept loop.
+                tokio::spawn(async move {
+                    let _ = stream.set_nodelay(true);
+                    match server_wrap(&ctx, stream).await {
+                        Ok((s, binding)) => handle_conn(s, binding, ctx, cmd).await,
+                        Err(e) => warn!(node = my_id, error = %e, "TLS accept failed"),
+                    }
+                });
             }
             Err(e) => warn!(node = my_id, error = %e, "accept error"),
         }
@@ -773,11 +1046,374 @@ async fn run_connector(addr: SocketAddr, ctx: Arc<AuthContext>, cmd: mpsc::Unbou
     let mut backoff = Duration::from_millis(500);
     loop {
         if let Ok(stream) = TcpStream::connect(addr).await {
-            backoff = Duration::from_millis(500);
-            handle_conn(stream, ctx.clone(), cmd.clone()).await; // returns on disconnect
+            let _ = stream.set_nodelay(true);
+            // A TLS dial failure is treated like a dead addr: drop and back off.
+            if let Ok((s, binding)) = client_wrap(&ctx, stream).await {
+                backoff = Duration::from_millis(500);
+                handle_conn(s, binding, ctx.clone(), cmd.clone()).await; // returns on disconnect
+            }
         }
         tokio::time::sleep(backoff).await;
         backoff = (backoff * 2).min(Duration::from_secs(8));
+    }
+}
+
+// ----------------------------------------------------------------------------
+// M41: opt-in TLS 1.3 transport encryption (encryption-only; identity is M40's job)
+// ----------------------------------------------------------------------------
+
+/// Wrap an inbound TCP stream for [`handle_conn`]. TLS off ⇒ the raw stream
+/// (byte-identical to pre-M41); TLS on ⇒ complete the server-side TLS handshake
+/// (presenting our ephemeral self-signed cert) and box the resulting stream. M42:
+/// the second tuple element is this channel's TLS exporter — `Some` only when TLS
+/// is on and `bind_channel` is set.
+async fn server_wrap(
+    ctx: &AuthContext,
+    tcp: TcpStream,
+) -> io::Result<(Box<dyn PeerStream>, Option<[u8; 32]>)> {
+    match &ctx.tls {
+        Some(t) => {
+            let stream = t.acceptor.accept(tcp).await?;
+            let binding = if ctx.bind_channel {
+                Some(export_channel_binding(stream.get_ref().1)?)
+            } else {
+                None
+            };
+            Ok((Box::new(stream), binding))
+        }
+        None => Ok((Box::new(tcp), None)),
+    }
+}
+
+/// Wrap an outbound TCP stream for [`handle_conn`]. TLS off ⇒ the raw stream; TLS
+/// on ⇒ complete the client-side TLS handshake. The SNI name is a fixed dummy —
+/// [`AcceptAnyServerCert`] ignores it (encryption-only, no server authentication).
+/// M42: see [`server_wrap`] for the exporter tuple element.
+async fn client_wrap(
+    ctx: &AuthContext,
+    tcp: TcpStream,
+) -> io::Result<(Box<dyn PeerStream>, Option<[u8; 32]>)> {
+    match &ctx.tls {
+        Some(t) => {
+            let name = rustls::pki_types::ServerName::try_from("zhixing-node")
+                .expect("static SNI is valid");
+            let stream = t.connector.connect(name, tcp).await?;
+            let binding = if ctx.bind_channel {
+                Some(export_channel_binding(stream.get_ref().1)?)
+            } else {
+                None
+            };
+            Ok((Box::new(stream), binding))
+        }
+        None => Ok((Box::new(tcp), None)),
+    }
+}
+
+/// M42: derive the 32-byte channel-binding value from a completed TLS connection's
+/// keying-material exporter (RFC 5705/8446). Called only after the handshake has
+/// finished (`server_wrap`/`client_wrap` await it first), so the export never fails
+/// for being premature; any error is surfaced as a dropped connection.
+fn export_channel_binding<D>(conn: &rustls::ConnectionCommon<D>) -> io::Result<[u8; 32]> {
+    let mut b = [0u8; 32];
+    conn.export_keying_material(&mut b, CHANNEL_BINDING_LABEL, None)
+        .map_err(|e| io::Error::other(format!("TLS channel-binding export failed: {e}")))?;
+    Ok(b)
+}
+
+/// Build the P2P [`TlsSetup`] once at boot.
+///
+/// `mtls = None` (M41, `require_peer_certs` off): **encryption-only** — an ephemeral
+/// self-signed cert on the server side and an accept-any verifier on the client
+/// side. It protects confidentiality/integrity but authenticates no one; peer
+/// identity is proven by the M40 `auth_handshake` inside the tunnel.
+///
+/// `mtls = Some(..)` (M43, `require_peer_certs` on): **genesis-pinned mutual TLS**
+/// over TLS 1.3, using RFC 7250 raw public keys. Each side presents its genesis
+/// ed25519 key (derived from the seed) as its credential, and a
+/// [`GenesisPinnedVerifier`] admits a connection only if the peer's presented key is
+/// a genesis validator — both directions. A non-validator cannot complete the
+/// handshake at all.
+fn build_tls_setup(mtls: Option<MtlsMaterial>) -> io::Result<TlsSetup> {
+    // Install the ring crypto provider process-wide. Idempotent: a second call
+    // (e.g. an in-process `localnet` with several nodes) returns Err, which we
+    // ignore — some provider is now installed either way.
+    let _ = rustls::crypto::ring::default_provider().install_default();
+
+    let Some(m) = mtls else {
+        return build_encrypt_only_tls_setup();
+    };
+
+    // Derive the TLS signing credential from the genesis seed: PKCS#8 v1 =
+    // fixed 16-byte header || 32-byte seed. `any_eddsa_type` yields a rustls
+    // signer whose `public_key()` SPKI carries exactly this node's genesis pubkey.
+    let mut pkcs8 = Vec::with_capacity(ED25519_PKCS8_PREFIX.len() + 32);
+    pkcs8.extend_from_slice(&ED25519_PKCS8_PREFIX);
+    pkcs8.extend_from_slice(&m.seed);
+    let key_der = rustls::pki_types::PrivatePkcs8KeyDer::from(pkcs8);
+    let signing_key = rustls::crypto::ring::sign::any_eddsa_type(&key_der)
+        .map_err(|e| io::Error::other(format!("mTLS ed25519 signer failed: {e}")))?;
+    let spki = signing_key
+        .public_key()
+        .ok_or_else(|| io::Error::other("mTLS signer exposed no public key"))?;
+    let certified = Arc::new(rustls::sign::CertifiedKey::new(
+        vec![rustls::pki_types::CertificateDer::from(spki.as_ref().to_vec())],
+        signing_key,
+    ));
+
+    let verifier = Arc::new(GenesisPinnedVerifier::new(m.validators));
+    let tls13 = &[&rustls::version::TLS13][..];
+
+    // Raw public keys are a TLS 1.3 feature (the raw-key signature verifier is
+    // 1.3-only), so pin the version explicitly on both sides.
+    let server_config = rustls::ServerConfig::builder_with_protocol_versions(tls13)
+        .with_client_cert_verifier(verifier.clone())
+        .with_cert_resolver(Arc::new(
+            rustls::server::AlwaysResolvesServerRawPublicKeys::new(certified.clone()),
+        ));
+
+    let client_config = rustls::ClientConfig::builder_with_protocol_versions(tls13)
+        .dangerous()
+        .with_custom_certificate_verifier(verifier)
+        .with_client_cert_resolver(Arc::new(
+            rustls::client::AlwaysResolvesClientRawPublicKeys::new(certified),
+        ));
+
+    Ok(TlsSetup {
+        acceptor: TlsAcceptor::from(Arc::new(server_config)),
+        connector: TlsConnector::from(Arc::new(client_config)),
+    })
+}
+
+/// M41 encryption-only TLS: ephemeral self-signed cert + accept-any client verifier.
+/// Split out so [`build_tls_setup`]'s mTLS branch stays legible; behavior here is
+/// byte-identical to the pre-M43 path.
+fn build_encrypt_only_tls_setup() -> io::Result<TlsSetup> {
+    // Fresh self-signed cert + key for this process (SAN "zhixing-node").
+    let cert = rcgen::generate_simple_self_signed(vec!["zhixing-node".to_string()])
+        .map_err(|e| io::Error::other(format!("self-signed cert generation failed: {e}")))?;
+    let cert_der = rustls::pki_types::CertificateDer::from(cert.cert.der().to_vec());
+    let key_der = rustls::pki_types::PrivateKeyDer::try_from(cert.key_pair.serialize_der())
+        .map_err(|e| io::Error::other(format!("private key encoding failed: {e}")))?;
+
+    let server_config = rustls::ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(vec![cert_der], key_der)
+        .map_err(|e| io::Error::other(format!("TLS server config failed: {e}")))?;
+
+    let client_config = rustls::ClientConfig::builder()
+        .dangerous()
+        .with_custom_certificate_verifier(Arc::new(AcceptAnyServerCert))
+        .with_no_client_auth();
+
+    Ok(TlsSetup {
+        acceptor: TlsAcceptor::from(Arc::new(server_config)),
+        connector: TlsConnector::from(Arc::new(client_config)),
+    })
+}
+
+/// A rustls client verifier that accepts **any** server certificate. Intentional:
+/// M41 TLS is encryption-only, so there is no PKI and no server identity to check
+/// here — an active MITM is out of scope for this slice (channel binding to the
+/// M40 handshake is deferred). Peer authentication is `auth_handshake`'s job.
+#[derive(Debug)]
+struct AcceptAnyServerCert;
+
+impl rustls::client::danger::ServerCertVerifier for AcceptAnyServerCert {
+    fn verify_server_cert(
+        &self,
+        _end_entity: &rustls::pki_types::CertificateDer<'_>,
+        _intermediates: &[rustls::pki_types::CertificateDer<'_>],
+        _server_name: &rustls::pki_types::ServerName<'_>,
+        _ocsp_response: &[u8],
+        _now: rustls::pki_types::UnixTime,
+    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+        Ok(rustls::client::danger::ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        _message: &[u8],
+        _cert: &rustls::pki_types::CertificateDer<'_>,
+        _dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        _message: &[u8],
+        _cert: &rustls::pki_types::CertificateDer<'_>,
+        _dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        rustls::crypto::ring::default_provider()
+            .signature_verification_algorithms
+            .supported_schemes()
+    }
+}
+
+/// Extract the 32-byte ed25519 public key from an RFC 7250 raw-public-key SPKI.
+///
+/// An ed25519 SPKI is a fixed 44 bytes: the 12-byte [`ED25519_SPKI_PREFIX`] (the
+/// `AlgorithmIdentifier` for `id-Ed25519` plus the BIT STRING header) followed by
+/// the 32-byte key. Anything of a different length or prefix is not an ed25519 raw
+/// public key and is rejected (returns `None`) rather than mis-sliced.
+fn spki_to_ed25519(spki: &[u8]) -> Option<PubKey> {
+    if spki.len() != ED25519_SPKI_PREFIX.len() + 32 {
+        return None;
+    }
+    if spki[..ED25519_SPKI_PREFIX.len()] != ED25519_SPKI_PREFIX {
+        return None;
+    }
+    let mut key = [0u8; 32];
+    key.copy_from_slice(&spki[ED25519_SPKI_PREFIX.len()..]);
+    Some(key)
+}
+
+/// M43 genesis-pinned mutual-TLS verifier, used on **both** sides of every peer
+/// link: as a [`ServerCertVerifier`](rustls::client::danger::ServerCertVerifier)
+/// (the dialer checking the listener's credential) and as a
+/// [`ClientCertVerifier`](rustls::server::danger::ClientCertVerifier) (the listener
+/// checking the dialer's). It admits a connection only if the peer presents an
+/// RFC 7250 raw ed25519 public key that is a member of the genesis validator set —
+/// so a non-validator cannot even complete the TLS handshake. `requires_raw_public_keys`
+/// is `true` on both traits, so rustls hands us the SPKI directly as `end_entity`.
+#[derive(Debug)]
+struct GenesisPinnedVerifier {
+    validators: Arc<HashSet<PubKey>>,
+    algs: rustls::crypto::WebPkiSupportedAlgorithms,
+}
+
+impl GenesisPinnedVerifier {
+    fn new(validators: Arc<HashSet<PubKey>>) -> Self {
+        Self {
+            validators,
+            algs: rustls::crypto::ring::default_provider().signature_verification_algorithms,
+        }
+    }
+
+    /// Decode the peer's SPKI and require the key to be a genesis validator.
+    /// Bad encoding and non-membership map to distinct certificate errors so a
+    /// handshake failure is legible; both abort the connection.
+    fn check_pinned(&self, spki: &[u8]) -> Result<(), rustls::Error> {
+        let key = spki_to_ed25519(spki).ok_or(rustls::Error::InvalidCertificate(
+            rustls::CertificateError::BadEncoding,
+        ))?;
+        if self.validators.contains(&key) {
+            Ok(())
+        } else {
+            Err(rustls::Error::InvalidCertificate(
+                rustls::CertificateError::ApplicationVerificationFailure,
+            ))
+        }
+    }
+
+    /// TLS 1.3 raw-public-key signature check, shared by both trait impls: proves
+    /// the peer holds the private half of the SPKI it presented.
+    fn verify_tls13(
+        &self,
+        message: &[u8],
+        cert: &rustls::pki_types::CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls13_signature_with_raw_key(
+            message,
+            &rustls::pki_types::SubjectPublicKeyInfoDer::from(cert.as_ref()),
+            dss,
+            &self.algs,
+        )
+    }
+}
+
+impl rustls::client::danger::ServerCertVerifier for GenesisPinnedVerifier {
+    fn verify_server_cert(
+        &self,
+        end_entity: &rustls::pki_types::CertificateDer<'_>,
+        _intermediates: &[rustls::pki_types::CertificateDer<'_>],
+        _server_name: &rustls::pki_types::ServerName<'_>,
+        _ocsp_response: &[u8],
+        _now: rustls::pki_types::UnixTime,
+    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+        self.check_pinned(end_entity.as_ref())?;
+        Ok(rustls::client::danger::ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        _message: &[u8],
+        _cert: &rustls::pki_types::CertificateDer<'_>,
+        _dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        // The mTLS path is TLS 1.3-only, so this is never reached; reject defensively.
+        Err(rustls::Error::General(
+            "TLS 1.2 not supported on the genesis-pinned mTLS path".into(),
+        ))
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &rustls::pki_types::CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        self.verify_tls13(message, cert, dss)
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        vec![rustls::SignatureScheme::ED25519]
+    }
+
+    fn requires_raw_public_keys(&self) -> bool {
+        true
+    }
+}
+
+impl rustls::server::danger::ClientCertVerifier for GenesisPinnedVerifier {
+    fn root_hint_subjects(&self) -> &[rustls::DistinguishedName] {
+        // Raw public keys have no issuer subjects to hint.
+        &[]
+    }
+
+    fn verify_client_cert(
+        &self,
+        end_entity: &rustls::pki_types::CertificateDer<'_>,
+        _intermediates: &[rustls::pki_types::CertificateDer<'_>],
+        _now: rustls::pki_types::UnixTime,
+    ) -> Result<rustls::server::danger::ClientCertVerified, rustls::Error> {
+        self.check_pinned(end_entity.as_ref())?;
+        Ok(rustls::server::danger::ClientCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        _message: &[u8],
+        _cert: &rustls::pki_types::CertificateDer<'_>,
+        _dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        // TLS 1.3-only path (see the server verifier); reject defensively.
+        Err(rustls::Error::General(
+            "TLS 1.2 not supported on the genesis-pinned mTLS path".into(),
+        ))
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &rustls::pki_types::CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        self.verify_tls13(message, cert, dss)
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        vec![rustls::SignatureScheme::ED25519]
+    }
+
+    fn requires_raw_public_keys(&self) -> bool {
+        true
     }
 }
 
@@ -814,6 +1450,30 @@ fn render_prometheus(m: &Metrics) -> String {
     gauge(&mut s, "zhixing_mempool_txs", "Pending transactions in the mempool.", m.mempool as u64);
     gauge(
         &mut s,
+        "zhixing_mempool_capacity",
+        "Configured mempool pending-pool capacity bound (saturation = txs/capacity).",
+        m.mempool_capacity as u64,
+    );
+    gauge(
+        &mut s,
+        "zhixing_mempool_per_account_limit",
+        "Configured per-account pending-tx bound (large = unbounded/off).",
+        m.mempool_per_account_limit as u64,
+    );
+    gauge(
+        &mut s,
+        "zhixing_seen_tx",
+        "Entries in the gossip tx dedup set (seen_tx).",
+        m.seen_tx as u64,
+    );
+    gauge(
+        &mut s,
+        "zhixing_seen_tx_capacity",
+        "Configured per-set gossip dedup bound (large = unbounded).",
+        m.seen_tx_capacity as u64,
+    );
+    gauge(
+        &mut s,
         "zhixing_pending_stake_ops",
         "Pending stake operations awaiting inclusion.",
         m.pending_stake_ops as u64,
@@ -827,6 +1487,48 @@ fn render_prometheus(m: &Metrics) -> String {
     s.push_str("# HELP zhixing_head_info Certified chain head hash (as a label).\n");
     s.push_str("# TYPE zhixing_head_info gauge\n");
     s.push_str(&format!("zhixing_head_info{{head=\"{head}\"}} 1\n"));
+    // M52: monotonic counters (the `counter` half of the Prometheus data model).
+    let counter = |s: &mut String, name: &str, help: &str, value: u64| {
+        s.push_str(&format!("# HELP {name} {help}\n"));
+        s.push_str(&format!("# TYPE {name} counter\n"));
+        s.push_str(&format!("{name} {value}\n"));
+    };
+    counter(
+        &mut s,
+        "zhixing_peer_connects_total",
+        "Cumulative peer registrations since boot.",
+        m.peer_connects,
+    );
+    counter(
+        &mut s,
+        "zhixing_local_txs_total",
+        "Cumulative transactions submitted to this node's local API.",
+        m.local_txs,
+    );
+    counter(
+        &mut s,
+        "zhixing_blocks_committed_total",
+        "Cumulative blocks finalized via this node's own consensus round.",
+        m.blocks_committed,
+    );
+    counter(
+        &mut s,
+        "zhixing_slashing_events_total",
+        "Cumulative equivocation events observed and submitted.",
+        m.slashing_events,
+    );
+    counter(
+        &mut s,
+        "zhixing_txs_rate_limited_total",
+        "Cumulative gossip transactions dropped by the per-peer rate limiter.",
+        m.txs_rate_limited,
+    );
+    counter(
+        &mut s,
+        "zhixing_txs_quota_rejected_total",
+        "Cumulative admissions rejected by the per-account mempool quota.",
+        m.txs_quota_rejected,
+    );
     s
 }
 
@@ -890,11 +1592,258 @@ async fn serve_metrics_conn(mut stream: TcpStream, cmd: mpsc::UnboundedSender<Cm
 }
 
 // ----------------------------------------------------------------------------
-// startup + run
+// M53: external transaction-ingress RPC (opt-in, hand-rolled HTTP)
 // ----------------------------------------------------------------------------
+
+/// Cap on the request-header bytes we buffer before giving up (mirrors the metrics
+/// endpoint's 8 KiB header cap).
+const MAX_RPC_HEADER: usize = 8192;
+/// Cap on the request-body bytes we accept. A tx is bounded (a fixed-`DIM`
+/// embedding, ≤32 reviews, a 64-byte signature), so 64 KiB is comfortably above
+/// any legitimate `codec::encode_tx` output while bounding a hostile client.
+const MAX_RPC_BODY: usize = 65536;
+
+/// Parse a `Content-Length` value out of the raw request-header block
+/// (case-insensitive header name). Returns `None` if absent or unparsable.
+fn parse_content_length(headers: &str) -> Option<usize> {
+    for line in headers.split("\r\n") {
+        let Some((name, value)) = line.split_once(':') else { continue };
+        if name.trim().eq_ignore_ascii_case("content-length") {
+            return value.trim().parse::<usize>().ok();
+        }
+    }
+    None
+}
+
+/// Build a fixed-shape `HTTP/1.1` response with a plain-text body. `status_line`
+/// is e.g. `"200 OK"`; the connection is closed after the response.
+fn http_response(status_line: &str, body: &str) -> String {
+    format!(
+        "HTTP/1.1 {}\r\n\
+         Content-Type: text/plain; charset=utf-8\r\n\
+         Content-Length: {}\r\n\
+         Connection: close\r\n\
+         \r\n\
+         {}",
+        status_line,
+        body.len(),
+        body,
+    )
+}
+
+/// Accept loop for the ingress RPC endpoint. Mirrors [`run_metrics`]: each
+/// connection is handled on its own task; an accept error is logged and the loop
+/// continues.
+async fn run_rpc(listener: TcpListener, my_id: u64, cmd: mpsc::UnboundedSender<Cmd>) {
+    loop {
+        match listener.accept().await {
+            Ok((stream, _addr)) => {
+                tokio::spawn(serve_rpc_conn(stream, cmd.clone()));
+            }
+            Err(e) => warn!(node = my_id, error = %e, "rpc accept error"),
+        }
+    }
+}
+
+/// Serve one ingress request. Reads the request headers (bounded), then:
+/// - a non-`POST` method (e.g. `GET`/`HEAD`) returns `200 OK`/`"ok"` — doubling
+///   as a health probe;
+/// - a `POST` reads the body (bounded by `Content-Length`, capped at
+///   [`MAX_RPC_BODY`]), decodes it as raw `codec::encode_tx` bytes, and submits
+///   it through the actor: `200`/hash on admission, `400` on a decode error,
+///   `422`/reason on a validation reject.
+///
+/// All client-side errors are swallowed (early return) — a broken client must
+/// never affect the node.
+/// M58: a parsed read-class GET route. `Health` is the catch-all (`/` and any
+/// unrecognized path) so the endpoint stays a liveness probe exactly as before M58;
+/// only a malformed `/account/<non-numeric>` resolves to `NotFound` (→ 404).
+enum GetRoute {
+    Health,
+    Height,
+    Head,
+    Account(u64),
+    NotFound,
+}
+
+/// M58: map a request path to a read-class route. Pure (no I/O) so it is unit-tested
+/// directly; `serve_rpc_conn` is the thin socket shell around it.
+fn route_get(path: &str) -> GetRoute {
+    match path {
+        "/height" => GetRoute::Height,
+        "/head" => GetRoute::Head,
+        p => match p.strip_prefix("/account/") {
+            Some(id) => id.parse::<u64>().map(GetRoute::Account).unwrap_or(GetRoute::NotFound),
+            None => GetRoute::Health,
+        },
+    }
+}
+
+/// M58: render an account as a grep-friendly `key=value` plain-text line, matching the
+/// endpoint's existing plain-text bodies (the ingress RPC replies with a bare hash).
+fn format_account(id: u64, a: &Account) -> String {
+    format!(
+        "id={id} balance={} staked_total={} earned_total={} slashed_total={} \
+         submissions={} accepted={} pubkey={}",
+        a.balance,
+        a.staked_total,
+        a.earned_total,
+        a.slashed_total,
+        a.submissions,
+        a.accepted,
+        crate::hash::hex(&a.pubkey),
+    )
+}
+
+async fn serve_rpc_conn(mut stream: TcpStream, cmd: mpsc::UnboundedSender<Cmd>) {
+    // Accumulate bytes until we see the end-of-headers marker, keeping any body
+    // bytes that arrived in the same read.
+    let mut acc: Vec<u8> = Vec::new();
+    let mut buf = [0u8; 1024];
+    let header_end = loop {
+        match stream.read(&mut buf).await {
+            Ok(0) => return, // client closed before a complete request
+            Ok(n) => {
+                acc.extend_from_slice(&buf[..n]);
+                if let Some(pos) = acc.windows(4).position(|w| w == b"\r\n\r\n") {
+                    break pos + 4;
+                }
+                if acc.len() >= MAX_RPC_HEADER {
+                    let _ = stream.write_all(http_response("431 Request Header Fields Too Large", "header too large").as_bytes()).await;
+                    return;
+                }
+            }
+            Err(_) => return,
+        }
+    };
+
+    // The request line + headers are ASCII; a non-UTF-8 header block is malformed.
+    let Ok(head) = std::str::from_utf8(&acc[..header_end]) else {
+        let _ = stream.write_all(http_response("400 Bad Request", "malformed headers").as_bytes()).await;
+        return;
+    };
+    let method = head.split_whitespace().next().unwrap_or("");
+    let path = head.split_whitespace().nth(1).unwrap_or("");
+
+    // M58: read-class GET routes. Each read routes through the single-owner actor via
+    // the same local-oneshot pattern as the POST path below; a send failure (actor
+    // stopped) reports 503. Unrecognized GET paths stay a 200 health probe.
+    if method.eq_ignore_ascii_case("GET") || method.eq_ignore_ascii_case("HEAD") {
+        let resp = match route_get(path) {
+            GetRoute::Height => {
+                let (reply, rx) = oneshot::channel();
+                if cmd.send(Cmd::Query(reply)).is_err() {
+                    http_response("503 Service Unavailable", "node stopped")
+                } else {
+                    match rx.await {
+                        Ok((height, _)) => http_response("200 OK", &height.to_string()),
+                        Err(_) => http_response("503 Service Unavailable", "node stopped"),
+                    }
+                }
+            }
+            GetRoute::Head => {
+                let (reply, rx) = oneshot::channel();
+                if cmd.send(Cmd::Query(reply)).is_err() {
+                    http_response("503 Service Unavailable", "node stopped")
+                } else {
+                    match rx.await {
+                        Ok((_, head_hash)) => http_response("200 OK", &crate::hash::hex(&head_hash)),
+                        Err(_) => http_response("503 Service Unavailable", "node stopped"),
+                    }
+                }
+            }
+            GetRoute::Account(id) => {
+                let (reply, rx) = oneshot::channel();
+                if cmd.send(Cmd::QueryAccount { id, reply }).is_err() {
+                    http_response("503 Service Unavailable", "node stopped")
+                } else {
+                    match rx.await {
+                        Ok(Some(a)) => http_response("200 OK", &format_account(id, &a)),
+                        Ok(None) => http_response("404 Not Found", &format!("account {id} not found")),
+                        Err(_) => http_response("503 Service Unavailable", "node stopped"),
+                    }
+                }
+            }
+            GetRoute::Health => http_response("200 OK", "ok"),
+            GetRoute::NotFound => http_response("404 Not Found", "not found"),
+        };
+        let _ = stream.write_all(resp.as_bytes()).await;
+        let _ = stream.flush().await;
+        return;
+    }
+
+    // Anything that isn't a POST is treated as a health probe.
+    if !method.eq_ignore_ascii_case("POST") {
+        let _ = stream.write_all(http_response("200 OK", "ok").as_bytes()).await;
+        let _ = stream.flush().await;
+        return;
+    }
+
+    // Determine how many body bytes to expect, capped.
+    let Some(len) = parse_content_length(head) else {
+        let _ = stream.write_all(http_response("411 Length Required", "missing content-length").as_bytes()).await;
+        return;
+    };
+    if len > MAX_RPC_BODY {
+        let _ = stream.write_all(http_response("413 Payload Too Large", "tx too large").as_bytes()).await;
+        return;
+    }
+
+    // Body bytes already read past the header terminator, plus whatever remains.
+    let mut body: Vec<u8> = acc[header_end..].to_vec();
+    while body.len() < len {
+        match stream.read(&mut buf).await {
+            Ok(0) => break, // client closed early
+            Ok(n) => body.extend_from_slice(&buf[..n]),
+            Err(_) => return,
+        }
+    }
+    if body.len() < len {
+        let _ = stream.write_all(http_response("400 Bad Request", "truncated body").as_bytes()).await;
+        return;
+    }
+    body.truncate(len);
+
+    // Decode raw codec bytes into a SubmissionTx.
+    let tx = match crate::codec::decode_tx(&body) {
+        Ok(tx) => tx,
+        Err(e) => {
+            let _ = stream.write_all(http_response("400 Bad Request", &e.to_string()).as_bytes()).await;
+            let _ = stream.flush().await;
+            return;
+        }
+    };
+
+    // Submit through the actor and report the admission result.
+    let (reply, rx) = oneshot::channel();
+    if cmd.send(Cmd::SubmitTx { tx: Box::new(tx), reply }).is_err() {
+        let _ = stream.write_all(http_response("503 Service Unavailable", "node stopped").as_bytes()).await;
+        return;
+    }
+    let resp = match rx.await {
+        Ok(Ok(h)) => http_response("200 OK", &crate::hash::hex(&h)),
+        Ok(Err(e)) => http_response("422 Unprocessable Entity", &e.to_string()),
+        Err(_) => http_response("503 Service Unavailable", "node stopped"),
+    };
+    let _ = stream.write_all(resp.as_bytes()).await;
+    let _ = stream.flush().await;
+}
 
 fn cfg_io(e: ConfigError) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidInput, e.to_string())
+}
+
+/// M51: the address a node gossips for itself in M39 peer exchange. When
+/// `advertise` is set it's a public/dialable address (NAT / port-mapped
+/// deployments); empty ⇒ the bind `listen`, exactly the M39 behavior
+/// (byte-identical back-compat). Only the *advertised* address changes here —
+/// the listener still binds `listen`.
+fn self_advertise_addr(listen: &str, advertise: &str) -> String {
+    if advertise.is_empty() {
+        listen.to_string()
+    } else {
+        advertise.to_string()
+    }
 }
 
 impl Node {
@@ -947,6 +1896,37 @@ impl Node {
             ));
         }
 
+        // M42: channel binding folds the TLS exporter into the auth transcript, so
+        // it is meaningless without both a TLS channel to bind to and an auth
+        // handshake to bind it into. Refuse to start on a nonsensical combination
+        // rather than silently produce transcripts no peer can match.
+        if cfg.network.bind_channel && (!cfg.network.enable_tls || !cfg.network.require_peer_auth) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "node {my_id} sets bind_channel but requires enable_tls + require_peer_auth"
+                ),
+            ));
+        }
+
+        // M43: genesis-pinned mTLS presents this node's genesis key as its TLS
+        // credential, so it needs a TLS channel to authenticate and a validator
+        // signing key to present. Refuse the nonsensical combinations up front.
+        if cfg.network.require_peer_certs && !cfg.network.enable_tls {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("node {my_id} sets require_peer_certs but not enable_tls"),
+            ));
+        }
+        if cfg.network.require_peer_certs && validator_key.is_none() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "node {my_id} sets require_peer_certs but has no validator signing key to present"
+                ),
+            ));
+        }
+
         // logs + boot recovery
         let bpath = format!("{}/blocks.log", cfg.node.data_dir);
         let cpath = format!("{}/certs.log", cfg.node.data_dir);
@@ -957,7 +1937,25 @@ impl Node {
 
         let peer_ids: Vec<u64> = cfg.peers.iter().map(|p| p.id).collect();
 
-        let mut node = GossipNode::new(my_id, genesis.clone(), 64, peer_ids.iter().copied());
+        let mut node = GossipNode::new(
+            my_id,
+            genesis.clone(),
+            cfg.mempool.max_block_txs,
+            peer_ids.iter().copied(),
+        );
+        // M54: bound the pending pool (DoS hardening). Default capacity is ample
+        // (localnet never reaches it ⇒ head unchanged); operators tune `[mempool]`.
+        node.set_mempool_capacity(cfg.mempool.capacity);
+        // M55: bound the gossip dedup sets (FIFO eviction). `seen_cache == 0` ⇒
+        // unbounded (the default) ⇒ setter not called ⇒ behavior byte-identical.
+        if cfg.mempool.seen_cache > 0 {
+            node.set_seen_capacity(cfg.mempool.seen_cache);
+        }
+        // M57: bound per-account pending occupancy (DoS hardening). `per_account_limit
+        // == 0` ⇒ unbounded (the default) ⇒ setter not called ⇒ behavior unchanged.
+        if cfg.mempool.per_account_limit > 0 {
+            node.set_mempool_per_account_limit(cfg.mempool.per_account_limit);
+        }
         if !blocks.is_empty() && !node.load_certified(&blocks, &certs) {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -982,7 +1980,7 @@ impl Node {
         // connectors below cover them — don't let discovery re-dial). Discovery
         // grows both sets as address-book gossip arrives.
         let mut addrs: HashMap<u64, String> = HashMap::new();
-        addrs.insert(my_id, cfg.node.listen.clone());
+        addrs.insert(my_id, self_advertise_addr(&cfg.node.listen, &cfg.network.advertise_addr));
         let mut dialing: HashSet<u64> = HashSet::new();
         for p in &cfg.peers {
             addrs.entry(p.id).or_insert_with(|| p.addr.clone());
@@ -993,13 +1991,38 @@ impl Node {
         // M40: build the shared handshake auth context. Clone the signing key
         // (the consensus actor keeps its own owned copy below), snapshot the
         // genesis id→pubkey registry, and carry the `require_peer_auth` policy.
+        // M41: build the TLS setup once when `[network] enable_tls` is on so every
+        // link (listener + boot/discovered connectors) shares the same acceptor +
+        // connector. M43: when `require_peer_certs` is on too, build genesis-pinned
+        // mTLS — the credential is this node's genesis seed and the verifier admits
+        // only genesis validators (guarded by the fail-fasts above).
         let validators: HashMap<u64, PubKey> =
             genesis.validators.iter().map(|(id, pk, _)| (*id, *pk)).collect();
+        let tls = if cfg.network.enable_tls {
+            let mtls = if cfg.network.require_peer_certs {
+                Some(MtlsMaterial {
+                    seed: validator_key
+                        .as_ref()
+                        .expect("guarded by require_peer_certs fail-fast")
+                        .secret_seed(),
+                    validators: Arc::new(
+                        genesis.validators.iter().map(|(_, pk, _)| *pk).collect(),
+                    ),
+                })
+            } else {
+                None
+            };
+            Some(build_tls_setup(mtls)?)
+        } else {
+            None
+        };
         let auth = Arc::new(AuthContext {
             my_id,
             kp: validator_key.clone(),
             validators,
             require: cfg.network.require_peer_auth,
+            tls,
+            bind_channel: cfg.network.bind_channel,
         });
 
         let actor = Actor {
@@ -1016,6 +2039,14 @@ impl Node {
             dialing,
             peer_exchange: cfg.network.enable_peer_exchange,
             auth: auth.clone(),
+            peer_connects: 0,
+            local_txs: 0,
+            blocks_committed: 0,
+            slashing_events: 0,
+            peer_tx_buckets: HashMap::new(),
+            tx_rate: cfg.mempool.per_peer_tx_per_sec,
+            tx_burst: cfg.mempool.per_peer_tx_burst,
+            txs_rate_limited: 0,
         };
         tokio::spawn(run_actor(actor, cmd_rx));
 
@@ -1065,6 +2096,16 @@ impl Node {
             tokio::spawn(run_metrics(mlistener, my_id, cmd_tx.clone()));
         }
 
+        // M53: optionally bind the external transaction-ingress RPC. Opt-in like
+        // metrics: only when `[rpc]` is present and `enabled = true`. Default off
+        // ⇒ no write path is exposed and the daemon behaves exactly as before.
+        if let Some(rc) = cfg.rpc.as_ref().filter(|r| r.enabled) {
+            let addr = rc.listen_addr().map_err(cfg_io)?;
+            let rlistener = TcpListener::bind(addr).await?;
+            info!(node = my_id, addr = %rlistener.local_addr()?, "rpc listening");
+            tokio::spawn(run_rpc(rlistener, my_id, cmd_tx.clone()));
+        }
+
         // M33: kick off consensus for the first height after the mesh has had a
         // moment to dial + handshake. A follower ignores this (no key). The
         // decide→next-height and sync-reconcile chains keep it going thereafter.
@@ -1097,15 +2138,432 @@ pub async fn run(
 /// M37: install a process-global `tracing` subscriber (stderr, `RUST_LOG`-filtered,
 /// default `info`). Idempotent — safe to call from either entry point, twice, or
 /// after a test has already set a global default (`try_init` error is swallowed).
+///
+/// M44: this is the config-free default — `init_tracing_with(None)` — kept so
+/// callers with no `[logging]` config (e.g. `localnet`) stay byte-identical.
 pub fn init_tracing() {
+    init_tracing_with(None);
+}
+
+/// M44: install the subscriber from an optional `[logging]` config. `None` (or a
+/// defaulted section) reproduces the M37 behavior verbatim: `info` fallback
+/// filter, text formatter, stderr. `level` replaces only the *default* filter —
+/// `RUST_LOG` still wins when set. `format = "json"` switches to the JSON
+/// formatter. Idempotent for the same reasons as [`init_tracing`].
+///
+/// M45: `file` non-empty switches the writer to a rolling log file (see
+/// [`build_file_appender`]); `file` empty keeps the M37/M44 stderr writer, so an
+/// absent/defaulted section is still byte-identical.
+///
+/// M46: with a file target, `stderr = true` tees to **both** the file and stderr
+/// (via a layered `Registry`, see [`init_tee`]). The two single-sink arms below are
+/// unchanged, so an absent `stderr` knob stays byte-identical to M45/M44/M37.
+///
+/// M47: within the tee, `stderr_level`/`file_level` give each sink its own
+/// `EnvFilter` (see [`init_tee_leveled`]); both empty (or `RUST_LOG` set) keeps the
+/// M46 shared-filter tee, so an absent per-sink knob stays byte-identical to M46.
+///
+/// M48: `levels`/`stderr_levels`/`file_levels` are array forms of the three scalar
+/// filter knobs — a non-empty array (joined by `,`, see [`resolve_directive`]) wins
+/// over its scalar; all empty ⇒ the scalars are used verbatim, so an absent array
+/// stays byte-identical to M47.
+///
+/// M49: within the tee, `stderr_format`/`file_format` give each sink its own
+/// formatter (text/json, see [`init_tee_leveled`]); both empty ⇒ both sinks inherit
+/// `format` (the M48/M46 tee), so an absent per-sink format stays byte-identical.
+pub fn init_tracing_with(logging: Option<&crate::config::LoggingConfig>) {
     use tracing_subscriber::{fmt, EnvFilter};
-    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
-    let _ = fmt().with_env_filter(filter).with_writer(std::io::stderr).try_init();
+    let lc = logging.cloned().unwrap_or_default(); // level "info", format "text", stderr
+    // M48: resolve each scalar↔array pair into one directive string (array wins).
+    let base = resolve_directive(&lc.level, &lc.levels);
+    let se = resolve_directive(&lc.stderr_level, &lc.stderr_levels);
+    let fe = resolve_directive(&lc.file_level, &lc.file_levels);
+    // `RUST_LOG` is the global override. When set & valid it wins everywhere (incl.
+    // both tee sinks); when unset, the per-sink levels (M47) can take effect.
+    let rust_log = EnvFilter::try_from_default_env();
+    let filter = match EnvFilter::try_from_default_env() {
+        Ok(f) => f,
+        Err(_) => EnvFilter::new(&base),
+    };
+    // `format` (text/json) and the writer (stderr/file) form a 2×2. Branch on the
+    // writer first because `.with_writer(...)` changes the builder's type, then on
+    // the format inside each arm. `filter` is moved into exactly one arm.
+    let json = lc.format == "json";
+    if lc.file.is_empty() {
+        // Exactly the M37/M44 path — stderr, byte-identical when `[logging]` absent.
+        let builder = fmt().with_env_filter(filter).with_writer(std::io::stderr);
+        if json {
+            let _ = builder.json().try_init();
+        } else {
+            let _ = builder.try_init();
+        }
+    } else if !lc.stderr {
+        // M45 path — file only, byte-identical to an M45 file target without a tee.
+        let builder = fmt().with_env_filter(filter).with_writer(build_file_appender(&lc.file, &lc.rotation, lc.max_files));
+        if json {
+            let _ = builder.json().try_init();
+        } else {
+            let _ = builder.try_init();
+        }
+    } else {
+        // Tee: file + stderr simultaneously.
+        let per_sink_level = rust_log.is_err() && (!se.is_empty() || !fe.is_empty());
+        // M49: per-sink formatter override. Independent of RUST_LOG (which governs
+        // filtering, not formatting); empty ⇒ inherit the base `format`.
+        let sjson = if lc.stderr_format.is_empty() { json } else { lc.stderr_format == "json" };
+        let fjson = if lc.file_format.is_empty() { json } else { lc.file_format == "json" };
+        let per_sink_fmt = !lc.stderr_format.is_empty() || !lc.file_format.is_empty();
+        if !per_sink_level && !per_sink_fmt {
+            // M46 path — one shared filter + one shared format for both sinks
+            // (byte-identical to M46).
+            init_tee(filter, json, &lc.file, &lc.rotation, lc.max_files);
+        } else {
+            // M47/M49 path — each sink gets its own EnvFilter and/or formatter. The
+            // per-sink filter builder honors RUST_LOG (global) first, else the per-sink
+            // directive, else the resolved base `level`. When `per_sink_level` is set,
+            // RUST_LOG is unset (the gate), so this reduces to the M47 `EnvFilter::new`.
+            let mk = |dir: &str| match EnvFilter::try_from_default_env() {
+                Ok(f) => f,
+                Err(_) => EnvFilter::new(if dir.is_empty() { &base } else { dir }),
+            };
+            let (sdir, fdir) = if per_sink_level { (se.as_str(), fe.as_str()) } else { ("", "") };
+            init_tee_leveled(mk(sdir), mk(fdir), sjson, fjson, &lc.file, &lc.rotation, lc.max_files);
+        }
+    }
+}
+
+/// M48: compose one `EnvFilter` directive string from a scalar knob and its array
+/// counterpart. A non-empty `array` (its non-empty, trimmed entries joined by `,`)
+/// wins; otherwise the scalar `s` is returned verbatim — so an absent/empty array is
+/// byte-identical to M47. Pure and tracing-free for easy testing.
+fn resolve_directive(s: &str, array: &[String]) -> String {
+    let joined: Vec<&str> = array
+        .iter()
+        .map(|d| d.trim())
+        .filter(|d| !d.is_empty())
+        .collect();
+    if joined.is_empty() {
+        s.to_string()
+    } else {
+        joined.join(",")
+    }
+}
+
+/// M46: install a subscriber that writes to **both** stderr and a rolling file at
+/// once. Two writers can't share the all-in-one `fmt()` subscriber, so the tee uses
+/// a layered `Registry` with one `fmt::Layer` per writer under a single shared
+/// `EnvFilter`. This path runs only for `file != "" && stderr == true`; the
+/// single-sink cases keep using `fmt()` untouched (byte-identical). Idempotent via
+/// `try_init`; the blocking `RollingFileAppender` needs no `WorkerGuard`.
+fn init_tee(
+    filter: tracing_subscriber::EnvFilter,
+    json: bool,
+    file: &str,
+    rotation: &str,
+    max_files: usize,
+) {
+    use tracing_subscriber::{fmt, prelude::*};
+    let appender = build_file_appender(file, rotation, max_files);
+    if json {
+        let _ = tracing_subscriber::registry()
+            .with(fmt::layer().json().with_writer(std::io::stderr))
+            .with(fmt::layer().json().with_writer(appender))
+            .with(filter)
+            .try_init();
+    } else {
+        let _ = tracing_subscriber::registry()
+            .with(fmt::layer().with_writer(std::io::stderr))
+            .with(fmt::layer().with_writer(appender))
+            .with(filter)
+            .try_init();
+    }
+}
+
+/// M47: like [`init_tee`], but each sink carries its **own** `EnvFilter` instead of
+/// one shared filter on the registry — so stderr and the file can log at different
+/// levels. `EnvFilter` implements `Filter`, so `layer.with_filter(env)` attaches it
+/// per layer. Runs only when `file != "" && stderr == true` and at least one per-sink
+/// level (RUST_LOG unset) or per-sink format is set; otherwise [`init_tee`] (shared
+/// filter + shared format) is used. Idempotent via `try_init`.
+///
+/// M49: each sink also carries its **own** formatter — `stderr_json`/`file_json`
+/// select text vs JSON independently. `.json()` returns a differently-typed layer, so
+/// the 2×2 format combos are enumerated (no boxing, matching [`init_tee`]'s style).
+fn init_tee_leveled(
+    stderr_filter: tracing_subscriber::EnvFilter,
+    file_filter: tracing_subscriber::EnvFilter,
+    stderr_json: bool,
+    file_json: bool,
+    file: &str,
+    rotation: &str,
+    max_files: usize,
+) {
+    use tracing_subscriber::{fmt, prelude::*, Layer};
+    let appender = build_file_appender(file, rotation, max_files);
+    match (stderr_json, file_json) {
+        (false, false) => {
+            let _ = tracing_subscriber::registry()
+                .with(fmt::layer().with_writer(std::io::stderr).with_filter(stderr_filter))
+                .with(fmt::layer().with_writer(appender).with_filter(file_filter))
+                .try_init();
+        }
+        (false, true) => {
+            let _ = tracing_subscriber::registry()
+                .with(fmt::layer().with_writer(std::io::stderr).with_filter(stderr_filter))
+                .with(fmt::layer().json().with_writer(appender).with_filter(file_filter))
+                .try_init();
+        }
+        (true, false) => {
+            let _ = tracing_subscriber::registry()
+                .with(fmt::layer().json().with_writer(std::io::stderr).with_filter(stderr_filter))
+                .with(fmt::layer().with_writer(appender).with_filter(file_filter))
+                .try_init();
+        }
+        (true, true) => {
+            let _ = tracing_subscriber::registry()
+                .with(fmt::layer().json().with_writer(std::io::stderr).with_filter(stderr_filter))
+                .with(fmt::layer().json().with_writer(appender).with_filter(file_filter))
+                .try_init();
+        }
+    }
+}
+
+/// M45: build a rolling-file writer from a `[logging] file` path + `rotation` knob.
+/// The path is split into a parent directory (created best-effort) and a file-name
+/// prefix; `RollingFileAppender` implements `MakeWriter` directly, so it feeds
+/// straight into `fmt().with_writer(...)` in blocking mode — no `WorkerGuard`.
+///
+/// M50: `max_files` caps retained rotated files (oldest pruned). `0` ⇒ the M45
+/// unbounded `RollingFileAppender::new` path, byte-identical; `> 0` ⇒ the builder
+/// with `max_log_files`, falling back to `::new` on any builder error.
+fn build_file_appender(
+    file: &str,
+    rotation: &str,
+    max_files: usize,
+) -> tracing_appender::rolling::RollingFileAppender {
+    use std::path::Path;
+    use tracing_appender::rolling::RollingFileAppender;
+    let path = Path::new(file);
+    let dir = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let prefix = path
+        .file_name()
+        .unwrap_or_else(|| std::ffi::OsStr::new("node.log"));
+    // Best-effort — a create/open failure just yields no file output (init already
+    // swallows subscriber errors); a bad `rotation` is rejected earlier at load.
+    let _ = std::fs::create_dir_all(dir);
+    let rot = parse_rotation(rotation);
+    if max_files == 0 {
+        // M45 path — unbounded retention, kept byte-identical for the default.
+        RollingFileAppender::new(rot, dir, prefix)
+    } else {
+        // M50 path — cap retained rotated files; fall back to the unbounded `::new`
+        // on any builder error rather than losing file output (init is best-effort).
+        let prefix = prefix.to_string_lossy().into_owned();
+        RollingFileAppender::builder()
+            .rotation(rot.clone())
+            .filename_prefix(prefix.clone())
+            .max_log_files(max_files)
+            .build(dir)
+            .unwrap_or_else(|_| RollingFileAppender::new(rot, dir, &prefix))
+    }
+}
+
+/// M45: map a validated `rotation` string to a `Rotation`. The config layer rejects
+/// unknown values at load time; `DAILY` is a defensive default here.
+fn parse_rotation(rotation: &str) -> tracing_appender::rolling::Rotation {
+    use tracing_appender::rolling::Rotation;
+    match rotation {
+        "hourly" => Rotation::HOURLY,
+        "minutely" => Rotation::MINUTELY,
+        "never" => Rotation::NEVER,
+        _ => Rotation::DAILY,
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn self_advertise_addr_prefers_override() {
+        // M51: empty advertise ⇒ the bind `listen`, verbatim (byte-identical M39
+        // seed). A non-empty advertise wins (the public/dialable NAT address).
+        assert_eq!(self_advertise_addr("0.0.0.0:9021", ""), "0.0.0.0:9021");
+        assert_eq!(
+            self_advertise_addr("0.0.0.0:9021", "203.0.113.7:9021"),
+            "203.0.113.7:9021"
+        );
+    }
+
+    #[test]
+    fn init_tracing_is_idempotent() {
+        // M44: the split init path must be safe to call from either entry point,
+        // more than once, and with either format — the global-subscriber
+        // `try_init` error is swallowed, so none of these panic. (Output capture
+        // against a process-global subscriber isn't asserted; the byte-identical
+        // default is covered structurally by `unwrap_or_default` + the config
+        // `logging_defaults_off_and_parses` test.)
+        init_tracing();
+        init_tracing_with(None);
+        init_tracing_with(Some(&crate::config::LoggingConfig {
+            level: "warn".into(),
+            format: "json".into(),
+            ..Default::default()
+        }));
+    }
+
+    #[test]
+    fn parse_rotation_and_file_init() {
+        // M45: the rotation string maps to the right `Rotation` (and an unknown
+        // value defaults to DAILY defensively — the config layer rejects it first).
+        // Compare via Debug so the test does not depend on `Rotation: PartialEq`.
+        use tracing_appender::rolling::Rotation;
+        let dbg = |r: &str| format!("{:?}", parse_rotation(r));
+        assert_eq!(dbg("hourly"), format!("{:?}", Rotation::HOURLY));
+        assert_eq!(dbg("minutely"), format!("{:?}", Rotation::MINUTELY));
+        assert_eq!(dbg("never"), format!("{:?}", Rotation::NEVER));
+        assert_eq!(dbg("daily"), format!("{:?}", Rotation::DAILY));
+        assert_eq!(dbg("weekly"), format!("{:?}", Rotation::DAILY)); // defensive default
+
+        // And the file branch of `init_tracing_with` builds a rolling appender
+        // (creating the parent dir) and installs without panicking — extends the
+        // M44 idempotency coverage to the non-stderr writer path.
+        let dir = std::env::temp_dir().join(format!("zhixing-m45-log-{}", std::process::id()));
+        let file = dir.join("node.log");
+        init_tracing_with(Some(&crate::config::LoggingConfig {
+            file: file.to_str().unwrap().to_string(),
+            rotation: "never".into(),
+            ..Default::default()
+        }));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn tee_init_does_not_panic() {
+        // M46: the tee branch (`file` set + `stderr = true`) builds a layered
+        // Registry with a stderr layer and a rolling-file layer, creates the parent
+        // dir, and installs without panicking — extends the M45 file-branch coverage
+        // to the two-writer path. (Global-subscriber `try_init` is swallowed, so this
+        // is safe to run alongside the other init tests.)
+        let dir = std::env::temp_dir().join(format!("zhixing-m46-tee-{}", std::process::id()));
+        let file = dir.join("node.log");
+        init_tracing_with(Some(&crate::config::LoggingConfig {
+            file: file.to_str().unwrap().to_string(),
+            rotation: "never".into(),
+            stderr: true,
+            ..Default::default()
+        }));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn tee_per_sink_levels_init_does_not_panic() {
+        // M47: with RUST_LOG unset and per-sink levels set, the tee builds a layered
+        // Registry where each sink carries its own EnvFilter (stderr=info, file=debug),
+        // creates the parent dir, and installs without panicking. (Global-subscriber
+        // `try_init` is swallowed, so this is safe alongside the other init tests.)
+        let dir =
+            std::env::temp_dir().join(format!("zhixing-m47-tee-lvl-{}", std::process::id()));
+        let file = dir.join("node.log");
+        init_tracing_with(Some(&crate::config::LoggingConfig {
+            file: file.to_str().unwrap().to_string(),
+            rotation: "never".into(),
+            stderr: true,
+            stderr_level: "info".into(),
+            file_level: "debug".into(),
+            ..Default::default()
+        }));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn file_appender_max_files_builds() {
+        // M50: with `max_files > 0`, `build_file_appender` takes the builder path
+        // (bounded retention via `max_log_files`), creates the parent dir, and yields
+        // a working appender; and the file arm of `init_tracing_with` installs without
+        // panicking. `max_files == 0` stays on the M45 `::new` path (covered elsewhere).
+        let dir =
+            std::env::temp_dir().join(format!("zhixing-m50-retain-{}", std::process::id()));
+        let file = dir.join("node.log");
+        let path = file.to_str().unwrap().to_string();
+        // The builder path builds without panicking (a real bounded appender).
+        let _appender = build_file_appender(&path, "minutely", 3);
+        assert!(dir.exists(), "parent dir is created best-effort");
+        // And it threads through the subscriber init just like the M45 file arm.
+        init_tracing_with(Some(&crate::config::LoggingConfig {
+            file: path,
+            rotation: "minutely".into(),
+            max_files: 3,
+            ..Default::default()
+        }));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn tee_per_sink_formats_init_does_not_panic() {
+        // M49: with per-sink formats set (stderr=text, file=json), the tee builds a
+        // layered Registry where each sink carries its own formatter, creates the
+        // parent dir, and installs without panicking — exercises the 2×2 format path.
+        // (Global-subscriber `try_init` is swallowed, so this is safe alongside the
+        // other init tests.)
+        let dir =
+            std::env::temp_dir().join(format!("zhixing-m49-tee-fmt-{}", std::process::id()));
+        let file = dir.join("node.log");
+        init_tracing_with(Some(&crate::config::LoggingConfig {
+            file: file.to_str().unwrap().to_string(),
+            rotation: "never".into(),
+            stderr: true,
+            stderr_format: "text".into(),
+            file_format: "json".into(),
+            ..Default::default()
+        }));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn resolve_directive_composes_arrays() {
+        // M48: an empty array ⇒ the scalar verbatim (byte-identical to M47).
+        assert_eq!(resolve_directive("info", &[]), "info");
+        assert_eq!(resolve_directive("", &[]), "");
+        // a non-empty array wins over the scalar and is joined by ','.
+        assert_eq!(
+            resolve_directive(
+                "info",
+                &["debug".to_string(), "tokio=warn".to_string()],
+            ),
+            "debug,tokio=warn",
+        );
+        // even when the scalar is empty, a non-empty array composes.
+        assert_eq!(
+            resolve_directive("", &["zhixing_node::daemon=debug".to_string()]),
+            "zhixing_node::daemon=debug",
+        );
+        // empty/whitespace entries are dropped so a stray "" can't poison the join.
+        assert_eq!(
+            resolve_directive(
+                "info",
+                &["".to_string(), "  ".to_string(), "warn".to_string()],
+            ),
+            "warn",
+        );
+        // an array of only-blank entries falls back to the scalar.
+        assert_eq!(resolve_directive("info", &["".to_string(), "  ".to_string()]), "info");
+    }
+
+    #[test]
+    fn directive_array_init_does_not_panic() {
+        // M48: with RUST_LOG unset and a `levels` array set (no file), the single-sink
+        // stderr path composes the array into one EnvFilter and installs without
+        // panicking. (Global-subscriber `try_init` is swallowed, so this is safe
+        // alongside the other init tests.)
+        init_tracing_with(Some(&crate::config::LoggingConfig {
+            levels: vec!["info".to_string(), "tokio=warn".to_string()],
+            ..Default::default()
+        }));
+    }
 
     #[tokio::test]
     async fn frame_round_trip_over_duplex() {
@@ -1164,22 +2622,65 @@ mod tests {
     fn auth_transcript_is_deterministic_and_order_sensitive() {
         let n1 = [1u8; 32];
         let n2 = [2u8; 32];
-        let a = auth_transcript(21, &n1, 22, &n2);
-        assert_eq!(a, auth_transcript(21, &n1, 22, &n2), "same inputs ⇒ identical bytes");
+        let a = auth_transcript(21, &n1, 22, &n2, None);
+        assert_eq!(a, auth_transcript(21, &n1, 22, &n2, None), "same inputs ⇒ identical bytes");
         // Swapping the signer/peer roles must change the bytes: each side signs a
         // *distinct* transcript, so one side's signature can't be replayed as the
         // other's.
-        assert_ne!(a, auth_transcript(22, &n2, 21, &n1));
+        assert_ne!(a, auth_transcript(22, &n2, 21, &n1, None));
         // The domain tag is a prefix (cross-protocol signature separation).
         assert!(a.starts_with(AUTH_DOMAIN));
         assert_eq!(a.len(), AUTH_DOMAIN.len() + 8 + 32 + 8 + 32);
     }
 
     #[test]
+    fn auth_transcript_binding_enters_signed_material() {
+        // M42: the channel binding is `None` by default and byte-identical to the
+        // pre-M42 layout; `Some(b)` appends the 32-byte exporter to the signed bytes.
+        let n1 = [5u8; 32];
+        let n2 = [6u8; 32];
+        let base = auth_transcript(21, &n1, 22, &n2, None);
+        assert_eq!(base.len(), AUTH_DOMAIN.len() + 8 + 32 + 8 + 32);
+
+        let bind_a = [7u8; 32];
+        let bind_b = [8u8; 32];
+        let bound_a = auth_transcript(21, &n1, 22, &n2, Some(&bind_a));
+        // The binding is appended (same 32-byte suffix growth) and the prefix is
+        // exactly the unbound transcript — so an unbound peer signs different bytes.
+        assert_eq!(bound_a.len(), base.len() + 32);
+        assert!(bound_a.starts_with(&base));
+        assert_ne!(bound_a, base);
+        // Different TLS channels ⇒ different exporters ⇒ different signed material.
+        let bound_b = auth_transcript(21, &n1, 22, &n2, Some(&bind_b));
+        assert_ne!(bound_a, bound_b);
+    }
+
+    #[test]
+    fn channel_binding_mismatch_rejects_handshake() {
+        // M42 (the MITM-relay defense at the crypto layer): a signature made over
+        // one channel's binding must NOT verify against a transcript reconstructed
+        // with a different channel's binding — which is exactly what a MITM relay
+        // produces (its two TLS legs export different keying material). The same
+        // binding on both sides still verifies (honest direct peers).
+        let n1 = [9u8; 32];
+        let n2 = [10u8; 32];
+        let leg_a = [11u8; 32]; // real peer ↔ attacker leg
+        let leg_b = [12u8; 32]; // attacker ↔ real peer leg
+
+        let signed = kp(21).sign(&auth_transcript(21, &n1, 22, &n2, Some(&leg_a)));
+        // Verifier on the other honest end reconstructs with ITS leg's binding:
+        let relayed = auth_transcript(21, &n1, 22, &n2, Some(&leg_b));
+        assert!(!verify(&kp(21).public(), &relayed, &signed), "relayed sig must fail");
+        // Same channel binding on both ends ⇒ verifies.
+        let direct = auth_transcript(21, &n1, 22, &n2, Some(&leg_a));
+        assert!(verify(&kp(21).public(), &direct, &signed));
+    }
+
+    #[test]
     fn auth_sign_verify_round_trip() {
         let n1 = [3u8; 32];
         let n2 = [4u8; 32];
-        let t = auth_transcript(21, &n1, 22, &n2);
+        let t = auth_transcript(21, &n1, 22, &n2, None);
         let sig = kp(21).sign(&t);
         assert!(verify(&kp(21).public(), &t, &sig), "the correct genesis key verifies");
         // A different validator's signature over the same transcript must fail —
@@ -1276,6 +2777,9 @@ mod tests {
             consensus: crate::config::ConsensusConfig::default(),
             network: crate::config::NetworkConfig::default(),
             metrics: None,
+            rpc: None,
+            logging: None,
+            mempool: crate::config::MempoolConfig::default(),
         }
     }
 
@@ -1690,8 +3194,18 @@ mod tests {
             is_validator: true,
             consensus_active: false,
             mempool: 5,
+            mempool_capacity: 4096,
+            mempool_per_account_limit: 32,
+            seen_tx: 9,
+            seen_tx_capacity: 1024,
             pending_stake_ops: 2,
             pending_evidence: 1,
+            peer_connects: 11,
+            local_txs: 13,
+            blocks_committed: 17,
+            slashing_events: 19,
+            txs_rate_limited: 23,
+            txs_quota_rejected: 29,
         }
     }
 
@@ -1705,6 +3219,10 @@ mod tests {
             ("zhixing_is_validator", 1),
             ("zhixing_consensus_active", 0),
             ("zhixing_mempool_txs", 5),
+            ("zhixing_mempool_capacity", 4096),
+            ("zhixing_mempool_per_account_limit", 32),
+            ("zhixing_seen_tx", 9),
+            ("zhixing_seen_tx_capacity", 1024),
             ("zhixing_pending_stake_ops", 2),
             ("zhixing_pending_evidence", 1),
         ] {
@@ -1725,6 +3243,23 @@ mod tests {
         assert!(out.contains(&format!("zhixing_head_info{{head=\"{head}\"}} 1")));
     }
 
+    #[test]
+    fn render_prometheus_emits_counters() {
+        let out = render_prometheus(&sample_metrics());
+        // M52: each monotonic counter carries its value and a `# TYPE … counter`.
+        for (name, value) in [
+            ("zhixing_peer_connects_total", 11),
+            ("zhixing_local_txs_total", 13),
+            ("zhixing_blocks_committed_total", 17),
+            ("zhixing_slashing_events_total", 19),
+            ("zhixing_txs_rate_limited_total", 23),
+            ("zhixing_txs_quota_rejected_total", 29),
+        ] {
+            assert!(out.contains(&format!("# TYPE {name} counter")), "missing TYPE for {name}");
+            assert!(out.contains(&format!("\n{name} {value}\n")), "missing `{name} {value}`");
+        }
+    }
+
     #[tokio::test]
     async fn metrics_handle_reports_snapshot() {
         // A single fresh validator: genesis height 0, no peers dialed, has a key.
@@ -1736,6 +3271,30 @@ mod tests {
         assert_eq!(m.height, 0);
         assert!(m.is_validator);
         assert_eq!(m.peers, 0);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn metrics_counters_advance() {
+        // M52: a lone validator (single-validator genesis ⇒ quorum 1) self-commits
+        // empty blocks on the M33 heartbeat, so `blocks_committed` climbs on its
+        // own; a submitted tx bumps `local_txs`. Exercises the actor-owned counter
+        // wiring end-to-end. (The active set comes from genesis, not the peer list,
+        // so we must shrink the genesis validator set — not just the seed peers.)
+        let dir = tmp_dir("metrics-counters");
+        let cfg = node_config(21, 19681, &[21], dir.clone());
+        let mut genesis = test_genesis();
+        genesis.validators = vec![(21, kp(21).public(), 1)];
+        let node = Node::start(cfg, genesis, Some(kp(21))).await.expect("start node");
+
+        node.submit(test_tx(21, 0, 1));
+        // Let the heartbeat drive a couple of block intervals (1000ms each).
+        tokio::time::sleep(Duration::from_millis(2500)).await;
+
+        let m = node.metrics().await.expect("metrics snapshot");
+        assert!(m.blocks_committed >= 1, "expected >=1 committed block, got {}", m.blocks_committed);
+        assert!(m.local_txs >= 1, "expected >=1 local tx, got {}", m.local_txs);
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1772,6 +3331,240 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    #[test]
+    fn parse_content_length_parses_and_caps() {
+        // M53: case-insensitive header lookup; absent/garbage ⇒ None.
+        let h = "POST /submit_tx HTTP/1.1\r\nHost: x\r\nContent-Length: 128\r\n\r\n";
+        assert_eq!(parse_content_length(h), Some(128));
+        let lower = "POST / HTTP/1.1\r\ncontent-length: 7\r\n\r\n";
+        assert_eq!(parse_content_length(lower), Some(7));
+        let none = "GET / HTTP/1.1\r\nHost: x\r\n\r\n";
+        assert_eq!(parse_content_length(none), None);
+        let garbage = "POST / HTTP/1.1\r\nContent-Length: abc\r\n\r\n";
+        assert_eq!(parse_content_length(garbage), None);
+    }
+
+    #[tokio::test]
+    async fn submit_tx_accepts_valid_and_rejects_invalid() {
+        // M53: the Node::submit_tx handle round-trips through the actor and
+        // surfaces the admission result. A single-validator genesis (quorum 1)
+        // keeps the node live; we assert on the mempool, not on a committed block.
+        let dir = tmp_dir("submit-tx-handle");
+        let cfg = node_config(21, 19701, &[21], dir.clone());
+        let mut genesis = test_genesis();
+        genesis.validators = vec![(21, kp(21).public(), 1)];
+        let node = Node::start(cfg, genesis, Some(kp(21))).await.expect("start node");
+
+        let good = test_tx(1, 0, 1);
+        let h = good.hash();
+        let accepted = node.submit_tx(good).await.expect("actor alive");
+        assert_eq!(accepted.expect("valid tx admitted"), h);
+
+        let m = node.metrics().await.expect("metrics");
+        assert!(m.mempool >= 1, "valid tx landed in the mempool, got {}", m.mempool);
+
+        // An unknown-author tx fails validation → Err surfaced to the caller.
+        let bad = test_tx(99, 1, 2);
+        let rejected = node.submit_tx(bad).await.expect("actor alive");
+        assert!(rejected.is_err(), "invalid tx is rejected");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn rpc_endpoint_accepts_tx_over_tcp() {
+        // M53: enable the ingress RPC, POST a codec-encoded tx over TCP, and
+        // assert 200 + hash in the body; then confirm it entered the mempool.
+        // A malformed body gets a 400.
+        let dir = tmp_dir("rpc-endpoint");
+        let mut cfg = node_config(21, 19721, &[21], dir.clone());
+        let rpc_addr = "127.0.0.1:19821";
+        cfg.rpc = Some(crate::config::RpcConfig { enabled: true, listen: rpc_addr.into() });
+        let mut genesis = test_genesis();
+        genesis.validators = vec![(21, kp(21).public(), 1)];
+        let node = Node::start(cfg, genesis, Some(kp(21))).await.expect("start node");
+
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        // Encode a valid tx and POST it.
+        let tx = test_tx(1, 0, 1);
+        let h = tx.hash();
+        let body = crate::codec::encode_tx(&tx);
+        let req = {
+            let mut r = format!(
+                "POST /submit_tx HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            )
+            .into_bytes();
+            r.extend_from_slice(&body);
+            r
+        };
+        let mut stream = TcpStream::connect(rpc_addr).await.expect("connect rpc");
+        stream.write_all(&req).await.expect("send request");
+        let mut resp = Vec::new();
+        stream.read_to_end(&mut resp).await.expect("read response");
+        let text = String::from_utf8_lossy(&resp);
+        assert!(text.starts_with("HTTP/1.1 200 OK"), "expected 200, got: {text}");
+        assert!(text.contains(&crate::hash::hex(&h)), "expected hash in body: {text}");
+
+        let m = node.metrics().await.expect("metrics");
+        assert!(m.mempool >= 1, "tx entered the mempool, got {}", m.mempool);
+
+        // A malformed body (not valid codec) gets a 400.
+        let bad_body = b"not a tx";
+        let bad_req = {
+            let mut r = format!(
+                "POST /submit_tx HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                bad_body.len()
+            )
+            .into_bytes();
+            r.extend_from_slice(bad_body);
+            r
+        };
+        let mut s2 = TcpStream::connect(rpc_addr).await.expect("connect rpc 2");
+        s2.write_all(&bad_req).await.expect("send bad request");
+        let mut resp2 = Vec::new();
+        s2.read_to_end(&mut resp2).await.expect("read response 2");
+        let text2 = String::from_utf8_lossy(&resp2);
+        assert!(text2.starts_with("HTTP/1.1 400"), "expected 400, got: {text2}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn route_get_parses_paths() {
+        // M58: the read-class router. Unknown non-/account paths stay Health (200) so
+        // the endpoint remains a liveness probe; only a bad account id is NotFound.
+        assert!(matches!(route_get("/height"), GetRoute::Height));
+        assert!(matches!(route_get("/head"), GetRoute::Head));
+        assert!(matches!(route_get("/account/7"), GetRoute::Account(7)));
+        assert!(matches!(route_get("/"), GetRoute::Health));
+        assert!(matches!(route_get("/whatever"), GetRoute::Health));
+        assert!(matches!(route_get("/account/notanum"), GetRoute::NotFound));
+    }
+
+    #[test]
+    fn format_account_renders_fields() {
+        // M58: the plain-text account renderer — a stable key=value line incl. hex pubkey.
+        let a = Account {
+            pubkey: [0xab; 32],
+            balance: 12,
+            staked_total: 3,
+            earned_total: 4,
+            slashed_total: 5,
+            submissions: 6,
+            accepted: 7,
+        };
+        assert_eq!(
+            format_account(1, &a),
+            format!(
+                "id=1 balance=12 staked_total=3 earned_total=4 slashed_total=5 \
+                 submissions=6 accepted=7 pubkey={}",
+                crate::hash::hex(&[0xab; 32])
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn rpc_get_returns_reads() {
+        // M58: enable the ingress RPC and exercise the read-class GET routes over real
+        // TCP: /height, /head, /account/{id} (known + unknown), and the "/" health
+        // probe (preserved from the pre-M58 method-only behavior).
+        let dir = tmp_dir("rpc-get");
+        let mut cfg = node_config(21, 19761, &[21], dir.clone());
+        let rpc_addr = "127.0.0.1:19841";
+        cfg.rpc = Some(crate::config::RpcConfig { enabled: true, listen: rpc_addr.into() });
+        let mut genesis = test_genesis();
+        genesis.validators = vec![(21, kp(21).public(), 1)];
+        let _node = Node::start(cfg, genesis, Some(kp(21))).await.expect("start node");
+
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        async fn get(addr: &str, path: &str) -> String {
+            let req = format!("GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
+            let mut s = TcpStream::connect(addr).await.expect("connect rpc");
+            s.write_all(req.as_bytes()).await.expect("send get");
+            let mut resp = Vec::new();
+            s.read_to_end(&mut resp).await.expect("read response");
+            String::from_utf8_lossy(&resp).into_owned()
+        }
+        fn body_of(resp: &str) -> &str {
+            resp.rsplit("\r\n\r\n").next().unwrap_or("")
+        }
+
+        // /height → 200 + a bare integer body.
+        let h = get(rpc_addr, "/height").await;
+        assert!(h.starts_with("HTTP/1.1 200 OK"), "height status: {h}");
+        let body = body_of(&h);
+        assert!(!body.is_empty() && body.chars().all(|c| c.is_ascii_digit()), "height body: {body:?}");
+
+        // /head → 200 + a 64-char hex head hash.
+        let hd = get(rpc_addr, "/head").await;
+        assert!(hd.starts_with("HTTP/1.1 200 OK"), "head status: {hd}");
+        let body = body_of(&hd);
+        assert_eq!(body.len(), 64, "head hex len: {body:?}");
+        assert!(body.chars().all(|c| c.is_ascii_hexdigit()), "head hex: {body:?}");
+
+        // /account/1 → 200 + account fields (genesis account 1 exists).
+        let a = get(rpc_addr, "/account/1").await;
+        assert!(a.starts_with("HTTP/1.1 200 OK"), "account status: {a}");
+        assert!(body_of(&a).contains("balance="), "account body: {a}");
+
+        // /account/<unknown> → 404.
+        let miss = get(rpc_addr, "/account/999999").await;
+        assert!(miss.starts_with("HTTP/1.1 404"), "unknown account: {miss}");
+
+        // "/" → 200 ok (health probe preserved).
+        let root = get(rpc_addr, "/").await;
+        assert!(root.starts_with("HTTP/1.1 200 OK"), "root status: {root}");
+        assert!(body_of(&root).contains("ok"), "root body: {root}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn token_bucket_refills_and_throttles() {
+        // M54: a burst of `burst` tokens is allowed, then requests are denied until
+        // time passes; refill is `rate`/sec and capped at `burst`.
+        let t0 = Instant::now();
+        let (rate, burst) = (1.0, 2.0);
+        let mut b = TokenBucket { tokens: burst, last: t0 };
+        // Two tokens available, both consumed; the third is denied (no time passes).
+        assert!(b.allow(t0, rate, burst));
+        assert!(b.allow(t0, rate, burst));
+        assert!(!b.allow(t0, rate, burst));
+        // After 1s exactly one token refills.
+        let t1 = t0 + Duration::from_secs(1);
+        assert!(b.allow(t1, rate, burst));
+        assert!(!b.allow(t1, rate, burst));
+        // A long idle refills no more than `burst` (not unbounded accrual).
+        let t2 = t1 + Duration::from_secs(100);
+        assert!(b.allow(t2, rate, burst));
+        assert!(b.allow(t2, rate, burst));
+        assert!(!b.allow(t2, rate, burst));
+    }
+
+    #[tokio::test]
+    async fn rpc_submit_reports_mempool_full() {
+        // M54: with `[mempool] capacity = 1`, the first tx is admitted and a second
+        // distinct tx is rejected with MempoolFull, surfaced via Node::submit_tx.
+        // Run as a pure follower (no key) so no block production drains the pool.
+        let dir = tmp_dir("submit-tx-full");
+        let mut cfg = node_config(21, 19741, &[21], dir.clone());
+        cfg.mempool.capacity = 1;
+        let node = Node::start(cfg, test_genesis(), None).await.expect("start node");
+
+        let first = node.submit_tx(test_tx(1, 0, 1)).await.expect("actor alive");
+        assert!(first.is_ok(), "first tx admitted, got {first:?}");
+        let second = node.submit_tx(test_tx(2, 0, 1)).await.expect("actor alive");
+        assert!(
+            matches!(second, Err(crate::ChainError::MempoolFull { capacity: 1 })),
+            "second tx rejected as MempoolFull, got {second:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     // --- integration: peer discovery / address gossip (M39) ---------------------
 
     /// Build a node config with an explicit (partial) peer list, so a test can
@@ -1798,6 +3591,9 @@ mod tests {
                 ..crate::config::NetworkConfig::default()
             },
             metrics: None,
+            rpc: None,
+            logging: None,
+            mempool: crate::config::MempoolConfig::default(),
         }
     }
 
@@ -1946,6 +3742,281 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(500)).await;
         let peers = node.metrics().await.map(|m| m.peers).unwrap_or(99);
         assert_eq!(peers, 0, "impostor without the genesis key must be rejected");
+
+        cleanup(&data_dirs);
+    }
+
+    // --- integration: TLS transport encryption (M41) -----------------------------
+
+    #[tokio::test]
+    async fn tls_mesh_converges() {
+        // Three validators with `enable_tls = true` (auth off). Every P2P link runs
+        // over TLS 1.3; the handshake + framing must work unchanged inside the
+        // tunnel, so consensus proceeds and heads agree (quorum 3-of-4). Proves the
+        // encrypted path is fully functional end-to-end over real sockets.
+        let ids = [22u64, 23, 24];
+        let port_base = 19851u16;
+        let genesis = test_genesis();
+
+        let mut nodes = Vec::new();
+        let mut data_dirs = BTreeMap::new();
+        for &id in &ids {
+            let dir = tmp_dir(&format!("tls-n{id}"));
+            data_dirs.insert(id, dir.clone());
+            let mut cfg = node_config(id, port_base, &ids, dir);
+            cfg.network.enable_tls = true;
+            let node = Node::start(cfg, genesis.clone(), Some(kp(id))).await.expect("start node");
+            nodes.push((id, node));
+        }
+
+        let states = await_converged(&nodes, 2, Duration::from_secs(30)).await;
+        assert!(states.windows(2).all(|w| w[0] == w[1]), "TLS mesh converged");
+
+        cleanup(&data_dirs);
+    }
+
+    #[tokio::test]
+    async fn tls_and_auth_mesh_converges() {
+        // Both layers on: `enable_tls = true` AND `require_peer_auth = true`. The
+        // M40 authenticated handshake runs *inside* the TLS tunnel — encryption and
+        // authentication compose. The mesh must still converge to a shared head.
+        let ids = [22u64, 23, 24];
+        let port_base = 19871u16;
+        let genesis = test_genesis();
+
+        let mut nodes = Vec::new();
+        let mut data_dirs = BTreeMap::new();
+        for &id in &ids {
+            let dir = tmp_dir(&format!("tlsauth-n{id}"));
+            data_dirs.insert(id, dir.clone());
+            let mut cfg = node_config(id, port_base, &ids, dir);
+            cfg.network.enable_tls = true;
+            cfg.network.require_peer_auth = true;
+            let node = Node::start(cfg, genesis.clone(), Some(kp(id))).await.expect("start node");
+            nodes.push((id, node));
+        }
+
+        let states = await_converged(&nodes, 2, Duration::from_secs(30)).await;
+        assert!(states.windows(2).all(|w| w[0] == w[1]), "TLS+auth mesh converged");
+
+        cleanup(&data_dirs);
+    }
+
+    #[tokio::test]
+    async fn plaintext_dialer_rejected_by_tls_node() {
+        // One honest validator with `enable_tls = true`. A raw-TCP dialer (no TLS)
+        // connects and writes plaintext. The server-side TLS handshake can't parse
+        // it as a ClientHello, so the connection never reaches the app handshake and
+        // no peer is registered — the network-wide TLS policy holds.
+        let port_base = 19891u16;
+        let genesis = test_genesis();
+        let dir = tmp_dir("tls-plain-n21");
+        let mut data_dirs = BTreeMap::new();
+        data_dirs.insert(21u64, dir.clone());
+
+        let mut cfg = node_config(21, port_base, &[21], dir);
+        cfg.network.enable_tls = true;
+        let node = Node::start(cfg, genesis.clone(), Some(kp(21))).await.expect("start node");
+
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let addr = format!("127.0.0.1:{port_base}");
+        let mut stream = TcpStream::connect(&addr).await.expect("connect");
+        let _ = stream.set_nodelay(true);
+        // Plaintext bytes (the old cleartext 8-byte id hello) — not a TLS record.
+        let _ = stream.write_all(&21u64.to_be_bytes()).await;
+        let _ = stream.flush().await;
+
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let peers = node.metrics().await.map(|m| m.peers).unwrap_or(99);
+        assert_eq!(peers, 0, "a plaintext dialer must not join a TLS node");
+
+        cleanup(&data_dirs);
+    }
+
+    // --- integration: TLS channel binding (M42) ----------------------------------
+
+    #[tokio::test]
+    async fn channel_bound_mesh_converges() {
+        // All three layers on: `enable_tls` + `require_peer_auth` + `bind_channel`.
+        // Each honest link is a single TLS session, so both ends export the identical
+        // keying material and fold the same 32 bytes into the auth transcript — the
+        // signatures verify and the mesh converges. Proves channel binding doesn't
+        // break honest, directly-connected peers.
+        let ids = [22u64, 23, 24];
+        let port_base = 19911u16;
+        let genesis = test_genesis();
+
+        let mut nodes = Vec::new();
+        let mut data_dirs = BTreeMap::new();
+        for &id in &ids {
+            let dir = tmp_dir(&format!("bind-n{id}"));
+            data_dirs.insert(id, dir.clone());
+            let mut cfg = node_config(id, port_base, &ids, dir);
+            cfg.network.enable_tls = true;
+            cfg.network.require_peer_auth = true;
+            cfg.network.bind_channel = true;
+            let node = Node::start(cfg, genesis.clone(), Some(kp(id))).await.expect("start node");
+            nodes.push((id, node));
+        }
+
+        let states = await_converged(&nodes, 2, Duration::from_secs(30)).await;
+        assert!(states.windows(2).all(|w| w[0] == w[1]), "channel-bound mesh converged");
+
+        cleanup(&data_dirs);
+    }
+
+    #[tokio::test]
+    async fn bind_channel_without_tls_fails_fast() {
+        // Channel binding is meaningless without a TLS channel to bind to and an auth
+        // handshake to bind it into. `Node::start` must refuse the nonsensical combo
+        // rather than emit transcripts no peer can match (mirrors the require_peer_auth
+        // / pubkey fail-fasts).
+        let genesis = test_genesis();
+        let dir = tmp_dir("bind-nofast-n21");
+        let mut data_dirs = BTreeMap::new();
+        data_dirs.insert(21u64, dir.clone());
+
+        // bind_channel on, but enable_tls left off (require_peer_auth also off).
+        let mut cfg = node_config(21, 19931, &[21], dir);
+        cfg.network.bind_channel = true;
+        let err = Node::start(cfg, genesis.clone(), Some(kp(21))).await;
+        assert!(err.is_err(), "bind_channel without enable_tls must fail fast");
+
+        cleanup(&data_dirs);
+    }
+
+    // --- genesis-pinned mTLS (M43) ------------------------------------------------
+
+    #[test]
+    fn ed25519_spki_pkcs8_derivation_matches_genesis_key() {
+        // The TLS credential derived from a genesis seed must round-trip back to the
+        // consensus pubkey: build the signer from PKCS#8(seed), read its SPKI, and
+        // decode it — the 32 key bytes must equal `Keypair::from_seed(seed).public()`.
+        let seed = seed(22);
+        let mut pkcs8 = Vec::new();
+        pkcs8.extend_from_slice(&ED25519_PKCS8_PREFIX);
+        pkcs8.extend_from_slice(&seed);
+        let key_der = rustls::pki_types::PrivatePkcs8KeyDer::from(pkcs8);
+        let signing_key =
+            rustls::crypto::ring::sign::any_eddsa_type(&key_der).expect("ed25519 signer");
+        let spki = signing_key.public_key().expect("spki");
+        assert_eq!(spki.as_ref().len(), ED25519_SPKI_PREFIX.len() + 32);
+        let decoded = spki_to_ed25519(spki.as_ref()).expect("decode spki");
+        assert_eq!(decoded, Keypair::from_seed(seed).public());
+
+        // Malformed SPKIs are rejected rather than mis-sliced.
+        assert!(spki_to_ed25519(&[0u8; 44]).is_none(), "wrong prefix rejected");
+        assert!(spki_to_ed25519(&spki.as_ref()[..40]).is_none(), "wrong length rejected");
+    }
+
+    #[test]
+    fn genesis_pinned_verifier_accepts_only_validators() {
+        use rustls::client::danger::ServerCertVerifier;
+        use rustls::server::danger::ClientCertVerifier;
+
+        // Build an RFC 7250 raw-public-key SPKI (prefix || key) as rustls hands it to
+        // the verifier's `end_entity`.
+        let spki_of = |pk: &PubKey| {
+            let mut v = Vec::with_capacity(44);
+            v.extend_from_slice(&ED25519_SPKI_PREFIX);
+            v.extend_from_slice(pk);
+            rustls::pki_types::CertificateDer::from(v)
+        };
+
+        let members: HashSet<PubKey> = [22u64, 23, 24].iter().map(|&id| kp(id).public()).collect();
+        let v = GenesisPinnedVerifier::new(Arc::new(members));
+
+        let inside = spki_of(&kp(23).public());
+        let outside = spki_of(&kp(99).public());
+        let name = rustls::pki_types::ServerName::try_from("zhixing-node").unwrap();
+        let now = rustls::pki_types::UnixTime::now();
+
+        // An in-set key is admitted as both a server and a client credential.
+        assert!(v.verify_server_cert(&inside, &[], &name, &[], now).is_ok());
+        assert!(v.verify_client_cert(&inside, &[], now).is_ok());
+        // An out-of-set key is rejected by both directions.
+        assert!(v.verify_server_cert(&outside, &[], &name, &[], now).is_err());
+        assert!(v.verify_client_cert(&outside, &[], now).is_err());
+    }
+
+    #[tokio::test]
+    async fn mtls_mesh_converges() {
+        // Three validators with genesis-pinned mTLS on (enable_tls + require_peer_certs
+        // + require_peer_auth). Each node presents its genesis key as its TLS credential
+        // and admits a peer only if the presented key is a genesis validator — mutually.
+        // The honest validators are all in-set, so every link's mTLS handshake succeeds
+        // and the mesh converges to a shared head (quorum 3-of-4).
+        let ids = [22u64, 23, 24];
+        let port_base = 19951u16;
+        let genesis = test_genesis();
+
+        let mut nodes = Vec::new();
+        let mut data_dirs = BTreeMap::new();
+        for &id in &ids {
+            let dir = tmp_dir(&format!("mtls-n{id}"));
+            data_dirs.insert(id, dir.clone());
+            let mut cfg = node_config(id, port_base, &ids, dir);
+            cfg.network.enable_tls = true;
+            cfg.network.require_peer_certs = true;
+            cfg.network.require_peer_auth = true;
+            let node = Node::start(cfg, genesis.clone(), Some(kp(id))).await.expect("start node");
+            nodes.push((id, node));
+        }
+
+        let states = await_converged(&nodes, 2, Duration::from_secs(30)).await;
+        assert!(states.windows(2).all(|w| w[0] == w[1]), "mTLS mesh converged");
+
+        cleanup(&data_dirs);
+    }
+
+    #[tokio::test]
+    async fn tls_only_dialer_rejected_by_mtls_node() {
+        // A node with encryption-only TLS cannot present a genesis raw-key credential,
+        // so an mTLS node must refuse it at the TLS layer — the mTLS node's peer count
+        // stays 0. Node 22 runs mTLS and dials peer 23; node 23 runs encryption-only
+        // TLS. Neither handshake direction can complete (the mTLS side demands a raw-key
+        // credential the plain-TLS side neither presents nor accepts).
+        let port_base = 19971u16;
+        let genesis = test_genesis();
+
+        let dir22 = tmp_dir("mtls-reject-n22");
+        let dir23 = tmp_dir("mtls-reject-n23");
+        let mut data_dirs = BTreeMap::new();
+        data_dirs.insert(22u64, dir22.clone());
+        data_dirs.insert(23u64, dir23.clone());
+
+        let mut cfg22 = node_config(22, port_base, &[22, 23], dir22);
+        cfg22.network.enable_tls = true;
+        cfg22.network.require_peer_certs = true;
+        let node22 =
+            Node::start(cfg22, genesis.clone(), Some(kp(22))).await.expect("start mtls node");
+
+        let mut cfg23 = node_config(23, port_base, &[22, 23], dir23);
+        cfg23.network.enable_tls = true; // encryption-only, no mTLS
+        let _node23 =
+            Node::start(cfg23, genesis.clone(), Some(kp(23))).await.expect("start tls node");
+
+        tokio::time::sleep(Duration::from_millis(800)).await;
+        let peers = node22.metrics().await.map(|m| m.peers).unwrap_or(99);
+        assert_eq!(peers, 0, "a plain-TLS dialer must not join an mTLS node");
+
+        cleanup(&data_dirs);
+    }
+
+    #[tokio::test]
+    async fn require_peer_certs_without_tls_fails_fast() {
+        // mTLS needs a TLS channel to authenticate over; `require_peer_certs` without
+        // `enable_tls` is nonsensical and must be refused at start (mirrors the
+        // bind_channel fail-fast).
+        let genesis = test_genesis();
+        let dir = tmp_dir("mtls-nofast-n21");
+        let mut data_dirs = BTreeMap::new();
+        data_dirs.insert(21u64, dir.clone());
+
+        let mut cfg = node_config(21, 19991, &[21], dir);
+        cfg.network.require_peer_certs = true; // but enable_tls left off
+        let err = Node::start(cfg, genesis.clone(), Some(kp(21))).await;
+        assert!(err.is_err(), "require_peer_certs without enable_tls must fail fast");
 
         cleanup(&data_dirs);
     }

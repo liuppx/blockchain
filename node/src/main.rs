@@ -234,6 +234,8 @@ fn main() {
         "bridge" => cmd_bridge(),
         "redeem" => cmd_redeem(),
         "run" => cmd_run(config_arg(&args)),
+        "submit-tx" => cmd_submit_tx(config_arg(&args), tx_arg(&args)),
+        "encode-tx" => cmd_encode_tx(&args),
         "localnet" => cmd_localnet(),
         "status" => cmd_status(dir_arg(&args)),
         "certs" => cmd_certs(dir_arg(&args)),
@@ -270,6 +272,19 @@ fn config_arg(args: &[String]) -> String {
     exit(2);
 }
 
+/// M53: the `--tx <file>` path holding raw `codec::encode_tx` bytes to submit.
+fn tx_arg(args: &[String]) -> String {
+    let mut i = 0;
+    while i < args.len() {
+        if args[i] == "--tx" && i + 1 < args.len() {
+            return args[i + 1].clone();
+        }
+        i += 1;
+    }
+    eprintln!("this command requires --tx <path> (a file of codec-encoded tx bytes)");
+    exit(2);
+}
+
 fn usage() {
     eprintln!("zhixing reference node");
     eprintln!("  node demo               run an in-memory demo chain");
@@ -294,6 +309,8 @@ fn usage() {
     eprintln!("  node bridge             trustless bridge: chain A locks to chain B, relayer ferries a cert-signed envelope, B's endpoint verifies + credits — no relayer trust");
     eprintln!("  node redeem             consensus-level redeem: B's producer follows A on-chain and mints from a source lock inside its state machine — the mint is BFT-enforced, not off-chain");
     eprintln!("  node run    --config F  run the networked BFT daemon (tokio TCP P2P): load config/genesis/validator key, gossip votes + sync/verify over sockets");
+    eprintln!("  node submit-tx --config F --tx F  submit a codec-encoded tx to a running daemon's [rpc] ingress endpoint; print accepted hash or reject reason");
+    eprintln!("  node encode-tx --key-file F --out F --author N --domain N --stake N --embedding f,..(DIM) --review R:S.. --repl-success N --repl-total N --timestamp-days F [--config F]  author+sign a tx offline into a submit-tx file; print its hash");
     eprintln!("  node localnet           spin up an in-process tokio testnet (4 validators, no sequencer) and show all nodes converge via distributed BFT voting over real sockets");
     eprintln!("  node status --dir DIR   replay the block log and print state");
     eprintln!("  node certs  --dir DIR   persist a certified chain (blocks+certs) and re-verify finality on reload");
@@ -2700,9 +2717,13 @@ use zhixing_node::light::ProofKind;
 /// runtime, and blocks on `daemon::run` until Ctrl-C. `main()` stays sync so the
 /// ~20 in-memory demo commands are unaffected by the async runtime.
 fn cmd_run(config_path: String) {
-    daemon::init_tracing();
+    // M44: load the config first, then install the subscriber from its optional
+    // `[logging]` section (absent ⇒ the M37 default). Config-load errors print via
+    // `fail_msg`/eprintln — not tracing — so no log lines are lost by ordering the
+    // load before the subscriber init.
     let cfg = config::load_node_config(&config_path)
         .unwrap_or_else(|e| fail_msg("load node config", &e));
+    daemon::init_tracing_with(cfg.logging.as_ref());
     let gcfg = config::load_genesis(&cfg.genesis)
         .unwrap_or_else(|e| fail_msg("load genesis", &e));
     let genesis = gcfg.to_genesis().unwrap_or_else(|e| fail_msg("build genesis", &e));
@@ -2722,6 +2743,208 @@ fn cmd_run(config_path: String) {
             fail("daemon", e);
         }
     });
+}
+
+/// M53: submit a transaction to a running daemon's external ingress RPC. The
+/// `--tx` file holds raw `codec::encode_tx` bytes (clients reuse this crate's
+/// codec); we POST them to the `[rpc]` endpoint named in the config and print the
+/// daemon's accept (tx hash) or reject (reason). A one-shot CLI needs no tokio
+/// runtime, so this uses a blocking `std::net::TcpStream`.
+fn cmd_submit_tx(config_path: String, tx_path: String) {
+    use std::io::{Read as _, Write as _};
+
+    let cfg = config::load_node_config(&config_path)
+        .unwrap_or_else(|e| fail_msg("load node config", &e));
+    let rpc = match cfg.rpc.as_ref().filter(|r| r.enabled) {
+        Some(r) => r,
+        None => fail_msg(
+            "submit-tx",
+            &"config has no enabled [rpc] section (set [rpc] enabled = true on the daemon)",
+        ),
+    };
+    let addr = rpc.listen.clone();
+
+    let body = std::fs::read(&tx_path).unwrap_or_else(|e| fail("read tx file", e));
+    // Fail fast on a locally-unparsable tx so the user doesn't blame the server.
+    if let Err(e) = zhixing_node::codec::decode_tx(&body) {
+        fail_msg("decode tx file", &e);
+    }
+
+    let mut stream = std::net::TcpStream::connect(&addr).unwrap_or_else(|e| fail("connect rpc", e));
+    let header = format!(
+        "POST /submit_tx HTTP/1.1\r\nHost: {addr}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        body.len()
+    );
+    stream.write_all(header.as_bytes()).unwrap_or_else(|e| fail("send request", e));
+    stream.write_all(&body).unwrap_or_else(|e| fail("send request", e));
+
+    let mut resp = Vec::new();
+    stream.read_to_end(&mut resp).unwrap_or_else(|e| fail("read response", e));
+    let text = String::from_utf8_lossy(&resp);
+
+    // Split status line + body; the status line's first token after the version
+    // is the numeric code.
+    let status_line = text.lines().next().unwrap_or("");
+    let resp_body = text.split("\r\n\r\n").nth(1).unwrap_or("");
+    let code = status_line.split_whitespace().nth(1).unwrap_or("");
+
+    if code.starts_with('2') {
+        println!("accepted: {}", resp_body.trim());
+    } else {
+        eprintln!("rejected ({status_line}): {}", resp_body.trim());
+        exit(1);
+    }
+}
+
+/// First `--flag value` occurrence, if present.
+fn opt_arg<'a>(args: &'a [String], flag: &str) -> Option<&'a str> {
+    args.windows(2).find(|w| w[0] == flag).map(|w| w[1].as_str())
+}
+
+/// All `--flag value` occurrences, in order — for repeatable flags like `--review`
+/// (the single-value `config_arg`/`tx_arg` only grab the first).
+fn multi_arg<'a>(args: &'a [String], flag: &str) -> Vec<&'a str> {
+    args.windows(2).filter(|w| w[0] == flag).map(|w| w[1].as_str()).collect()
+}
+
+/// A required `--flag value`; missing ⇒ usage error + exit 2 (the encode-tx idiom).
+fn req_arg<'a>(args: &'a [String], flag: &str) -> &'a str {
+    opt_arg(args, flag).unwrap_or_else(|| {
+        eprintln!("encode-tx requires {flag} <value>");
+        exit(2);
+    })
+}
+
+/// A required, parseable `--flag value` (u64/u32/f32); bad value ⇒ exit 2.
+fn parse_arg<T: std::str::FromStr>(args: &[String], flag: &str) -> T {
+    let raw = req_arg(args, flag);
+    raw.parse::<T>().unwrap_or_else(|_| {
+        eprintln!("encode-tx: {flag} value `{raw}` is not valid");
+        exit(2);
+    })
+}
+
+/// Parse a comma-separated embedding of exactly `DIM` f32 components.
+fn parse_embedding(s: &str) -> Result<Emb, String> {
+    let parts: Vec<&str> = s.split(',').map(|p| p.trim()).collect();
+    if parts.len() != DIM {
+        return Err(format!(
+            "embedding needs exactly {DIM} comma-separated values, got {}",
+            parts.len()
+        ));
+    }
+    let mut e = [0.0f32; DIM];
+    for (i, p) in parts.iter().enumerate() {
+        e[i] = p.parse::<f32>().map_err(|_| format!("embedding[{i}] not an f32: `{p}`"))?;
+    }
+    Ok(e)
+}
+
+/// Parse a `<reviewer>:<score>` review pair.
+fn parse_review(s: &str) -> Result<Review, String> {
+    let (r, sc) = s
+        .split_once(':')
+        .ok_or_else(|| format!("review must be <reviewer>:<score>, got `{s}`"))?;
+    let reviewer = r.trim().parse::<u64>().map_err(|_| format!("review reviewer not a u64: `{r}`"))?;
+    let score = sc.trim().parse::<f32>().map_err(|_| format!("review score not an f32: `{sc}`"))?;
+    Ok(Review { reviewer, score })
+}
+
+/// Assemble and ed25519-sign a `SubmissionTx` from its fields and a 32-byte seed.
+/// The one pure function the encode-tx unit tests pin on.
+#[allow(clippy::too_many_arguments)]
+fn build_signed_tx(
+    seed: [u8; 32],
+    author: u64,
+    embedding: Emb,
+    domain: u32,
+    stake: u64,
+    reviews: Vec<Review>,
+    repl_success: u32,
+    repl_total: u32,
+    timestamp_days: f32,
+) -> SubmissionTx {
+    SubmissionTx {
+        author,
+        embedding,
+        domain,
+        stake,
+        reviews,
+        repl_success,
+        repl_total,
+        timestamp_days,
+        signature: [0u8; 64],
+    }
+    .signed(&Keypair::from_seed(seed))
+}
+
+/// M56: author a transaction offline — the producer side of M53's `submit-tx`.
+/// Assemble a `SubmissionTx` from flags, sign it with the ed25519 seed in
+/// `--key-file` (64-char hex, the same format as a validator's `seed_hex`), and
+/// write the raw `codec::encode_tx` bytes to `--out`. With `--config`, cross-check
+/// the derived pubkey against the author's genesis entry so a key/author mismatch
+/// fails here (not later as a server `422 BadSignature`). Full `validate_tx`
+/// (reviewers known, balance ≥ stake) still runs at submit/apply time. One-shot, so
+/// no tokio runtime.
+fn cmd_encode_tx(args: &[String]) {
+    let key_path = req_arg(args, "--key-file");
+    let out_path = req_arg(args, "--out");
+    let author: u64 = parse_arg(args, "--author");
+    let domain: u32 = parse_arg(args, "--domain");
+    let stake: u64 = parse_arg(args, "--stake");
+    let repl_success: u32 = parse_arg(args, "--repl-success");
+    let repl_total: u32 = parse_arg(args, "--repl-total");
+    let timestamp_days: f32 = parse_arg(args, "--timestamp-days");
+
+    let embedding =
+        parse_embedding(req_arg(args, "--embedding")).unwrap_or_else(|e| fail_msg("encode-tx embedding", &e));
+
+    let review_args = multi_arg(args, "--review");
+    if review_args.is_empty() {
+        fail_msg("encode-tx", &"at least one --review <reviewer>:<score> is required");
+    }
+    let reviews: Vec<Review> = review_args
+        .iter()
+        .map(|r| parse_review(r).unwrap_or_else(|e| fail_msg("encode-tx review", &e)))
+        .collect();
+
+    // --key-file holds a 64-char hex seed (a trailing newline is tolerated via
+    // `trim`); reuse config::decode_seed for identical parsing + BadHex errors.
+    let key_hex = std::fs::read_to_string(key_path).unwrap_or_else(|e| fail("read key file", e));
+    let seed = config::decode_seed(key_hex.trim(), "--key-file")
+        .unwrap_or_else(|e| fail_msg("decode key seed", &e));
+    let kp = Keypair::from_seed(seed);
+
+    // Optional guardrail: the derived pubkey must match the author's genesis entry.
+    if let Some(cfg_path) = opt_arg(args, "--config") {
+        let cfg = config::load_node_config(cfg_path).unwrap_or_else(|e| fail_msg("load node config", &e));
+        let gcfg = config::load_genesis(&cfg.genesis).unwrap_or_else(|e| fail_msg("load genesis", &e));
+        let genesis = gcfg.to_genesis().unwrap_or_else(|e| fail_msg("build genesis", &e));
+        match genesis.accounts.iter().find(|(id, _, _)| *id == author) {
+            Some((_, _, pk)) if *pk == kp.public() => {}
+            Some(_) => fail_msg(
+                "author key",
+                &format!("--key-file pubkey does not match genesis account {author}"),
+            ),
+            None => fail_msg("author key", &format!("author {author} is not a genesis account")),
+        }
+    }
+
+    let tx = build_signed_tx(
+        seed, author, embedding, domain, stake, reviews, repl_success, repl_total, timestamp_days,
+    );
+
+    // Self-check the encoding round-trips (the same guard submit-tx applies to its
+    // input) so a malformed tx is caught here, before anyone tries to submit it.
+    let bytes = zhixing_node::codec::encode_tx(&tx);
+    if let Err(e) = zhixing_node::codec::decode_tx(&bytes) {
+        fail_msg("encode-tx self-check", &e);
+    }
+
+    std::fs::write(out_path, &bytes).unwrap_or_else(|e| fail("write tx file", e));
+    println!("encoded {}", hex(&tx.hash()));
+    println!("bytes {}", bytes.len());
+    println!("out {out_path}");
 }
 
 /// End-to-end showcase on the production path: launch a small tokio testnet
@@ -2760,6 +2983,9 @@ fn cmd_localnet() {
             consensus: crate::config::ConsensusConfig::default(),
             network: crate::config::NetworkConfig::default(),
             metrics: None,
+            rpc: None,
+            logging: None,
+            mempool: crate::config::MempoolConfig::default(),
         }
     };
 
@@ -3031,4 +3257,92 @@ fn committed_sets(g: &Genesis, blocks: &[Block]) -> Vec<ValidatorSet> {
         sets.push(replay.state.validators.clone());
     }
     sets
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn seed_for(id: u64) -> [u8; 32] {
+        let mut s = [0u8; 32];
+        s[..8].copy_from_slice(&id.to_le_bytes());
+        s
+    }
+
+    fn sample_tx() -> SubmissionTx {
+        build_signed_tx(
+            seed_for(1),
+            1,
+            unit(1),
+            1,
+            2 * MICRO,
+            reviews(&[(10, 0.9), (11, 0.85), (12, 0.9)]),
+            3,
+            3,
+            1.0,
+        )
+    }
+
+    #[test]
+    fn encode_tx_round_trips() {
+        // SubmissionTx has no PartialEq (f32 fields); assert decode∘encode is
+        // faithful by re-encoding the decoded tx to the same bytes.
+        let tx = sample_tx();
+        let bytes = zhixing_node::codec::encode_tx(&tx);
+        let back = zhixing_node::codec::decode_tx(&bytes).expect("decode");
+        assert_eq!(bytes, zhixing_node::codec::encode_tx(&back));
+    }
+
+    #[test]
+    fn encode_tx_signature_valid() {
+        let tx = sample_tx();
+        let pk = Keypair::from_seed(seed_for(1)).public();
+        let msg = zhixing_node::codec::tx_signing_bytes(&tx);
+        assert!(zhixing_node::crypto::verify(&pk, &msg, &tx.signature));
+    }
+
+    #[test]
+    fn encode_tx_hash_is_stable() {
+        // Deterministic: same inputs ⇒ same content hash (no RNG in signing).
+        assert_eq!(sample_tx().hash(), sample_tx().hash());
+    }
+
+    #[test]
+    fn parse_embedding_accepts_exactly_dim() {
+        let e = parse_embedding("1,0,0,0,0,0,0,0").expect("parse");
+        assert_eq!(e[0], 1.0);
+        assert_eq!(e[7], 0.0);
+    }
+
+    #[test]
+    fn parse_embedding_rejects_wrong_arity() {
+        assert!(parse_embedding("1,0,0").is_err());
+    }
+
+    #[test]
+    fn parse_embedding_rejects_non_float() {
+        assert!(parse_embedding("1,0,x,0,0,0,0,0").is_err());
+    }
+
+    #[test]
+    fn parse_review_ok() {
+        let r = parse_review("10:0.9").expect("parse");
+        assert_eq!(r.reviewer, 10);
+        assert_eq!(r.score, 0.9);
+    }
+
+    #[test]
+    fn parse_review_rejects_bad_format() {
+        assert!(parse_review("10-0.9").is_err()); // no colon
+        assert!(parse_review("x:0.9").is_err()); // non-u64 reviewer
+    }
+
+    #[test]
+    fn multi_arg_collects_all_occurrences() {
+        let args: Vec<String> = ["node", "encode-tx", "--review", "10:0.9", "--review", "11:0.8"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert_eq!(multi_arg(&args, "--review"), vec!["10:0.9", "11:0.8"]);
+    }
 }

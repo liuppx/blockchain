@@ -233,6 +233,67 @@ pub const TAG_PEERS: u8 = 17;
 /// `serve_*` helper as today.
 pub const MAX_BATCH_ITEMS: usize = 32;
 
+/// M55: a flood-dedup hash set bounded to its `capacity` most-recent entries.
+/// Unlike the mempool's *reject-at-bound* policy (M54), a dedup set must keep
+/// accepting new hashes to suppress floods, so it evicts the **oldest** entry
+/// (FIFO) once full. Eviction only risks a bounded re-flood of a long-silent
+/// item (it is treated as new once, re-admitted-or-dropped by state validation,
+/// and re-broadcast once) — never a consensus-safety or replay violation, since
+/// admission is independently gated by `validate_tx` in `Mempool::insert`.
+///
+/// `capacity == usize::MAX` ⇒ unbounded (the default): the FIFO `order` deque is
+/// never touched, so behavior is byte-for-byte identical to a plain `BTreeSet`.
+struct SeenSet {
+    set: BTreeSet<Hash>,
+    /// Insertion order for FIFO eviction; only maintained when bounded.
+    order: VecDeque<Hash>,
+    capacity: usize,
+}
+
+impl SeenSet {
+    fn new() -> Self {
+        SeenSet {
+            set: BTreeSet::new(),
+            order: VecDeque::new(),
+            capacity: usize::MAX,
+        }
+    }
+
+    /// Set the per-set bound (`usize::MAX` ⇒ unbounded). Trims immediately if
+    /// already over — at startup the set is empty so this is normally a no-op.
+    fn set_capacity(&mut self, capacity: usize) {
+        self.capacity = capacity;
+        while self.capacity != usize::MAX && self.order.len() > self.capacity {
+            if let Some(old) = self.order.pop_front() {
+                self.set.remove(&old);
+            }
+        }
+    }
+
+    /// Mirrors `BTreeSet::insert`: returns `true` iff the hash was newly
+    /// inserted. Evicts the oldest entry (FIFO) once over capacity.
+    fn insert(&mut self, h: Hash) -> bool {
+        let is_new = self.set.insert(h);
+        if is_new && self.capacity != usize::MAX {
+            self.order.push_back(h);
+            while self.order.len() > self.capacity {
+                if let Some(old) = self.order.pop_front() {
+                    self.set.remove(&old);
+                }
+            }
+        }
+        is_new
+    }
+
+    fn len(&self) -> usize {
+        self.set.len()
+    }
+
+    fn capacity(&self) -> usize {
+        self.capacity
+    }
+}
+
 /// One peer: a chain, a mempool, the retained certified chain (blocks paired with
 /// certificates, for serving sync), and the gossip bookkeeping. Its [`on_message`]
 /// is a pure state machine — it performs no I/O and returns the messages to send,
@@ -254,12 +315,13 @@ pub struct GossipNode {
     /// `i+1`. Kept so this node can answer a peer's `GetBlocks`.
     blocks: Vec<Block>,
     certs: Vec<Commit>,
-    /// Content hashes of transactions already seen — makes gossip flooding idempotent.
-    seen_tx: BTreeSet<Hash>,
+    /// Content hashes of transactions already seen — makes gossip flooding
+    /// idempotent. M55: bounded (FIFO-evicting) via [`SeenSet`].
+    seen_tx: SeenSet,
     /// Content hashes of equivocation evidence already seen — dedup for `Evidence`.
-    seen_evidence: BTreeSet<Hash>,
+    seen_evidence: SeenSet,
     /// Content hashes of stake ops already seen — dedup for `StakeOp`.
-    seen_stake_op: BTreeSet<Hash>,
+    seen_stake_op: SeenSet,
     /// Evidence staged to be carried by the next block this node proposes
     /// (drained by the driver via [`Self::take_pending_evidence`]).
     pending_evidence: Vec<SlashEvidence>,
@@ -279,9 +341,9 @@ impl GossipNode {
             mempool: Mempool::new(max_txs),
             blocks: Vec::new(),
             certs: Vec::new(),
-            seen_tx: BTreeSet::new(),
-            seen_evidence: BTreeSet::new(),
-            seen_stake_op: BTreeSet::new(),
+            seen_tx: SeenSet::new(),
+            seen_evidence: SeenSet::new(),
+            seen_stake_op: SeenSet::new(),
             pending_evidence: Vec::new(),
             pending_stake_ops: Vec::new(),
             peers: peers.into_iter().filter(|&p| p != id).collect(),
@@ -864,12 +926,55 @@ impl GossipNode {
     /// the gossip to flood it to peers. A tx that fails static validation is
     /// dropped (empty result).
     pub fn submit_local(&mut self, tx: SubmissionTx) -> Vec<(u64, GossipMsg)> {
+        self.submit_local_checked(tx).map(|(_, out)| out).unwrap_or_default()
+    }
+
+    /// M54: bound the pending mempool (DoS hardening). `usize::MAX` ⇒ unbounded.
+    /// Admission past the bound is rejected with `ChainError::MempoolFull`.
+    pub fn set_mempool_capacity(&mut self, capacity: usize) {
+        self.mempool.set_capacity(capacity);
+    }
+
+    /// M57: bound how many pending txs a single account (`author`) may hold at once
+    /// (DoS hardening — stops one account from monopolizing the pool). `usize::MAX`
+    /// ⇒ unbounded. Admission past it is rejected with `ChainError::AccountQuotaFull`.
+    pub fn set_mempool_per_account_limit(&mut self, limit: usize) {
+        self.mempool.set_per_account_limit(limit);
+    }
+
+    /// M55: bound each gossip dedup set (`seen_tx`/`seen_evidence`/`seen_stake_op`)
+    /// to `capacity` most-recent entries (FIFO eviction). `usize::MAX` ⇒ unbounded
+    /// (the default). The three sets are bounded independently to the same value.
+    pub fn set_seen_capacity(&mut self, capacity: usize) {
+        self.seen_tx.set_capacity(capacity);
+        self.seen_evidence.set_capacity(capacity);
+        self.seen_stake_op.set_capacity(capacity);
+    }
+
+    /// M55: current number of entries in the tx dedup set (the one under flood
+    /// pressure) — surfaced as a metrics gauge.
+    pub fn seen_tx_len(&self) -> usize {
+        self.seen_tx.len()
+    }
+
+    /// M55: the configured tx dedup-set bound (`usize::MAX` ⇒ unbounded).
+    pub fn seen_tx_capacity(&self) -> usize {
+        self.seen_tx.capacity()
+    }
+
+    /// M53: like [`submit_local`](Self::submit_local) but surfaces the mempool's
+    /// rejection reason instead of swallowing it — used by the external ingress
+    /// RPC to report accept (with the tx hash) or reject (with a `ChainError`).
+    /// Ordering matches `submit_local` verbatim: the tx is marked seen even when
+    /// admission fails, so a rejected tx is not re-requested from peers.
+    pub fn submit_local_checked(
+        &mut self,
+        tx: SubmissionTx,
+    ) -> Result<(Hash, Vec<(u64, GossipMsg)>), crate::ChainError> {
         let h = tx.hash();
         self.seen_tx.insert(h);
-        if self.mempool.insert(&self.chain, tx.clone()).is_err() {
-            return Vec::new();
-        }
-        self.broadcast(GossipMsg::Tx(tx), None)
+        let hash = self.mempool.insert(&self.chain, tx.clone())?;
+        Ok((hash, self.broadcast(GossipMsg::Tx(tx), None)))
     }
 
     /// Submit a locally-originated piece of equivocation evidence: stage it
@@ -2655,6 +2760,31 @@ mod tests {
     }
 
     #[test]
+    fn submit_local_checked_surfaces_reject() {
+        // M53: the checked variant returns the tx hash on admission and the
+        // ChainError on rejection, while plain submit_local stays byte-identical
+        // (empty vec on that same reject, marked seen either way).
+        let mut node = GossipNode::new(1, genesis(), 16, [1, 2]);
+
+        let good = tx(1, 1, 1);
+        let h = good.hash();
+        let (returned, gossip) =
+            node.submit_local_checked(good).expect("valid tx is admitted");
+        assert_eq!(returned, h);
+        assert!(node.mempool.contains(&h), "valid tx landed in the mempool");
+        assert!(!gossip.is_empty(), "admission produces gossip to flood");
+
+        // An unknown-author tx fails validation → the checked variant surfaces it.
+        let bad = tx(99, 2, 2);
+        let bh = bad.hash();
+        assert!(node.submit_local_checked(bad.clone()).is_err(), "reject is surfaced");
+        assert!(!node.mempool.contains(&bh), "rejected tx never entered the mempool");
+
+        // Plain submit_local swallows the same reject (empty vec), byte-identical.
+        assert!(node.submit_local(bad).is_empty(), "submit_local drops the reject");
+    }
+
+    #[test]
     fn a_duplicate_tx_does_not_re_flood() {
         let ids = [1u64, 2];
         let nodes: Vec<GossipNode> =
@@ -2667,6 +2797,73 @@ mod tests {
         // re-injecting the same tx to node 2 yields no new forwarding
         let again = net.nodes.get_mut(&2).unwrap().on_message(1, GossipMsg::Tx(t));
         assert!(again.is_empty(), "an already-seen tx is not re-gossiped");
+    }
+
+    #[test]
+    fn seen_set_evicts_oldest_at_capacity() {
+        // M55: a bounded SeenSet keeps only its `capacity` most-recent entries,
+        // evicting the oldest (FIFO). Re-inserting an evicted hash reports it as
+        // new again; a still-present hash reports as a duplicate.
+        let mut s = SeenSet::new();
+        s.set_capacity(2);
+        let (a, b, c) = ([1u8; 32], [2u8; 32], [3u8; 32]);
+        assert!(s.insert(a));
+        assert!(s.insert(b));
+        assert!(s.insert(c)); // evicts a (oldest)
+        assert_eq!(s.len(), 2);
+        assert!(!s.insert(c), "newest still present ⇒ duplicate");
+        assert!(!s.insert(b), "b still present ⇒ duplicate");
+        assert!(s.insert(a), "a was evicted ⇒ treated as new again");
+        assert_eq!(s.len(), 2); // inserting a evicted b
+    }
+
+    #[test]
+    fn seen_set_unbounded_by_default() {
+        // Default capacity is usize::MAX ⇒ nothing is ever evicted and the FIFO
+        // order deque stays empty (byte-identical to a plain BTreeSet).
+        let mut s = SeenSet::new();
+        assert_eq!(s.capacity(), usize::MAX);
+        for i in 0..1000u32 {
+            let mut h = [0u8; 32];
+            h[..4].copy_from_slice(&i.to_le_bytes());
+            assert!(s.insert(h));
+        }
+        assert_eq!(s.len(), 1000);
+        assert!(s.order.is_empty(), "unbounded mode never tracks order");
+    }
+
+    #[test]
+    fn seen_set_set_capacity_trims_when_over() {
+        // Lowering the bound below the current size evicts oldest down to it.
+        let mut s = SeenSet::new();
+        s.set_capacity(10);
+        for i in 0..3u8 {
+            s.insert([i; 32]);
+        }
+        assert_eq!(s.len(), 3);
+        s.set_capacity(1);
+        assert_eq!(s.len(), 1, "trimmed down to the new bound");
+        assert!(s.insert([0u8; 32]), "the two older entries were evicted");
+    }
+
+    #[test]
+    fn bounded_seen_tx_reaccepts_evicted_flood() {
+        // M55: once a tx hash is evicted from the bounded seen_tx set, the same tx
+        // arriving again via gossip is treated as new and re-floods (contrast with
+        // `a_duplicate_tx_does_not_re_flood`). Bounded re-flood is the accepted cost
+        // of bounding; it is never a consensus-safety issue.
+        let mut node = GossipNode::new(1, genesis(), 16, [1, 2, 3]);
+        node.set_seen_capacity(1);
+
+        let a = tx(1, 1, 1);
+        let b = tx(2, 2, 2);
+        node.submit_local_checked(a.clone()).expect("A admitted");
+        // Submitting B marks B seen and evicts A's hash from the size-1 seen set.
+        node.submit_local_checked(b).expect("B admitted");
+
+        // A arrives again from peer 2: no longer "seen" ⇒ re-flooded to the others.
+        let out = node.on_message(2, GossipMsg::Tx(a));
+        assert!(!out.is_empty(), "an evicted tx re-floods when it reappears");
     }
 
     #[test]
