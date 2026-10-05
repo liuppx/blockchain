@@ -61,12 +61,15 @@ use tokio::sync::{mpsc, oneshot};
 use tokio_rustls::{rustls, TlsAcceptor, TlsConnector};
 use tracing::{debug, error, info, warn};
 
+use crate::codec::CertifiedHeader;
 use crate::config::{ConfigError, NodeConfig};
+use crate::consensus::Commit;
 use crate::crypto::verify;
+use crate::light::{BatchItem, BatchResponseEnvelope, ProofEntry, ProofKind};
 use crate::net::{decode_gossip, encode_gossip, GossipMsg, GossipNode};
 use crate::round::{Action, Msg, RoundState, Step};
 use crate::store::{BlockLog, CertLog};
-use crate::{Account, Genesis, Hash, Keypair, PubKey, SlashEvidence, SubmissionTx};
+use crate::{Account, Block, Genesis, Hash, Keypair, PubKey, SlashEvidence, SubmissionTx};
 
 /// Hard cap on a single wire frame (16 MiB). The blocking `read_msg` has no cap
 /// (a hostile `u32` length would allocate up to 4 GiB); a real transport must.
@@ -378,6 +381,41 @@ enum Cmd {
         id: u64,
         reply: oneshot::Sender<Option<Account>>,
     },
+    /// M59: read one account's inclusion proof + the certified head it verifies
+    /// against, for the verifiable read-class RPC. `None` ⇒ unknown id or no
+    /// certified head yet (height 0).
+    QueryAccountProof {
+        id: u64,
+        reply: oneshot::Sender<Option<(CertifiedHeader, ProofEntry)>>,
+    },
+    /// M60: read any `ProofKind`'s inclusion proof + the certified head it verifies
+    /// against (reviewer/validator/graph node), for the verifiable read-class RPC.
+    /// `None` ⇒ unknown id/index or no certified head yet (height 0).
+    QueryInclusion {
+        kind: ProofKind,
+        id: u64,
+        reply: oneshot::Sender<Option<(CertifiedHeader, ProofEntry)>>,
+    },
+    /// M63: read one bridge lock's self-contained `LockEnvelope` (header + cert +
+    /// tracked set + lock + proof), for the verifiable read-class RPC. `None` ⇒
+    /// unknown lock id.
+    QueryLock {
+        lock_id: u64,
+        reply: oneshot::Sender<Option<crate::bridge::LockEnvelope>>,
+    },
+    /// M64: list all bridge locks (id + height + fields) for the plain read-class RPC
+    /// directory. Always a (possibly empty) list — an empty chain is a valid `200`.
+    QueryLocks {
+        reply: oneshot::Sender<crate::light::LockListing>,
+    },
+    /// M61: serve a heterogeneous proof batch + the certified head it verifies
+    /// against, for the verifiable batch read RPC. `None` ⇒ `serve_batch` rejected
+    /// (over `MAX_BATCH_ITEMS` or a degenerate Diff range) or no certified head
+    /// yet (height 0).
+    QueryBatch {
+        items: Vec<BatchItem>,
+        reply: oneshot::Sender<Option<crate::light::BatchReply>>,
+    },
     /// M38: read a richer runtime snapshot for the metrics/health endpoint.
     Metrics(oneshot::Sender<Metrics>),
 }
@@ -478,6 +516,62 @@ impl Node {
     pub async fn account(&self, id: u64) -> Option<Option<Account>> {
         let (reply, rx) = oneshot::channel();
         self.cmd.send(Cmd::QueryAccount { id, reply }).ok()?;
+        rx.await.ok()
+    }
+
+    /// M59: read one account's inclusion proof + the certified head it verifies
+    /// against, via the verifiable read-class query path. Outer `None` ⇒ actor
+    /// stopped; inner `None` ⇒ unknown account or no certified head yet.
+    pub async fn account_proof(
+        &self,
+        id: u64,
+    ) -> Option<Option<(CertifiedHeader, ProofEntry)>> {
+        let (reply, rx) = oneshot::channel();
+        self.cmd.send(Cmd::QueryAccountProof { id, reply }).ok()?;
+        rx.await.ok()
+    }
+
+    /// M60: read any `ProofKind`'s inclusion proof + the certified head it verifies
+    /// against (reviewer/validator/graph node), generalizing M59's `account_proof`.
+    /// Outer `None` ⇒ actor stopped; inner `None` ⇒ unknown id/index or no cert head.
+    pub async fn proof(
+        &self,
+        kind: ProofKind,
+        id: u64,
+    ) -> Option<Option<(CertifiedHeader, ProofEntry)>> {
+        let (reply, rx) = oneshot::channel();
+        self.cmd.send(Cmd::QueryInclusion { kind, id, reply }).ok()?;
+        rx.await.ok()
+    }
+
+    /// M63: read one bridge lock's self-contained `LockEnvelope`, via the
+    /// verifiable read-class query path. Outer `None` ⇒ actor stopped; inner
+    /// `None` ⇒ unknown lock id.
+    pub async fn lock_proof(&self, lock_id: u64) -> Option<Option<crate::bridge::LockEnvelope>> {
+        let (reply, rx) = oneshot::channel();
+        self.cmd.send(Cmd::QueryLock { lock_id, reply }).ok()?;
+        rx.await.ok()
+    }
+
+    /// M64: list every bridge lock on the chain (id + height + fields), via the plain
+    /// read-class query path. `None` ⇒ actor stopped; the inner list may be empty.
+    pub async fn lock_listing(&self) -> Option<crate::light::LockListing> {
+        let (reply, rx) = oneshot::channel();
+        self.cmd.send(Cmd::QueryLocks { reply }).ok()?;
+        rx.await.ok()
+    }
+
+    /// M61: serve a heterogeneous proof batch + the certified head it verifies
+    /// against, for the verifiable batch read RPC — the RPC analogue of the gossip
+    /// GetBatch path. Outer `None` ⇒ actor stopped; inner `None` ⇒ `serve_batch`
+    /// rejected (over cap / degenerate Diff range) or no cert head yet. M62: the
+    /// third tuple element is the `[1..=max_h2]` block range Diff slots replay.
+    pub async fn batch_proof(
+        &self,
+        items: Vec<BatchItem>,
+    ) -> Option<Option<crate::light::BatchReply>> {
+        let (reply, rx) = oneshot::channel();
+        self.cmd.send(Cmd::QueryBatch { items, reply }).ok()?;
         rx.await.ok()
     }
 }
@@ -926,6 +1020,21 @@ async fn run_actor(mut actor: Actor, mut rx: mpsc::UnboundedReceiver<Cmd>) {
             }
             Cmd::QueryAccount { id, reply } => {
                 let _ = reply.send(actor.node.chain.state.accounts.get(&id).cloned());
+            }
+            Cmd::QueryAccountProof { id, reply } => {
+                let _ = reply.send(actor.node.account_inclusion(id));
+            }
+            Cmd::QueryInclusion { kind, id, reply } => {
+                let _ = reply.send(actor.node.inclusion(kind, id));
+            }
+            Cmd::QueryLock { lock_id, reply } => {
+                let _ = reply.send(actor.node.serve_lock(lock_id));
+            }
+            Cmd::QueryLocks { reply } => {
+                let _ = reply.send(actor.node.lock_listing());
+            }
+            Cmd::QueryBatch { items, reply } => {
+                let _ = reply.send(actor.node.batch(items));
             }
             Cmd::Metrics(reply) => {
                 let _ = reply.send(Metrics {
@@ -1663,6 +1772,17 @@ enum GetRoute {
     Height,
     Head,
     Account(u64),
+    /// M59: `GET /account/{id}/proof` — a verifiable read (header + cert + proof).
+    AccountProof(u64),
+    /// M60: `GET /{reviewer,validator,graph}/{id}/proof` — verifiable reads for the
+    /// other `ProofKind`s (graph node addressed by insertion index).
+    Proof(ProofKind, u64),
+    /// M63: `GET /bridge/lock/{id}/proof` — the self-contained bridge-lock
+    /// `LockEnvelope` for `lock_id` (header + cert + tracked set + lock + proof).
+    BridgeLock(u64),
+    /// M64: `GET /bridge/locks` — the plain (unverified) directory of every bridge
+    /// lock on the chain (id + height + fields), so a client can discover ids.
+    BridgeLocks,
     NotFound,
 }
 
@@ -1672,10 +1792,63 @@ fn route_get(path: &str) -> GetRoute {
     match path {
         "/height" => GetRoute::Height,
         "/head" => GetRoute::Head,
-        p => match p.strip_prefix("/account/") {
-            Some(id) => id.parse::<u64>().map(GetRoute::Account).unwrap_or(GetRoute::NotFound),
-            None => GetRoute::Health,
-        },
+        // M64: the plain bridge-lock directory. Exact-match here, so it never collides
+        // with the M63 `/bridge/lock/` prefix below (`…lock` + `s`, not `…lock` + `/`).
+        "/bridge/locks" => GetRoute::BridgeLocks,
+        p => {
+            if let Some(rest) = p.strip_prefix("/account/") {
+                // M59: `{id}/proof` is the verifiable read; a bare `{id}` is the M58
+                // plain read. An empty or non-numeric id in either shape ⇒ 404.
+                match rest.strip_suffix("/proof") {
+                    Some(idp) => idp
+                        .parse::<u64>()
+                        .map(GetRoute::AccountProof)
+                        .unwrap_or(GetRoute::NotFound),
+                    None => rest.parse::<u64>().map(GetRoute::Account).unwrap_or(GetRoute::NotFound),
+                }
+            } else if let Some(rest) = p.strip_prefix("/reviewer/") {
+                proof_route(rest, ProofKind::Reviewer)
+            } else if let Some(rest) = p.strip_prefix("/validator/") {
+                proof_route(rest, ProofKind::Validator)
+            } else if let Some(rest) = p.strip_prefix("/graph/") {
+                proof_route(rest, ProofKind::GraphNode)
+            } else if let Some(rest) = p.strip_prefix("/bridge/lock/") {
+                // M63: `{id}/proof` is the only form — a bridge lock has no plain
+                // read, so a bare id (no `/proof`) or a non-numeric id ⇒ 404.
+                match rest.strip_suffix("/proof") {
+                    Some(idp) => idp
+                        .parse::<u64>()
+                        .map(GetRoute::BridgeLock)
+                        .unwrap_or(GetRoute::NotFound),
+                    None => GetRoute::NotFound,
+                }
+            } else {
+                GetRoute::Health
+            }
+        }
+    }
+}
+
+/// M60: parse `/<entity>/{id}/proof` into a verifiable read route; these entities have
+/// no M58 plain-read form, so a bare `{id}` (no `/proof`) or a non-numeric id ⇒ 404.
+fn proof_route(rest: &str, kind: ProofKind) -> GetRoute {
+    match rest.strip_suffix("/proof") {
+        Some(idp) => idp
+            .parse::<u64>()
+            .map(|id| GetRoute::Proof(kind, id))
+            .unwrap_or(GetRoute::NotFound),
+        None => GetRoute::NotFound,
+    }
+}
+
+/// M60: a short human label for a `ProofKind`, used in the `404` body of a verifiable
+/// read (`"<kind> {id} not found"`).
+fn proof_kind_label(k: ProofKind) -> &'static str {
+    match k {
+        ProofKind::Account => "account",
+        ProofKind::Reviewer => "reviewer",
+        ProofKind::Validator => "validator",
+        ProofKind::GraphNode => "graph node",
     }
 }
 
@@ -1692,6 +1865,69 @@ fn format_account(id: u64, a: &Account) -> String {
         a.submissions,
         a.accepted,
         crate::hash::hex(&a.pubkey),
+    )
+}
+
+/// M59: render a verifiable account read as two grep-friendly hex lines — the
+/// certified head (`BlockHeader` + its finality `Commit`) and the account's typed
+/// inclusion `ProofEntry`. A client hex-decodes both, runs `decode_certified_header`
+/// / `decode_proof_entry`, then `ValidatorTracker::verify_proof_against_header`
+/// against its own independently-tracked validator set — so the read is provable
+/// rather than trusted. Pure (no I/O) for direct unit testing.
+fn format_account_proof(ch: &CertifiedHeader, entry: &ProofEntry) -> String {
+    format!(
+        "certified_header={}\nproof_entry={}",
+        crate::hash::hex(&crate::codec::encode_certified_header(ch)),
+        crate::hash::hex(&crate::codec::encode_proof_entry(entry)),
+    )
+}
+
+/// M63: render a verifiable bridge-lock read as one grep-friendly hex line — the
+/// self-contained `LockEnvelope` (header + cert + tracked set + lock + proof). A
+/// client hex-decodes it, runs `decode_lock_envelope`, then follows the source and
+/// `BridgeEndpoint::verify_lock` — no separate certified head is needed because the
+/// envelope bundles its own. Pure (no I/O) for direct unit testing.
+fn format_lock(env: &crate::bridge::LockEnvelope) -> String {
+    format!(
+        "lock_envelope={}",
+        crate::hash::hex(&crate::net::encode_lock_envelope(env)),
+    )
+}
+
+/// M64: render the bridge-lock directory as grep-friendly `key=value` lines, one
+/// per lock (empty string when the chain has no locks). Plain/unverified, like
+/// `format_account` — a client verifies any single lock via the M63 proof route.
+fn format_lock_listing(locks: &[(u64, u64, crate::BridgeLock)]) -> String {
+    locks
+        .iter()
+        .map(|(id, h, l)| {
+            format!(
+                "lock_id={id} height={h} account={} amount={} dest_chain={} dest_account={} nonce={}",
+                l.account,
+                l.amount,
+                crate::hash::hex(&l.dest_chain),
+                l.dest_account,
+                l.nonce,
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// M61: render a verifiable batch read as two grep-friendly hex lines — the
+/// certified head and the encoded `BatchResponseEnvelope`. A client hex-decodes
+/// both, runs `decode_certified_header` / `decode_batch_envelope`, then
+/// `ValidatorTracker::verify_batch` against its own tracked set. Pure (no I/O).
+fn format_batch(
+    ch: &CertifiedHeader,
+    env: &BatchResponseEnvelope,
+    range: &[(Block, Commit)],
+) -> String {
+    format!(
+        "certified_header={}\nbatch_envelope={}\nrange_blocks={}",
+        crate::hash::hex(&crate::codec::encode_certified_header(ch)),
+        crate::hash::hex(&crate::net::encode_batch_envelope(env)),
+        crate::hash::hex(&crate::net::encode_blocks(range)),
     )
 }
 
@@ -1764,6 +2000,67 @@ async fn serve_rpc_conn(mut stream: TcpStream, cmd: mpsc::UnboundedSender<Cmd>) 
                     }
                 }
             }
+            GetRoute::AccountProof(id) => {
+                let (reply, rx) = oneshot::channel();
+                if cmd.send(Cmd::QueryAccountProof { id, reply }).is_err() {
+                    http_response("503 Service Unavailable", "node stopped")
+                } else {
+                    match rx.await {
+                        Ok(Some((ch, entry))) => {
+                            http_response("200 OK", &format_account_proof(&ch, &entry))
+                        }
+                        Ok(None) => http_response("404 Not Found", &format!("account {id} not found")),
+                        Err(_) => http_response("503 Service Unavailable", "node stopped"),
+                    }
+                }
+            }
+            GetRoute::Proof(kind, id) => {
+                // M60: reviewer/validator/graph verifiable read — reuses the
+                // kind-agnostic `format_account_proof` (it hex-encodes the pair).
+                let (reply, rx) = oneshot::channel();
+                if cmd.send(Cmd::QueryInclusion { kind, id, reply }).is_err() {
+                    http_response("503 Service Unavailable", "node stopped")
+                } else {
+                    match rx.await {
+                        Ok(Some((ch, entry))) => {
+                            http_response("200 OK", &format_account_proof(&ch, &entry))
+                        }
+                        Ok(None) => http_response(
+                            "404 Not Found",
+                            &format!("{} {id} not found", proof_kind_label(kind)),
+                        ),
+                        Err(_) => http_response("503 Service Unavailable", "node stopped"),
+                    }
+                }
+            }
+            GetRoute::BridgeLock(id) => {
+                // M63: bridge-lock verifiable read — `serve_lock` returns a
+                // self-contained `LockEnvelope`, so the body is a single hex line.
+                let (reply, rx) = oneshot::channel();
+                if cmd.send(Cmd::QueryLock { lock_id: id, reply }).is_err() {
+                    http_response("503 Service Unavailable", "node stopped")
+                } else {
+                    match rx.await {
+                        Ok(Some(env)) => http_response("200 OK", &format_lock(&env)),
+                        Ok(None) => {
+                            http_response("404 Not Found", &format!("bridge lock {id} not found"))
+                        }
+                        Err(_) => http_response("503 Service Unavailable", "node stopped"),
+                    }
+                }
+            }
+            GetRoute::BridgeLocks => {
+                // M64: plain bridge-lock directory — always a (possibly empty) `200`.
+                let (reply, rx) = oneshot::channel();
+                if cmd.send(Cmd::QueryLocks { reply }).is_err() {
+                    http_response("503 Service Unavailable", "node stopped")
+                } else {
+                    match rx.await {
+                        Ok(listing) => http_response("200 OK", &format_lock_listing(&listing)),
+                        Err(_) => http_response("503 Service Unavailable", "node stopped"),
+                    }
+                }
+            }
             GetRoute::Health => http_response("200 OK", "ok"),
             GetRoute::NotFound => http_response("404 Not Found", "not found"),
         };
@@ -1775,6 +2072,56 @@ async fn serve_rpc_conn(mut stream: TcpStream, cmd: mpsc::UnboundedSender<Cmd>) 
     // Anything that isn't a POST is treated as a health probe.
     if !method.eq_ignore_ascii_case("POST") {
         let _ = stream.write_all(http_response("200 OK", "ok").as_bytes()).await;
+        let _ = stream.flush().await;
+        return;
+    }
+
+    // M61: `POST /batch` is a verifiable batch read — an encoded `Vec<BatchItem>`
+    // body in, the certified head + `BatchResponseEnvelope` out. Any other POST
+    // path stays the M53 tx-submission path verbatim.
+    if path == "/batch" {
+        let Some(len) = parse_content_length(head) else {
+            let _ = stream.write_all(http_response("411 Length Required", "missing content-length").as_bytes()).await;
+            return;
+        };
+        if len > MAX_RPC_BODY {
+            let _ = stream.write_all(http_response("413 Payload Too Large", "batch too large").as_bytes()).await;
+            return;
+        }
+        let mut body: Vec<u8> = acc[header_end..].to_vec();
+        while body.len() < len {
+            match stream.read(&mut buf).await {
+                Ok(0) => break,
+                Ok(n) => body.extend_from_slice(&buf[..n]),
+                Err(_) => return,
+            }
+        }
+        if body.len() < len {
+            let _ = stream.write_all(http_response("400 Bad Request", "truncated body").as_bytes()).await;
+            return;
+        }
+        body.truncate(len);
+
+        let items = match crate::net::decode_batch_request(&body) {
+            Ok(items) => items,
+            Err(e) => {
+                let _ = stream.write_all(http_response("400 Bad Request", &e.to_string()).as_bytes()).await;
+                let _ = stream.flush().await;
+                return;
+            }
+        };
+
+        let (reply, rx) = oneshot::channel();
+        if cmd.send(Cmd::QueryBatch { items, reply }).is_err() {
+            let _ = stream.write_all(http_response("503 Service Unavailable", "node stopped").as_bytes()).await;
+            return;
+        }
+        let resp = match rx.await {
+            Ok(Some((ch, env, range))) => http_response("200 OK", &format_batch(&ch, &env, &range)),
+            Ok(None) => http_response("422 Unprocessable Entity", "batch rejected"),
+            Err(_) => http_response("503 Service Unavailable", "node stopped"),
+        };
+        let _ = stream.write_all(resp.as_bytes()).await;
         let _ = stream.flush().await;
         return;
     }
@@ -3518,6 +3865,700 @@ mod tests {
         let root = get(rpc_addr, "/").await;
         assert!(root.starts_with("HTTP/1.1 200 OK"), "root status: {root}");
         assert!(body_of(&root).contains("ok"), "root body: {root}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn route_get_parses_account_proof() {
+        // M59: `/account/{id}/proof` is the verifiable read; the bare `{id}` stays the
+        // M58 plain read; a bad/empty id in either shape is NotFound (404). The M58
+        // routes are unaffected.
+        assert!(matches!(route_get("/account/7/proof"), GetRoute::AccountProof(7)));
+        assert!(matches!(route_get("/account/7"), GetRoute::Account(7)));
+        assert!(matches!(route_get("/account/notanum/proof"), GetRoute::NotFound));
+        assert!(matches!(route_get("/account//proof"), GetRoute::NotFound));
+        assert!(matches!(route_get("/height"), GetRoute::Height));
+        assert!(matches!(route_get("/"), GetRoute::Health));
+    }
+
+    #[tokio::test]
+    async fn account_inclusion_verifies_end_to_end() {
+        // M59: the verifiable read producer bundles the account's inclusion proof with
+        // the certified head. A client hex/codec-decodes both and checks them with the
+        // existing SPV verifier against its OWN tracked validator set — so the read is
+        // provable, not trusted. Here we round-trip through the wire codec and verify.
+        let dir = tmp_dir("acct-proof-verify");
+        let cfg = node_config(21, 19781, &[21], dir.clone());
+        let mut genesis = test_genesis();
+        genesis.validators = vec![(21, kp(21).public(), 1)]; // quorum 1 ⇒ node self-commits
+        let node = Node::start(cfg, genesis.clone(), Some(kp(21))).await.expect("start node");
+
+        // Wait for at least one certified block (empty-block heartbeat gives a head cert).
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            if node.status().await.map(|(h, _)| h >= 1).unwrap_or(false) {
+                break;
+            }
+            assert!(tokio::time::Instant::now() < deadline, "node never produced a block");
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+
+        // Genesis account 1 → Some((ch, entry)); round-trip through the wire codec, then
+        // verify against the independently-tracked genesis validator set.
+        let (ch, entry) = node
+            .account_proof(1)
+            .await
+            .expect("actor up")
+            .expect("account 1 exists");
+        let ch = crate::codec::decode_certified_header(&crate::codec::encode_certified_header(&ch))
+            .expect("certified header round trip");
+        let entry = crate::codec::decode_proof_entry(&crate::codec::encode_proof_entry(&entry))
+            .expect("proof entry round trip");
+        let tracked = crate::light::ValidatorTracker::from_genesis(&genesis)
+            .validators()
+            .clone();
+        crate::light::ValidatorTracker::verify_proof_against_header(
+            &ch.header, &ch.cert, &tracked, &entry,
+        )
+        .expect("account proof must verify against the tracked genesis set");
+
+        // Unknown account → inner None (no such id in state).
+        assert!(node.account_proof(999999).await.expect("actor up").is_none());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn rpc_account_proof_over_tcp() {
+        // M59: the verifiable read route over real TCP — a known account returns the two
+        // labeled hex lines, an unknown account is 404, and the M58 plain read still works.
+        let dir = tmp_dir("rpc-acct-proof");
+        let mut cfg = node_config(21, 19801, &[21], dir.clone());
+        let rpc_addr = "127.0.0.1:19811";
+        cfg.rpc = Some(crate::config::RpcConfig { enabled: true, listen: rpc_addr.into() });
+        let mut genesis = test_genesis();
+        genesis.validators = vec![(21, kp(21).public(), 1)];
+        let node = Node::start(cfg, genesis, Some(kp(21))).await.expect("start node");
+
+        // Wait for a certified head so the proof route has something to verify against.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            if node.status().await.map(|(h, _)| h >= 1).unwrap_or(false) {
+                break;
+            }
+            assert!(tokio::time::Instant::now() < deadline, "node never produced a block");
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+
+        async fn get(addr: &str, path: &str) -> String {
+            let req = format!("GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
+            let mut s = TcpStream::connect(addr).await.expect("connect rpc");
+            s.write_all(req.as_bytes()).await.expect("send get");
+            let mut resp = Vec::new();
+            s.read_to_end(&mut resp).await.expect("read response");
+            String::from_utf8_lossy(&resp).into_owned()
+        }
+        fn body_of(resp: &str) -> &str {
+            resp.rsplit("\r\n\r\n").next().unwrap_or("")
+        }
+
+        // /account/1/proof → 200 + two labeled hex lines.
+        let p = get(rpc_addr, "/account/1/proof").await;
+        assert!(p.starts_with("HTTP/1.1 200 OK"), "proof status: {p}");
+        let body = body_of(&p);
+        assert!(body.contains("certified_header="), "proof body: {body:?}");
+        assert!(body.contains("proof_entry="), "proof body: {body:?}");
+
+        // /account/<unknown>/proof → 404.
+        let miss = get(rpc_addr, "/account/999999/proof").await;
+        assert!(miss.starts_with("HTTP/1.1 404"), "unknown proof: {miss}");
+
+        // M58 plain read unaffected.
+        let a = get(rpc_addr, "/account/1").await;
+        assert!(a.starts_with("HTTP/1.1 200 OK"), "account status: {a}");
+        assert!(body_of(&a).contains("balance="), "account body: {a}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn lock_proof_formats_and_verifies() {
+        // M63: the `/bridge/lock/{id}/proof` body is the single hex line
+        // `lock_envelope=`. Build a lock-bearing chain via the driver (a running
+        // daemon can't stage a lock — the mempool never carries one), serve it, run
+        // it through the actual `format_lock` formatter, then hex-decode and verify
+        // the envelope at a destination `BridgeEndpoint` — exactly what a stateless
+        // HTTP client would do. Mirrors net.rs `serve_lock_and_lock_envelope_round_trip`.
+        use crate::bridge::BridgeEndpoint;
+        use crate::driver::ChainDriver;
+        use crate::{DeltaKParams, Genesis, MICRO};
+        use std::collections::BTreeMap;
+        fn seed_for(id: u64) -> [u8; 32] {
+            let mut s = [0u8; 32];
+            s[..8].copy_from_slice(&id.to_le_bytes());
+            s
+        }
+        let ga = Genesis {
+            accounts: vec![(1, 50 * MICRO, kp(1).public())],
+            reviewers: vec![],
+            seed_nodes: vec![],
+            params: DeltaKParams::default(),
+            base_emission_micro: 0,
+            slash_bps: 10_000,
+            timestamp_days: 0.0,
+            validators: vec![(21, kp(21).public(), 1)],
+            bridge_sources: vec![],
+        };
+        // Destination chain B (distinct genesis hash via a different timestamp).
+        let mut gb = ga.clone();
+        gb.timestamp_days = 1.0;
+        let b_genesis_hash = crate::ChainState::genesis(gb.clone()).1;
+
+        // Chain A carries one bridge lock destined for B.
+        let seeds: BTreeMap<u64, [u8; 32]> = [(21u64, seed_for(21))].into_iter().collect();
+        let mut d = ChainDriver::new(ga.clone(), seeds, 16);
+        let lock = crate::BridgeLock {
+            account: 1,
+            amount: 4 * MICRO,
+            dest_chain: b_genesis_hash,
+            dest_account: 7,
+            nonce: 0,
+            signature: [0u8; 64],
+        }
+        .signed(&kp(1));
+        d.stage_bridge_lock(lock);
+        d.produce_until_drained(1.0, 16).expect("produce");
+        let mut node = crate::net::GossipNode::new(1, ga.clone(), 16, [2u64]);
+        node.load_certified(d.blocks(), d.certificates());
+        let env = node.serve_lock(0).expect("serve_lock");
+
+        // Format exactly as the RPC handler would, then recover the envelope.
+        let body = format_lock(&env);
+        let hex = body.strip_prefix("lock_envelope=").expect("lock_envelope= prefix");
+        fn unhex(s: &str) -> Vec<u8> {
+            (0..s.len())
+                .step_by(2)
+                .map(|i| u8::from_str_radix(&s[i..i + 2], 16).expect("hex"))
+                .collect()
+        }
+        let env2 = crate::net::decode_lock_envelope(&unhex(hex)).expect("decode envelope");
+
+        // A destination endpoint verifies the self-contained envelope — no extra fetch.
+        let mut endpoint = BridgeEndpoint::new(&gb, &ga);
+        endpoint
+            .follow_source(&env2.source_header, &env2.source_cert, &env2.source_tracked_set)
+            .expect("follow");
+        let verified = endpoint.verify_lock(&env2).expect("verify");
+        assert_eq!(verified.dest_account, 7);
+        assert_eq!(verified.amount, 4 * MICRO);
+    }
+
+    #[tokio::test]
+    async fn rpc_lock_proof_over_tcp() {
+        // M63: the bridge-lock route over real TCP. A live daemon chain carries no
+        // lock (the mempool never stages one), so `serve_lock` returns None ⇒ 404 —
+        // this exercises routing + gating + the 404 path end to end. The verifiable
+        // 200 body is covered in-process by `lock_proof_formats_and_verifies`.
+        let dir = tmp_dir("rpc-lock-proof");
+        let mut cfg = node_config(21, 20071, &[21], dir.clone());
+        let rpc_addr = "127.0.0.1:20081";
+        cfg.rpc = Some(crate::config::RpcConfig { enabled: true, listen: rpc_addr.into() });
+        let mut genesis = test_genesis();
+        genesis.validators = vec![(21, kp(21).public(), 1)];
+        let node = Node::start(cfg, genesis, Some(kp(21))).await.expect("start node");
+
+        // Wait for a certified head (the route is reachable regardless of locks).
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            if node.status().await.map(|(h, _)| h >= 1).unwrap_or(false) {
+                break;
+            }
+            assert!(tokio::time::Instant::now() < deadline, "node never produced a block");
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+
+        async fn get(addr: &str, path: &str) -> String {
+            let req = format!("GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
+            let mut s = TcpStream::connect(addr).await.expect("connect rpc");
+            s.write_all(req.as_bytes()).await.expect("send get");
+            let mut resp = Vec::new();
+            s.read_to_end(&mut resp).await.expect("read response");
+            String::from_utf8_lossy(&resp).into_owned()
+        }
+
+        // No lock on this chain → 404.
+        let miss = get(rpc_addr, "/bridge/lock/0/proof").await;
+        assert!(miss.starts_with("HTTP/1.1 404"), "unknown lock: {miss}");
+        // Bare id (no `/proof`) → 404.
+        let bare = get(rpc_addr, "/bridge/lock/0").await;
+        assert!(bare.starts_with("HTTP/1.1 404"), "bare lock route: {bare}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn rpc_bridge_locks_over_tcp() {
+        // M64: the bridge-lock directory over real TCP. A live daemon chain carries no
+        // lock (the mempool never stages one), so the plain listing is empty — but it
+        // is still a `200` (an empty directory is a valid answer, unlike the M63 proof
+        // route's `404`). This exercises routing + gating + the empty-200 path end to
+        // end; the two-lock listing is covered in-process by `lock_listing_lists_and_formats`.
+        let dir = tmp_dir("rpc-bridge-locks");
+        let mut cfg = node_config(21, 20091, &[21], dir.clone());
+        let rpc_addr = "127.0.0.1:20101";
+        cfg.rpc = Some(crate::config::RpcConfig { enabled: true, listen: rpc_addr.into() });
+        let mut genesis = test_genesis();
+        genesis.validators = vec![(21, kp(21).public(), 1)];
+        let node = Node::start(cfg, genesis, Some(kp(21))).await.expect("start node");
+
+        // Wait for a certified head (the route is reachable regardless of locks).
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            if node.status().await.map(|(h, _)| h >= 1).unwrap_or(false) {
+                break;
+            }
+            assert!(tokio::time::Instant::now() < deadline, "node never produced a block");
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+
+        async fn get(addr: &str, path: &str) -> String {
+            let req = format!("GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
+            let mut s = TcpStream::connect(addr).await.expect("connect rpc");
+            s.write_all(req.as_bytes()).await.expect("send get");
+            let mut resp = Vec::new();
+            s.read_to_end(&mut resp).await.expect("read response");
+            String::from_utf8_lossy(&resp).into_owned()
+        }
+        fn body_of(resp: &str) -> &str {
+            resp.split_once("\r\n\r\n").map(|(_, b)| b).unwrap_or("")
+        }
+
+        // Plain directory on an empty chain → 200 with an empty body (not 404).
+        let resp = get(rpc_addr, "/bridge/locks").await;
+        assert!(resp.starts_with("HTTP/1.1 200 OK"), "bridge locks status: {resp}");
+        assert_eq!(body_of(&resp), "", "empty chain → empty directory body");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn route_get_parses_proof_kinds() {
+        // M60: the three sibling verifiable reads parse to `Proof(kind, id)`; graph is
+        // addressed by insertion index. These entities have no M58 plain-read form, so a
+        // bare `{id}` (no `/proof`) or a non-numeric id is NotFound (404). M59's account
+        // routes and the M58 health fallback are unaffected.
+        assert!(matches!(route_get("/reviewer/10/proof"), GetRoute::Proof(ProofKind::Reviewer, 10)));
+        assert!(matches!(route_get("/validator/21/proof"), GetRoute::Proof(ProofKind::Validator, 21)));
+        assert!(matches!(route_get("/graph/0/proof"), GetRoute::Proof(ProofKind::GraphNode, 0)));
+        assert!(matches!(route_get("/reviewer/x/proof"), GetRoute::NotFound));
+        assert!(matches!(route_get("/validator/21"), GetRoute::NotFound));
+        assert!(matches!(route_get("/graph//proof"), GetRoute::NotFound));
+        // M59 account routes still resolve to their own variants.
+        assert!(matches!(route_get("/account/7/proof"), GetRoute::AccountProof(7)));
+        assert!(matches!(route_get("/account/7"), GetRoute::Account(7)));
+        assert!(matches!(route_get("/"), GetRoute::Health));
+    }
+
+    #[test]
+    fn route_get_parses_bridge_lock() {
+        // M63: `/bridge/lock/{id}/proof` is the only form — a bridge lock has no
+        // plain-read route, so a bare id or a non-numeric id is NotFound (404).
+        assert!(matches!(route_get("/bridge/lock/0/proof"), GetRoute::BridgeLock(0)));
+        assert!(matches!(route_get("/bridge/lock/42/proof"), GetRoute::BridgeLock(42)));
+        assert!(matches!(route_get("/bridge/lock/0"), GetRoute::NotFound));
+        assert!(matches!(route_get("/bridge/lock/abc/proof"), GetRoute::NotFound));
+        assert!(matches!(route_get("/bridge/lock//proof"), GetRoute::NotFound));
+    }
+
+    #[test]
+    fn route_get_parses_bridge_locks() {
+        // M64: `/bridge/locks` is a plain directory read — an exact match, distinct
+        // from the M63 `/bridge/lock/{id}/proof` prefix route (char after `…lock` is
+        // `s`, not `/`). A trailing slash is not the directory, so it falls through to
+        // the M58 health liveness fallback like any unknown path.
+        assert!(matches!(route_get("/bridge/locks"), GetRoute::BridgeLocks));
+        assert!(matches!(route_get("/bridge/locks/"), GetRoute::Health));
+        // M63 single-lock route still resolves to its own variant (no regression).
+        assert!(matches!(route_get("/bridge/lock/0/proof"), GetRoute::BridgeLock(0)));
+        assert!(matches!(route_get("/bridge/lock/0"), GetRoute::NotFound));
+    }
+
+    #[test]
+    fn lock_listing_lists_and_formats() {
+        // M64: a chain carrying two bridge locks enumerates both (id order, with the
+        // right heights/fields), and the formatter emits one `key=value` line each; an
+        // empty chain yields an empty listing and an empty body. Mirrors the net.rs
+        // `sample_lock_envelope` driver setup, but staging two locks.
+        use crate::driver::ChainDriver;
+        use crate::{DeltaKParams, Genesis, MICRO};
+        use std::collections::BTreeMap;
+        let ga = Genesis {
+            accounts: vec![(1, 50 * MICRO, kp(1).public())],
+            reviewers: vec![],
+            seed_nodes: vec![],
+            params: DeltaKParams::default(),
+            base_emission_micro: 0,
+            slash_bps: 10_000,
+            timestamp_days: 0.0,
+            validators: vec![(21, kp(21).public(), 1)],
+            bridge_sources: vec![],
+        };
+        fn seed_for(id: u64) -> [u8; 32] {
+            let mut s = [0u8; 32];
+            s[..8].copy_from_slice(&id.to_le_bytes());
+            s
+        }
+        let seeds: BTreeMap<u64, [u8; 32]> = [(21u64, seed_for(21))].into_iter().collect();
+        let mut d = ChainDriver::new(ga.clone(), seeds, 16);
+        let lock0 = crate::BridgeLock {
+            account: 1,
+            amount: 3 * MICRO,
+            dest_chain: [0xAB; 32],
+            dest_account: 9,
+            nonce: 0,
+            signature: [0u8; 64],
+        }
+        .signed(&kp(1));
+        let lock1 = crate::BridgeLock {
+            account: 1,
+            amount: 5 * MICRO,
+            dest_chain: [0xCD; 32],
+            dest_account: 7,
+            nonce: 1,
+            signature: [0u8; 64],
+        }
+        .signed(&kp(1));
+        d.stage_bridge_lock(lock0.clone());
+        d.stage_bridge_lock(lock1.clone());
+        d.produce_until_drained(1.0, 16).expect("produce");
+        let mut node = crate::net::GossipNode::new(1, ga.clone(), 16, [2u64]);
+        node.load_certified(d.blocks(), d.certificates());
+
+        let listing = node.lock_listing();
+        assert_eq!(listing.len(), 2, "two locks enumerated");
+        assert_eq!(listing[0].0, 0, "first id is 0");
+        assert_eq!(listing[1].0, 1, "second id is 1");
+        assert_eq!(listing[0].2.amount, 3 * MICRO, "lock 0 fields preserved");
+        assert_eq!(listing[1].2.dest_account, 7, "lock 1 fields preserved");
+        assert!(listing[0].1 >= 1 && listing[1].1 >= 1, "heights are real blocks");
+
+        let body = format_lock_listing(&listing);
+        assert!(body.contains("lock_id=0"), "body lists id 0: {body}");
+        assert!(body.contains("lock_id=1"), "body lists id 1: {body}");
+        assert_eq!(body.lines().count(), 2, "one line per lock");
+
+        // Empty chain → empty listing, empty body.
+        let empty = crate::net::GossipNode::new(1, ga, 16, [2u64]);
+        assert!(empty.lock_listing().is_empty(), "no locks → empty listing");
+        assert_eq!(format_lock_listing(&[]), "", "empty listing → empty body");
+    }
+
+    #[tokio::test]
+    async fn inclusion_verifies_all_kinds_end_to_end() {
+        // M60: the generalized verifiable read producer bundles each `ProofKind`'s
+        // inclusion proof with the certified head. For reviewer / validator / graph node,
+        // a client round-trips the pair through the wire codec and checks it with the
+        // existing SPV verifier against its OWN tracked genesis set — validator proofs
+        // route to `next_validators_root`, the others to `accounts_root`. test_genesis
+        // already carries reviewers (10,11,12), a seed graph node (idx 0), and validators.
+        let dir = tmp_dir("inclusion-all-kinds");
+        let cfg = node_config(21, 20011, &[21], dir.clone());
+        let mut genesis = test_genesis();
+        genesis.validators = vec![(21, kp(21).public(), 1)]; // quorum 1 ⇒ node self-commits
+        let node = Node::start(cfg, genesis.clone(), Some(kp(21))).await.expect("start node");
+
+        // Wait for a certified head so each proof has a signed header to verify against.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            if node.status().await.map(|(h, _)| h >= 1).unwrap_or(false) {
+                break;
+            }
+            assert!(tokio::time::Instant::now() < deadline, "node never produced a block");
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+
+        let tracked = crate::light::ValidatorTracker::from_genesis(&genesis)
+            .validators()
+            .clone();
+        for (kind, id) in [
+            (ProofKind::Reviewer, 10u64),
+            (ProofKind::Validator, 21),
+            (ProofKind::GraphNode, 0),
+        ] {
+            let (ch, entry) = node
+                .proof(kind, id)
+                .await
+                .expect("actor up")
+                .unwrap_or_else(|| panic!("{kind:?} {id} should exist in genesis"));
+            // Round-trip through the wire codec, exactly as a remote client would.
+            let ch = crate::codec::decode_certified_header(
+                &crate::codec::encode_certified_header(&ch),
+            )
+            .expect("certified header round trip");
+            let entry = crate::codec::decode_proof_entry(&crate::codec::encode_proof_entry(&entry))
+                .expect("proof entry round trip");
+            crate::light::ValidatorTracker::verify_proof_against_header(
+                &ch.header, &ch.cert, &tracked, &entry,
+            )
+            .unwrap_or_else(|e| panic!("{kind:?} {id} proof must verify: {e:?}"));
+        }
+
+        // Unknown id / index for each kind → inner None.
+        assert!(node.proof(ProofKind::Reviewer, 99).await.expect("actor up").is_none());
+        assert!(node.proof(ProofKind::Validator, 99).await.expect("actor up").is_none());
+        assert!(node.proof(ProofKind::GraphNode, 9999).await.expect("actor up").is_none());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn rpc_other_proofs_over_tcp() {
+        // M60: the reviewer / validator / graph verifiable reads over real TCP — each
+        // known id returns the two labeled hex lines, an unknown id is 404, and a bare
+        // `{id}` without `/proof` (these have no plain-read form) is also 404.
+        let dir = tmp_dir("rpc-other-proofs");
+        let mut cfg = node_config(21, 20031, &[21], dir.clone());
+        let rpc_addr = "127.0.0.1:20051";
+        cfg.rpc = Some(crate::config::RpcConfig { enabled: true, listen: rpc_addr.into() });
+        let mut genesis = test_genesis();
+        genesis.validators = vec![(21, kp(21).public(), 1)];
+        let node = Node::start(cfg, genesis, Some(kp(21))).await.expect("start node");
+
+        // Wait for a certified head so the proof routes have something to verify against.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            if node.status().await.map(|(h, _)| h >= 1).unwrap_or(false) {
+                break;
+            }
+            assert!(tokio::time::Instant::now() < deadline, "node never produced a block");
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+
+        async fn get(addr: &str, path: &str) -> String {
+            let req = format!("GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
+            let mut s = TcpStream::connect(addr).await.expect("connect rpc");
+            s.write_all(req.as_bytes()).await.expect("send get");
+            let mut resp = Vec::new();
+            s.read_to_end(&mut resp).await.expect("read response");
+            String::from_utf8_lossy(&resp).into_owned()
+        }
+        fn body_of(resp: &str) -> &str {
+            resp.rsplit("\r\n\r\n").next().unwrap_or("")
+        }
+
+        // Each known entity → 200 + two labeled hex lines.
+        for path in ["/validator/21/proof", "/reviewer/10/proof", "/graph/0/proof"] {
+            let p = get(rpc_addr, path).await;
+            assert!(p.starts_with("HTTP/1.1 200 OK"), "{path} status: {p}");
+            let body = body_of(&p);
+            assert!(body.contains("certified_header="), "{path} body: {body:?}");
+            assert!(body.contains("proof_entry="), "{path} body: {body:?}");
+        }
+
+        // Unknown id → 404.
+        let miss = get(rpc_addr, "/validator/999/proof").await;
+        assert!(miss.starts_with("HTTP/1.1 404"), "unknown proof: {miss}");
+        // Bare `{id}` (no `/proof`) → 404 (no plain-read form for these entities).
+        let bare = get(rpc_addr, "/validator/21").await;
+        assert!(bare.starts_with("HTTP/1.1 404"), "bare id: {bare}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn batch_serves_and_verifies_end_to_end() {
+        // M61: the batch read producer bundles a heterogeneous proof batch with the
+        // certified head. A client round-trips the certified head + envelope through
+        // the wire codec and checks the whole batch with the existing `verify_batch`
+        // against its OWN tracked genesis set — inclusion (reviewer / validator) +
+        // kNN + range in one shot; validator slots route to `next_validators_root`,
+        // the rest to `accounts_root`. No Diff item ⇒ empty `blocks_in_range`.
+        let dir = tmp_dir("batch-verify");
+        let cfg = node_config(21, 20012, &[21], dir.clone());
+        let mut genesis = test_genesis();
+        genesis.validators = vec![(21, kp(21).public(), 1)]; // quorum 1 ⇒ node self-commits
+        let node = Node::start(cfg, genesis.clone(), Some(kp(21))).await.expect("start node");
+
+        // Wait for a certified head so the batch has a signed header to verify against.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            if node.status().await.map(|(h, _)| h >= 1).unwrap_or(false) {
+                break;
+            }
+            assert!(tokio::time::Instant::now() < deadline, "node never produced a block");
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+
+        let items = vec![
+            BatchItem::Inclusion { kind: ProofKind::Reviewer, id: 10 },
+            BatchItem::Inclusion { kind: ProofKind::Validator, id: 21 },
+            BatchItem::Knn { query: unit(0), k: 1 },
+            BatchItem::Range { query: unit(0), min_sim: 0.0 },
+        ];
+        let (ch, env, range) = node
+            .batch_proof(items.clone())
+            .await
+            .expect("actor up")
+            .expect("batch served");
+        assert_eq!(env.items.len(), items.len(), "one response slot per request item");
+        // M62: no Diff item ⇒ the shipped range is empty.
+        assert!(range.is_empty(), "a Diff-free batch ships no range blocks");
+
+        // Round-trip both halves through the wire codec, exactly as a remote client would.
+        let ch = crate::codec::decode_certified_header(&crate::codec::encode_certified_header(&ch))
+            .expect("certified header round trip");
+        let env = crate::net::decode_batch_envelope(&crate::net::encode_batch_envelope(&env))
+            .expect("batch envelope round trip");
+
+        let tracker = crate::light::ValidatorTracker::from_genesis(&genesis);
+        let tracked = tracker.validators().clone();
+        tracker
+            .verify_batch(&genesis, &ch.header, &ch.cert, &tracked, &[], &items, &env)
+            .expect("batch must verify against the tracked genesis set");
+
+        // An unknown inclusion id yields an inner None slot and still verifies (no-op).
+        let miss_items = vec![BatchItem::Inclusion { kind: ProofKind::Reviewer, id: 99 }];
+        let (ch2, env2, _range2) = node
+            .batch_proof(miss_items.clone())
+            .await
+            .expect("actor up")
+            .expect("batch served");
+        assert!(matches!(env2.items[0], crate::light::BatchResponseItem::Inclusion(None)), "unknown id ⇒ None slot");
+        tracker
+            .verify_batch(&genesis, &ch2.header, &ch2.cert, &tracked, &[], &miss_items, &env2)
+            .expect("a None slot is a verified no-op");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn rpc_batch_over_tcp() {
+        // M61: the verifiable batch read over real TCP — a POST /batch with an encoded
+        // `Vec<BatchItem>` body returns the two labeled hex lines; a garbage body is
+        // 400; and a non-`/batch` POST still routes to the M53 tx-submission path.
+        let dir = tmp_dir("rpc-batch");
+        let mut cfg = node_config(21, 20032, &[21], dir.clone());
+        let rpc_addr = "127.0.0.1:20052";
+        cfg.rpc = Some(crate::config::RpcConfig { enabled: true, listen: rpc_addr.into() });
+        let mut genesis = test_genesis();
+        genesis.validators = vec![(21, kp(21).public(), 1)];
+        let node = Node::start(cfg, genesis, Some(kp(21))).await.expect("start node");
+
+        // Wait for a certified head so the batch route has something to verify against.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            if node.status().await.map(|(h, _)| h >= 1).unwrap_or(false) {
+                break;
+            }
+            assert!(tokio::time::Instant::now() < deadline, "node never produced a block");
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+
+        async fn post(addr: &str, path: &str, body: &[u8]) -> String {
+            let mut req = format!(
+                "POST {path} HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            )
+            .into_bytes();
+            req.extend_from_slice(body);
+            let mut s = TcpStream::connect(addr).await.expect("connect rpc");
+            s.write_all(&req).await.expect("send post");
+            let mut resp = Vec::new();
+            s.read_to_end(&mut resp).await.expect("read response");
+            String::from_utf8_lossy(&resp).into_owned()
+        }
+        fn body_of(resp: &str) -> &str {
+            resp.rsplit("\r\n\r\n").next().unwrap_or("")
+        }
+
+        // POST /batch with a valid encoded request → 200 + two labeled hex lines.
+        let items = vec![
+            BatchItem::Inclusion { kind: ProofKind::Reviewer, id: 10 },
+            BatchItem::Knn { query: unit(0), k: 1 },
+        ];
+        let ok = post(rpc_addr, "/batch", &crate::net::encode_batch_request(&items)).await;
+        assert!(ok.starts_with("HTTP/1.1 200 OK"), "batch status: {ok}");
+        let body = body_of(&ok);
+        assert!(body.contains("certified_header="), "batch body: {body:?}");
+        assert!(body.contains("batch_envelope="), "batch body: {body:?}");
+
+        // Garbage body → 400 (undecodable as a batch request).
+        let bad = post(rpc_addr, "/batch", b"not a batch").await;
+        assert!(bad.starts_with("HTTP/1.1 400"), "garbage batch: {bad}");
+
+        // A non-`/batch` POST still routes to the M53 submit path (undecodable tx → 400,
+        // proving it took the tx branch rather than the batch branch).
+        let submit = post(rpc_addr, "/submit_tx", b"not a tx").await;
+        assert!(submit.starts_with("HTTP/1.1 400"), "submit path status: {submit}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn rpc_batch_diff_over_tcp() {
+        // M62: a POST /batch carrying a Diff item returns a third `range_blocks=`
+        // hex line holding the `[1..=h2]` block range the Diff verifier replays —
+        // so a stateless client can verify the Diff slot without pre-syncing.
+        let dir = tmp_dir("rpc-batch-diff");
+        let mut cfg = node_config(21, 20112, &[21], dir.clone());
+        let rpc_addr = "127.0.0.1:20113";
+        cfg.rpc = Some(crate::config::RpcConfig { enabled: true, listen: rpc_addr.into() });
+        let mut genesis = test_genesis();
+        genesis.validators = vec![(21, kp(21).public(), 1)];
+        let node = Node::start(cfg, genesis, Some(kp(21))).await.expect("start node");
+
+        // Diff{1,2} needs height ≥ 2.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            if node.status().await.map(|(h, _)| h >= 2).unwrap_or(false) {
+                break;
+            }
+            assert!(tokio::time::Instant::now() < deadline, "node never reached height 2");
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+
+        async fn post(addr: &str, path: &str, body: &[u8]) -> String {
+            let mut req = format!(
+                "POST {path} HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            )
+            .into_bytes();
+            req.extend_from_slice(body);
+            let mut s = TcpStream::connect(addr).await.expect("connect rpc");
+            s.write_all(&req).await.expect("send post");
+            let mut resp = Vec::new();
+            s.read_to_end(&mut resp).await.expect("read response");
+            String::from_utf8_lossy(&resp).into_owned()
+        }
+        fn body_of(resp: &str) -> &str {
+            resp.rsplit("\r\n\r\n").next().unwrap_or("")
+        }
+        fn unhex(s: &str) -> Vec<u8> {
+            (0..s.len())
+                .step_by(2)
+                .map(|i| u8::from_str_radix(&s[i..i + 2], 16).expect("hex"))
+                .collect()
+        }
+
+        let items = vec![
+            BatchItem::Diff { h1: 1, h2: 2 },
+            BatchItem::Inclusion { kind: ProofKind::Reviewer, id: 10 },
+        ];
+        let ok = post(rpc_addr, "/batch", &crate::net::encode_batch_request(&items)).await;
+        assert!(ok.starts_with("HTTP/1.1 200 OK"), "batch status: {ok}");
+        let body = body_of(&ok);
+        assert!(body.contains("certified_header="), "batch body: {body:?}");
+        assert!(body.contains("batch_envelope="), "batch body: {body:?}");
+
+        // The new third line carries the `[1..=2]` block range; decode it and confirm
+        // it holds exactly two certified blocks.
+        let range_hex = body
+            .lines()
+            .find_map(|l| l.strip_prefix("range_blocks="))
+            .expect("range_blocks line present");
+        let range = crate::net::decode_blocks(&unhex(range_hex)).expect("decode range blocks");
+        assert_eq!(range.len(), 2, "Diff{{1,2}} ships the full [1..=2] range over RPC");
 
         let _ = std::fs::remove_dir_all(&dir);
     }

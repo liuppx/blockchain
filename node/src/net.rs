@@ -494,6 +494,62 @@ impl GossipNode {
         }
     }
 
+    /// M60: bundle any `ProofKind`'s inclusion proof with the certified header it
+    /// verifies against (reviewer/validator/graph node over RPC, generalizing
+    /// M59's account-only `account_inclusion`). `None` ⇒ unknown id/index OR no
+    /// certified head yet (height 0). GraphNode addresses by insertion index.
+    pub fn inclusion(
+        &self,
+        kind: crate::light::ProofKind,
+        id: u64,
+    ) -> Option<(CertifiedHeader, crate::light::ProofEntry)> {
+        let entry = self.serve_inclusion(kind, id)?;
+        let head_ch = self.headers_from(self.height()).into_iter().next_back()?;
+        Some((head_ch, entry))
+    }
+
+    /// M61: serve a heterogeneous batch bundled with the certified head it
+    /// verifies against — the RPC analogue of the gossip GetBatch path,
+    /// generalizing M60's single `inclusion`. `None` ⇒ `serve_batch` rejected
+    /// (over `MAX_BATCH_ITEMS` or a degenerate Diff range) OR no certified head
+    /// yet (height 0). Inclusion/kNN/range slots verify against the bundled
+    /// head; Diff slots additionally need the client's own range blocks.
+    ///
+    /// M62: the third tuple element ships exactly that range — `[1..=max_h2]`,
+    /// where `max_h2` is the largest h₂ across the request's Diff items (0 ⇒
+    /// empty when the batch has no Diff item) — so a Diff slot verifies without
+    /// the client having pre-synced the chain. Computed before `items` is moved
+    /// into `serve_batch`.
+    pub fn batch(
+        &self,
+        items: Vec<crate::light::BatchItem>,
+    ) -> Option<crate::light::BatchReply> {
+        let max_h2 = items
+            .iter()
+            .filter_map(|it| match it {
+                crate::light::BatchItem::Diff { h2, .. } => Some(*h2),
+                _ => None,
+            })
+            .max()
+            .unwrap_or(0);
+        let env = self.serve_batch(items)?;
+        let head_ch = self.headers_from(self.height()).into_iter().next_back()?;
+        Some((head_ch, env, self.blocks_through(max_h2)))
+    }
+
+    /// M59: bundle an account inclusion proof with the certified header it
+    /// verifies against. `None` ⇒ unknown account OR no certified head yet
+    /// (height 0). The head block's `accounts_root` commits to exactly the
+    /// current state the proof is built from, so the returned pair always
+    /// self-verifies (same soundness as the gossip `GetProof` path — this is
+    /// just the single-account producer wired for the external read RPC).
+    pub fn account_inclusion(
+        &self,
+        id: u64,
+    ) -> Option<(CertifiedHeader, crate::light::ProofEntry)> {
+        self.inclusion(crate::light::ProofKind::Account, id)
+    }
+
     /// M29: serve a heterogeneous batched proof request. Walks
     /// `items`, dispatches each one to the matching existing
     /// `serve_*` helper, and assembles a typed
@@ -804,6 +860,22 @@ impl GossipNode {
         })
     }
 
+    /// M64: every bridge lock on this chain as `(lock_id, height, lock)`, id order
+    /// (the `BTreeMap` iterates sorted) — the directory a client enumerates before
+    /// fetching a single lock's proof via `serve_lock`. Plain (unverified) data; a
+    /// client verifies any one lock via the M63 `/bridge/lock/{id}/proof` route.
+    pub fn lock_listing(&self) -> crate::light::LockListing {
+        self.chain
+            .state
+            .bridge_locks
+            .iter()
+            .map(|(&id, lock)| {
+                let h = self.chain.state.bridge_lock_heights.get(&id).copied().unwrap_or(0);
+                (id, h, lock.clone())
+            })
+            .collect()
+    }
+
     /// The certified blocks from `height` onward (inclusive), capped at
     /// [`MAX_BATCH`] — the payload for a peer's `GetBlocks`.
     fn batch_from(&self, height: u64) -> Vec<(Block, Commit)> {
@@ -812,6 +884,20 @@ impl GossipNode {
         }
         let start = (height - 1) as usize;
         (start..self.blocks.len().min(start + MAX_BATCH))
+            .map(|i| (self.blocks[i].clone(), self.certs[i].clone()))
+            .collect()
+    }
+
+    /// M62: every certified `(Block, Commit)` from height 1 through `up_to`
+    /// inclusive (`[1..=up_to]`), in height order — the block range a client
+    /// needs to replay for `ValidatorTracker::verify_diff_against_headers`.
+    /// Unlike [`Self::batch_from`] this is NOT capped at [`MAX_BATCH`]: the
+    /// Diff verifier replays the whole prefix, so a short cap would make a
+    /// long-chain Diff unverifiable. `up_to == 0` ⇒ empty (a batch with no Diff
+    /// item needs no range); `up_to` beyond the tip clamps to the stored tip.
+    fn blocks_through(&self, up_to: u64) -> Vec<(Block, Commit)> {
+        let end = (up_to as usize).min(self.blocks.len());
+        (0..end)
             .map(|i| (self.blocks[i].clone(), self.certs[i].clone()))
             .collect()
     }
@@ -1681,11 +1767,9 @@ pub fn encode_gossip(m: &GossipMsg) -> Vec<u8> {
         }
         GossipMsg::Blocks(batch) => {
             out.push(TAG_BLOCKS);
-            out.extend_from_slice(&(batch.len() as u64).to_be_bytes());
-            for (b, c) in batch {
-                put_bytes(&mut out, &encode_block(b));
-                put_bytes(&mut out, &encode_commit(c));
-            }
+            // M62: body format lifted to the standalone `encode_blocks` so the
+            // RPC `/batch` `range_blocks=` line shares these exact bytes.
+            out.extend_from_slice(&encode_blocks(batch));
         }
         GossipMsg::Tx(tx) => {
             out.push(TAG_TX);
@@ -1757,29 +1841,7 @@ pub fn encode_gossip(m: &GossipMsg) -> Vec<u8> {
         // symmetric with the M24/M28 pairs.
         GossipMsg::GetBatch { items } => {
             out.push(TAG_GETBATCH);
-            out.extend_from_slice(&(items.len() as u32).to_be_bytes());
-            for item in items.iter() {
-                out.push(crate::codec::encode_batch_response_kind(item.kind_tag()));
-                match item {
-                    crate::light::BatchItem::Inclusion { kind, id } => {
-                        out.push(crate::codec::encode_proof_kind(*kind));
-                        out.extend_from_slice(&id.to_be_bytes());
-                    }
-                    crate::light::BatchItem::Knn { query, k } => {
-                        put_bytes(&mut out, &crate::codec::encode_knn_request(query, *k));
-                    }
-                    crate::light::BatchItem::Range { query, min_sim } => {
-                        put_bytes(
-                            &mut out,
-                            &crate::codec::encode_range_request(query, *min_sim),
-                        );
-                    }
-                    crate::light::BatchItem::Diff { h1, h2 } => {
-                        out.extend_from_slice(&h1.to_be_bytes());
-                        out.extend_from_slice(&h2.to_be_bytes());
-                    }
-                }
-            }
+            out.extend_from_slice(&encode_batch_request(items));
         }
         GossipMsg::Batch { envelope } => {
             out.push(TAG_BATCH);
@@ -2090,6 +2152,41 @@ pub fn decode_lock_envelope(buf: &[u8]) -> Result<crate::bridge::LockEnvelope, C
     })
 }
 
+/// M62: standalone codec for a `(Block, Commit)` range, so the RPC `/batch`
+/// `range_blocks=` line shares the exact byte format the gossip `Blocks` payload
+/// carries inline (`encode_gossip`'s `Blocks` arm delegates here). Layout:
+/// u64_be(count), then per pair a length-prefixed `encode_block` followed by a
+/// length-prefixed `encode_commit`.
+pub fn encode_blocks(batch: &[(Block, Commit)]) -> Vec<u8> {
+    let mut out = Vec::new();
+    out.extend_from_slice(&(batch.len() as u64).to_be_bytes());
+    for (b, c) in batch.iter() {
+        put_bytes(&mut out, &encode_block(b));
+        put_bytes(&mut out, &encode_commit(c));
+    }
+    out
+}
+
+/// Mirror of [`encode_blocks`]. Unlike the inline gossip `TAG_BLOCKS` decoder
+/// this is NOT capped at [`MAX_BATCH`] — a legitimate Diff range can span the
+/// whole chain — and it does NOT pre-`with_capacity` on the declared count, so a
+/// buffer that lies about its length fails fast at the first missing pair
+/// (`UnexpectedEof`) instead of over-allocating.
+pub fn decode_blocks(buf: &[u8]) -> Result<Vec<(Block, Commit)>, CodecError> {
+    let mut rest = buf;
+    let n = take_u64(&mut rest)?;
+    let mut batch = Vec::new();
+    for _ in 0..n {
+        let block = decode_block(take_bytes(&mut rest)?)?;
+        let commit = decode_commit(take_bytes(&mut rest)?)?;
+        batch.push((block, commit));
+    }
+    if !rest.is_empty() {
+        return Err(CodecError::TrailingBytes);
+    }
+    Ok(batch)
+}
+
 /// M29: encode a `BatchResponseEnvelope` as a single length-prefixed
 /// blob for the `Batch { envelope }` wire format. Body layout:
 ///   u32_be(|items|)
@@ -2099,6 +2196,82 @@ pub fn decode_lock_envelope(buf: &[u8]) -> Result<crate::bridge::LockEnvelope, C
 ///     Knn:       1-byte presence tag ‖ length-prefixed `encode_knn_claim`
 ///     Range:     1-byte presence tag ‖ length-prefixed `encode_range_claim`
 ///     Diff:      length-prefixed `encode_diff_envelope`
+/// M61: standalone codec for a batch *request* (`Vec<BatchItem>`), so the RPC
+/// `POST /batch` body shares the exact byte format the gossip `GetBatch` carries
+/// inline (`encode_gossip` delegates here). Layout: u32 item count, then per item
+/// a 1-byte kind tag + per-kind body — Inclusion: 1-byte proof-kind + u64 id;
+/// Knn/Range: length-prefixed request; Diff: two u64 heights. No trailing length
+/// prefix (the gossip tag framing / RPC body length bound it).
+pub fn encode_batch_request(items: &[crate::light::BatchItem]) -> Vec<u8> {
+    let mut out = Vec::new();
+    out.extend_from_slice(&(items.len() as u32).to_be_bytes());
+    for item in items.iter() {
+        out.push(crate::codec::encode_batch_response_kind(item.kind_tag()));
+        match item {
+            crate::light::BatchItem::Inclusion { kind, id } => {
+                out.push(crate::codec::encode_proof_kind(*kind));
+                out.extend_from_slice(&id.to_be_bytes());
+            }
+            crate::light::BatchItem::Knn { query, k } => {
+                put_bytes(&mut out, &crate::codec::encode_knn_request(query, *k));
+            }
+            crate::light::BatchItem::Range { query, min_sim } => {
+                put_bytes(&mut out, &crate::codec::encode_range_request(query, *min_sim));
+            }
+            crate::light::BatchItem::Diff { h1, h2 } => {
+                out.extend_from_slice(&h1.to_be_bytes());
+                out.extend_from_slice(&h2.to_be_bytes());
+            }
+        }
+    }
+    out
+}
+
+/// M61: inverse of [`encode_batch_request`]. Caps the item count at
+/// `MAX_BATCH_ITEMS` (→ [`CodecError::TooManyItems`]), matching the inline gossip
+/// `GetBatch` decoder and [`decode_batch_envelope`].
+pub fn decode_batch_request(
+    buf: &[u8],
+) -> Result<Vec<crate::light::BatchItem>, CodecError> {
+    let mut rest = buf;
+    let n = take_u32(&mut rest)? as usize;
+    if n > MAX_BATCH_ITEMS {
+        return Err(CodecError::TooManyItems(n as u64));
+    }
+    let mut items = Vec::with_capacity(n);
+    for _ in 0..n {
+        let kind = crate::codec::decode_batch_response_kind(
+            rest.first().copied().ok_or(CodecError::UnexpectedEof)?,
+        )?;
+        rest = &rest[1..];
+        match kind {
+            0 => {
+                let kind_byte = rest.first().copied().ok_or(CodecError::UnexpectedEof)?;
+                rest = &rest[1..];
+                let k = crate::codec::decode_proof_kind(kind_byte)?;
+                let id = take_u64(&mut rest)?;
+                items.push(crate::light::BatchItem::Inclusion { kind: k, id });
+            }
+            1 => {
+                let (query, k) = crate::codec::decode_knn_request(take_bytes(&mut rest)?)?;
+                items.push(crate::light::BatchItem::Knn { query, k });
+            }
+            2 => {
+                let (query, min_sim) =
+                    crate::codec::decode_range_request(take_bytes(&mut rest)?)?;
+                items.push(crate::light::BatchItem::Range { query, min_sim });
+            }
+            3 => {
+                let h1 = take_u64(&mut rest)?;
+                let h2 = take_u64(&mut rest)?;
+                items.push(crate::light::BatchItem::Diff { h1, h2 });
+            }
+            other => return Err(CodecError::BadEnum(other as u32)),
+        }
+    }
+    Ok(items)
+}
+
 pub fn encode_batch_envelope(env: &crate::light::BatchResponseEnvelope) -> Vec<u8> {
     let mut out = Vec::new();
     out.extend_from_slice(&(env.items.len() as u32).to_be_bytes());
@@ -3202,6 +3375,112 @@ mod tests {
     }
 
     // --- M24: batched typed proof gossip + light wallet end-to-end ---------
+
+    #[test]
+    fn batch_request_codec_round_trip() {
+        // M61: the standalone batch-request codec (reused by the RPC `POST /batch`
+        // body) round-trips a heterogeneous `Vec<BatchItem>`, caps the item count,
+        // and emits bytes byte-identical to the inline gossip `GetBatch` framing.
+        let items = vec![
+            crate::light::BatchItem::Inclusion { kind: crate::light::ProofKind::Reviewer, id: 10 },
+            crate::light::BatchItem::Knn { query: unit(0), k: 1 },
+            crate::light::BatchItem::Range { query: unit(0), min_sim: 0.0 },
+            crate::light::BatchItem::Diff { h1: 1, h2: 2 },
+        ];
+
+        // Round-trip: re-encoding the decoded items reproduces the original bytes
+        // (compared as bytes to sidestep float Eq on the embedding queries).
+        let bytes = encode_batch_request(&items);
+        let decoded = decode_batch_request(&bytes).expect("decode batch request");
+        assert_eq!(encode_batch_request(&decoded), bytes, "round-trip must be stable");
+
+        // The standalone encoding equals the tail of the inline gossip `GetBatch`
+        // framing (tag byte + request bytes) — the RPC body shares that wire format.
+        let gossip = encode_gossip(&GossipMsg::GetBatch { items: items.clone() });
+        assert_eq!(gossip[0], TAG_GETBATCH, "gossip GetBatch leads with its tag");
+        assert_eq!(&gossip[1..], &bytes[..], "RPC body matches the gossip GetBatch tail");
+
+        // Over-cap request is rejected at decode time (mirrors the gossip decoder).
+        let big: Vec<_> = (0..=MAX_BATCH_ITEMS)
+            .map(|i| crate::light::BatchItem::Inclusion {
+                kind: crate::light::ProofKind::Account,
+                id: i as u64,
+            })
+            .collect();
+        let over = encode_batch_request(&big);
+        assert!(
+            matches!(decode_batch_request(&over), Err(CodecError::TooManyItems(_))),
+            "over-cap batch must decode to TooManyItems",
+        );
+    }
+
+    #[test]
+    fn blocks_codec_round_trip() {
+        // M62: the standalone `(Block, Commit)` range codec (the RPC `/batch`
+        // `range_blocks=` line) round-trips, matches the inline gossip `Blocks`
+        // framing byte-for-byte, and fails fast on a lying length.
+        let (blocks, certs) = certified_chain(2);
+        let batch: Vec<(Block, Commit)> =
+            blocks.iter().cloned().zip(certs.iter().cloned()).collect();
+
+        let bytes = encode_blocks(&batch);
+        let decoded = decode_blocks(&bytes).expect("decode blocks");
+        assert_eq!(encode_blocks(&decoded), bytes, "round-trip must be stable");
+
+        // The standalone encoding equals the tail of the inline gossip `Blocks`
+        // framing (tag byte + body) — the RPC line shares that wire format.
+        let gossip = encode_gossip(&GossipMsg::Blocks(batch.clone()));
+        assert_eq!(gossip[0], TAG_BLOCKS, "gossip Blocks leads with its tag");
+        assert_eq!(&gossip[1..], &bytes[..], "range_blocks line matches the gossip Blocks tail");
+
+        // An empty range encodes to just the u64 count (0) and round-trips.
+        assert_eq!(encode_blocks(&[]), 0u64.to_be_bytes().to_vec());
+        assert!(decode_blocks(&encode_blocks(&[])).expect("decode empty").is_empty());
+
+        // A buffer that lies about its count (huge n, no bodies) fails fast at the
+        // first missing pair — no OOM from a pre-sized allocation.
+        let mut liar = 1_000_000u64.to_be_bytes().to_vec();
+        liar.extend_from_slice(&[0u8; 4]); // some trailing junk, far short of a pair
+        assert!(
+            matches!(decode_blocks(&liar), Err(CodecError::UnexpectedEof)),
+            "a lying count must fail at EOF, not allocate",
+        );
+    }
+
+    #[test]
+    fn batch_includes_range_for_diff_and_verifies() {
+        // M62: a batch carrying a Diff item ships the `[1..=max_h2]` block range
+        // the Diff verifier replays, so `verify_batch` accepts the Diff slot
+        // without the client having pre-synced the chain.
+        let (blocks, certs) = certified_chain(2);
+        let mut full = GossipNode::new(1, genesis(), 8, []);
+        full.load_certified(&blocks, &certs);
+
+        let items = vec![
+            crate::light::BatchItem::Diff { h1: 1, h2: 2 },
+            crate::light::BatchItem::Inclusion {
+                kind: crate::light::ProofKind::Reviewer,
+                id: 10,
+            },
+        ];
+        let (ch, env, range) = full.batch(items.clone()).expect("batch served");
+        assert_eq!(env.items.len(), items.len(), "one slot per request item");
+        assert_eq!(range.len(), 2, "Diff{{1,2}} ships the full [1..=2] block range");
+
+        let tracker = crate::light::ValidatorTracker::from_genesis(&genesis());
+        let tracked = tracker.validators().clone();
+        tracker
+            .verify_batch(&genesis(), &ch.header, &ch.cert, &tracked, &range, &items, &env)
+            .expect("the shipped range satisfies the Diff slot; head anchors the rest");
+
+        // A Diff-free batch ships no range.
+        let plain = vec![crate::light::BatchItem::Inclusion {
+            kind: crate::light::ProofKind::Reviewer,
+            id: 10,
+        }];
+        let (_ch2, _env2, range2) = full.batch(plain).expect("batch served");
+        assert!(range2.is_empty(), "no Diff item ⇒ empty range");
+    }
 
     #[test]
     fn full_node_serves_a_batch_of_proofs_in_response_to_get_proof() {

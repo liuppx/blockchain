@@ -301,6 +301,21 @@ pub struct BatchResponseEnvelope {
     pub items: Vec<BatchResponseItem>,
 }
 
+/// M62: the reply shape for a verifiable batch read — the certified head, the
+/// response envelope, and the `[1..=max_h2]` block range Diff slots replay
+/// (empty when the batch has no Diff item). Factored out so the `GossipNode`
+/// producer, the daemon `Cmd`, and `Node::batch_proof` share one named type.
+pub type BatchReply = (
+    crate::codec::CertifiedHeader,
+    BatchResponseEnvelope,
+    Vec<(Block, Commit)>,
+);
+
+/// M64: the bridge-lock directory listing — `(lock_id, height, lock)` per lock,
+/// id order. Factored out so the `GossipNode` producer, the daemon `Cmd`, and
+/// `Node::lock_listing` share one named type (and dodge `clippy::type_complexity`).
+pub type LockListing = Vec<(u64, u64, crate::BridgeLock)>;
+
 /// Follows the active validator set across a certified chain without full
 /// replay. Construct with [`Self::from_genesis`], then feed certified blocks in
 /// height order via [`Self::follow`] / [`Self::follow_all`].
