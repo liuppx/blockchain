@@ -381,6 +381,14 @@ enum Cmd {
         id: u64,
         reply: oneshot::Sender<Option<Account>>,
     },
+    /// M65: plain (unverified) read of a reviewer/validator/graph entity by id, the
+    /// non-proof sibling of `QueryAccount`. `None` ⇒ no such entity (404). Account has
+    /// its own richer plain read (`QueryAccount`).
+    QueryEntity {
+        kind: ProofKind,
+        id: u64,
+        reply: oneshot::Sender<Option<EntityView>>,
+    },
     /// M59: read one account's inclusion proof + the certified head it verifies
     /// against, for the verifiable read-class RPC. `None` ⇒ unknown id or no
     /// certified head yet (height 0).
@@ -516,6 +524,15 @@ impl Node {
     pub async fn account(&self, id: u64) -> Option<Option<Account>> {
         let (reply, rx) = oneshot::channel();
         self.cmd.send(Cmd::QueryAccount { id, reply }).ok()?;
+        rx.await.ok()
+    }
+
+    /// M65: plain (unverified) read of a reviewer/validator/graph entity by id (the
+    /// non-proof sibling of `account`). Outer `None` ⇒ actor stopped; inner `None` ⇒
+    /// no such entity.
+    pub async fn entity(&self, kind: ProofKind, id: u64) -> Option<Option<EntityView>> {
+        let (reply, rx) = oneshot::channel();
+        self.cmd.send(Cmd::QueryEntity { kind, id, reply }).ok()?;
         rx.await.ok()
     }
 
@@ -1020,6 +1037,30 @@ async fn run_actor(mut actor: Actor, mut rx: mpsc::UnboundedReceiver<Cmd>) {
             }
             Cmd::QueryAccount { id, reply } => {
                 let _ = reply.send(actor.node.chain.state.accounts.get(&id).cloned());
+            }
+            Cmd::QueryEntity { kind, id, reply } => {
+                // M65: plain read — simple state lookup, built inline like QueryAccount.
+                let st = &actor.node.chain.state;
+                let view = match kind {
+                    ProofKind::Reviewer => st
+                        .reviewers
+                        .get(&id)
+                        .map(|&r| EntityView::Reviewer { id, reputation: r }),
+                    ProofKind::Validator => st
+                        .validators
+                        .get(id)
+                        .map(|v| EntityView::Validator { id, power: v.power, pubkey: v.pubkey }),
+                    ProofKind::GraphNode => st.graph.nodes.get(id as usize).map(|n| {
+                        EntityView::GraphNode {
+                            node_id: n.node_id,
+                            domain: n.domain,
+                            embedding: n.embedding,
+                        }
+                    }),
+                    // Account has its own plain read (QueryAccount); never routed here.
+                    ProofKind::Account => None,
+                };
+                let _ = reply.send(view);
             }
             Cmd::QueryAccountProof { id, reply } => {
                 let _ = reply.send(actor.node.account_inclusion(id));
@@ -1727,14 +1768,25 @@ fn parse_content_length(headers: &str) -> Option<usize> {
 /// Build a fixed-shape `HTTP/1.1` response with a plain-text body. `status_line`
 /// is e.g. `"200 OK"`; the connection is closed after the response.
 fn http_response(status_line: &str, body: &str) -> String {
+    // M66: delegate to the Content-Type-aware builder with the historic plaintext type,
+    // so every pre-M66 caller's output stays byte-identical.
+    http_response_ct(status_line, "text/plain; charset=utf-8", body)
+}
+
+/// M66: build a response with an explicit `Content-Type`. Plain reads keep
+/// `text/plain; charset=utf-8` (via [`http_response`]); a `?format=json` read passes
+/// bare `application/json` (JSON is always UTF-8, so it carries no `charset` param).
+/// `Content-Length` is the UTF-8 byte length of `body`, exactly as before.
+fn http_response_ct(status_line: &str, content_type: &str, body: &str) -> String {
     format!(
         "HTTP/1.1 {}\r\n\
-         Content-Type: text/plain; charset=utf-8\r\n\
+         Content-Type: {}\r\n\
          Content-Length: {}\r\n\
          Connection: close\r\n\
          \r\n\
          {}",
         status_line,
+        content_type,
         body.len(),
         body,
     )
@@ -1777,6 +1829,9 @@ enum GetRoute {
     /// M60: `GET /{reviewer,validator,graph}/{id}/proof` — verifiable reads for the
     /// other `ProofKind`s (graph node addressed by insertion index).
     Proof(ProofKind, u64),
+    /// M65: `GET /{reviewer,validator,graph}/{id}` — plain (unverified) read of the
+    /// entity's fields, the non-proof sibling of `Account(u64)` (M58).
+    Plain(ProofKind, u64),
     /// M63: `GET /bridge/lock/{id}/proof` — the self-contained bridge-lock
     /// `LockEnvelope` for `lock_id` (header + cert + tracked set + lock + proof).
     BridgeLock(u64),
@@ -1788,6 +1843,38 @@ enum GetRoute {
 
 /// M58: map a request path to a read-class route. Pure (no I/O) so it is unit-tested
 /// directly; `serve_rpc_conn` is the thin socket shell around it.
+/// M66: split an origin-form request target into `(path, query)` at the first `?`.
+/// No `?` ⇒ `("<path>", "")`. A request-line target never carries a `#fragment`
+/// (RFC 9112 — fragments are client-side only), so we deliberately do not split on `#`.
+/// Keeping the path byte-identical for query-less targets is what makes the pre-M66
+/// plaintext routing and responses unchanged.
+fn split_query(target: &str) -> (&str, &str) {
+    match target.split_once('?') {
+        Some((p, q)) => (p, q),
+        None => (target, ""),
+    }
+}
+
+/// M66: the chosen response rendering. `Text` (the default) preserves every pre-M66
+/// body byte-for-byte; `Json` selects the hand-rolled minimal JSON renderers.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum RespFormat {
+    Text,
+    Json,
+}
+
+/// M66: parse `?format=…` out of a raw query string. `format=json` (exact, case
+/// sensitive) ⇒ `Json`; anything else — absent, empty, `format=text`, an unknown key
+/// or value — ⇒ `Text`. The first `format=` pair wins; later duplicates are ignored.
+fn response_format(query: &str) -> RespFormat {
+    for pair in query.split('&') {
+        if let Some(v) = pair.strip_prefix("format=") {
+            return if v == "json" { RespFormat::Json } else { RespFormat::Text };
+        }
+    }
+    RespFormat::Text
+}
+
 fn route_get(path: &str) -> GetRoute {
     match path {
         "/height" => GetRoute::Height,
@@ -1807,11 +1894,11 @@ fn route_get(path: &str) -> GetRoute {
                     None => rest.parse::<u64>().map(GetRoute::Account).unwrap_or(GetRoute::NotFound),
                 }
             } else if let Some(rest) = p.strip_prefix("/reviewer/") {
-                proof_route(rest, ProofKind::Reviewer)
+                entity_route(rest, ProofKind::Reviewer)
             } else if let Some(rest) = p.strip_prefix("/validator/") {
-                proof_route(rest, ProofKind::Validator)
+                entity_route(rest, ProofKind::Validator)
             } else if let Some(rest) = p.strip_prefix("/graph/") {
-                proof_route(rest, ProofKind::GraphNode)
+                entity_route(rest, ProofKind::GraphNode)
             } else if let Some(rest) = p.strip_prefix("/bridge/lock/") {
                 // M63: `{id}/proof` is the only form — a bridge lock has no plain
                 // read, so a bare id (no `/proof`) or a non-numeric id ⇒ 404.
@@ -1829,15 +1916,19 @@ fn route_get(path: &str) -> GetRoute {
     }
 }
 
-/// M60: parse `/<entity>/{id}/proof` into a verifiable read route; these entities have
-/// no M58 plain-read form, so a bare `{id}` (no `/proof`) or a non-numeric id ⇒ 404.
-fn proof_route(rest: &str, kind: ProofKind) -> GetRoute {
+/// M60/M65: parse `/<entity>/{id}[/proof]` for reviewer/validator/graph. `{id}/proof`
+/// is the M60 verifiable read; a bare `{id}` is the M65 plain (unverified) read, the
+/// non-proof sibling of `/account/{id}`. A non-numeric or empty id ⇒ 404.
+fn entity_route(rest: &str, kind: ProofKind) -> GetRoute {
     match rest.strip_suffix("/proof") {
         Some(idp) => idp
             .parse::<u64>()
             .map(|id| GetRoute::Proof(kind, id))
             .unwrap_or(GetRoute::NotFound),
-        None => GetRoute::NotFound,
+        None => rest
+            .parse::<u64>()
+            .map(|id| GetRoute::Plain(kind, id))
+            .unwrap_or(GetRoute::NotFound),
     }
 }
 
@@ -1868,6 +1959,32 @@ fn format_account(id: u64, a: &Account) -> String {
     )
 }
 
+/// M65: a plain (unverified) snapshot of a reviewer/validator/graph entity for the
+/// read-class RPC — the non-proof siblings of `GET /account/{id}`. Account keeps its
+/// own richer `Account` snapshot; this carries the per-kind fields.
+pub enum EntityView {
+    Reviewer { id: u64, reputation: f32 },
+    Validator { id: u64, power: u64, pubkey: crate::crypto::PubKey },
+    GraphNode { node_id: u64, domain: u32, embedding: crate::Embedding },
+}
+
+/// M65: render a plain entity view as a grep-friendly `key=value` line (same shape as
+/// `format_account`). The graph embedding is emitted as comma-joined f32 for a
+/// complete read. Pure (no I/O) for direct unit testing.
+fn format_entity(v: &EntityView) -> String {
+    match v {
+        EntityView::Reviewer { id, reputation } => {
+            format!("kind=reviewer id={id} reputation={reputation}")
+        }
+        EntityView::Validator { id, power, pubkey } => {
+            format!("kind=validator id={id} power={power} pubkey={}", crate::hash::hex(pubkey))
+        }
+        EntityView::GraphNode { node_id, domain, embedding } => {
+            let emb = embedding.iter().map(|f| f.to_string()).collect::<Vec<_>>().join(",");
+            format!("kind=graph node_id={node_id} domain={domain} dim={} embedding={emb}", embedding.len())
+        }
+    }
+}
 /// M59: render a verifiable account read as two grep-friendly hex lines — the
 /// certified head (`BlockHeader` + its finality `Commit`) and the account's typed
 /// inclusion `ProofEntry`. A client hex-decodes both, runs `decode_certified_header`
@@ -1931,6 +2048,193 @@ fn format_batch(
     )
 }
 
+// ---- M66: hand-rolled minimal JSON renderers (no `serde_json`). ----------------
+// These mirror the `format_*` plain-text renderers above but emit `application/json`
+// bodies for `?format=json` reads. All are pure (no I/O) for direct unit testing.
+// u64 fields are emitted as JSON *strings* — values routinely exceed 2^53 and would
+// lose precision as JSON numbers in a JavaScript `JSON.parse` client; f32 fields
+// (reputation, embedding) stay JSON numbers (`null` when non-finite).
+
+/// Quote and escape a string as a JSON string literal, per RFC 8259: escape `"` and
+/// `\`, and all control characters U+0000–U+001F (`\n`/`\r`/`\t` by name, the rest as
+/// `\u00XX`). Today's inputs are hex strings and `{error}` messages, but a complete
+/// escaper keeps the renderers correct for any text that later flows through.
+fn json_str(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
+/// A u64 as a JSON string (lossless for any consumer).
+fn json_u64(n: u64) -> String {
+    json_str(&n.to_string())
+}
+
+/// An f32 as a JSON number token, or `null` when non-finite (`inf`/`NaN` are not valid
+/// JSON, so a non-finite reputation/embedding component must never leak into a body).
+fn json_f32(x: f32) -> String {
+    if x.is_finite() {
+        x.to_string()
+    } else {
+        "null".to_string()
+    }
+}
+
+/// `GET /height?format=json` → `{"height":"<n>"}`.
+fn json_height(h: u64) -> String {
+    format!("{{\"height\":{}}}", json_u64(h))
+}
+
+/// `GET /head?format=json` → `{"head":"<hex>"}`.
+fn json_head(head: &[u8; 32]) -> String {
+    format!("{{\"head\":{}}}", json_str(&crate::hash::hex(head)))
+}
+
+/// `GET /account/{id}?format=json` — the JSON sibling of [`format_account`].
+fn json_account(id: u64, a: &Account) -> String {
+    format!(
+        "{{\"id\":{},\"balance\":{},\"staked_total\":{},\"earned_total\":{},\
+         \"slashed_total\":{},\"submissions\":{},\"accepted\":{},\"pubkey\":{}}}",
+        json_u64(id),
+        json_u64(a.balance),
+        json_u64(a.staked_total),
+        json_u64(a.earned_total),
+        json_u64(a.slashed_total),
+        json_u64(a.submissions),
+        json_u64(a.accepted),
+        json_str(&crate::hash::hex(&a.pubkey)),
+    )
+}
+
+/// `GET /{reviewer,validator,graph}/{id}?format=json` — the JSON sibling of
+/// [`format_entity`]. Each object carries a `"kind"` discriminator so a client can
+/// disambiguate the three shapes.
+fn json_entity(v: &EntityView) -> String {
+    match v {
+        EntityView::Reviewer { id, reputation } => format!(
+            "{{\"kind\":\"reviewer\",\"id\":{},\"reputation\":{}}}",
+            json_u64(*id),
+            json_f32(*reputation),
+        ),
+        EntityView::Validator { id, power, pubkey } => format!(
+            "{{\"kind\":\"validator\",\"id\":{},\"power\":{},\"pubkey\":{}}}",
+            json_u64(*id),
+            json_u64(*power),
+            json_str(&crate::hash::hex(pubkey)),
+        ),
+        EntityView::GraphNode { node_id, domain, embedding } => {
+            let emb = embedding.iter().map(|f| json_f32(*f)).collect::<Vec<_>>().join(",");
+            format!(
+                "{{\"kind\":\"graph\",\"node_id\":{},\"domain\":{},\"dim\":{},\"embedding\":[{}]}}",
+                json_u64(*node_id),
+                json_u64(*domain as u64),
+                json_u64(embedding.len() as u64),
+                emb,
+            )
+        }
+    }
+}
+
+/// `GET /bridge/locks?format=json` — the JSON sibling of [`format_lock_listing`]. A
+/// JSON **array** of objects (`[]` when the chain has no locks — the one intentional
+/// divergence from the text renderer's empty string).
+fn json_lock_listing(locks: &[(u64, u64, crate::BridgeLock)]) -> String {
+    let items = locks
+        .iter()
+        .map(|(id, h, l)| {
+            format!(
+                "{{\"lock_id\":{},\"height\":{},\"account\":{},\"amount\":{},\
+                 \"dest_chain\":{},\"dest_account\":{},\"nonce\":{}}}",
+                json_u64(*id),
+                json_u64(*h),
+                json_u64(l.account),
+                json_u64(l.amount),
+                json_str(&crate::hash::hex(&l.dest_chain)),
+                json_u64(l.dest_account),
+                json_u64(l.nonce),
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+    format!("[{items}]")
+}
+
+// ---- M67: hex-wrapping JSON renderers for the proof / batch reads. --------------
+// The proof envelopes are opaque, self-verifying blobs (the client decodes them with
+// the existing `verify_proof_against_header` / `verify_batch` / `verify_lock` stack),
+// so their JSON form keeps the *same* hex bytes as the `format_*` text lines, merely
+// relocated into named fields — no internal structure is exposed. All pure (no I/O).
+
+/// M67: `{"certified_header":"<hex>","proof_entry":"<hex>"}` — the JSON twin of
+/// [`format_account_proof`], shared by the account- and entity-proof reads.
+fn json_account_proof(ch: &CertifiedHeader, entry: &ProofEntry) -> String {
+    format!(
+        "{{\"certified_header\":{},\"proof_entry\":{}}}",
+        json_str(&crate::hash::hex(&crate::codec::encode_certified_header(ch))),
+        json_str(&crate::hash::hex(&crate::codec::encode_proof_entry(entry))),
+    )
+}
+
+/// M67: `{"lock_envelope":"<hex>"}` — the JSON twin of [`format_lock`].
+fn json_lock(env: &crate::bridge::LockEnvelope) -> String {
+    format!(
+        "{{\"lock_envelope\":{}}}",
+        json_str(&crate::hash::hex(&crate::net::encode_lock_envelope(env))),
+    )
+}
+
+/// M67: `{"certified_header":"<hex>","batch_envelope":"<hex>","range_blocks":"<hex>"}`
+/// — the JSON twin of [`format_batch`].
+fn json_batch(ch: &CertifiedHeader, env: &BatchResponseEnvelope, range: &[(Block, Commit)]) -> String {
+    format!(
+        "{{\"certified_header\":{},\"batch_envelope\":{},\"range_blocks\":{}}}",
+        json_str(&crate::hash::hex(&crate::codec::encode_certified_header(ch))),
+        json_str(&crate::hash::hex(&crate::net::encode_batch_envelope(env))),
+        json_str(&crate::hash::hex(&crate::net::encode_blocks(range))),
+    )
+}
+
+/// M66: a `200 OK` body whose rendering follows the requested [`RespFormat`] — plain
+/// text (the default) or `application/json`.
+fn ok_body(fmt: RespFormat, text: &str, json: &str) -> String {
+    match fmt {
+        RespFormat::Text => http_response("200 OK", text),
+        RespFormat::Json => http_response_ct("200 OK", "application/json", json),
+    }
+}
+
+/// M67: a status-agnostic *error* body for a semantic failure (data miss, decode
+/// failure, admission reject), rendered as plain text or `{"error":"<msg>"}` per
+/// [`RespFormat`]. Pure transport/framing errors (`411`/`413`/truncated body/`431`/
+/// `503`) and routing misses (`GetRoute::NotFound`) stay plain text — format is only
+/// threaded into responses that carry a semantic body.
+fn error_body(fmt: RespFormat, status_line: &str, msg: &str) -> String {
+    match fmt {
+        RespFormat::Text => http_response(status_line, msg),
+        RespFormat::Json => {
+            http_response_ct(status_line, "application/json", &format!("{{\"error\":{}}}", json_str(msg)))
+        }
+    }
+}
+
+/// M66: a `404 Not Found` body for a *data* miss (the entity id does not exist), as
+/// plain text or `{"error":"<msg>"}` per [`RespFormat`].
+fn not_found_body(fmt: RespFormat, msg: &str) -> String {
+    error_body(fmt, "404 Not Found", msg)
+}
+
 async fn serve_rpc_conn(mut stream: TcpStream, cmd: mpsc::UnboundedSender<Cmd>) {
     // Accumulate bytes until we see the end-of-headers marker, keeping any body
     // bytes that arrived in the same read.
@@ -1959,7 +2263,12 @@ async fn serve_rpc_conn(mut stream: TcpStream, cmd: mpsc::UnboundedSender<Cmd>) 
         return;
     };
     let method = head.split_whitespace().next().unwrap_or("");
-    let path = head.split_whitespace().nth(1).unwrap_or("");
+    let target = head.split_whitespace().nth(1).unwrap_or("");
+    // M66: split any `?query` off the request target before routing, then read the
+    // optional `?format=json`. A query-less target leaves `path` byte-identical, so
+    // pre-M66 routing and plaintext responses are unchanged.
+    let (path, query) = split_query(target);
+    let fmt = response_format(query);
 
     // M58: read-class GET routes. Each read routes through the single-owner actor via
     // the same local-oneshot pattern as the POST path below; a send failure (actor
@@ -1972,7 +2281,7 @@ async fn serve_rpc_conn(mut stream: TcpStream, cmd: mpsc::UnboundedSender<Cmd>) 
                     http_response("503 Service Unavailable", "node stopped")
                 } else {
                     match rx.await {
-                        Ok((height, _)) => http_response("200 OK", &height.to_string()),
+                        Ok((height, _)) => ok_body(fmt, &height.to_string(), &json_height(height)),
                         Err(_) => http_response("503 Service Unavailable", "node stopped"),
                     }
                 }
@@ -1983,7 +2292,9 @@ async fn serve_rpc_conn(mut stream: TcpStream, cmd: mpsc::UnboundedSender<Cmd>) 
                     http_response("503 Service Unavailable", "node stopped")
                 } else {
                     match rx.await {
-                        Ok((_, head_hash)) => http_response("200 OK", &crate::hash::hex(&head_hash)),
+                        Ok((_, head_hash)) => {
+                            ok_body(fmt, &crate::hash::hex(&head_hash), &json_head(&head_hash))
+                        }
                         Err(_) => http_response("503 Service Unavailable", "node stopped"),
                     }
                 }
@@ -1994,8 +2305,24 @@ async fn serve_rpc_conn(mut stream: TcpStream, cmd: mpsc::UnboundedSender<Cmd>) 
                     http_response("503 Service Unavailable", "node stopped")
                 } else {
                     match rx.await {
-                        Ok(Some(a)) => http_response("200 OK", &format_account(id, &a)),
-                        Ok(None) => http_response("404 Not Found", &format!("account {id} not found")),
+                        Ok(Some(a)) => ok_body(fmt, &format_account(id, &a), &json_account(id, &a)),
+                        Ok(None) => not_found_body(fmt, &format!("account {id} not found")),
+                        Err(_) => http_response("503 Service Unavailable", "node stopped"),
+                    }
+                }
+            }
+            GetRoute::Plain(kind, id) => {
+                // M65: plain (unverified) reviewer/validator/graph read — the non-proof
+                // sibling of `GET /account/{id}`. 404 when no such entity.
+                let (reply, rx) = oneshot::channel();
+                if cmd.send(Cmd::QueryEntity { kind, id, reply }).is_err() {
+                    http_response("503 Service Unavailable", "node stopped")
+                } else {
+                    match rx.await {
+                        Ok(Some(v)) => ok_body(fmt, &format_entity(&v), &json_entity(&v)),
+                        Ok(None) => {
+                            not_found_body(fmt, &format!("{} {id} not found", proof_kind_label(kind)))
+                        }
                         Err(_) => http_response("503 Service Unavailable", "node stopped"),
                     }
                 }
@@ -2006,10 +2333,12 @@ async fn serve_rpc_conn(mut stream: TcpStream, cmd: mpsc::UnboundedSender<Cmd>) 
                     http_response("503 Service Unavailable", "node stopped")
                 } else {
                     match rx.await {
-                        Ok(Some((ch, entry))) => {
-                            http_response("200 OK", &format_account_proof(&ch, &entry))
-                        }
-                        Ok(None) => http_response("404 Not Found", &format!("account {id} not found")),
+                        Ok(Some((ch, entry))) => ok_body(
+                            fmt,
+                            &format_account_proof(&ch, &entry),
+                            &json_account_proof(&ch, &entry),
+                        ),
+                        Ok(None) => not_found_body(fmt, &format!("account {id} not found")),
                         Err(_) => http_response("503 Service Unavailable", "node stopped"),
                     }
                 }
@@ -2022,11 +2351,13 @@ async fn serve_rpc_conn(mut stream: TcpStream, cmd: mpsc::UnboundedSender<Cmd>) 
                     http_response("503 Service Unavailable", "node stopped")
                 } else {
                     match rx.await {
-                        Ok(Some((ch, entry))) => {
-                            http_response("200 OK", &format_account_proof(&ch, &entry))
-                        }
-                        Ok(None) => http_response(
-                            "404 Not Found",
+                        Ok(Some((ch, entry))) => ok_body(
+                            fmt,
+                            &format_account_proof(&ch, &entry),
+                            &json_account_proof(&ch, &entry),
+                        ),
+                        Ok(None) => not_found_body(
+                            fmt,
                             &format!("{} {id} not found", proof_kind_label(kind)),
                         ),
                         Err(_) => http_response("503 Service Unavailable", "node stopped"),
@@ -2041,9 +2372,9 @@ async fn serve_rpc_conn(mut stream: TcpStream, cmd: mpsc::UnboundedSender<Cmd>) 
                     http_response("503 Service Unavailable", "node stopped")
                 } else {
                     match rx.await {
-                        Ok(Some(env)) => http_response("200 OK", &format_lock(&env)),
+                        Ok(Some(env)) => ok_body(fmt, &format_lock(&env), &json_lock(&env)),
                         Ok(None) => {
-                            http_response("404 Not Found", &format!("bridge lock {id} not found"))
+                            not_found_body(fmt, &format!("bridge lock {id} not found"))
                         }
                         Err(_) => http_response("503 Service Unavailable", "node stopped"),
                     }
@@ -2056,7 +2387,9 @@ async fn serve_rpc_conn(mut stream: TcpStream, cmd: mpsc::UnboundedSender<Cmd>) 
                     http_response("503 Service Unavailable", "node stopped")
                 } else {
                     match rx.await {
-                        Ok(listing) => http_response("200 OK", &format_lock_listing(&listing)),
+                        Ok(listing) => {
+                            ok_body(fmt, &format_lock_listing(&listing), &json_lock_listing(&listing))
+                        }
                         Err(_) => http_response("503 Service Unavailable", "node stopped"),
                     }
                 }
@@ -2105,7 +2438,7 @@ async fn serve_rpc_conn(mut stream: TcpStream, cmd: mpsc::UnboundedSender<Cmd>) 
         let items = match crate::net::decode_batch_request(&body) {
             Ok(items) => items,
             Err(e) => {
-                let _ = stream.write_all(http_response("400 Bad Request", &e.to_string()).as_bytes()).await;
+                let _ = stream.write_all(error_body(fmt, "400 Bad Request", &e.to_string()).as_bytes()).await;
                 let _ = stream.flush().await;
                 return;
             }
@@ -2117,8 +2450,12 @@ async fn serve_rpc_conn(mut stream: TcpStream, cmd: mpsc::UnboundedSender<Cmd>) 
             return;
         }
         let resp = match rx.await {
-            Ok(Some((ch, env, range))) => http_response("200 OK", &format_batch(&ch, &env, &range)),
-            Ok(None) => http_response("422 Unprocessable Entity", "batch rejected"),
+            Ok(Some((ch, env, range))) => ok_body(
+                fmt,
+                &format_batch(&ch, &env, &range),
+                &json_batch(&ch, &env, &range),
+            ),
+            Ok(None) => error_body(fmt, "422 Unprocessable Entity", "batch rejected"),
             Err(_) => http_response("503 Service Unavailable", "node stopped"),
         };
         let _ = stream.write_all(resp.as_bytes()).await;
@@ -2155,7 +2492,7 @@ async fn serve_rpc_conn(mut stream: TcpStream, cmd: mpsc::UnboundedSender<Cmd>) 
     let tx = match crate::codec::decode_tx(&body) {
         Ok(tx) => tx,
         Err(e) => {
-            let _ = stream.write_all(http_response("400 Bad Request", &e.to_string()).as_bytes()).await;
+            let _ = stream.write_all(error_body(fmt, "400 Bad Request", &e.to_string()).as_bytes()).await;
             let _ = stream.flush().await;
             return;
         }
@@ -2168,8 +2505,11 @@ async fn serve_rpc_conn(mut stream: TcpStream, cmd: mpsc::UnboundedSender<Cmd>) 
         return;
     }
     let resp = match rx.await {
-        Ok(Ok(h)) => http_response("200 OK", &crate::hash::hex(&h)),
-        Ok(Err(e)) => http_response("422 Unprocessable Entity", &e.to_string()),
+        Ok(Ok(h)) => {
+            let hex = crate::hash::hex(&h);
+            ok_body(fmt, &hex, &format!("{{\"hash\":{}}}", json_str(&hex)))
+        }
+        Ok(Err(e)) => error_body(fmt, "422 Unprocessable Entity", &e.to_string()),
         Err(_) => http_response("503 Service Unavailable", "node stopped"),
     };
     let _ = stream.write_all(resp.as_bytes()).await;
@@ -4142,22 +4482,290 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    #[tokio::test]
+    async fn rpc_plain_entities_over_tcp() {
+        // M65: plain reviewer/validator/graph reads over real TCP. Unlike bridge locks,
+        // `test_genesis` carries real reviewers (10,11,12), validators (21-24), and a
+        // seed graph node (idx 0), so a live daemon serves 200-with-data. Exercises
+        // routing + gating + the 200/404 paths end to end.
+        let dir = tmp_dir("rpc-plain-entities");
+        let mut cfg = node_config(21, 20131, &[21], dir.clone());
+        let rpc_addr = "127.0.0.1:20141";
+        cfg.rpc = Some(crate::config::RpcConfig { enabled: true, listen: rpc_addr.into() });
+        let mut genesis = test_genesis();
+        genesis.validators = vec![(21, kp(21).public(), 1)];
+        let node = Node::start(cfg, genesis, Some(kp(21))).await.expect("start node");
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            if node.status().await.map(|(h, _)| h >= 1).unwrap_or(false) {
+                break;
+            }
+            assert!(tokio::time::Instant::now() < deadline, "node never produced a block");
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+
+        async fn get(addr: &str, path: &str) -> String {
+            let req = format!("GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
+            let mut s = TcpStream::connect(addr).await.expect("connect rpc");
+            s.write_all(req.as_bytes()).await.expect("send get");
+            let mut resp = Vec::new();
+            s.read_to_end(&mut resp).await.expect("read response");
+            String::from_utf8_lossy(&resp).into_owned()
+        }
+        fn body_of(resp: &str) -> &str {
+            resp.split_once("\r\n\r\n").map(|(_, b)| b).unwrap_or("")
+        }
+
+        // Reviewer 10 (reputation 1.0).
+        let rev = get(rpc_addr, "/reviewer/10").await;
+        assert!(rev.starts_with("HTTP/1.1 200 OK"), "reviewer status: {rev}");
+        assert!(body_of(&rev).contains("kind=reviewer id=10"), "reviewer body: {rev}");
+        assert!(body_of(&rev).contains("reputation=1"), "reviewer body: {rev}");
+
+        // Validator 21 (power 1, the only one in this single-validator genesis).
+        let val = get(rpc_addr, "/validator/21").await;
+        assert!(val.starts_with("HTTP/1.1 200 OK"), "validator status: {val}");
+        assert!(body_of(&val).contains("kind=validator id=21 power=1"), "validator body: {val}");
+
+        // Graph node 0 (the seed node, domain 0).
+        let gr = get(rpc_addr, "/graph/0").await;
+        assert!(gr.starts_with("HTTP/1.1 200 OK"), "graph status: {gr}");
+        assert!(body_of(&gr).contains("kind=graph node_id=0 domain=0"), "graph body: {gr}");
+
+        // Unknown reviewer id → 404.
+        let miss = get(rpc_addr, "/reviewer/999").await;
+        assert!(miss.starts_with("HTTP/1.1 404"), "unknown reviewer: {miss}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn route_get_parses_proof_kinds() {
         // M60: the three sibling verifiable reads parse to `Proof(kind, id)`; graph is
-        // addressed by insertion index. These entities have no M58 plain-read form, so a
-        // bare `{id}` (no `/proof`) or a non-numeric id is NotFound (404). M59's account
-        // routes and the M58 health fallback are unaffected.
+        // addressed by insertion index. A non-numeric or empty id is NotFound (404);
+        // a bare id is the M65 plain read (below). M59's account routes and the M58
+        // health fallback are unaffected.
         assert!(matches!(route_get("/reviewer/10/proof"), GetRoute::Proof(ProofKind::Reviewer, 10)));
         assert!(matches!(route_get("/validator/21/proof"), GetRoute::Proof(ProofKind::Validator, 21)));
         assert!(matches!(route_get("/graph/0/proof"), GetRoute::Proof(ProofKind::GraphNode, 0)));
         assert!(matches!(route_get("/reviewer/x/proof"), GetRoute::NotFound));
-        assert!(matches!(route_get("/validator/21"), GetRoute::NotFound));
+        // M65: a bare id is now the plain read (was NotFound through M64).
+        assert!(matches!(route_get("/validator/21"), GetRoute::Plain(ProofKind::Validator, 21)));
         assert!(matches!(route_get("/graph//proof"), GetRoute::NotFound));
         // M59 account routes still resolve to their own variants.
         assert!(matches!(route_get("/account/7/proof"), GetRoute::AccountProof(7)));
         assert!(matches!(route_get("/account/7"), GetRoute::Account(7)));
         assert!(matches!(route_get("/"), GetRoute::Health));
+    }
+
+    #[test]
+    fn route_get_parses_plain_entities() {
+        // M65: a bare `/{reviewer,validator,graph}/{id}` is the plain (unverified) read,
+        // the non-proof sibling of `/account/{id}`. The M60 `/proof` form still resolves
+        // to `Proof`; a non-numeric or empty id is still NotFound (404).
+        assert!(matches!(route_get("/reviewer/10"), GetRoute::Plain(ProofKind::Reviewer, 10)));
+        assert!(matches!(route_get("/validator/21"), GetRoute::Plain(ProofKind::Validator, 21)));
+        assert!(matches!(route_get("/graph/0"), GetRoute::Plain(ProofKind::GraphNode, 0)));
+        // No M60 regression.
+        assert!(matches!(route_get("/reviewer/10/proof"), GetRoute::Proof(ProofKind::Reviewer, 10)));
+        // Bad ids.
+        assert!(matches!(route_get("/reviewer/x"), GetRoute::NotFound));
+        assert!(matches!(route_get("/graph/"), GetRoute::NotFound));
+    }
+
+    #[test]
+    fn format_entity_renders() {
+        // M65: each entity kind renders to a grep-friendly `key=value` line.
+        let r = format_entity(&EntityView::Reviewer { id: 10, reputation: 1.0 });
+        assert_eq!(r, "kind=reviewer id=10 reputation=1");
+        let v = format_entity(&EntityView::Validator { id: 21, power: 5, pubkey: [0xAB; 32] });
+        assert!(v.starts_with("kind=validator id=21 power=5 pubkey="), "{v}");
+        assert!(v.contains(&crate::hash::hex(&[0xABu8; 32])), "{v}");
+        let mut emb = [0.0f32; crate::DIM];
+        emb[0] = 1.0;
+        let g = format_entity(&EntityView::GraphNode { node_id: 3, domain: 7, embedding: emb });
+        assert!(g.starts_with("kind=graph node_id=3 domain=7 "), "{g}");
+        assert!(g.contains(&format!("dim={}", crate::DIM)), "{g}");
+        assert!(g.contains("embedding=1,0"), "{g}");
+    }
+
+    #[test]
+    fn split_query_splits() {
+        // M66: the query is split off at the first `?`; a query-less target leaves the
+        // path byte-identical (so pre-M66 routing/responses are unchanged).
+        assert_eq!(split_query("/account/10?format=json"), ("/account/10", "format=json"));
+        assert_eq!(split_query("/head"), ("/head", ""));
+        assert_eq!(split_query("/bridge/locks?a=1&format=json"), ("/bridge/locks", "a=1&format=json"));
+        assert_eq!(split_query("/height?"), ("/height", ""));
+    }
+
+    #[test]
+    fn response_format_parses() {
+        // M66: only an exact, case-sensitive `format=json` selects JSON; everything
+        // else — absent, empty, `format=text`, wrong case, unknown key — stays Text.
+        assert_eq!(response_format("format=json"), RespFormat::Json);
+        assert_eq!(response_format(""), RespFormat::Text);
+        assert_eq!(response_format("format=text"), RespFormat::Text);
+        assert_eq!(response_format("format=JSON"), RespFormat::Text);
+        assert_eq!(response_format("foo=bar"), RespFormat::Text);
+        assert_eq!(response_format("format="), RespFormat::Text);
+        // Not the first pair.
+        assert_eq!(response_format("a=1&format=json"), RespFormat::Json);
+        // First `format=` wins — a later duplicate does not override it.
+        assert_eq!(response_format("format=text&format=json"), RespFormat::Text);
+    }
+
+    #[test]
+    fn json_escapes_control_chars() {
+        // M66: `json_str` escapes `"`, `\`, and all control chars (RFC 8259).
+        assert_eq!(json_str("a\"b\\c"), "\"a\\\"b\\\\c\"");
+        assert_eq!(json_str("l1\nl2\tx"), "\"l1\\nl2\\tx\"");
+        assert_eq!(json_str("\u{0001}"), "\"\\u0001\"");
+        // `json_f32` maps non-finite values to `null`; a finite value is a bare token.
+        assert_eq!(json_f32(f32::NAN), "null");
+        assert_eq!(json_f32(f32::INFINITY), "null");
+        assert_eq!(json_f32(1.0), "1");
+    }
+
+    #[test]
+    fn json_account_renders() {
+        // M66: u64 fields are JSON *strings* (lossless), pubkey is a hex string. A
+        // `u64::MAX` value round-trips exactly as a string, not a lossy JSON number.
+        let a = Account { balance: u64::MAX, pubkey: [0xAB; 32], ..Default::default() };
+        let j = json_account(7, &a);
+        assert!(j.starts_with("{\"id\":\"7\","), "{j}");
+        assert!(j.contains("\"balance\":\"18446744073709551615\""), "{j}");
+        assert!(j.contains(&format!("\"pubkey\":\"{}\"", crate::hash::hex(&[0xABu8; 32]))), "{j}");
+    }
+
+    #[test]
+    fn json_entity_renders() {
+        // M66: each JSON entity object carries a `"kind"` discriminator; u64 fields are
+        // strings, the graph embedding is a JSON array of numbers.
+        let r = json_entity(&EntityView::Reviewer { id: 10, reputation: 1.0 });
+        assert_eq!(r, "{\"kind\":\"reviewer\",\"id\":\"10\",\"reputation\":1}");
+        let v = json_entity(&EntityView::Validator { id: 21, power: 5, pubkey: [0xAB; 32] });
+        assert!(v.starts_with("{\"kind\":\"validator\",\"id\":\"21\",\"power\":\"5\","), "{v}");
+        let mut emb = [0.0f32; crate::DIM];
+        emb[0] = 1.0;
+        let g = json_entity(&EntityView::GraphNode { node_id: 3, domain: 7, embedding: emb });
+        assert!(g.starts_with("{\"kind\":\"graph\",\"node_id\":\"3\",\"domain\":\"7\","), "{g}");
+        assert!(g.contains(&format!("\"dim\":\"{}\"", crate::DIM)), "{g}");
+        assert!(g.contains("\"embedding\":[1,0"), "{g}");
+    }
+
+    #[test]
+    fn json_lock_listing_renders() {
+        // M66: the empty chain renders `[]` (the one intentional divergence from the
+        // text renderer's empty string); a single lock is a one-element array.
+        assert_eq!(json_lock_listing(&[]), "[]");
+        let lock = crate::BridgeLock {
+            account: 3,
+            amount: u64::MAX,
+            dest_chain: [0xCD; 32],
+            dest_account: 9,
+            nonce: 2,
+            signature: [0u8; 64],
+        };
+        let j = json_lock_listing(&[(1, 5, lock)]);
+        assert!(j.starts_with("[{\"lock_id\":\"1\",\"height\":\"5\","), "{j}");
+        assert!(j.contains("\"amount\":\"18446744073709551615\""), "{j}");
+        assert!(j.contains("\"nonce\":\"2\"}]"), "{j}");
+    }
+
+    #[test]
+    fn error_body_renders() {
+        // M67: `error_body` is status-agnostic — Text is the bare message with a
+        // text/plain type; Json is {"error":"<msg>"} with application/json, the message
+        // escaped. A status other than 404 carries through, and `not_found_body`
+        // delegates to it with a 404 status line.
+        let t = error_body(RespFormat::Text, "422 Unprocessable Entity", "nope");
+        assert!(t.starts_with("HTTP/1.1 422 Unprocessable Entity"), "{t}");
+        assert!(t.contains("Content-Type: text/plain; charset=utf-8\r\n"), "{t}");
+        assert!(t.ends_with("\r\n\r\nnope"), "{t}");
+
+        let j = error_body(RespFormat::Json, "422 Unprocessable Entity", "no\"pe");
+        assert!(j.starts_with("HTTP/1.1 422 Unprocessable Entity"), "{j}");
+        assert!(j.contains("Content-Type: application/json\r\n"), "{j}");
+        assert!(j.ends_with("\r\n\r\n{\"error\":\"no\\\"pe\"}"), "{j}");
+
+        let nf = not_found_body(RespFormat::Json, "gone");
+        assert!(nf.starts_with("HTTP/1.1 404 Not Found"), "{nf}");
+        assert!(nf.ends_with("\r\n\r\n{\"error\":\"gone\"}"), "{nf}");
+    }
+
+    #[test]
+    fn json_proof_renderers_render() {
+        // M67: the hex-wrapping JSON renderers (`json_account_proof` / `json_lock` /
+        // `json_batch`) carry the SAME opaque hex as their `format_*` text siblings,
+        // just relocated into named fields. Build a lock-bearing certified chain via
+        // the driver (as `lock_proof_formats_and_verifies` does), wrap it in a pure
+        // `GossipNode`, then assert each JSON body embeds its sibling's exact hex.
+        use crate::driver::ChainDriver;
+        use crate::light::{BatchItem, ProofKind};
+        use crate::{DeltaKParams, Genesis, MICRO};
+        use std::collections::BTreeMap;
+        fn seed_for(id: u64) -> [u8; 32] {
+            let mut s = [0u8; 32];
+            s[..8].copy_from_slice(&id.to_le_bytes());
+            s
+        }
+        let ga = Genesis {
+            accounts: vec![(1, 50 * MICRO, kp(1).public())],
+            reviewers: vec![(10, 1.0)],
+            seed_nodes: vec![(unit(0), 0)],
+            params: DeltaKParams::default(),
+            base_emission_micro: 0,
+            slash_bps: 10_000,
+            timestamp_days: 0.0,
+            validators: vec![(21, kp(21).public(), 1)],
+            bridge_sources: vec![],
+        };
+        let mut gb = ga.clone();
+        gb.timestamp_days = 1.0;
+        let b_genesis_hash = crate::ChainState::genesis(gb.clone()).1;
+        let seeds: BTreeMap<u64, [u8; 32]> = [(21u64, seed_for(21))].into_iter().collect();
+        let mut d = ChainDriver::new(ga.clone(), seeds, 16);
+        let lock = crate::BridgeLock {
+            account: 1,
+            amount: 4 * MICRO,
+            dest_chain: b_genesis_hash,
+            dest_account: 7,
+            nonce: 0,
+            signature: [0u8; 64],
+        }
+        .signed(&kp(1));
+        d.stage_bridge_lock(lock);
+        d.produce_until_drained(1.0, 16).expect("produce");
+        let mut node = crate::net::GossipNode::new(1, ga.clone(), 16, [2u64]);
+        node.load_certified(d.blocks(), d.certificates());
+
+        // Account proof: JSON embeds the same two hex blobs as `format_account_proof`.
+        let (ch, entry) = node.account_inclusion(1).expect("account inclusion");
+        let ch_hex = crate::hash::hex(&crate::codec::encode_certified_header(&ch));
+        let entry_hex = crate::hash::hex(&crate::codec::encode_proof_entry(&entry));
+        let text = format_account_proof(&ch, &entry);
+        assert!(text.contains(&ch_hex) && text.contains(&entry_hex), "{text}");
+        assert_eq!(
+            json_account_proof(&ch, &entry),
+            format!("{{\"certified_header\":\"{ch_hex}\",\"proof_entry\":\"{entry_hex}\"}}"),
+        );
+
+        // Lock envelope: single hex field matching `format_lock`.
+        let env = node.serve_lock(0).expect("serve_lock");
+        let lock_hex = crate::hash::hex(&crate::net::encode_lock_envelope(&env));
+        assert_eq!(json_lock(&env), format!("{{\"lock_envelope\":\"{lock_hex}\"}}"));
+
+        // Batch: three hex fields matching `format_batch`.
+        let (bch, benv, range) = node
+            .batch(vec![BatchItem::Inclusion { kind: ProofKind::Reviewer, id: 10 }])
+            .expect("batch");
+        let jb = json_batch(&bch, &benv, &range);
+        assert!(jb.starts_with("{\"certified_header\":\""), "{jb}");
+        assert!(jb.contains("\"batch_envelope\":\""), "{jb}");
+        assert!(jb.contains("\"range_blocks\":\""), "{jb}");
+        assert!(jb.ends_with("\"}"), "{jb}");
     }
 
     #[test]
@@ -4359,9 +4967,174 @@ mod tests {
         // Unknown id → 404.
         let miss = get(rpc_addr, "/validator/999/proof").await;
         assert!(miss.starts_with("HTTP/1.1 404"), "unknown proof: {miss}");
-        // Bare `{id}` (no `/proof`) → 404 (no plain-read form for these entities).
+        // M65: a bare `{id}` (no `/proof`) is now the plain (unverified) read → 200 with
+        // a `key=value` body, the non-proof sibling of `/account/{id}`.
         let bare = get(rpc_addr, "/validator/21").await;
-        assert!(bare.starts_with("HTTP/1.1 404"), "bare id: {bare}");
+        assert!(bare.starts_with("HTTP/1.1 200 OK"), "bare id: {bare}");
+        assert!(body_of(&bare).contains("kind=validator id=21"), "bare id body: {bare}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn rpc_json_reads_over_tcp() {
+        // M66: `?format=json` on a structured plain read returns an `application/json`
+        // body; a data miss returns `{"error":…}`; and a query-less read stays
+        // byte-identical to the pre-M66 `text/plain` response.
+        let dir = tmp_dir("rpc-json");
+        let mut cfg = node_config(21, 20151, &[21], dir.clone());
+        let rpc_addr = "127.0.0.1:20161";
+        cfg.rpc = Some(crate::config::RpcConfig { enabled: true, listen: rpc_addr.into() });
+        let mut genesis = test_genesis();
+        genesis.validators = vec![(21, kp(21).public(), 1)]; // quorum 1 ⇒ self-commit
+        let node = Node::start(cfg, genesis, Some(kp(21))).await.expect("start node");
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            if node.status().await.map(|(h, _)| h >= 1).unwrap_or(false) {
+                break;
+            }
+            assert!(tokio::time::Instant::now() < deadline, "node never produced a block");
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+
+        async fn get(addr: &str, path: &str) -> String {
+            let req = format!("GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
+            let mut s = TcpStream::connect(addr).await.expect("connect rpc");
+            s.write_all(req.as_bytes()).await.expect("send get");
+            let mut resp = Vec::new();
+            s.read_to_end(&mut resp).await.expect("read response");
+            String::from_utf8_lossy(&resp).into_owned()
+        }
+        fn body_of(resp: &str) -> &str {
+            resp.rsplit("\r\n\r\n").next().unwrap_or("")
+        }
+
+        // Each JSON read is 200 + application/json + the expected JSON shape.
+        let h = get(rpc_addr, "/height?format=json").await;
+        assert!(h.starts_with("HTTP/1.1 200 OK"), "height: {h}");
+        assert!(h.contains("Content-Type: application/json\r\n"), "height ct: {h}");
+        assert!(body_of(&h).starts_with("{\"height\":\""), "height body: {h}");
+
+        let a = get(rpc_addr, "/account/1?format=json").await;
+        assert!(a.starts_with("HTTP/1.1 200 OK"), "account: {a}");
+        assert!(a.contains("Content-Type: application/json\r\n"), "account ct: {a}");
+        assert!(body_of(&a).contains("\"balance\":\""), "account body: {a}");
+
+        let r = get(rpc_addr, "/reviewer/10?format=json").await;
+        assert!(r.starts_with("HTTP/1.1 200 OK"), "reviewer: {r}");
+        assert!(body_of(&r).contains("\"kind\":\"reviewer\""), "reviewer body: {r}");
+
+        let locks = get(rpc_addr, "/bridge/locks?format=json").await;
+        assert!(locks.starts_with("HTTP/1.1 200 OK"), "locks: {locks}");
+        assert!(locks.contains("Content-Type: application/json\r\n"), "locks ct: {locks}");
+        assert!(body_of(&locks).starts_with("["), "locks body: {locks}");
+
+        // A data miss under JSON → 404 + application/json + {"error":…}.
+        let miss = get(rpc_addr, "/reviewer/999?format=json").await;
+        assert!(miss.starts_with("HTTP/1.1 404"), "miss: {miss}");
+        assert!(miss.contains("Content-Type: application/json\r\n"), "miss ct: {miss}");
+        assert!(body_of(&miss).starts_with("{\"error\":"), "miss body: {miss}");
+
+        // Head invariant at the response layer: a query-less read is byte-identical to
+        // the pre-M66 plaintext response (text/plain, bare decimal height).
+        let plain = get(rpc_addr, "/height").await;
+        assert!(plain.contains("Content-Type: text/plain; charset=utf-8\r\n"), "plain ct: {plain}");
+        assert!(body_of(&plain).chars().all(|c| c.is_ascii_digit()), "plain body: {plain}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn rpc_json_proofs_over_tcp() {
+        // M67: `?format=json` now extends to the proof / submit reads that were
+        // text-only through M66. Each returns an `application/json` body wrapping the
+        // same opaque hex; submit success is {"hash":…}; a decode failure or data miss
+        // is {"error":…}; and a query-less proof read stays byte-identical to today.
+        let dir = tmp_dir("rpc-json-proofs");
+        let mut cfg = node_config(21, 20171, &[21], dir.clone());
+        let rpc_addr = "127.0.0.1:20181";
+        cfg.rpc = Some(crate::config::RpcConfig { enabled: true, listen: rpc_addr.into() });
+        let mut genesis = test_genesis();
+        genesis.validators = vec![(21, kp(21).public(), 1)]; // quorum 1 ⇒ self-commit
+        let node = Node::start(cfg, genesis, Some(kp(21))).await.expect("start node");
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            if node.status().await.map(|(h, _)| h >= 1).unwrap_or(false) {
+                break;
+            }
+            assert!(tokio::time::Instant::now() < deadline, "node never produced a block");
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+
+        async fn get(addr: &str, path: &str) -> String {
+            let req = format!("GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
+            let mut s = TcpStream::connect(addr).await.expect("connect rpc");
+            s.write_all(req.as_bytes()).await.expect("send get");
+            let mut resp = Vec::new();
+            s.read_to_end(&mut resp).await.expect("read response");
+            String::from_utf8_lossy(&resp).into_owned()
+        }
+        async fn post(addr: &str, path: &str, body: &[u8]) -> String {
+            let mut req = format!(
+                "POST {path} HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            )
+            .into_bytes();
+            req.extend_from_slice(body);
+            let mut s = TcpStream::connect(addr).await.expect("connect rpc");
+            s.write_all(&req).await.expect("send post");
+            let mut resp = Vec::new();
+            s.read_to_end(&mut resp).await.expect("read response");
+            String::from_utf8_lossy(&resp).into_owned()
+        }
+        fn body_of(resp: &str) -> &str {
+            resp.rsplit("\r\n\r\n").next().unwrap_or("")
+        }
+
+        // Account proof under JSON → 200 + application/json + {"certified_header":…}.
+        let ap = get(rpc_addr, "/account/1/proof?format=json").await;
+        assert!(ap.starts_with("HTTP/1.1 200 OK"), "account proof: {ap}");
+        assert!(ap.contains("Content-Type: application/json\r\n"), "account proof ct: {ap}");
+        assert!(body_of(&ap).starts_with("{\"certified_header\":\""), "account proof body: {ap}");
+
+        // Entity proof reuses the same renderer → carries the proof_entry field.
+        let rp = get(rpc_addr, "/reviewer/10/proof?format=json").await;
+        assert!(rp.starts_with("HTTP/1.1 200 OK"), "reviewer proof: {rp}");
+        assert!(body_of(&rp).contains("\"proof_entry\":\""), "reviewer proof body: {rp}");
+
+        // The daemon drives no bridge locks → data miss → 404 + {"error":…}.
+        let lk = get(rpc_addr, "/bridge/lock/1/proof?format=json").await;
+        assert!(lk.starts_with("HTTP/1.1 404"), "bridge lock: {lk}");
+        assert!(lk.contains("Content-Type: application/json\r\n"), "bridge lock ct: {lk}");
+        assert!(body_of(&lk).starts_with("{\"error\":"), "bridge lock body: {lk}");
+
+        // POST /submit_tx?format=json with a valid tx → {"hash":…}.
+        let tx = test_tx(1, 0, 1);
+        let hx = crate::hash::hex(&tx.hash());
+        let ok = post(rpc_addr, "/submit_tx?format=json", &crate::codec::encode_tx(&tx)).await;
+        assert!(ok.starts_with("HTTP/1.1 200 OK"), "submit json: {ok}");
+        assert!(ok.contains("Content-Type: application/json\r\n"), "submit json ct: {ok}");
+        assert_eq!(body_of(&ok), format!("{{\"hash\":\"{hx}\"}}"), "submit json body: {ok}");
+
+        // A malformed submit body under JSON → 400 + {"error":…}.
+        let bad = post(rpc_addr, "/submit_tx?format=json", b"not a tx").await;
+        assert!(bad.starts_with("HTTP/1.1 400"), "submit bad: {bad}");
+        assert!(body_of(&bad).starts_with("{\"error\":"), "submit bad body: {bad}");
+
+        // POST /batch?format=json with an encoded request → {"certified_header":…}.
+        let items = vec![BatchItem::Inclusion { kind: ProofKind::Reviewer, id: 10 }];
+        let batch = post(rpc_addr, "/batch?format=json", &crate::net::encode_batch_request(&items)).await;
+        assert!(batch.starts_with("HTTP/1.1 200 OK"), "batch json: {batch}");
+        assert!(batch.contains("Content-Type: application/json\r\n"), "batch json ct: {batch}");
+        assert!(body_of(&batch).starts_with("{\"certified_header\":\""), "batch json body: {batch}");
+
+        // Head invariant at the response layer: a query-less proof read is byte-identical
+        // to the pre-M67 plaintext (text/plain, labeled `certified_header=` hex line).
+        let plain = get(rpc_addr, "/account/1/proof").await;
+        assert!(plain.contains("Content-Type: text/plain; charset=utf-8\r\n"), "plain ct: {plain}");
+        assert!(body_of(&plain).starts_with("certified_header="), "plain body: {plain}");
 
         let _ = std::fs::remove_dir_all(&dir);
     }
