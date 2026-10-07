@@ -446,6 +446,12 @@ enum Cmd {
     QueryBonds {
         reply: oneshot::Sender<Vec<(u64, u64)>>,
     },
+    /// M88: list the unbonding-delay queue (account + amount + mature height) for the
+    /// plain read-class RPC directory — a read sibling of `/bonds` on the stake
+    /// lifecycle. Always a (possibly empty) list.
+    QueryUnbonding {
+        reply: oneshot::Sender<Vec<crate::UnbondingEntry>>,
+    },
     /// M61: serve a heterogeneous proof batch + the certified head it verifies
     /// against, for the verifiable batch read RPC. `None` ⇒ `serve_batch` rejected
     /// (over `MAX_BATCH_ITEMS` or a degenerate Diff range) or no certified head
@@ -1135,6 +1141,10 @@ async fn run_actor(mut actor: Actor, mut rx: mpsc::UnboundedReceiver<Cmd>) {
                 let bonds =
                     actor.node.chain.state.bonds.iter().map(|(&id, &amt)| (id, amt)).collect();
                 let _ = reply.send(bonds);
+            }
+            Cmd::QueryUnbonding { reply } => {
+                // M88: snapshot the unbonding-delay queue (insertion order) for the directory.
+                let _ = reply.send(actor.node.chain.state.unbonding.clone());
             }
             Cmd::QueryBatch { items, reply } => {
                 let _ = reply.send(actor.node.batch(items));
@@ -1954,6 +1964,10 @@ enum GetRoute {
     /// bonded micro-$COG), a read sibling of `/validators` that exposes the raw stake
     /// backing voting power rather than the power itself. No single-read sibling.
     Bonds,
+    /// M88: `GET /unbonding` — the unbonding-delay queue (account + amount + mature
+    /// height), the withdrawals awaiting return to balances after `UNBONDING_PERIOD`.
+    /// A read sibling of `/bonds` on the stake lifecycle; no single-read sibling.
+    Unbonding,
     NotFound,
 }
 
@@ -2216,6 +2230,9 @@ fn route_get(path: &str) -> GetRoute {
         // M87: the per-validator bonded-stake directory. Exact-match; there is no
         // `/bond/` single-read prefix, so `/bonds/` simply falls through to `Health`.
         "/bonds" => GetRoute::Bonds,
+        // M88: the unbonding-delay queue. Exact-match; there is no `/unbonding/` single-read
+        // prefix, so `/unbonding/` simply falls through to `Health`.
+        "/unbonding" => GetRoute::Unbonding,
         p => {
             if let Some(rest) = p.strip_prefix("/account/") {
                 // M59: `{id}/proof` is the verifiable read; a bare `{id}` is the M58
@@ -2664,6 +2681,40 @@ fn json_bond_listing(bonds: &[(u64, u64)]) -> String {
         .map(|&(id, bonded)| json_bond(id, bonded))
         .collect::<Vec<_>>()
         .join(",");
+    format!("[{items}]")
+}
+
+/// M88: render one unbonding-queue entry as a grep-friendly `key=value` line
+/// (`kind=unbonding account=… amount=… mature_height=…`). Standalone (no `EntityView` —
+/// a queue entry is a plain state value, not a merkle-proof entity). Pure for testing.
+fn format_unbonding(e: &crate::UnbondingEntry) -> String {
+    format!(
+        "kind=unbonding account={} amount={} mature_height={}",
+        e.account, e.amount, e.mature_height
+    )
+}
+
+/// M88: the JSON sibling of [`format_unbonding`] — a single object with lossless
+/// quoted-u64 scalars, matching the `kind`-tagged shape of the other list-read items.
+fn json_unbonding(e: &crate::UnbondingEntry) -> String {
+    format!(
+        "{{\"kind\":\"unbonding\",\"account\":{},\"amount\":{},\"mature_height\":{}}}",
+        json_u64(e.account),
+        json_u64(e.amount),
+        json_u64(e.mature_height),
+    )
+}
+
+/// M88: render the unbonding-delay queue as grep-friendly lines, one per entry (empty
+/// string when the queue is empty). Reuses `format_unbonding` per item; insertion order.
+fn format_unbonding_listing(queue: &[crate::UnbondingEntry]) -> String {
+    queue.iter().map(format_unbonding).collect::<Vec<_>>().join("\n")
+}
+
+/// M88: `GET /unbonding?format=json` — the JSON sibling of [`format_unbonding_listing`].
+/// A JSON **array** of objects (`[]` when empty), reusing `json_unbonding` per item.
+fn json_unbonding_listing(queue: &[crate::UnbondingEntry]) -> String {
+    let items = queue.iter().map(json_unbonding).collect::<Vec<_>>().join(",");
     format!("[{items}]")
 }
 
@@ -3535,6 +3586,37 @@ async fn serve_rpc_conn(mut stream: TcpStream, cmd: mpsc::UnboundedSender<Cmd>) 
                                 fmt,
                                 &format_page(&format_bond_listing(page), total, next),
                                 &json_page(&json_bond_listing(page), total, next),
+                            )
+                        }
+                        Err(_) => http_response("503 Service Unavailable", "node stopped"),
+                    }
+                }
+            }
+            GetRoute::Unbonding => {
+                // M88: unbonding-delay queue — always a (possibly empty) `200`. Seventh
+                // consumer of the pagination stack (after `/bridge/locks`, `/validators`,
+                // `/accounts`, `/reviewers`, `/graph`, `/bonds`), reusing
+                // `format_unbonding`/`json_unbonding` per item.
+                let (reply, rx) = oneshot::channel();
+                if cmd.send(Cmd::QueryUnbonding { reply }).is_err() {
+                    http_response("503 Service Unavailable", "node stopped")
+                } else {
+                    match rx.await {
+                        Ok(listing) => {
+                            let offset = usize_param(query, "offset").unwrap_or(0);
+                            let limit = Some(effective_limit(usize_param(query, "limit")));
+                            let total = listing.len();
+                            let page = paginate(&listing, offset, limit);
+                            let start = offset.min(total);
+                            let next = if start + page.len() < total {
+                                Some(start + page.len())
+                            } else {
+                                None
+                            };
+                            ok_body(
+                                fmt,
+                                &format_page(&format_unbonding_listing(page), total, next),
+                                &json_page(&json_unbonding_listing(page), total, next),
                             )
                         }
                         Err(_) => http_response("503 Service Unavailable", "node stopped"),
@@ -5994,6 +6076,60 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn rpc_unbonding_list_over_tcp() {
+        // M88: the unbonding-delay queue over real TCP — the seventh list endpoint, reusing
+        // the pagination stack + the new `format_unbonding`/`json_unbonding` per-item
+        // renderers. The queue only fills when an `Unbond` `StakeOp` schedules a withdrawal,
+        // so a fresh chain's `/unbonding` is live-but-empty — asserted end to end
+        // (route → Cmd → `state.unbonding` → envelope).
+        let dir = tmp_dir("rpc-unbonding-list");
+        let mut cfg = node_config(29, 20331, &[29], dir.clone());
+        let rpc_addr = "127.0.0.1:20341";
+        cfg.rpc = Some(crate::config::RpcConfig { enabled: true, listen: rpc_addr.into() });
+        let mut genesis = test_genesis();
+        genesis.validators = vec![(29, kp(29).public(), 1)]; // quorum 1 ⇒ self-commit
+        let node = Node::start(cfg, genesis, Some(kp(29))).await.expect("start node");
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            if node.status().await.map(|(h, _)| h >= 1).unwrap_or(false) {
+                break;
+            }
+            assert!(tokio::time::Instant::now() < deadline, "node never produced a block");
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+
+        async fn get(addr: &str, path: &str) -> String {
+            let req = format!("GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
+            let mut s = TcpStream::connect(addr).await.expect("connect rpc");
+            s.write_all(req.as_bytes()).await.expect("send get");
+            let mut resp = Vec::new();
+            s.read_to_end(&mut resp).await.expect("read response");
+            String::from_utf8_lossy(&resp).into_owned()
+        }
+        fn body_of(resp: &str) -> &str {
+            resp.split_once("\r\n\r\n").map(|(_, b)| b).unwrap_or("")
+        }
+
+        // Plain directory → 200 with an empty page (no queued withdrawals at genesis).
+        let resp = get(rpc_addr, "/unbonding").await;
+        assert!(resp.starts_with("HTTP/1.1 200 OK"), "unbonding status: {resp}");
+        assert_eq!(body_of(&resp), "total=0", "unbonding text envelope (empty queue)");
+
+        // JSON representation → the `total`/`next`/`items` envelope with an empty array.
+        let as_json = get(rpc_addr, "/unbonding?format=json").await;
+        assert!(as_json.starts_with("HTTP/1.1 200 OK"), "unbonding json status: {as_json}");
+        assert!(as_json.contains("Content-Type: application/json\r\n"), "json ct: {as_json}");
+        assert_eq!(
+            body_of(&as_json),
+            "{\"total\":\"0\",\"next\":null,\"items\":[]}",
+            "unbonding JSON envelope (empty queue)"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
     async fn rpc_plain_entities_over_tcp() {
         // M65: plain reviewer/validator/graph reads over real TCP. Unlike bridge locks,
         // `test_genesis` carries real reviewers (10,11,12), validators (21-24), and a
@@ -6758,6 +6894,50 @@ mod tests {
         // Empty set ⇒ empty text, `[]` JSON.
         assert_eq!(format_bond_listing(&[]), "");
         assert_eq!(json_bond_listing(&[]), "[]");
+    }
+
+    #[test]
+    fn route_get_parses_unbonding() {
+        // M88: `/unbonding` is a plain directory read — an exact match. There is no
+        // `/unbonding/` single-read prefix, so a trailing slash falls through to the health
+        // fallback (like `/bonds/`, not `NotFound`).
+        assert!(matches!(route_get("/unbonding"), GetRoute::Unbonding));
+        assert!(matches!(route_get("/unbonding/"), GetRoute::Health));
+        // Sibling list reads still resolve to their own variants (no collision).
+        assert!(matches!(route_get("/bonds"), GetRoute::Bonds));
+        assert!(matches!(route_get("/validators"), GetRoute::Validators));
+    }
+
+    #[test]
+    fn unbonding_listing_renders() {
+        // M88: two queued withdrawals render one grep-friendly line each (insertion order)
+        // and a JSON array of `kind=unbonding` objects with lossless quoted-u64 scalars; the
+        // empty queue yields an empty text body and `[]`.
+        let queue = vec![
+            crate::UnbondingEntry { account: 7, amount: 3_000_000, mature_height: 12 },
+            crate::UnbondingEntry { account: 9, amount: 500_000, mature_height: 15 },
+        ];
+        let text = format_unbonding_listing(&queue);
+        assert_eq!(
+            text,
+            "kind=unbonding account=7 amount=3000000 mature_height=12\n\
+kind=unbonding account=9 amount=500000 mature_height=15"
+        );
+        let json = json_unbonding_listing(&queue);
+        assert_eq!(
+            json,
+            "[{\"kind\":\"unbonding\",\"account\":\"7\",\"amount\":\"3000000\",\"mature_height\":\"12\"},\
+{\"kind\":\"unbonding\",\"account\":\"9\",\"amount\":\"500000\",\"mature_height\":\"15\"}]"
+        );
+        // Single-item renderers match what the listing emits per entry.
+        assert_eq!(format_unbonding(&queue[0]), "kind=unbonding account=7 amount=3000000 mature_height=12");
+        assert_eq!(
+            json_unbonding(&queue[1]),
+            "{\"kind\":\"unbonding\",\"account\":\"9\",\"amount\":\"500000\",\"mature_height\":\"15\"}"
+        );
+        // Empty queue ⇒ empty text, `[]` JSON.
+        assert_eq!(format_unbonding_listing(&[]), "");
+        assert_eq!(json_unbonding_listing(&[]), "[]");
     }
 
     #[test]
