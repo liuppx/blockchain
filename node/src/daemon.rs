@@ -422,6 +422,12 @@ enum Cmd {
     QueryValidators {
         reply: oneshot::Sender<Vec<crate::validator::Validator>>,
     },
+    /// M84: list all accounts (id + balance + stats + pubkey) for the plain read-class RPC
+    /// directory — the list sibling of the single `/account/{id}` plain read. Always a
+    /// (possibly empty) list.
+    QueryAccounts {
+        reply: oneshot::Sender<Vec<(u64, Account)>>,
+    },
     /// M61: serve a heterogeneous proof batch + the certified head it verifies
     /// against, for the verifiable batch read RPC. `None` ⇒ `serve_batch` rejected
     /// (over `MAX_BATCH_ITEMS` or a degenerate Diff range) or no certified head
@@ -1083,6 +1089,18 @@ async fn run_actor(mut actor: Actor, mut rx: mpsc::UnboundedReceiver<Cmd>) {
             Cmd::QueryValidators { reply } => {
                 // M83: read the validator set straight from state, like QueryEntity.
                 let _ = reply.send(actor.node.chain.state.validators.validators().to_vec());
+            }
+            Cmd::QueryAccounts { reply } => {
+                // M84: snapshot the id-sorted account map for the list directory.
+                let accounts = actor
+                    .node
+                    .chain
+                    .state
+                    .accounts
+                    .iter()
+                    .map(|(&id, a)| (id, a.clone()))
+                    .collect();
+                let _ = reply.send(accounts);
             }
             Cmd::QueryBatch { items, reply } => {
                 let _ = reply.send(actor.node.batch(items));
@@ -1889,6 +1907,9 @@ enum GetRoute {
     /// M83: `GET /validators` — the plain (unverified) directory of the active
     /// validator set (id + power + pubkey), the list sibling of `Plain(Validator, id)`.
     Validators,
+    /// M84: `GET /accounts` — the plain (unverified) balances directory (id + balance +
+    /// stats + pubkey), the list sibling of `Account(u64)`.
+    Accounts,
     NotFound,
 }
 
@@ -2138,6 +2159,9 @@ fn route_get(path: &str) -> GetRoute {
         // M83: the plain validator-set directory. Exact-match here, so it never collides
         // with the M60/M65 `/validator/` prefix below (`…validator` + `s`, not `…validator` + `/`).
         "/validators" => GetRoute::Validators,
+        // M84: the plain account/balances directory. Exact-match here, so it never collides
+        // with the M58/M59 `/account/` prefix below (`…account` + `s`, not `…account` + `/`).
+        "/accounts" => GetRoute::Accounts,
         p => {
             if let Some(rest) = p.strip_prefix("/account/") {
                 // M59: `{id}/proof` is the verifiable read; a bare `{id}` is the M58
@@ -2468,6 +2492,28 @@ fn json_validator_listing(vs: &[crate::validator::Validator]) -> String {
                 json_str(&crate::hash::hex(&v.pubkey)),
             )
         })
+        .collect::<Vec<_>>()
+        .join(",");
+    format!("[{items}]")
+}
+
+/// M84: render the account directory as grep-friendly `key=value` lines, one per account
+/// (empty string when there are none). Reuses `format_account` per item — same line shape
+/// as the single `/account/{id}` plain read.
+fn format_account_listing(accounts: &[(u64, Account)]) -> String {
+    accounts
+        .iter()
+        .map(|(id, a)| format_account(*id, a))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// M84: `GET /accounts?format=json` — the JSON sibling of [`format_account_listing`]. A
+/// JSON **array** of objects (`[]` when empty), reusing `json_account` per item.
+fn json_account_listing(accounts: &[(u64, Account)]) -> String {
+    let items = accounts
+        .iter()
+        .map(|(id, a)| json_account(*id, a))
         .collect::<Vec<_>>()
         .join(",");
     format!("[{items}]")
@@ -3219,6 +3265,36 @@ async fn serve_rpc_conn(mut stream: TcpStream, cmd: mpsc::UnboundedSender<Cmd>) 
                                 fmt,
                                 &format_page(&format_validator_listing(page), total, next),
                                 &json_page(&json_validator_listing(page), total, next),
+                            )
+                        }
+                        Err(_) => http_response("503 Service Unavailable", "node stopped"),
+                    }
+                }
+            }
+            GetRoute::Accounts => {
+                // M84: plain account/balances directory — always a (possibly empty) `200`.
+                // Third consumer of the pagination stack (after `/bridge/locks` and
+                // `/validators`), reusing `format_account`/`json_account` per item.
+                let (reply, rx) = oneshot::channel();
+                if cmd.send(Cmd::QueryAccounts { reply }).is_err() {
+                    http_response("503 Service Unavailable", "node stopped")
+                } else {
+                    match rx.await {
+                        Ok(listing) => {
+                            let offset = usize_param(query, "offset").unwrap_or(0);
+                            let limit = Some(effective_limit(usize_param(query, "limit")));
+                            let total = listing.len();
+                            let page = paginate(&listing, offset, limit);
+                            let start = offset.min(total);
+                            let next = if start + page.len() < total {
+                                Some(start + page.len())
+                            } else {
+                                None
+                            };
+                            ok_body(
+                                fmt,
+                                &format_page(&format_account_listing(page), total, next),
+                                &json_page(&json_account_listing(page), total, next),
                             )
                         }
                         Err(_) => http_response("503 Service Unavailable", "node stopped"),
@@ -5405,6 +5481,85 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn rpc_accounts_list_over_tcp() {
+        // M84: the account/balances directory over real TCP — the third list endpoint,
+        // reusing the pagination stack + the existing `format_account`/`json_account`
+        // per-item renderers. A one-account genesis gives a populated, deterministic body.
+        let dir = tmp_dir("rpc-accounts-list");
+        let mut cfg = node_config(25, 20251, &[25], dir.clone());
+        let rpc_addr = "127.0.0.1:20261";
+        cfg.rpc = Some(crate::config::RpcConfig { enabled: true, listen: rpc_addr.into() });
+        let mut genesis = test_genesis();
+        genesis.validators = vec![(25, kp(25).public(), 1)]; // quorum 1 ⇒ self-commit
+        genesis.accounts = vec![(1, 50 * crate::MICRO, kp(1).public())];
+        genesis.reviewers = vec![];
+        let node = Node::start(cfg, genesis, Some(kp(25))).await.expect("start node");
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            if node.status().await.map(|(h, _)| h >= 1).unwrap_or(false) {
+                break;
+            }
+            assert!(tokio::time::Instant::now() < deadline, "node never produced a block");
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+
+        async fn get(addr: &str, path: &str) -> String {
+            let req = format!("GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
+            let mut s = TcpStream::connect(addr).await.expect("connect rpc");
+            s.write_all(req.as_bytes()).await.expect("send get");
+            let mut resp = Vec::new();
+            s.read_to_end(&mut resp).await.expect("read response");
+            String::from_utf8_lossy(&resp).into_owned()
+        }
+        fn body_of(resp: &str) -> &str {
+            resp.split_once("\r\n\r\n").map(|(_, b)| b).unwrap_or("")
+        }
+
+        // The single genesis account, balance == its endowment, zeroed stats.
+        let want = Account {
+            pubkey: kp(1).public(),
+            balance: 50 * crate::MICRO,
+            staked_total: 0,
+            earned_total: 0,
+            slashed_total: 0,
+            submissions: 0,
+            accepted: 0,
+        };
+
+        // Plain directory → 200 with the single account.
+        let resp = get(rpc_addr, "/accounts").await;
+        assert!(resp.starts_with("HTTP/1.1 200 OK"), "accounts status: {resp}");
+        assert_eq!(
+            body_of(&resp),
+            format!("total=1\n{}", format_account(1, &want)),
+            "single-account text envelope"
+        );
+
+        // JSON representation → the `total`/`next`/`items` envelope with the account.
+        let as_json = get(rpc_addr, "/accounts?format=json").await;
+        assert!(as_json.starts_with("HTTP/1.1 200 OK"), "accounts json status: {as_json}");
+        assert!(as_json.contains("Content-Type: application/json\r\n"), "json ct: {as_json}");
+        assert_eq!(
+            body_of(&as_json),
+            format!("{{\"total\":\"1\",\"next\":null,\"items\":[{}]}}", json_account(1, &want)),
+            "single-account JSON envelope"
+        );
+
+        // `?offset=1` windows past the only account → empty page, no `next`.
+        let past = get(rpc_addr, "/accounts?offset=1").await;
+        assert!(past.starts_with("HTTP/1.1 200 OK"), "offset status: {past}");
+        assert_eq!(body_of(&past), "total=1", "offset past end → total=1, empty page");
+
+        // `?limit=0` is an explicit empty page, but another page remains → `next=0`.
+        let empty = get(rpc_addr, "/accounts?limit=0").await;
+        assert!(empty.starts_with("HTTP/1.1 200 OK"), "limit=0 status: {empty}");
+        assert_eq!(body_of(&empty), "total=1\nnext=0", "limit=0 → empty page with next=0");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
     async fn rpc_plain_entities_over_tcp() {
         // M65: plain reviewer/validator/graph reads over real TCP. Unlike bridge locks,
         // `test_genesis` carries real reviewers (10,11,12), validators (21-24), and a
@@ -5862,6 +6017,46 @@ mod tests {
     }
 
     #[test]
+    fn account_listing_renders() {
+        // M84: the empty directory renders `""` (text) / `[]` (json); two accounts render
+        // one `format_account`-shaped line each (text) and a two-object array (json),
+        // reusing the exact single-item renderers.
+        assert_eq!(format_account_listing(&[]), "");
+        assert_eq!(json_account_listing(&[]), "[]");
+
+        let a1 = Account {
+            pubkey: [0xab; 32],
+            balance: 12,
+            staked_total: 3,
+            earned_total: 4,
+            slashed_total: 5,
+            submissions: 6,
+            accepted: 7,
+        };
+        let a2 = Account {
+            pubkey: [0x01; 32],
+            balance: u64::MAX,
+            staked_total: 0,
+            earned_total: 0,
+            slashed_total: 0,
+            submissions: 0,
+            accepted: 0,
+        };
+        let accounts = vec![(1u64, a1.clone()), (2u64, a2.clone())];
+
+        // Text listing is exactly the per-item lines joined by `\n`.
+        assert_eq!(
+            format_account_listing(&accounts),
+            format!("{}\n{}", format_account(1, &a1), format_account(2, &a2)),
+        );
+        // JSON listing is exactly the per-item objects wrapped in an array.
+        assert_eq!(
+            json_account_listing(&accounts),
+            format!("[{},{}]", json_account(1, &a1), json_account(2, &a2)),
+        );
+    }
+
+    #[test]
     fn error_body_renders() {
         // M67: `error_body` is status-agnostic — Text is the bare message with a
         // text/plain type; Json is {"error":"<msg>"} with application/json, the message
@@ -5999,6 +6194,19 @@ mod tests {
         // M60/M65 single-validator routes still resolve to their own variants.
         assert!(matches!(route_get("/validator/21"), GetRoute::Plain(ProofKind::Validator, 21)));
         assert!(matches!(route_get("/validator/21/proof"), GetRoute::Proof(ProofKind::Validator, 21)));
+    }
+
+    #[test]
+    fn route_get_parses_accounts() {
+        // M84: `/accounts` is a plain directory read — an exact match, distinct from the
+        // M58/M59 `/account/{id}` prefix route (char after `…account` is `s`, not `/`). A
+        // trailing slash is not the directory, so it falls through to the M58 health
+        // liveness fallback like any unknown path.
+        assert!(matches!(route_get("/accounts"), GetRoute::Accounts));
+        assert!(matches!(route_get("/accounts/"), GetRoute::Health));
+        // M58/M59 single-account routes still resolve to their own variants.
+        assert!(matches!(route_get("/account/7"), GetRoute::Account(7)));
+        assert!(matches!(route_get("/account/7/proof"), GetRoute::AccountProof(7)));
     }
 
     #[test]
