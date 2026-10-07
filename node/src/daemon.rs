@@ -2320,18 +2320,107 @@ fn json_lock_listing(locks: &[(u64, u64, crate::BridgeLock)]) -> String {
     format!("[{items}]")
 }
 
-// ---- M67: hex-wrapping JSON renderers for the proof / batch reads. --------------
-// The proof envelopes are opaque, self-verifying blobs (the client decodes them with
-// the existing `verify_proof_against_header` / `verify_batch` / `verify_lock` stack),
-// so their JSON form keeps the *same* hex bytes as the `format_*` text lines, merely
-// relocated into named fields — no internal structure is exposed. All pure (no I/O).
+// ---- M67/M74: JSON renderers for the proof / batch reads. ------------------------
+// M67 serialized every proof envelope to one opaque `hex(encode_*)` blob dropped into
+// a named JSON field — self-verifying, but useless to a JSON client that only wants a
+// height or a state root without pulling in the binary codec. M74 begins decoding
+// them: the `certified_header` field — the one sub-envelope shared by the proof and
+// batch reads — is now a structured object (block header + finality cert), while the
+// still-opaque parts (`proof_entry`, `batch_envelope`, `range_blocks`, `lock_envelope`)
+// remain hex pending M75+. All pure (no I/O).
 
-/// M67: `{"certified_header":"<hex>","proof_entry":"<hex>"}` — the JSON twin of
-/// [`format_account_proof`], shared by the account- and entity-proof reads.
+/// M74: a `ValidatorUpdate` as `{"id","pubkey","power"}`.
+fn json_validator_update(u: &crate::validator::ValidatorUpdate) -> String {
+    format!(
+        "{{\"id\":{},\"pubkey\":{},\"power\":{}}}",
+        json_u64(u.id),
+        json_str(&crate::hash::hex(&u.pubkey)),
+        json_u64(u.power),
+    )
+}
+
+/// M74: a finality `Vote`. `vote_type` is a string discriminator
+/// (`"prevote"`/`"precommit"`), mirroring `json_entity`'s `"kind"`.
+fn json_vote(v: &crate::consensus::Vote) -> String {
+    let vote_type = match v.vote_type {
+        crate::consensus::VoteType::Prevote => "prevote",
+        crate::consensus::VoteType::Precommit => "precommit",
+    };
+    format!(
+        "{{\"validator\":{},\"height\":{},\"round\":{},\"block_hash\":{},\
+         \"vote_type\":{},\"signature\":{}}}",
+        json_u64(v.validator),
+        json_u64(v.height),
+        json_u64(v.round as u64),
+        json_str(&crate::hash::hex(&v.block_hash)),
+        json_str(vote_type),
+        json_str(&crate::hash::hex(&v.signature)),
+    )
+}
+
+/// M74: a finality `Commit` — `{"height","round","block_hash","precommits":[…]}`.
+fn json_commit(c: &Commit) -> String {
+    let precommits = c.precommits.iter().map(json_vote).collect::<Vec<_>>().join(",");
+    format!(
+        "{{\"height\":{},\"round\":{},\"block_hash\":{},\"precommits\":[{}]}}",
+        json_u64(c.height),
+        json_u64(c.round as u64),
+        json_str(&crate::hash::hex(&c.block_hash)),
+        precommits,
+    )
+}
+
+/// M74: a `BlockHeader` — all 15 fields, hashes as hex strings, the
+/// `validator_updates` vec as a JSON array.
+fn json_block_header(h: &crate::codec::BlockHeader) -> String {
+    let vus = h
+        .validator_updates
+        .iter()
+        .map(json_validator_update)
+        .collect::<Vec<_>>()
+        .join(",");
+    format!(
+        "{{\"height\":{},\"prev_hash\":{},\"timestamp_days\":{},\
+         \"next_validators_root\":{},\"state_root\":{},\"accounts_root\":{},\
+         \"graph_root\":{},\"bridge_root\":{},\"validator_updates\":[{}],\
+         \"txs_commitment\":{},\"stake_ops_commitment\":{},\"evidence_commitment\":{},\
+         \"bridge_locks_commitment\":{},\"bridge_headers_commitment\":{},\
+         \"bridge_redeems_commitment\":{}}}",
+        json_u64(h.height),
+        json_str(&crate::hash::hex(&h.prev_hash)),
+        json_f32(h.timestamp_days),
+        json_str(&crate::hash::hex(&h.next_validators_root)),
+        json_str(&crate::hash::hex(&h.state_root)),
+        json_str(&crate::hash::hex(&h.accounts_root)),
+        json_str(&crate::hash::hex(&h.graph_root)),
+        json_str(&crate::hash::hex(&h.bridge_root)),
+        vus,
+        json_str(&crate::hash::hex(&h.txs_commitment)),
+        json_str(&crate::hash::hex(&h.stake_ops_commitment)),
+        json_str(&crate::hash::hex(&h.evidence_commitment)),
+        json_str(&crate::hash::hex(&h.bridge_locks_commitment)),
+        json_str(&crate::hash::hex(&h.bridge_headers_commitment)),
+        json_str(&crate::hash::hex(&h.bridge_redeems_commitment)),
+    )
+}
+
+/// M74: the shared `CertifiedHeader` as `{"header":{…},"cert":{…}}` — replaces the
+/// M67 opaque-hex blob in both the proof and batch JSON reads.
+fn json_certified_header(ch: &CertifiedHeader) -> String {
+    format!(
+        "{{\"header\":{},\"cert\":{}}}",
+        json_block_header(&ch.header),
+        json_commit(&ch.cert),
+    )
+}
+
+/// M67/M74: `{"certified_header":{…},"proof_entry":"<hex>"}` — the JSON twin of
+/// [`format_account_proof`], shared by the account- and entity-proof reads. The
+/// `certified_header` is structured (M74); `proof_entry` stays hex pending M75+.
 fn json_account_proof(ch: &CertifiedHeader, entry: &ProofEntry) -> String {
     format!(
         "{{\"certified_header\":{},\"proof_entry\":{}}}",
-        json_str(&crate::hash::hex(&crate::codec::encode_certified_header(ch))),
+        json_certified_header(ch),
         json_str(&crate::hash::hex(&crate::codec::encode_proof_entry(entry))),
     )
 }
@@ -2344,12 +2433,13 @@ fn json_lock(env: &crate::bridge::LockEnvelope) -> String {
     )
 }
 
-/// M67: `{"certified_header":"<hex>","batch_envelope":"<hex>","range_blocks":"<hex>"}`
-/// — the JSON twin of [`format_batch`].
+/// M67/M74: `{"certified_header":{…},"batch_envelope":"<hex>","range_blocks":"<hex>"}`
+/// — the JSON twin of [`format_batch`]. The `certified_header` is structured (M74);
+/// `batch_envelope`/`range_blocks` stay hex pending M75+.
 fn json_batch(ch: &CertifiedHeader, env: &BatchResponseEnvelope, range: &[(Block, Commit)]) -> String {
     format!(
         "{{\"certified_header\":{},\"batch_envelope\":{},\"range_blocks\":{}}}",
-        json_str(&crate::hash::hex(&crate::codec::encode_certified_header(ch))),
+        json_certified_header(ch),
         json_str(&crate::hash::hex(&crate::net::encode_batch_envelope(env))),
         json_str(&crate::hash::hex(&crate::net::encode_blocks(range))),
     )
@@ -5082,7 +5172,9 @@ mod tests {
         let mut node = crate::net::GossipNode::new(1, ga.clone(), 16, [2u64]);
         node.load_certified(d.blocks(), d.certificates());
 
-        // Account proof: JSON embeds the same two hex blobs as `format_account_proof`.
+        // Account proof (M74): the shared `certified_header` is now a structured
+        // object (`json_certified_header`), while `proof_entry` stays an opaque hex
+        // blob matching `format_account_proof`.
         let (ch, entry) = node.account_inclusion(1).expect("account inclusion");
         let ch_hex = crate::hash::hex(&crate::codec::encode_certified_header(&ch));
         let entry_hex = crate::hash::hex(&crate::codec::encode_proof_entry(&entry));
@@ -5090,7 +5182,10 @@ mod tests {
         assert!(text.contains(&ch_hex) && text.contains(&entry_hex), "{text}");
         assert_eq!(
             json_account_proof(&ch, &entry),
-            format!("{{\"certified_header\":\"{ch_hex}\",\"proof_entry\":\"{entry_hex}\"}}"),
+            format!(
+                "{{\"certified_header\":{},\"proof_entry\":\"{entry_hex}\"}}",
+                json_certified_header(&ch),
+            ),
         );
 
         // Lock envelope: single hex field matching `format_lock`.
@@ -5098,12 +5193,12 @@ mod tests {
         let lock_hex = crate::hash::hex(&crate::net::encode_lock_envelope(&env));
         assert_eq!(json_lock(&env), format!("{{\"lock_envelope\":\"{lock_hex}\"}}"));
 
-        // Batch: three hex fields matching `format_batch`.
+        // Batch (M74): structured `certified_header`, hex `batch_envelope`/`range_blocks`.
         let (bch, benv, range) = node
             .batch(vec![BatchItem::Inclusion { kind: ProofKind::Reviewer, id: 10 }])
             .expect("batch");
         let jb = json_batch(&bch, &benv, &range);
-        assert!(jb.starts_with("{\"certified_header\":\""), "{jb}");
+        assert!(jb.starts_with("{\"certified_header\":{\"header\":{"), "{jb}");
         assert!(jb.contains("\"batch_envelope\":\""), "{jb}");
         assert!(jb.contains("\"range_blocks\":\""), "{jb}");
         assert!(jb.ends_with("\"}"), "{jb}");
@@ -5580,7 +5675,7 @@ mod tests {
         let ap = get(rpc_addr, "/account/1/proof?format=json").await;
         assert!(ap.starts_with("HTTP/1.1 200 OK"), "account proof: {ap}");
         assert!(ap.contains("Content-Type: application/json\r\n"), "account proof ct: {ap}");
-        assert!(body_of(&ap).starts_with("{\"certified_header\":\""), "account proof body: {ap}");
+        assert!(body_of(&ap).starts_with("{\"certified_header\":{\"header\":{"), "account proof body: {ap}");
 
         // Entity proof reuses the same renderer → carries the proof_entry field.
         let rp = get(rpc_addr, "/reviewer/10/proof?format=json").await;
@@ -5611,7 +5706,7 @@ mod tests {
         let batch = post(rpc_addr, "/batch?format=json", &crate::net::encode_batch_request(&items)).await;
         assert!(batch.starts_with("HTTP/1.1 200 OK"), "batch json: {batch}");
         assert!(batch.contains("Content-Type: application/json\r\n"), "batch json ct: {batch}");
-        assert!(body_of(&batch).starts_with("{\"certified_header\":\""), "batch json body: {batch}");
+        assert!(body_of(&batch).starts_with("{\"certified_header\":{\"header\":{"), "batch json body: {batch}");
 
         // Head invariant at the response layer: a query-less proof read is byte-identical
         // to the pre-M67 plaintext (text/plain, labeled `certified_header=` hex line).
@@ -6316,5 +6411,84 @@ mod tests {
         assert!(err.is_err(), "require_peer_certs without enable_tls must fail fast");
 
         cleanup(&data_dirs);
+    }
+
+    // --- M74: structured JSON for the shared `CertifiedHeader` envelope ----------
+
+    #[test]
+    fn json_certified_header_structured() {
+        // Build a CertifiedHeader fixture with distinct sentinel values: a full
+        // BlockHeader, plus a one-vote finality Commit.
+        let header = crate::codec::BlockHeader {
+            height: 7,
+            prev_hash: [0x01; 32],
+            timestamp_days: 1.5,
+            next_validators_root: [0x02; 32],
+            state_root: [0xAB; 32],
+            accounts_root: [0x03; 32],
+            graph_root: [0x04; 32],
+            bridge_root: [0x05; 32],
+            validator_updates: vec![crate::validator::ValidatorUpdate {
+                id: 3,
+                pubkey: [0x11; 32],
+                power: 9,
+            }],
+            txs_commitment: [0x06; 32],
+            stake_ops_commitment: [0x07; 32],
+            evidence_commitment: [0x08; 32],
+            bridge_locks_commitment: [0x09; 32],
+            bridge_headers_commitment: [0x0a; 32],
+            bridge_redeems_commitment: [0x0b; 32],
+        };
+        let cert = Commit {
+            height: 7,
+            round: 0,
+            block_hash: [0xCD; 32],
+            precommits: vec![crate::consensus::Vote::signed(
+                21,
+                7,
+                0,
+                [0xCD; 32],
+                crate::consensus::VoteType::Precommit,
+                &kp(21),
+            )],
+        };
+        let ch = CertifiedHeader { header, cert };
+
+        // The certified header renders as a nested object, not an opaque hex string.
+        let j = json_certified_header(&ch);
+        assert!(j.starts_with("{\"header\":{"), "nested header object: {j}");
+        assert!(j.contains("\"height\":\"7\""), "u64 rendered as a quoted string: {j}");
+        assert!(j.contains(&format!("\"state_root\":\"{}\"", "ab".repeat(32))), "{j}");
+        assert!(j.contains("\"timestamp_days\":1.5"), "f32 as a bare number: {j}");
+        assert!(j.contains("\"validator_updates\":[{"), "non-empty update array: {j}");
+        assert!(j.contains("\"round\":\"0\""), "u32 as a quoted string: {j}");
+        assert!(j.contains("\"vote_type\":\"precommit\""), "enum as discriminator: {j}");
+        assert!(j.contains("\"precommits\":[{"), "non-empty precommit array: {j}");
+        // Hand-rolled body is well-formed: braces balance.
+        assert_eq!(
+            j.matches('{').count(),
+            j.matches('}').count(),
+            "balanced braces: {j}"
+        );
+
+        // The proof read now embeds the structured header while `proof_entry` stays
+        // an opaque hex string (M74 decodes the shared header only; leaves are M75+).
+        let entry = ProofEntry::Account {
+            id: 1,
+            account: Account {
+                pubkey: [0x22; 32],
+                balance: 100,
+                staked_total: 0,
+                earned_total: 0,
+                slashed_total: 0,
+                submissions: 0,
+                accepted: 0,
+            },
+            proof: crate::merkle::Proof { steps: vec![] },
+        };
+        let p = json_account_proof(&ch, &entry);
+        assert!(p.starts_with("{\"certified_header\":{\"header\":{"), "embedded object: {p}");
+        assert!(p.contains("\"proof_entry\":\""), "proof_entry stays a hex string: {p}");
     }
 }
