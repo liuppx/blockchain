@@ -2320,14 +2320,14 @@ fn json_lock_listing(locks: &[(u64, u64, crate::BridgeLock)]) -> String {
     format!("[{items}]")
 }
 
-// ---- M67/M74: JSON renderers for the proof / batch reads. ------------------------
+// ---- M67/M74/M75: JSON renderers for the proof / batch reads. --------------------
 // M67 serialized every proof envelope to one opaque `hex(encode_*)` blob dropped into
 // a named JSON field — self-verifying, but useless to a JSON client that only wants a
-// height or a state root without pulling in the binary codec. M74 begins decoding
-// them: the `certified_header` field — the one sub-envelope shared by the proof and
-// batch reads — is now a structured object (block header + finality cert), while the
-// still-opaque parts (`proof_entry`, `batch_envelope`, `range_blocks`, `lock_envelope`)
-// remain hex pending M75+. All pure (no I/O).
+// height or a state root without pulling in the binary codec. M74 decoded the
+// `certified_header` sub-envelope (shared by the proof and batch reads); M75 decodes
+// the `proof_entry` field (typed leaf + merkle path), so the account/entity proof read
+// is now fully structured. The still-opaque parts (`batch_envelope`, `range_blocks`,
+// `lock_envelope`) remain hex pending M76+. All pure (no I/O).
 
 /// M74: a `ValidatorUpdate` as `{"id","pubkey","power"}`.
 fn json_validator_update(u: &crate::validator::ValidatorUpdate) -> String {
@@ -2414,14 +2414,76 @@ fn json_certified_header(ch: &CertifiedHeader) -> String {
     )
 }
 
-/// M67/M74: `{"certified_header":{…},"proof_entry":"<hex>"}` — the JSON twin of
-/// [`format_account_proof`], shared by the account- and entity-proof reads. The
-/// `certified_header` is structured (M74); `proof_entry` stays hex pending M75+.
+/// M75: a `merkle::Proof` as `{"steps":[{"side":"left|right","hash":"<hex>"}, …]}`.
+/// Each step is one sibling hash tagged by the side it hashes in on.
+fn json_merkle_proof(p: &crate::merkle::Proof) -> String {
+    let steps = p
+        .steps
+        .iter()
+        .map(|s| match s {
+            crate::merkle::Step::Left(h) => {
+                format!("{{\"side\":\"left\",\"hash\":{}}}", json_str(&crate::hash::hex(h)))
+            }
+            crate::merkle::Step::Right(h) => {
+                format!("{{\"side\":\"right\",\"hash\":{}}}", json_str(&crate::hash::hex(h)))
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+    format!("{{\"steps\":[{}]}}", steps)
+}
+
+/// M75: a `ProofEntry` as a `{"kind":…, <leaf fields>, "proof":{…}}` object. The
+/// `kind` discriminator + leaf shapes mirror `json_entity`; the `Account` leaf reuses
+/// `json_account`; every variant carries its `json_merkle_proof` inclusion path.
+fn json_proof_entry(e: &ProofEntry) -> String {
+    match e {
+        ProofEntry::Account { id, account, proof } => format!(
+            "{{\"kind\":\"account\",\"account\":{},\"proof\":{}}}",
+            json_account(*id, account),
+            json_merkle_proof(proof),
+        ),
+        ProofEntry::Reviewer { id, reputation, proof } => format!(
+            "{{\"kind\":\"reviewer\",\"id\":{},\"reputation\":{},\"proof\":{}}}",
+            json_u64(*id),
+            json_f32(*reputation),
+            json_merkle_proof(proof),
+        ),
+        ProofEntry::Validator { id, validator, proof } => format!(
+            "{{\"kind\":\"validator\",\"id\":{},\"power\":{},\"pubkey\":{},\"proof\":{}}}",
+            json_u64(*id),
+            json_u64(validator.power),
+            json_str(&crate::hash::hex(&validator.pubkey)),
+            json_merkle_proof(proof),
+        ),
+        ProofEntry::GraphNode { node_id, graph_node, proof } => {
+            let emb = graph_node
+                .embedding
+                .iter()
+                .map(|f| json_f32(*f))
+                .collect::<Vec<_>>()
+                .join(",");
+            format!(
+                "{{\"kind\":\"graph\",\"node_id\":{},\"domain\":{},\"dim\":{},\
+                 \"embedding\":[{}],\"proof\":{}}}",
+                json_u64(*node_id),
+                json_u64(graph_node.domain as u64),
+                json_u64(graph_node.embedding.len() as u64),
+                emb,
+                json_merkle_proof(proof),
+            )
+        }
+    }
+}
+
+/// M67/M74/M75: `{"certified_header":{…},"proof_entry":{…}}` — the JSON twin of
+/// [`format_account_proof`], shared by the account- and entity-proof reads. Both the
+/// `certified_header` (M74) and `proof_entry` (M75) are now fully structured.
 fn json_account_proof(ch: &CertifiedHeader, entry: &ProofEntry) -> String {
     format!(
         "{{\"certified_header\":{},\"proof_entry\":{}}}",
         json_certified_header(ch),
-        json_str(&crate::hash::hex(&crate::codec::encode_proof_entry(entry))),
+        json_proof_entry(entry),
     )
 }
 
@@ -5172,9 +5234,9 @@ mod tests {
         let mut node = crate::net::GossipNode::new(1, ga.clone(), 16, [2u64]);
         node.load_certified(d.blocks(), d.certificates());
 
-        // Account proof (M74): the shared `certified_header` is now a structured
-        // object (`json_certified_header`), while `proof_entry` stays an opaque hex
-        // blob matching `format_account_proof`.
+        // Account proof (M74/M75): both the shared `certified_header` and the
+        // `proof_entry` are now structured objects (`json_certified_header` /
+        // `json_proof_entry`); the text sibling still carries both as hex.
         let (ch, entry) = node.account_inclusion(1).expect("account inclusion");
         let ch_hex = crate::hash::hex(&crate::codec::encode_certified_header(&ch));
         let entry_hex = crate::hash::hex(&crate::codec::encode_proof_entry(&entry));
@@ -5183,8 +5245,9 @@ mod tests {
         assert_eq!(
             json_account_proof(&ch, &entry),
             format!(
-                "{{\"certified_header\":{},\"proof_entry\":\"{entry_hex}\"}}",
+                "{{\"certified_header\":{},\"proof_entry\":{}}}",
                 json_certified_header(&ch),
+                json_proof_entry(&entry),
             ),
         );
 
@@ -5680,7 +5743,10 @@ mod tests {
         // Entity proof reuses the same renderer → carries the proof_entry field.
         let rp = get(rpc_addr, "/reviewer/10/proof?format=json").await;
         assert!(rp.starts_with("HTTP/1.1 200 OK"), "reviewer proof: {rp}");
-        assert!(body_of(&rp).contains("\"proof_entry\":\""), "reviewer proof body: {rp}");
+        assert!(
+            body_of(&rp).contains("\"proof_entry\":{\"kind\":"),
+            "reviewer proof body: {rp}"
+        );
 
         // The daemon drives no bridge locks → data miss → 404 + {"error":…}.
         let lk = get(rpc_addr, "/bridge/lock/1/proof?format=json").await;
@@ -6489,6 +6555,89 @@ mod tests {
         };
         let p = json_account_proof(&ch, &entry);
         assert!(p.starts_with("{\"certified_header\":{\"header\":{"), "embedded object: {p}");
-        assert!(p.contains("\"proof_entry\":\""), "proof_entry stays a hex string: {p}");
+        assert!(
+            p.contains("\"proof_entry\":{\"kind\":\"account\""),
+            "proof_entry is now a structured object: {p}"
+        );
+    }
+
+    #[test]
+    fn json_proof_entry_structured() {
+        // M75: `json_proof_entry` renders each `ProofEntry` variant as a
+        // `{"kind":…, <leaf fields>, "proof":{…}}` object — the account leaf via
+        // `json_account`, the others mirroring `json_entity`, and every variant
+        // carrying its merkle inclusion path via `json_merkle_proof`.
+        use crate::light::ProofEntry;
+        let path = crate::merkle::Proof {
+            steps: vec![
+                crate::merkle::Step::Left([0xAA; 32]),
+                crate::merkle::Step::Right([0xBB; 32]),
+            ],
+        };
+        let merkle_json = "\"proof\":{\"steps\":[{\"side\":\"left\",\"hash\":\"\
+             aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"},\
+             {\"side\":\"right\",\"hash\":\"\
+             bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\"}]}";
+
+        // Account leaf reuses `json_account` (balance / pubkey present).
+        let acct = ProofEntry::Account {
+            id: 1,
+            account: crate::Account {
+                pubkey: kp(1).public(),
+                balance: 42,
+                staked_total: 0,
+                earned_total: 0,
+                slashed_total: 0,
+                submissions: 0,
+                accepted: 0,
+            },
+            proof: path.clone(),
+        };
+        let a = json_proof_entry(&acct);
+        assert!(a.starts_with("{\"kind\":\"account\",\"account\":{"), "{a}");
+        assert!(a.contains("\"balance\":\"42\"") && a.contains("\"pubkey\":\""), "{a}");
+        assert!(a.contains(merkle_json), "{a}");
+
+        // Reviewer leaf: bare reputation.
+        let rev = ProofEntry::Reviewer { id: 10, reputation: 1.5, proof: path.clone() };
+        let r = json_proof_entry(&rev);
+        assert!(r.starts_with("{\"kind\":\"reviewer\",\"id\":\"10\",\"reputation\":1.5,"), "{r}");
+        assert!(r.contains(merkle_json), "{r}");
+
+        // Validator leaf: id / power / pubkey.
+        let val = ProofEntry::Validator {
+            id: 21,
+            validator: crate::validator::Validator { id: 21, pubkey: kp(21).public(), power: 7 },
+            proof: path.clone(),
+        };
+        let v = json_proof_entry(&val);
+        assert!(v.starts_with("{\"kind\":\"validator\",\"id\":\"21\",\"power\":\"7\","), "{v}");
+        assert!(v.contains("\"pubkey\":\""), "{v}");
+        assert!(v.contains(merkle_json), "{v}");
+
+        // Graph leaf: node_id / domain / dim / embedding[].
+        let gn = ProofEntry::GraphNode {
+            node_id: 99,
+            graph_node: crate::engine::GraphNode {
+                node_id: 99,
+                embedding: [0.0; 8],
+                domain: 3,
+            },
+            proof: path.clone(),
+        };
+        let g = json_proof_entry(&gn);
+        assert!(g.starts_with("{\"kind\":\"graph\",\"node_id\":\"99\","), "{g}");
+        assert!(
+            g.contains("\"domain\":\"3\"") && g.contains("\"dim\":\"8\"") && g.contains("\"embedding\":["),
+            "{g}"
+        );
+        assert!(g.contains(merkle_json), "{g}");
+
+        // Braces balance for every variant.
+        for s in [&a, &r, &v, &g] {
+            let opens = s.chars().filter(|&c| c == '{').count();
+            let closes = s.chars().filter(|&c| c == '}').count();
+            assert_eq!(opens, closes, "unbalanced braces: {s}");
+        }
     }
 }
