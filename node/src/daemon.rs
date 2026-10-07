@@ -2320,7 +2320,7 @@ fn json_lock_listing(locks: &[(u64, u64, crate::BridgeLock)]) -> String {
     format!("[{items}]")
 }
 
-// ---- M67/M74/M75/M76/M77: JSON renderers for the proof / batch / lock reads. --------
+// ---- M67/M74/M75/M76/M77/M78: JSON renderers for the proof / batch / lock reads. -----
 // M67 serialized every proof envelope to one opaque `hex(encode_*)` blob dropped into
 // a named JSON field — self-verifying, but useless to a JSON client that only wants a
 // height or a state root without pulling in the binary codec. M74 decoded the
@@ -2328,8 +2328,9 @@ fn json_lock_listing(locks: &[(u64, u64, crate::BridgeLock)]) -> String {
 // the `proof_entry` field (typed leaf + merkle path), so the account/entity proof read
 // is fully structured; M76 decodes the `batch_envelope` field (all four
 // `BatchResponseItem` variants: Inclusion / Knn / Range / Diff); M77 decodes the
-// `lock_envelope` field (bridge-lock proof read), so only `range_blocks` remains opaque
-// hex (pending M78). All pure (no I/O).
+// `lock_envelope` field (bridge-lock proof read); M78 decodes the `range_blocks` field
+// (full `Block` bodies + commits). With M78 **no opaque-hex field remains** anywhere on
+// the structured-JSON read surface. All pure (no I/O).
 
 /// M74: a `ValidatorUpdate` as `{"id","pubkey","power"}`.
 fn json_validator_update(u: &crate::validator::ValidatorUpdate) -> String {
@@ -2666,15 +2667,122 @@ fn json_lock(env: &crate::bridge::LockEnvelope) -> String {
     format!("{{\"lock_envelope\":{}}}", json_lock_envelope(env))
 }
 
-/// M67/M74/M76: `{"certified_header":{…},"batch_envelope":{…},"range_blocks":"<hex>"}`
-/// — the JSON twin of [`format_batch`]. The `certified_header` (M74) and `batch_envelope`
-/// (M76) are now structured; `range_blocks` stays hex pending M77+.
+/// M78: a `Review` as `{"reviewer","score"}`.
+fn json_review(r: &crate::Review) -> String {
+    format!("{{\"reviewer\":{},\"score\":{}}}", json_u64(r.reviewer), json_f32(r.score))
+}
+
+/// M78: a `SubmissionTx` — the unit of work, with its embedding and reviews.
+fn json_submission_tx(tx: &crate::SubmissionTx) -> String {
+    let reviews = tx.reviews.iter().map(json_review).collect::<Vec<_>>().join(",");
+    format!(
+        "{{\"author\":{},\"embedding\":{},\"domain\":{},\"stake\":{},\"reviews\":[{}],\
+         \"repl_success\":{},\"repl_total\":{},\"timestamp_days\":{},\"signature\":{}}}",
+        json_u64(tx.author),
+        json_embedding(&tx.embedding),
+        json_u64(tx.domain as u64),
+        json_u64(tx.stake),
+        reviews,
+        json_u64(tx.repl_success as u64),
+        json_u64(tx.repl_total as u64),
+        json_f32(tx.timestamp_days),
+        json_str(&crate::hash::hex(&tx.signature)),
+    )
+}
+
+/// M78: a `StakeOp` — a bond/unbond staking op (enum → string discriminator).
+fn json_stake_op(op: &crate::StakeOp) -> String {
+    let kind = match op.kind {
+        crate::BondKind::Bond => "bond",
+        crate::BondKind::Unbond => "unbond",
+    };
+    format!(
+        "{{\"account\":{},\"kind\":{},\"amount\":{},\"signature\":{}}}",
+        json_u64(op.account),
+        json_str(kind),
+        json_u64(op.amount),
+        json_str(&crate::hash::hex(&op.signature)),
+    )
+}
+
+/// M78: a `SlashEvidence` — a pair of conflicting precommit votes (reuses `json_vote`).
+fn json_slash_evidence(e: &crate::SlashEvidence) -> String {
+    format!("{{\"vote_a\":{},\"vote_b\":{}}}", json_vote(&e.vote_a), json_vote(&e.vote_b))
+}
+
+/// M78: a `BridgeHeader` — a followed source header + cert + next set.
+fn json_bridge_header(h: &crate::BridgeHeader) -> String {
+    format!(
+        "{{\"source_chain\":{},\"header\":{},\"cert\":{},\"next_set\":{}}}",
+        json_str(&crate::hash::hex(&h.source_chain)),
+        json_block_header(&h.header),
+        json_commit(&h.cert),
+        json_validator_set(&h.next_set),
+    )
+}
+
+/// M78: a `BridgeRedeem` — a cross-chain lock redemption (reuses `json_bridge_lock`).
+fn json_bridge_redeem(r: &crate::BridgeRedeem) -> String {
+    format!(
+        "{{\"source_chain\":{},\"source_header\":{},\"source_cert\":{},\"lock_id\":{},\
+         \"lock\":{},\"proof\":{}}}",
+        json_str(&crate::hash::hex(&r.source_chain)),
+        json_block_header(&r.source_header),
+        json_commit(&r.source_cert),
+        json_u64(r.lock_id),
+        json_bridge_lock(&r.lock),
+        json_merkle_proof(&r.proof),
+    )
+}
+
+/// M78: a full `Block` — the 8 header-scalar fields + the 7 body vectors, each via its
+/// leaf renderer. (`Block` holds the real body vecs, not `BlockHeader`'s `*_commitment`
+/// digests, so it needs its own renderer.)
+fn json_block(b: &crate::Block) -> String {
+    let join = |parts: Vec<String>| parts.join(",");
+    let txs = join(b.txs.iter().map(json_submission_tx).collect());
+    let vus = join(b.validator_updates.iter().map(json_validator_update).collect());
+    let sops = join(b.stake_ops.iter().map(json_stake_op).collect());
+    let ev = join(b.slashing_evidence.iter().map(json_slash_evidence).collect());
+    let locks = join(b.bridge_locks.iter().map(json_bridge_lock).collect());
+    let bhdrs = join(b.bridge_headers.iter().map(json_bridge_header).collect());
+    let brdms = join(b.bridge_redeems.iter().map(json_bridge_redeem).collect());
+    format!(
+        "{{\"height\":{},\"prev_hash\":{},\"timestamp_days\":{},\"next_validators_root\":{},\
+         \"state_root\":{},\"accounts_root\":{},\"graph_root\":{},\"bridge_root\":{},\
+         \"txs\":[{}],\"validator_updates\":[{}],\"stake_ops\":[{}],\"slashing_evidence\":[{}],\
+         \"bridge_locks\":[{}],\"bridge_headers\":[{}],\"bridge_redeems\":[{}]}}",
+        json_u64(b.height),
+        json_str(&crate::hash::hex(&b.prev_hash)),
+        json_f32(b.timestamp_days),
+        json_str(&crate::hash::hex(&b.next_validators_root)),
+        json_str(&crate::hash::hex(&b.state_root)),
+        json_str(&crate::hash::hex(&b.accounts_root)),
+        json_str(&crate::hash::hex(&b.graph_root)),
+        json_str(&crate::hash::hex(&b.bridge_root)),
+        txs, vus, sops, ev, locks, bhdrs, brdms,
+    )
+}
+
+/// M78: the batch read's block range as `[{"block":{…},"commit":{…}}, …]` (empty → `[]`).
+fn json_range_blocks(range: &[(Block, Commit)]) -> String {
+    let items = range
+        .iter()
+        .map(|(b, c)| format!("{{\"block\":{},\"commit\":{}}}", json_block(b), json_commit(c)))
+        .collect::<Vec<_>>()
+        .join(",");
+    format!("[{items}]")
+}
+
+/// M67/M74/M76/M78: `{"certified_header":{…},"batch_envelope":{…},"range_blocks":[…]}`
+/// — the JSON twin of [`format_batch`]. The `certified_header` (M74), `batch_envelope`
+/// (M76) and `range_blocks` (M78) are all structured; no opaque-hex field remains.
 fn json_batch(ch: &CertifiedHeader, env: &BatchResponseEnvelope, range: &[(Block, Commit)]) -> String {
     format!(
         "{{\"certified_header\":{},\"batch_envelope\":{},\"range_blocks\":{}}}",
         json_certified_header(ch),
         json_batch_envelope(env),
-        json_str(&crate::hash::hex(&crate::net::encode_blocks(range))),
+        json_range_blocks(range),
     )
 }
 
@@ -5428,15 +5536,17 @@ mod tests {
         let env = node.serve_lock(0).expect("serve_lock");
         assert_eq!(json_lock(&env), format!("{{\"lock_envelope\":{}}}", json_lock_envelope(&env)));
 
-        // Batch (M74/M76): structured `certified_header` + `batch_envelope`, hex `range_blocks`.
+        // Batch (M74/M76/M78): structured `certified_header` + `batch_envelope`;
+        // `range_blocks` is now a structured array (here empty — Inclusion-only request
+        // carries no Diff range).
         let (bch, benv, range) = node
             .batch(vec![BatchItem::Inclusion { kind: ProofKind::Reviewer, id: 10 }])
             .expect("batch");
         let jb = json_batch(&bch, &benv, &range);
         assert!(jb.starts_with("{\"certified_header\":{\"header\":{"), "{jb}");
         assert!(jb.contains("\"batch_envelope\":{\"items\":["), "{jb}");
-        assert!(jb.contains("\"range_blocks\":\""), "{jb}");
-        assert!(jb.ends_with("\"}"), "{jb}");
+        assert!(jb.contains("\"range_blocks\":[]"), "{jb}");
+        assert!(jb.ends_with("]}"), "{jb}");
     }
 
     #[test]
@@ -6992,5 +7102,135 @@ mod tests {
         let opens = j.chars().filter(|&c| c == '{').count();
         let closes = j.chars().filter(|&c| c == '}').count();
         assert_eq!(opens, closes, "unbalanced braces: {j}");
+    }
+
+    #[test]
+    fn json_range_blocks_structured() {
+        // M78: `json_range_blocks` decodes the batch read's `[(Block, Commit)]` range —
+        // the last opaque-hex read field — as `[{"block":{…},"commit":{…}}, …]`. Build a
+        // Block with every body vector non-empty (mirrors codec.rs sample_block plus the
+        // bridge-headers/redeems round-trip) so each leaf renderer is exercised: txs with
+        // nested reviews + embedding, validator_updates, stake_ops (both bond kinds),
+        // slashing_evidence (via json_vote), bridge_locks, and bridge_headers/redeems that
+        // reuse json_block_header/json_commit/json_validator_set/json_bridge_lock/
+        // json_merkle_proof. After M78 no read-surface JSON field carries opaque hex.
+        let hdr = |height: u64| crate::codec::BlockHeader {
+            height,
+            prev_hash: [0u8; 32],
+            timestamp_days: 0.0,
+            next_validators_root: [0u8; 32],
+            state_root: [0u8; 32],
+            accounts_root: [0u8; 32],
+            graph_root: [0u8; 32],
+            bridge_root: [0u8; 32],
+            validator_updates: vec![],
+            txs_commitment: [0u8; 32],
+            stake_ops_commitment: [0u8; 32],
+            evidence_commitment: [0u8; 32],
+            bridge_locks_commitment: [0u8; 32],
+            bridge_headers_commitment: [0u8; 32],
+            bridge_redeems_commitment: [0u8; 32],
+        };
+        let cert = |height: u64| Commit { height, round: 0, block_hash: [0u8; 32], precommits: vec![] };
+        let vote = |block_hash: [u8; 32]| crate::consensus::Vote {
+            validator: 22,
+            height: 9,
+            round: 1,
+            block_hash,
+            vote_type: crate::consensus::VoteType::Precommit,
+            signature: [3u8; 64],
+        };
+        let lock = crate::BridgeLock {
+            account: 1,
+            amount: 3_000_000,
+            dest_chain: [77u8; 32],
+            dest_account: 9,
+            nonce: 1,
+            signature: [6u8; 64],
+        };
+        let mut emb = [0.0f32; crate::DIM];
+        emb[3] = 1.0;
+        let block = crate::Block {
+            height: 7,
+            prev_hash: [42u8; 32],
+            timestamp_days: 3.5,
+            next_validators_root: [17u8; 32],
+            state_root: [11u8; 32],
+            accounts_root: [12u8; 32],
+            graph_root: [13u8; 32],
+            bridge_root: [14u8; 32],
+            txs: vec![crate::SubmissionTx {
+                author: 1,
+                embedding: emb,
+                domain: 2,
+                stake: 2_000_000,
+                reviews: vec![
+                    crate::Review { reviewer: 10, score: 0.9 },
+                    crate::Review { reviewer: 11, score: 0.75 },
+                ],
+                repl_success: 2,
+                repl_total: 3,
+                timestamp_days: 3.0,
+                signature: [9u8; 64],
+            }],
+            validator_updates: vec![crate::validator::ValidatorUpdate { id: 25, pubkey: [5u8; 32], power: 3 }],
+            stake_ops: vec![
+                crate::StakeOp { account: 1, kind: crate::BondKind::Bond, amount: 5_000_000, signature: [7u8; 64] },
+                crate::StakeOp { account: 2, kind: crate::BondKind::Unbond, amount: 2_000_000, signature: [8u8; 64] },
+            ],
+            slashing_evidence: vec![crate::SlashEvidence { vote_a: vote([1u8; 32]), vote_b: vote([2u8; 32]) }],
+            bridge_locks: vec![lock.clone()],
+            bridge_headers: vec![crate::BridgeHeader {
+                source_chain: [55u8; 32],
+                header: hdr(7),
+                cert: cert(7),
+                next_set: crate::validator::ValidatorSet::new(vec![crate::validator::Validator {
+                    id: 21,
+                    pubkey: kp(21).public(),
+                    power: 2,
+                }]),
+            }],
+            bridge_redeems: vec![crate::BridgeRedeem {
+                source_chain: [55u8; 32],
+                source_header: hdr(7),
+                source_cert: cert(7),
+                lock_id: 3,
+                lock,
+                proof: crate::merkle::Proof { steps: vec![crate::merkle::Step::Right([4u8; 32])] },
+            }],
+        };
+        let j = json_range_blocks(&[(block, cert(7))]);
+
+        // Range scaffold + block header scalars.
+        assert!(j.starts_with("[{\"block\":{\"height\":\"7\""), "{j}");
+        assert!(j.contains("\"state_root\":\""), "{j}");
+
+        // Txs: nested embedding + reviews.
+        assert!(j.contains("\"txs\":[{\"author\":\"1\",\"embedding\":["), "{j}");
+        assert!(j.contains("\"reviews\":[{\"reviewer\":\"10\",\"score\":0.9"), "{j}");
+
+        // Validator updates / stake ops (both bond kinds) / evidence.
+        assert!(j.contains("\"validator_updates\":[{\"id\":\"25\""), "{j}");
+        assert!(j.contains("\"stake_ops\":[{\"account\":\"1\",\"kind\":\"bond\""), "{j}");
+        assert!(j.contains("\"kind\":\"unbond\""), "{j}");
+        assert!(j.contains("\"slashing_evidence\":[{\"vote_a\":{\"validator\":\"22\""), "{j}");
+
+        // Bridge ops: locks + headers + redeems (nested lock leaf).
+        assert!(j.contains("\"bridge_locks\":[{\"account\":\"1\""), "{j}");
+        assert!(j.contains("\"bridge_headers\":[{\"source_chain\":\""), "{j}");
+        assert!(j.contains("\"bridge_redeems\":[{\"source_chain\":\""), "{j}");
+        assert!(j.contains("\"lock\":{\"account\":\"1\""), "{j}");
+
+        // Paired commit + range close.
+        assert!(j.contains("},\"commit\":{\"height\":\"7\""), "{j}");
+        assert!(j.ends_with("]"), "{j}");
+
+        // Braces/brackets balance.
+        let ob = j.chars().filter(|&c| c == '{').count();
+        let cb = j.chars().filter(|&c| c == '}').count();
+        assert_eq!(ob, cb, "unbalanced braces: {j}");
+        let os = j.chars().filter(|&c| c == '[').count();
+        let cs = j.chars().filter(|&c| c == ']').count();
+        assert_eq!(os, cs, "unbalanced brackets: {j}");
     }
 }
