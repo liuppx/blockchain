@@ -434,6 +434,12 @@ enum Cmd {
     QueryReviewers {
         reply: oneshot::Sender<Vec<(u64, f32)>>,
     },
+    /// M86: list all cognitive-graph nodes (node_id + domain + embedding) for the plain
+    /// read-class RPC directory — the list sibling of the single `/graph/{id}` plain read.
+    /// Always a (possibly empty) list.
+    QueryGraphNodes {
+        reply: oneshot::Sender<Vec<crate::engine::GraphNode>>,
+    },
     /// M61: serve a heterogeneous proof batch + the certified head it verifies
     /// against, for the verifiable batch read RPC. `None` ⇒ `serve_batch` rejected
     /// (over `MAX_BATCH_ITEMS` or a degenerate Diff range) or no certified head
@@ -1113,6 +1119,10 @@ async fn run_actor(mut actor: Actor, mut rx: mpsc::UnboundedReceiver<Cmd>) {
                 let reviewers =
                     actor.node.chain.state.reviewers.iter().map(|(&id, &r)| (id, r)).collect();
                 let _ = reply.send(reviewers);
+            }
+            Cmd::QueryGraphNodes { reply } => {
+                // M86: snapshot the insertion-ordered graph node vector (node_id == index).
+                let _ = reply.send(actor.node.chain.state.graph.nodes.clone());
             }
             Cmd::QueryBatch { items, reply } => {
                 let _ = reply.send(actor.node.batch(items));
@@ -1925,6 +1935,9 @@ enum GetRoute {
     /// M85: `GET /reviewers` — the plain (unverified) reviewer directory (id + reputation),
     /// the list sibling of `Plain(Reviewer, id)`.
     Reviewers,
+    /// M86: `GET /graph` — the plain (unverified) cognitive-graph directory (node_id +
+    /// domain + embedding), the list sibling of `Plain(GraphNode, id)`.
+    GraphNodes,
     NotFound,
 }
 
@@ -2180,6 +2193,10 @@ fn route_get(path: &str) -> GetRoute {
         // M85: the plain reviewer directory. Exact-match here, so it never collides with
         // the M60/M65 `/reviewer/` prefix below (`…reviewer` + `s`, not `…reviewer` + `/`).
         "/reviewers" => GetRoute::Reviewers,
+        // M86: the plain cognitive-graph directory. Exact-match; the `/graph/` prefix
+        // (single reads/proofs) is handled in the fallthrough arm below, where `/graph/`
+        // with an empty id already resolves to `NotFound`.
+        "/graph" => GetRoute::GraphNodes,
         p => {
             if let Some(rest) = p.strip_prefix("/account/") {
                 // M59: `{id}/proof` is the verifiable read; a bare `{id}` is the M58
@@ -2554,6 +2571,40 @@ fn json_reviewer_listing(reviewers: &[(u64, f32)]) -> String {
     let items = reviewers
         .iter()
         .map(|&(id, reputation)| json_entity(&EntityView::Reviewer { id, reputation }))
+        .collect::<Vec<_>>()
+        .join(",");
+    format!("[{items}]")
+}
+
+/// M86: render the cognitive-graph directory as grep-friendly `key=value` lines, one per
+/// node (empty string when there are none). Reuses `format_entity` per item — same line
+/// shape as the single `/graph/{id}` plain read; nodes are in insertion order (node_id).
+fn format_graph_listing(nodes: &[crate::engine::GraphNode]) -> String {
+    nodes
+        .iter()
+        .map(|n| {
+            format_entity(&EntityView::GraphNode {
+                node_id: n.node_id,
+                domain: n.domain,
+                embedding: n.embedding,
+            })
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// M86: `GET /graph?format=json` — the JSON sibling of [`format_graph_listing`]. A JSON
+/// **array** of objects (`[]` when empty), reusing `json_entity` per item.
+fn json_graph_listing(nodes: &[crate::engine::GraphNode]) -> String {
+    let items = nodes
+        .iter()
+        .map(|n| {
+            json_entity(&EntityView::GraphNode {
+                node_id: n.node_id,
+                domain: n.domain,
+                embedding: n.embedding,
+            })
+        })
         .collect::<Vec<_>>()
         .join(",");
     format!("[{items}]")
@@ -3365,6 +3416,37 @@ async fn serve_rpc_conn(mut stream: TcpStream, cmd: mpsc::UnboundedSender<Cmd>) 
                                 fmt,
                                 &format_page(&format_reviewer_listing(page), total, next),
                                 &json_page(&json_reviewer_listing(page), total, next),
+                            )
+                        }
+                        Err(_) => http_response("503 Service Unavailable", "node stopped"),
+                    }
+                }
+            }
+            GetRoute::GraphNodes => {
+                // M86: plain cognitive-graph directory — always a (possibly empty) `200`.
+                // Fifth consumer of the pagination stack (after `/bridge/locks`,
+                // `/validators`, `/accounts`, `/reviewers`), reusing `format_entity`/
+                // `json_entity` per item.
+                let (reply, rx) = oneshot::channel();
+                if cmd.send(Cmd::QueryGraphNodes { reply }).is_err() {
+                    http_response("503 Service Unavailable", "node stopped")
+                } else {
+                    match rx.await {
+                        Ok(listing) => {
+                            let offset = usize_param(query, "offset").unwrap_or(0);
+                            let limit = Some(effective_limit(usize_param(query, "limit")));
+                            let total = listing.len();
+                            let page = paginate(&listing, offset, limit);
+                            let start = offset.min(total);
+                            let next = if start + page.len() < total {
+                                Some(start + page.len())
+                            } else {
+                                None
+                            };
+                            ok_body(
+                                fmt,
+                                &format_page(&format_graph_listing(page), total, next),
+                                &json_page(&json_graph_listing(page), total, next),
                             )
                         }
                         Err(_) => http_response("503 Service Unavailable", "node stopped"),
@@ -5709,6 +5791,67 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn rpc_graph_list_over_tcp() {
+        // M86: the cognitive-graph directory over real TCP — the fifth list endpoint, reusing
+        // the pagination stack + the existing `format_entity`/`json_entity` per-item
+        // renderers. `test_genesis` seeds one graph node (node_id 0), a populated body.
+        let dir = tmp_dir("rpc-graph-list");
+        let mut cfg = node_config(27, 20291, &[27], dir.clone());
+        let rpc_addr = "127.0.0.1:20301";
+        cfg.rpc = Some(crate::config::RpcConfig { enabled: true, listen: rpc_addr.into() });
+        let mut genesis = test_genesis();
+        genesis.validators = vec![(27, kp(27).public(), 1)]; // quorum 1 ⇒ self-commit
+        let node = Node::start(cfg, genesis, Some(kp(27))).await.expect("start node");
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            if node.status().await.map(|(h, _)| h >= 1).unwrap_or(false) {
+                break;
+            }
+            assert!(tokio::time::Instant::now() < deadline, "node never produced a block");
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+
+        async fn get(addr: &str, path: &str) -> String {
+            let req = format!("GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
+            let mut s = TcpStream::connect(addr).await.expect("connect rpc");
+            s.write_all(req.as_bytes()).await.expect("send get");
+            let mut resp = Vec::new();
+            s.read_to_end(&mut resp).await.expect("read response");
+            String::from_utf8_lossy(&resp).into_owned()
+        }
+        fn body_of(resp: &str) -> &str {
+            resp.split_once("\r\n\r\n").map(|(_, b)| b).unwrap_or("")
+        }
+
+        // The single seeded graph node (node_id 0, domain 0, unit embedding). Rendered by
+        // the same `/graph/0` single-read path, so the listing line is byte-identical.
+        let want = EntityView::GraphNode { node_id: 0, domain: 0, embedding: unit(0) };
+
+        // Plain directory → 200 with the single node.
+        let resp = get(rpc_addr, "/graph").await;
+        assert!(resp.starts_with("HTTP/1.1 200 OK"), "graph status: {resp}");
+        assert_eq!(body_of(&resp), format!("total=1\n{}", format_entity(&want)), "graph text envelope");
+
+        // JSON representation → the `total`/`next`/`items` envelope with the node.
+        let as_json = get(rpc_addr, "/graph?format=json").await;
+        assert!(as_json.starts_with("HTTP/1.1 200 OK"), "graph json status: {as_json}");
+        assert!(as_json.contains("Content-Type: application/json\r\n"), "json ct: {as_json}");
+        assert_eq!(
+            body_of(&as_json),
+            format!("{{\"total\":\"1\",\"next\":null,\"items\":[{}]}}", json_entity(&want)),
+            "graph JSON envelope"
+        );
+
+        // `?offset=1` windows past the only node → empty page, no `next`.
+        let past = get(rpc_addr, "/graph?offset=1").await;
+        assert!(past.starts_with("HTTP/1.1 200 OK"), "offset status: {past}");
+        assert_eq!(body_of(&past), "total=1", "offset past end → total=1, empty page");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
     async fn rpc_plain_entities_over_tcp() {
         // M65: plain reviewer/validator/graph reads over real TCP. Unlike bridge locks,
         // `test_genesis` carries real reviewers (10,11,12), validators (21-24), and a
@@ -6229,6 +6372,36 @@ mod tests {
     }
 
     #[test]
+    fn graph_listing_renders() {
+        // M86: the empty directory renders `""` (text) / `[]` (json); two graph nodes render
+        // one `format_entity`-shaped line each (text) and a two-object array (json), reusing
+        // the exact single-item `EntityView::GraphNode` renderers (node_id order).
+        assert_eq!(format_graph_listing(&[]), "");
+        assert_eq!(json_graph_listing(&[]), "[]");
+
+        let mut e0 = [0.0f32; crate::DIM];
+        e0[0] = 1.0;
+        let mut e1 = [0.0f32; crate::DIM];
+        e1[1] = 1.0;
+        let nodes = vec![
+            crate::engine::GraphNode { node_id: 0, embedding: e0, domain: 7 },
+            crate::engine::GraphNode { node_id: 1, embedding: e1, domain: 9 },
+        ];
+        let ev = |node_id, embedding, domain| EntityView::GraphNode { node_id, domain, embedding };
+
+        // Text listing is exactly the per-item lines joined by `\n`.
+        assert_eq!(
+            format_graph_listing(&nodes),
+            format!("{}\n{}", format_entity(&ev(0, e0, 7)), format_entity(&ev(1, e1, 9))),
+        );
+        // JSON listing is exactly the per-item objects wrapped in an array.
+        assert_eq!(
+            json_graph_listing(&nodes),
+            format!("[{},{}]", json_entity(&ev(0, e0, 7)), json_entity(&ev(1, e1, 9))),
+        );
+    }
+
+    #[test]
     fn error_body_renders() {
         // M67: `error_body` is status-agnostic — Text is the bare message with a
         // text/plain type; Json is {"error":"<msg>"} with application/json, the message
@@ -6391,6 +6564,18 @@ mod tests {
         // M65/M60 single-reviewer routes still resolve to their own variants.
         assert!(matches!(route_get("/reviewer/10"), GetRoute::Plain(ProofKind::Reviewer, 10)));
         assert!(matches!(route_get("/reviewer/10/proof"), GetRoute::Proof(ProofKind::Reviewer, 10)));
+    }
+
+    #[test]
+    fn route_get_parses_graph() {
+        // M86: `/graph` is a plain directory read — an exact match, distinct from the
+        // M60/M65 `/graph/{id}` prefix route. `/graph/` (empty id) already resolves to
+        // `NotFound` in the fallthrough arm, so it is *not* the directory.
+        assert!(matches!(route_get("/graph"), GetRoute::GraphNodes));
+        assert!(matches!(route_get("/graph/"), GetRoute::NotFound));
+        // M65/M60 single-node routes still resolve to their own variants.
+        assert!(matches!(route_get("/graph/0"), GetRoute::Plain(ProofKind::GraphNode, 0)));
+        assert!(matches!(route_get("/graph/0/proof"), GetRoute::Proof(ProofKind::GraphNode, 0)));
     }
 
     #[test]
