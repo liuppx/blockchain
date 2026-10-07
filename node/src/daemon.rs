@@ -2320,14 +2320,15 @@ fn json_lock_listing(locks: &[(u64, u64, crate::BridgeLock)]) -> String {
     format!("[{items}]")
 }
 
-// ---- M67/M74/M75: JSON renderers for the proof / batch reads. --------------------
+// ---- M67/M74/M75/M76: JSON renderers for the proof / batch reads. ----------------
 // M67 serialized every proof envelope to one opaque `hex(encode_*)` blob dropped into
 // a named JSON field — self-verifying, but useless to a JSON client that only wants a
 // height or a state root without pulling in the binary codec. M74 decoded the
-// `certified_header` sub-envelope (shared by the proof and batch reads); M75 decodes
+// `certified_header` sub-envelope (shared by the proof and batch reads); M75 decoded
 // the `proof_entry` field (typed leaf + merkle path), so the account/entity proof read
-// is now fully structured. The still-opaque parts (`batch_envelope`, `range_blocks`,
-// `lock_envelope`) remain hex pending M76+. All pure (no I/O).
+// is fully structured; M76 decodes the `batch_envelope` field (all four
+// `BatchResponseItem` variants: Inclusion / Knn / Range / Diff). The still-opaque parts
+// (`range_blocks`, `lock_envelope`) remain hex pending M77+. All pure (no I/O).
 
 /// M74: a `ValidatorUpdate` as `{"id","pubkey","power"}`.
 fn json_validator_update(u: &crate::validator::ValidatorUpdate) -> String {
@@ -2487,6 +2488,145 @@ fn json_account_proof(ch: &CertifiedHeader, entry: &ProofEntry) -> String {
     )
 }
 
+/// M76: an `Embedding` / `[f32]` slice as a JSON number array (each via `json_f32`, so
+/// a non-finite component renders as `null`).
+fn json_embedding(emb: &[f32]) -> String {
+    format!(
+        "[{}]",
+        emb.iter().map(|f| json_f32(*f)).collect::<Vec<_>>().join(","),
+    )
+}
+
+/// M76: a `GraphNode` as `{"node_id","domain","dim","embedding":[…]}` (nested form, used
+/// inside the batch graph-leaf renderer; distinct from `json_proof_entry`'s flattened
+/// `"kind":"graph"` leaf).
+fn json_graph_node(gn: &crate::engine::GraphNode) -> String {
+    format!(
+        "{{\"node_id\":{},\"domain\":{},\"dim\":{},\"embedding\":{}}}",
+        json_u64(gn.node_id),
+        json_u64(gn.domain as u64),
+        json_u64(gn.embedding.len() as u64),
+        json_embedding(&gn.embedding),
+    )
+}
+
+/// M76: one cert-signed graph leaf `{"node_id","graph_node":{…},"proof":{…}}` — shared by
+/// the kNN / range neighbour tuples (`(node_id, GraphNode, Proof)`) and `DiffClaim`'s
+/// `GraphLeafAtHeight`.
+fn json_graph_leaf(node_id: u64, gn: &crate::engine::GraphNode, proof: &crate::merkle::Proof) -> String {
+    format!(
+        "{{\"node_id\":{},\"graph_node\":{},\"proof\":{}}}",
+        json_u64(node_id),
+        json_graph_node(gn),
+        json_merkle_proof(proof),
+    )
+}
+
+/// M76: the M26 kNN claim as `{"query":[…],"k":…,"neighbours":[graph_leaf…]}`.
+fn json_knn_claim(c: &crate::light::KnnClaim) -> String {
+    let neighbours = c
+        .neighbours
+        .iter()
+        .map(|(id, gn, proof)| json_graph_leaf(*id, gn, proof))
+        .collect::<Vec<_>>()
+        .join(",");
+    format!(
+        "{{\"query\":{},\"k\":{},\"neighbours\":[{}]}}",
+        json_embedding(&c.query),
+        json_u64(c.k as u64),
+        neighbours,
+    )
+}
+
+/// M76: the M27 range claim as `{"query":[…],"min_sim":…,"nodes":[graph_leaf…]}`.
+fn json_range_claim(c: &crate::light::RangeClaim) -> String {
+    let nodes = c
+        .nodes
+        .iter()
+        .map(|(id, gn, proof)| json_graph_leaf(*id, gn, proof))
+        .collect::<Vec<_>>()
+        .join(",");
+    format!(
+        "{{\"query\":{},\"min_sim\":{},\"nodes\":[{}]}}",
+        json_embedding(&c.query),
+        json_f32(c.min_sim),
+        nodes,
+    )
+}
+
+/// M76: the M28 diff body as `{"added":[graph_leaf…],"dropped":[graph_leaf…]}`.
+fn json_diff_claim(d: &crate::DiffClaim) -> String {
+    let leaves = |xs: &[crate::GraphLeafAtHeight]| {
+        xs.iter()
+            .map(|l| json_graph_leaf(l.node_id, &l.graph_node, &l.proof))
+            .collect::<Vec<_>>()
+            .join(",")
+    };
+    format!(
+        "{{\"added\":[{}],\"dropped\":[{}]}}",
+        leaves(&d.added),
+        leaves(&d.dropped),
+    )
+}
+
+/// M76: a single `Validator` as `{"id","pubkey","power"}`.
+fn json_validator(v: &crate::validator::Validator) -> String {
+    format!(
+        "{{\"id\":{},\"pubkey\":{},\"power\":{}}}",
+        json_u64(v.id),
+        json_str(&crate::hash::hex(&v.pubkey)),
+        json_u64(v.power),
+    )
+}
+
+/// M76: a `ValidatorSet` as a JSON array of validators.
+fn json_validator_set(s: &crate::validator::ValidatorSet) -> String {
+    format!(
+        "[{}]",
+        s.validators().iter().map(json_validator).collect::<Vec<_>>().join(","),
+    )
+}
+
+/// M76: the M28 temporal-diff envelope — both certified headers + their certs + the diff
+/// body + both tracked validator sets. Reuses `json_block_header`/`json_commit` (M74).
+fn json_diff_envelope(e: &crate::light::DiffEnvelope) -> String {
+    format!(
+        "{{\"header_prev\":{},\"cert_prev\":{},\"header_new\":{},\"cert_new\":{},\
+         \"diff\":{},\"tracked_set_h1\":{},\"tracked_set_h2\":{}}}",
+        json_block_header(&e.header_prev),
+        json_commit(&e.cert_prev),
+        json_block_header(&e.header_new),
+        json_commit(&e.cert_new),
+        json_diff_claim(&e.diff),
+        json_validator_set(&e.tracked_set_h1),
+        json_validator_set(&e.tracked_set_h2),
+    )
+}
+
+/// M76: one `BatchResponseItem` slot, kind-tagged; the inner body is bare `null` on the
+/// empty/unknown `Option`, else the structured entry/claim/envelope.
+fn json_batch_item(it: &crate::light::BatchResponseItem) -> String {
+    use crate::light::BatchResponseItem as I;
+    match it {
+        I::Inclusion(Some(e)) => format!("{{\"kind\":\"inclusion\",\"entry\":{}}}", json_proof_entry(e)),
+        I::Inclusion(None) => "{\"kind\":\"inclusion\",\"entry\":null}".to_string(),
+        I::Knn(Some(c)) => format!("{{\"kind\":\"knn\",\"claim\":{}}}", json_knn_claim(c)),
+        I::Knn(None) => "{\"kind\":\"knn\",\"claim\":null}".to_string(),
+        I::Range(Some(c)) => format!("{{\"kind\":\"range\",\"claim\":{}}}", json_range_claim(c)),
+        I::Range(None) => "{\"kind\":\"range\",\"claim\":null}".to_string(),
+        I::Diff(e) => format!("{{\"kind\":\"diff\",\"envelope\":{}}}", json_diff_envelope(e)),
+    }
+}
+
+/// M76: the full `BatchResponseEnvelope` as `{"items":[…]}` — replaces the M67 opaque
+/// hex in `json_batch`.
+fn json_batch_envelope(env: &BatchResponseEnvelope) -> String {
+    format!(
+        "{{\"items\":[{}]}}",
+        env.items.iter().map(json_batch_item).collect::<Vec<_>>().join(","),
+    )
+}
+
 /// M67: `{"lock_envelope":"<hex>"}` — the JSON twin of [`format_lock`].
 fn json_lock(env: &crate::bridge::LockEnvelope) -> String {
     format!(
@@ -2495,14 +2635,14 @@ fn json_lock(env: &crate::bridge::LockEnvelope) -> String {
     )
 }
 
-/// M67/M74: `{"certified_header":{…},"batch_envelope":"<hex>","range_blocks":"<hex>"}`
-/// — the JSON twin of [`format_batch`]. The `certified_header` is structured (M74);
-/// `batch_envelope`/`range_blocks` stay hex pending M75+.
+/// M67/M74/M76: `{"certified_header":{…},"batch_envelope":{…},"range_blocks":"<hex>"}`
+/// — the JSON twin of [`format_batch`]. The `certified_header` (M74) and `batch_envelope`
+/// (M76) are now structured; `range_blocks` stays hex pending M77+.
 fn json_batch(ch: &CertifiedHeader, env: &BatchResponseEnvelope, range: &[(Block, Commit)]) -> String {
     format!(
         "{{\"certified_header\":{},\"batch_envelope\":{},\"range_blocks\":{}}}",
         json_certified_header(ch),
-        json_str(&crate::hash::hex(&crate::net::encode_batch_envelope(env))),
+        json_batch_envelope(env),
         json_str(&crate::hash::hex(&crate::net::encode_blocks(range))),
     )
 }
@@ -5256,13 +5396,13 @@ mod tests {
         let lock_hex = crate::hash::hex(&crate::net::encode_lock_envelope(&env));
         assert_eq!(json_lock(&env), format!("{{\"lock_envelope\":\"{lock_hex}\"}}"));
 
-        // Batch (M74): structured `certified_header`, hex `batch_envelope`/`range_blocks`.
+        // Batch (M74/M76): structured `certified_header` + `batch_envelope`, hex `range_blocks`.
         let (bch, benv, range) = node
             .batch(vec![BatchItem::Inclusion { kind: ProofKind::Reviewer, id: 10 }])
             .expect("batch");
         let jb = json_batch(&bch, &benv, &range);
         assert!(jb.starts_with("{\"certified_header\":{\"header\":{"), "{jb}");
-        assert!(jb.contains("\"batch_envelope\":\""), "{jb}");
+        assert!(jb.contains("\"batch_envelope\":{\"items\":["), "{jb}");
         assert!(jb.contains("\"range_blocks\":\""), "{jb}");
         assert!(jb.ends_with("\"}"), "{jb}");
     }
@@ -6639,5 +6779,117 @@ mod tests {
             let closes = s.chars().filter(|&c| c == '}').count();
             assert_eq!(opens, closes, "unbalanced braces: {s}");
         }
+    }
+
+    #[test]
+    fn json_batch_envelope_structured() {
+        // M76: `json_batch_envelope` renders every `BatchResponseItem` variant as a
+        // kind-tagged object (`null` inner body on the empty/unknown Option); the graph
+        // leaves reuse `json_graph_node`/`json_merkle_proof`, the Diff envelope reuses
+        // `json_block_header`/`json_commit`. Fixtures mirror the codec round-trip tests.
+        use crate::light::{
+            BatchResponseEnvelope, BatchResponseItem, DiffEnvelope, KnnClaim, ProofEntry,
+            RangeClaim,
+        };
+        let g = crate::engine::GraphNode { node_id: 7, embedding: [0.25; 8], domain: 42 };
+        let path = crate::merkle::Proof {
+            steps: vec![crate::merkle::Step::Left([0xAA; 32])],
+        };
+        let hdr = |height: u64| crate::codec::BlockHeader {
+            height,
+            prev_hash: [0u8; 32],
+            timestamp_days: 0.0,
+            next_validators_root: [0u8; 32],
+            state_root: [0u8; 32],
+            accounts_root: [0u8; 32],
+            graph_root: [0u8; 32],
+            bridge_root: [0u8; 32],
+            validator_updates: vec![],
+            txs_commitment: [0u8; 32],
+            stake_ops_commitment: [0u8; 32],
+            evidence_commitment: [0u8; 32],
+            bridge_locks_commitment: [0u8; 32],
+            bridge_headers_commitment: [0u8; 32],
+            bridge_redeems_commitment: [0u8; 32],
+        };
+        let cert = |height: u64| Commit { height, round: 0, block_hash: [0u8; 32], precommits: vec![] };
+        let acct = crate::Account {
+            pubkey: kp(1).public(),
+            balance: 100,
+            staked_total: 0,
+            earned_total: 0,
+            slashed_total: 0,
+            submissions: 0,
+            accepted: 0,
+        };
+        let diff_env = DiffEnvelope {
+            header_prev: hdr(1),
+            cert_prev: cert(1),
+            header_new: hdr(2),
+            cert_new: cert(2),
+            diff: crate::DiffClaim {
+                added: vec![crate::GraphLeafAtHeight {
+                    node_id: 7,
+                    graph_node: g.clone(),
+                    proof: path.clone(),
+                }],
+                dropped: vec![],
+            },
+            tracked_set_h1: crate::validator::ValidatorSet::new(vec![crate::validator::Validator {
+                id: 21,
+                pubkey: kp(21).public(),
+                power: 1,
+            }]),
+            tracked_set_h2: crate::validator::ValidatorSet::new(vec![]),
+        };
+        let env = BatchResponseEnvelope {
+            items: vec![
+                BatchResponseItem::Inclusion(Some(ProofEntry::Account {
+                    id: 1,
+                    account: acct,
+                    proof: path.clone(),
+                })),
+                BatchResponseItem::Inclusion(None),
+                BatchResponseItem::Knn(Some(KnnClaim {
+                    query: [0.5; 8],
+                    k: 3,
+                    neighbours: vec![(7, g.clone(), path.clone())],
+                })),
+                BatchResponseItem::Range(Some(RangeClaim {
+                    query: [1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+                    min_sim: 0.5,
+                    nodes: vec![(7, g.clone(), path.clone())],
+                })),
+                BatchResponseItem::Diff(Box::new(diff_env)),
+            ],
+        };
+        let j = json_batch_envelope(&env);
+
+        // Envelope scaffold + each kind tag.
+        assert!(j.starts_with("{\"items\":["), "{j}");
+        assert!(j.contains("{\"kind\":\"inclusion\",\"entry\":{\"kind\":\"account\""), "{j}");
+        assert!(j.contains("{\"kind\":\"inclusion\",\"entry\":null}"), "{j}");
+        assert!(j.contains("{\"kind\":\"knn\",\"claim\":{\"query\":["), "{j}");
+        assert!(j.contains("\"k\":\"3\""), "{j}");
+        assert!(j.contains("{\"kind\":\"range\",\"claim\":{\"query\":["), "{j}");
+        assert!(j.contains("\"min_sim\":0.5"), "{j}");
+        assert!(j.contains("{\"kind\":\"diff\",\"envelope\":{\"header_prev\":{\"height\":\"1\""), "{j}");
+
+        // Graph leaf: nested graph_node + merkle path.
+        assert!(
+            j.contains("\"graph_node\":{\"node_id\":\"7\",\"domain\":\"42\",\"dim\":\"8\",\"embedding\":["),
+            "{j}"
+        );
+        assert!(j.contains("\"proof\":{\"steps\":[{\"side\":\"left\",\"hash\":\""), "{j}");
+
+        // Diff body + tracked validator sets.
+        assert!(j.contains("\"diff\":{\"added\":[{\"node_id\":\"7\""), "{j}");
+        assert!(j.contains("\"tracked_set_h1\":[{\"id\":\"21\",\"pubkey\":"), "{j}");
+        assert!(j.contains("\"tracked_set_h2\":[]"), "{j}");
+
+        // Braces balance.
+        let opens = j.chars().filter(|&c| c == '{').count();
+        let closes = j.chars().filter(|&c| c == '}').count();
+        assert_eq!(opens, closes, "unbalanced braces: {j}");
     }
 }
