@@ -452,6 +452,12 @@ enum Cmd {
     QueryUnbonding {
         reply: oneshot::Sender<Vec<crate::UnbondingEntry>>,
     },
+    /// M89: list the pending stake-op pool (staged for the next proposed block) for the
+    /// plain read-class RPC directory — the first pending-pool read. Always a (possibly
+    /// empty) list.
+    QueryStakeOps {
+        reply: oneshot::Sender<Vec<crate::StakeOp>>,
+    },
     /// M61: serve a heterogeneous proof batch + the certified head it verifies
     /// against, for the verifiable batch read RPC. `None` ⇒ `serve_batch` rejected
     /// (over `MAX_BATCH_ITEMS` or a degenerate Diff range) or no certified head
@@ -1145,6 +1151,10 @@ async fn run_actor(mut actor: Actor, mut rx: mpsc::UnboundedReceiver<Cmd>) {
             Cmd::QueryUnbonding { reply } => {
                 // M88: snapshot the unbonding-delay queue (insertion order) for the directory.
                 let _ = reply.send(actor.node.chain.state.unbonding.clone());
+            }
+            Cmd::QueryStakeOps { reply } => {
+                // M89: snapshot the pending stake-op pool staged for the next block.
+                let _ = reply.send(actor.node.pending_stake_ops().to_vec());
             }
             Cmd::QueryBatch { items, reply } => {
                 let _ = reply.send(actor.node.batch(items));
@@ -1968,6 +1978,10 @@ enum GetRoute {
     /// height), the withdrawals awaiting return to balances after `UNBONDING_PERIOD`.
     /// A read sibling of `/bonds` on the stake lifecycle; no single-read sibling.
     Unbonding,
+    /// M89: `GET /stake-ops` — the pending stake-op pool (account + bond/unbond + amount
+    /// + signature) staged for the next proposed block. The first *pending-pool* read
+    /// (mempool-side, not committed state); no single-read sibling.
+    StakeOps,
     NotFound,
 }
 
@@ -2233,6 +2247,9 @@ fn route_get(path: &str) -> GetRoute {
         // M88: the unbonding-delay queue. Exact-match; there is no `/unbonding/` single-read
         // prefix, so `/unbonding/` simply falls through to `Health`.
         "/unbonding" => GetRoute::Unbonding,
+        // M89: the pending stake-op pool. Exact-match; there is no `/stake-op/` single-read
+        // prefix, so `/stake-ops/` simply falls through to `Health`.
+        "/stake-ops" => GetRoute::StakeOps,
         p => {
             if let Some(rest) = p.strip_prefix("/account/") {
                 // M59: `{id}/proof` is the verifiable read; a bare `{id}` is the M58
@@ -2715,6 +2732,36 @@ fn format_unbonding_listing(queue: &[crate::UnbondingEntry]) -> String {
 /// A JSON **array** of objects (`[]` when empty), reusing `json_unbonding` per item.
 fn json_unbonding_listing(queue: &[crate::UnbondingEntry]) -> String {
     let items = queue.iter().map(json_unbonding).collect::<Vec<_>>().join(",");
+    format!("[{items}]")
+}
+
+/// M89: render one pending stake op as a grep-friendly `key=value` line, mirroring the
+/// fields of [`json_stake_op`] (`account` + `kind` bond/unbond discriminator + `amount`
+/// + `signature` hex). Standalone (a stake op is a pending-pool value, not a merkle-proof
+/// entity). Pure for direct unit testing.
+fn format_stake_op(op: &crate::StakeOp) -> String {
+    let kind = match op.kind {
+        crate::BondKind::Bond => "bond",
+        crate::BondKind::Unbond => "unbond",
+    };
+    format!(
+        "account={} kind={kind} amount={} signature={}",
+        op.account,
+        op.amount,
+        crate::hash::hex(&op.signature)
+    )
+}
+
+/// M89: render the pending stake-op pool as grep-friendly lines, one per op (empty string
+/// when the pool is empty). Reuses `format_stake_op` per item; staging order.
+fn format_stakeop_listing(ops: &[crate::StakeOp]) -> String {
+    ops.iter().map(format_stake_op).collect::<Vec<_>>().join("\n")
+}
+
+/// M89: `GET /stake-ops?format=json` — the JSON sibling of [`format_stakeop_listing`]. A
+/// JSON **array** of objects (`[]` when empty), reusing the existing `json_stake_op` per item.
+fn json_stakeop_listing(ops: &[crate::StakeOp]) -> String {
+    let items = ops.iter().map(json_stake_op).collect::<Vec<_>>().join(",");
     format!("[{items}]")
 }
 
@@ -3617,6 +3664,37 @@ async fn serve_rpc_conn(mut stream: TcpStream, cmd: mpsc::UnboundedSender<Cmd>) 
                                 fmt,
                                 &format_page(&format_unbonding_listing(page), total, next),
                                 &json_page(&json_unbonding_listing(page), total, next),
+                            )
+                        }
+                        Err(_) => http_response("503 Service Unavailable", "node stopped"),
+                    }
+                }
+            }
+            GetRoute::StakeOps => {
+                // M89: pending stake-op pool — always a (possibly empty) `200`. Eighth
+                // consumer of the pagination stack and the first pending-pool read (after the
+                // committed-state lists `/validators`, `/accounts`, `/reviewers`, `/graph`,
+                // `/bonds`, `/unbonding`), reusing `format_stake_op`/`json_stake_op` per item.
+                let (reply, rx) = oneshot::channel();
+                if cmd.send(Cmd::QueryStakeOps { reply }).is_err() {
+                    http_response("503 Service Unavailable", "node stopped")
+                } else {
+                    match rx.await {
+                        Ok(listing) => {
+                            let offset = usize_param(query, "offset").unwrap_or(0);
+                            let limit = Some(effective_limit(usize_param(query, "limit")));
+                            let total = listing.len();
+                            let page = paginate(&listing, offset, limit);
+                            let start = offset.min(total);
+                            let next = if start + page.len() < total {
+                                Some(start + page.len())
+                            } else {
+                                None
+                            };
+                            ok_body(
+                                fmt,
+                                &format_page(&format_stakeop_listing(page), total, next),
+                                &json_page(&json_stakeop_listing(page), total, next),
                             )
                         }
                         Err(_) => http_response("503 Service Unavailable", "node stopped"),
@@ -6130,6 +6208,60 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn rpc_stake_ops_list_over_tcp() {
+        // M89: the pending stake-op pool over real TCP — the eighth list endpoint and the
+        // first pending-pool read, reusing the pagination stack + `format_stake_op`/
+        // `json_stake_op`. The pool only fills when a signed `StakeOp` is staged for the next
+        // block, so a fresh chain's `/stake-ops` is live-but-empty — asserted end to end
+        // (route → Cmd → `pending_stake_ops()` → envelope).
+        let dir = tmp_dir("rpc-stake-ops-list");
+        let mut cfg = node_config(30, 20351, &[30], dir.clone());
+        let rpc_addr = "127.0.0.1:20361";
+        cfg.rpc = Some(crate::config::RpcConfig { enabled: true, listen: rpc_addr.into() });
+        let mut genesis = test_genesis();
+        genesis.validators = vec![(30, kp(30).public(), 1)]; // quorum 1 ⇒ self-commit
+        let node = Node::start(cfg, genesis, Some(kp(30))).await.expect("start node");
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            if node.status().await.map(|(h, _)| h >= 1).unwrap_or(false) {
+                break;
+            }
+            assert!(tokio::time::Instant::now() < deadline, "node never produced a block");
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+
+        async fn get(addr: &str, path: &str) -> String {
+            let req = format!("GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
+            let mut s = TcpStream::connect(addr).await.expect("connect rpc");
+            s.write_all(req.as_bytes()).await.expect("send get");
+            let mut resp = Vec::new();
+            s.read_to_end(&mut resp).await.expect("read response");
+            String::from_utf8_lossy(&resp).into_owned()
+        }
+        fn body_of(resp: &str) -> &str {
+            resp.split_once("\r\n\r\n").map(|(_, b)| b).unwrap_or("")
+        }
+
+        // Plain directory → 200 with an empty page (no staged stake ops at genesis).
+        let resp = get(rpc_addr, "/stake-ops").await;
+        assert!(resp.starts_with("HTTP/1.1 200 OK"), "stake-ops status: {resp}");
+        assert_eq!(body_of(&resp), "total=0", "stake-ops text envelope (empty pool)");
+
+        // JSON representation → the `total`/`next`/`items` envelope with an empty array.
+        let as_json = get(rpc_addr, "/stake-ops?format=json").await;
+        assert!(as_json.starts_with("HTTP/1.1 200 OK"), "stake-ops json status: {as_json}");
+        assert!(as_json.contains("Content-Type: application/json\r\n"), "json ct: {as_json}");
+        assert_eq!(
+            body_of(&as_json),
+            "{\"total\":\"0\",\"next\":null,\"items\":[]}",
+            "stake-ops JSON envelope (empty pool)"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
     async fn rpc_plain_entities_over_tcp() {
         // M65: plain reviewer/validator/graph reads over real TCP. Unlike bridge locks,
         // `test_genesis` carries real reviewers (10,11,12), validators (21-24), and a
@@ -6938,6 +7070,61 @@ kind=unbonding account=9 amount=500000 mature_height=15"
         // Empty queue ⇒ empty text, `[]` JSON.
         assert_eq!(format_unbonding_listing(&[]), "");
         assert_eq!(json_unbonding_listing(&[]), "[]");
+    }
+
+    #[test]
+    fn route_get_parses_stake_ops() {
+        // M89: `/stake-ops` is a plain directory read — an exact match. There is no
+        // `/stake-op/` single-read prefix, so a trailing slash falls through to the health
+        // fallback (like `/bonds/` and `/unbonding/`, not `NotFound`).
+        assert!(matches!(route_get("/stake-ops"), GetRoute::StakeOps));
+        assert!(matches!(route_get("/stake-ops/"), GetRoute::Health));
+        // Sibling list reads still resolve to their own variants (no collision).
+        assert!(matches!(route_get("/unbonding"), GetRoute::Unbonding));
+        assert!(matches!(route_get("/bonds"), GetRoute::Bonds));
+    }
+
+    #[test]
+    fn stakeop_listing_renders() {
+        // M89: two pending stake ops render one grep-friendly line each (staging order) and a
+        // JSON array reusing `json_stake_op`; the empty pool yields an empty text body and `[]`.
+        let ops = vec![
+            crate::StakeOp {
+                account: 7,
+                kind: crate::BondKind::Bond,
+                amount: 3_000_000,
+                signature: [0u8; 64],
+            },
+            crate::StakeOp {
+                account: 9,
+                kind: crate::BondKind::Unbond,
+                amount: 500_000,
+                signature: [0u8; 64],
+            },
+        ];
+        let sig_hex = crate::hash::hex(&[0u8; 64]);
+        let text = format_stakeop_listing(&ops);
+        assert_eq!(
+            text,
+            format!(
+                "account=7 kind=bond amount=3000000 signature={sig_hex}\n\
+account=9 kind=unbond amount=500000 signature={sig_hex}"
+            )
+        );
+        // The listing's JSON items are byte-identical to the existing single-op renderer.
+        let json = json_stakeop_listing(&ops);
+        assert_eq!(
+            json,
+            format!("[{},{}]", json_stake_op(&ops[0]), json_stake_op(&ops[1]))
+        );
+        // Single-item text renderer matches what the listing emits per entry.
+        assert_eq!(
+            format_stake_op(&ops[0]),
+            format!("account=7 kind=bond amount=3000000 signature={sig_hex}")
+        );
+        // Empty pool ⇒ empty text, `[]` JSON.
+        assert_eq!(format_stakeop_listing(&[]), "");
+        assert_eq!(json_stakeop_listing(&[]), "[]");
     }
 
     #[test]
