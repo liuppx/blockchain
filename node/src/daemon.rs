@@ -2180,6 +2180,22 @@ fn format_lock_listing(locks: &[(u64, u64, crate::BridgeLock)]) -> String {
         .join("\n")
 }
 
+/// M79: wrap a rendered text page in the pagination envelope. Always a `total={n}`
+/// header line; a `next={off}` line only when another page remains (its presence is the
+/// grep-friendly "more pages" signal); then the item lines (omitted when the page is
+/// empty). Generic over the inner renderer so future list reads reuse it.
+fn format_page(items: &str, total: usize, next: Option<usize>) -> String {
+    let mut s = format!("total={total}");
+    if let Some(n) = next {
+        s.push_str(&format!("\nnext={n}"));
+    }
+    if !items.is_empty() {
+        s.push('\n');
+        s.push_str(items);
+    }
+    s
+}
+
 /// M61: render a verifiable batch read as two grep-friendly hex lines — the
 /// certified head and the encoded `BatchResponseEnvelope`. A client hex-decodes
 /// both, runs `decode_certified_header` / `decode_batch_envelope`, then
@@ -2318,6 +2334,17 @@ fn json_lock_listing(locks: &[(u64, u64, crate::BridgeLock)]) -> String {
         .collect::<Vec<_>>()
         .join(",");
     format!("[{items}]")
+}
+
+/// M79: wrap a rendered JSON array page as `{"total":"N","next":"M"|null,"items":[…]}`.
+/// `total`/`next` use the lossless quoted-u64 convention; `next` is bare `null` at the
+/// end of the listing (the one divergence from the text form, which omits the line).
+fn json_page(items: &str, total: usize, next: Option<usize>) -> String {
+    let next = match next {
+        Some(n) => json_u64(n as u64),
+        None => "null".to_string(),
+    };
+    format!("{{\"total\":{},\"next\":{},\"items\":{}}}", json_u64(total as u64), next, items)
 }
 
 // ---- M67/M74/M75/M76/M77/M78: JSON renderers for the proof / batch / lock reads. -----
@@ -2981,12 +3008,25 @@ async fn serve_rpc_conn(mut stream: TcpStream, cmd: mpsc::UnboundedSender<Cmd>) 
                 } else {
                     match rx.await {
                         Ok(listing) => {
-                            // M72: optional `?offset=`/`?limit=` window; both absent ⇒
-                            // full listing, byte-identical to M64 (offset 0, unbounded).
+                            // M72: optional `?offset=`/`?limit=` window. M79: wrap the
+                            // page in the `total`/`next` envelope — `total` is the full
+                            // unwindowed count, `next` the offset to request for the
+                            // following page (none once the window reaches the end).
                             let offset = usize_param(query, "offset").unwrap_or(0);
                             let limit = usize_param(query, "limit");
+                            let total = listing.len();
                             let page = paginate(&listing, offset, limit);
-                            ok_body(fmt, &format_lock_listing(page), &json_lock_listing(page))
+                            let start = offset.min(total);
+                            let next = if start + page.len() < total {
+                                Some(start + page.len())
+                            } else {
+                                None
+                            };
+                            ok_body(
+                                fmt,
+                                &format_page(&format_lock_listing(page), total, next),
+                                &json_page(&json_lock_listing(page), total, next),
+                            )
                         }
                         Err(_) => http_response("503 Service Unavailable", "node stopped"),
                     }
@@ -5072,22 +5112,28 @@ mod tests {
             resp.split_once("\r\n\r\n").map(|(_, b)| b).unwrap_or("")
         }
 
-        // Plain directory on an empty chain → 200 with an empty body (not 404).
+        // Plain directory on an empty chain → 200. M79: the body is now the pagination
+        // envelope, so an empty chain renders `total=0` (no `next=` line, no items).
         let resp = get(rpc_addr, "/bridge/locks").await;
         assert!(resp.starts_with("HTTP/1.1 200 OK"), "bridge locks status: {resp}");
-        assert_eq!(body_of(&resp), "", "empty chain → empty directory body");
+        assert_eq!(body_of(&resp), "total=0", "empty chain → total=0 envelope");
 
         // M72: pagination params don't break framing on the (empty) live chain — an
         // empty window is still a 200 (window correctness over data: `paginate_windows`).
+        // M79: the empty window renders the `total=0` envelope (text) / `items:[]` (JSON).
         let paged = get(rpc_addr, "/bridge/locks?limit=1&offset=0").await;
         assert!(paged.starts_with("HTTP/1.1 200 OK"), "paged status: {paged}");
         assert!(paged.contains("Content-Type: text/plain; charset=utf-8\r\n"), "paged ct: {paged}");
-        assert_eq!(body_of(&paged), "", "empty window → empty body");
+        assert_eq!(body_of(&paged), "total=0", "empty window → total=0 envelope");
 
         let paged_json = get(rpc_addr, "/bridge/locks?format=json&limit=0").await;
         assert!(paged_json.starts_with("HTTP/1.1 200 OK"), "paged json status: {paged_json}");
         assert!(paged_json.contains("Content-Type: application/json\r\n"), "paged json ct: {paged_json}");
-        assert_eq!(body_of(&paged_json), "[]", "empty window → empty JSON array");
+        assert_eq!(
+            body_of(&paged_json),
+            "{\"total\":\"0\",\"next\":null,\"items\":[]}",
+            "empty window → total=0 JSON envelope"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -5252,6 +5298,31 @@ mod tests {
         assert_eq!(paginate(&items, 10, Some(3)), &[] as &[i32]); // offset past end
         assert_eq!(paginate(&items, 0, Some(99)), &items[..]); // limit clamps to len
         assert_eq!(paginate(&items, usize::MAX, Some(usize::MAX)), &[] as &[i32]); // no overflow
+    }
+
+    #[test]
+    fn lock_page_envelopes() {
+        // M79: `format_page`/`json_page` wrap an already-rendered inner page in the
+        // `total`/`next` pagination envelope. `next` present ⇒ more pages remain; at the
+        // end of the listing text omits the `next=` line while JSON carries bare `null`.
+        // First/middle page (more remaining): `next = Some(2)` of `total = 3`.
+        assert_eq!(
+            json_page("[{\"x\":1}]", 3, Some(2)),
+            "{\"total\":\"3\",\"next\":\"2\",\"items\":[{\"x\":1}]}"
+        );
+        assert_eq!(format_page("lock_id=0 …", 3, Some(2)), "total=3\nnext=2\nlock_id=0 …");
+
+        // Last page (window reaches the end): `next = None`.
+        assert_eq!(
+            json_page("[{\"x\":9}]", 3, None),
+            "{\"total\":\"3\",\"next\":null,\"items\":[{\"x\":9}]}"
+        );
+        assert_eq!(format_page("lock_id=2 …", 3, None), "total=3\nlock_id=2 …");
+
+        // Empty page: JSON keeps the `items:[]` array; text is exactly `total=0`
+        // (no `next=` line, no trailing newline).
+        assert_eq!(json_page("[]", 0, None), "{\"total\":\"0\",\"next\":null,\"items\":[]}");
+        assert_eq!(format_page("", 0, None), "total=0");
     }
 
     #[test]
@@ -5811,7 +5882,9 @@ mod tests {
         let locks = get(rpc_addr, "/bridge/locks?format=json").await;
         assert!(locks.starts_with("HTTP/1.1 200 OK"), "locks: {locks}");
         assert!(locks.contains("Content-Type: application/json\r\n"), "locks ct: {locks}");
-        assert!(body_of(&locks).starts_with("["), "locks body: {locks}");
+        // M79: JSON locks are now the pagination envelope `{"total":…,"next":…,"items":[…]}`.
+        assert!(body_of(&locks).starts_with("{\"total\":"), "locks body: {locks}");
+        assert!(body_of(&locks).contains("\"items\":["), "locks body: {locks}");
 
         // A data miss under JSON → 404 + application/json + {"error":…}.
         let miss = get(rpc_addr, "/reviewer/999?format=json").await;
