@@ -1777,15 +1777,16 @@ fn http_response(status_line: &str, body: &str) -> String {
 /// `text/plain; charset=utf-8` (via [`http_response`]); a `?format=json` read passes
 /// bare `application/json` (JSON is always UTF-8, so it carries no `charset` param).
 /// `Content-Length` is the UTF-8 byte length of `body`, exactly as before.
-/// M71: every response carries `Vary: Accept` (RFC 7231 §7.1.4) — the endpoint
-/// selects text vs JSON from the request's `Accept` header, so shared caches must
-/// key on it (lest a JSON body be replayed to a text client, or vice-versa).
+/// M71: every response carries `Vary` (RFC 7231 §7.1.4) — the endpoint selects text vs
+/// JSON from the request's `Accept` header, so shared caches must key on it (lest a JSON
+/// body be replayed to a text client, or vice-versa). M82: the response also negotiates on
+/// `Accept-Charset` (UTF-8-only ⇒ possible `406`), so `Vary` widens to `Accept, Accept-Charset`.
 fn http_response_ct(status_line: &str, content_type: &str, body: &str) -> String {
     format!(
         "HTTP/1.1 {}\r\n\
          Content-Type: {}\r\n\
          Content-Length: {}\r\n\
-         Vary: Accept\r\n\
+         Vary: Accept, Accept-Charset\r\n\
          Connection: close\r\n\
          \r\n\
          {}",
@@ -1812,6 +1813,21 @@ fn not_acceptable_json() -> String {
         .collect::<Vec<_>>()
         .join(",");
     format!("{{\"error\":\"not_acceptable\",\"available\":[{available}]}}")
+}
+
+/// M82: the charsets this RPC server can emit. UTF-8 only (every body is UTF-8), so a
+/// single source of truth for Accept-Charset negotiation + its `406` body.
+const OFFERED_CHARSETS: [&str; 1] = ["utf-8"];
+
+/// M82: RFC 7231 §6.5.6 — the `406` body when `Accept-Charset` rules out every charset we
+/// emit. Same machine-readable error shape as `not_acceptable_json`, listing charsets.
+fn not_acceptable_charset_json() -> String {
+    let available = OFFERED_CHARSETS
+        .iter()
+        .map(|c| json_str(c))
+        .collect::<Vec<_>>()
+        .join(",");
+    format!("{{\"error\":\"not_acceptable\",\"available_charsets\":[{available}]}}")
 }
 
 /// Accept loop for the ingress RPC endpoint. Mirrors [`run_metrics`]: each
@@ -2047,6 +2063,56 @@ fn resolve_format(query: &str, head: &str) -> Option<RespFormat> {
         Negotiation::Use(f) => Some(f),
         Negotiation::NotAcceptable => None,
     }
+}
+
+/// M82: best q-milli for a concrete charset against an `Accept-Charset` value
+/// (RFC 7231 §5.3.3). An exact (case-insensitive) name beats the `*` wildcard; a charset
+/// neither named nor covered by `*` scores 0. Mirrors `media_match`; reuses `parse_qmilli`.
+fn charset_q(accept_value: &str, name: &str) -> u16 {
+    let (mut best_q, mut best_spec) = (0u16, 0u8);
+    for range in accept_value.split(',') {
+        let mut parts = range.split(';');
+        let token = parts.next().unwrap_or("").trim();
+        let spec = if token.eq_ignore_ascii_case(name) {
+            2
+        } else if token == "*" {
+            1
+        } else {
+            0
+        };
+        if spec == 0 {
+            continue;
+        }
+        let mut q = 1000u16;
+        for p in parts {
+            let p = p.trim();
+            if let Some(v) = p.strip_prefix("q=").or_else(|| p.strip_prefix("Q=")) {
+                q = parse_qmilli(v);
+            }
+        }
+        if spec > best_spec || (spec == best_spec && q > best_q) {
+            best_spec = spec;
+            best_q = q;
+        }
+    }
+    best_q
+}
+
+/// M82: `Accept-Charset` negotiation (RFC 7231 §5.3.3). We emit UTF-8 only: an absent header
+/// is unconstrained (⇒ acceptable, keeping no-header requests byte-identical bar `Vary`); a
+/// present header is acceptable iff some offered charset gets a non-zero q. An explicit
+/// `utf-8;q=0` (exact beats `*`) or a list omitting utf-8/`*` ⇒ not acceptable ⇒ `406`.
+fn charset_acceptable(head: &str) -> bool {
+    let mut value = None;
+    for line in head.split("\r\n") {
+        let Some((name, v)) = line.split_once(':') else { continue };
+        if name.trim().eq_ignore_ascii_case("accept-charset") {
+            value = Some(v);
+            break;
+        }
+    }
+    let Some(value) = value else { return true }; // absent ⇒ no constraint
+    OFFERED_CHARSETS.iter().any(|c| charset_q(value, c) > 0)
 }
 
 fn route_get(path: &str) -> GetRoute {
@@ -2917,6 +2983,25 @@ async fn serve_rpc_conn(mut stream: TcpStream, cmd: mpsc::UnboundedSender<Cmd>) 
             return;
         }
     };
+
+    // M82: Accept-Charset negotiation (RFC 7231 §5.3.3). We emit UTF-8 only; a header that
+    // rules it out ⇒ 406 with a machine-readable list of the charsets we can emit. Checked
+    // after Accept and before routing, so it gates every method uniformly (an absent header
+    // is unconstrained, keeping no-header requests unchanged).
+    if !charset_acceptable(head) {
+        let _ = stream
+            .write_all(
+                http_response_ct(
+                    "406 Not Acceptable",
+                    "application/json",
+                    &not_acceptable_charset_json(),
+                )
+                .as_bytes(),
+            )
+            .await;
+        let _ = stream.flush().await;
+        return;
+    }
 
     // M58: read-class GET routes. Each read routes through the single-owner actor via
     // the same local-oneshot pattern as the POST path below; a send failure (actor
@@ -5491,15 +5576,45 @@ mod tests {
     }
 
     #[test]
+    fn charset_negotiation_honors_utf8() {
+        // M82: we emit UTF-8 only. `charset_q` scores a concrete charset against an
+        // Accept-Charset value — exact (case-insensitive) beats `*`, which beats no match.
+        assert_eq!(charset_q("utf-8", "utf-8"), 1000);
+        assert_eq!(charset_q("UTF-8", "utf-8"), 1000); // case-insensitive
+        assert_eq!(charset_q("*", "utf-8"), 1000); // wildcard covers it
+        assert_eq!(charset_q("iso-8859-1", "utf-8"), 0); // unmentioned, no `*`
+        assert_eq!(charset_q("utf-8;q=0.5", "utf-8"), 500);
+        assert_eq!(charset_q("utf-8;q=0, *", "utf-8"), 0); // exact (q=0) beats `*`
+
+        // `charset_acceptable` reads the header off the raw block: absent ⇒ unconstrained.
+        let head = |ac: &str| format!("GET / HTTP/1.1\r\nHost: x\r\nAccept-Charset: {ac}\r\n\r\n");
+        assert!(charset_acceptable("GET / HTTP/1.1\r\nHost: x\r\n\r\n")); // absent ⇒ true
+        assert!(charset_acceptable(&head("utf-8")));
+        assert!(charset_acceptable(&head("UTF-8"))); // case-insensitive name
+        assert!(charset_acceptable(&head("*")));
+        assert!(charset_acceptable(&head("iso-8859-1, *;q=0.5"))); // via `*`
+        assert!(!charset_acceptable(&head("utf-8;q=0"))); // explicit rejection
+        assert!(!charset_acceptable(&head("iso-8859-1"))); // omits utf-8 and `*`
+        assert!(!charset_acceptable(&head("utf-8;q=0, *"))); // exact beats `*`
+
+        // The 406 body is a machine-readable list of the charsets we can emit.
+        assert_eq!(
+            not_acceptable_charset_json(),
+            "{\"error\":\"not_acceptable\",\"available_charsets\":[\"utf-8\"]}"
+        );
+    }
+
+    #[test]
     fn http_response_sets_vary_accept() {
-        // M71: every RPC response advertises `Vary: Accept` (RFC 7231 §7.1.4) so
-        // shared caches key on the Accept header, through the single builder.
+        // M71/M82: every RPC response advertises `Vary: Accept, Accept-Charset`
+        // (RFC 7231 §7.1.4) so shared caches key on both negotiation inputs, through
+        // the single builder.
         let text = http_response("200 OK", "x");
-        assert!(text.contains("\r\nVary: Accept\r\n"), "text: {text}");
+        assert!(text.contains("\r\nVary: Accept, Accept-Charset\r\n"), "text: {text}");
         assert!(text.starts_with("HTTP/1.1 200 OK"), "text status: {text}");
         assert!(text.contains("Content-Type: text/plain; charset=utf-8\r\n"), "text ct: {text}");
         let json = http_response_ct("200 OK", "application/json", "{}");
-        assert!(json.contains("\r\nVary: Accept\r\n"), "json: {json}");
+        assert!(json.contains("\r\nVary: Accept, Accept-Charset\r\n"), "json: {json}");
         assert!(json.starts_with("HTTP/1.1 200 OK"), "json status: {json}");
         assert!(json.contains("Content-Type: application/json\r\n"), "json ct: {json}");
     }
@@ -5911,8 +6026,8 @@ mod tests {
         let h = get(rpc_addr, "/height?format=json").await;
         assert!(h.starts_with("HTTP/1.1 200 OK"), "height: {h}");
         assert!(h.contains("Content-Type: application/json\r\n"), "height ct: {h}");
-        // M71: representation-selected responses advertise `Vary: Accept` for caches.
-        assert!(h.contains("Vary: Accept\r\n"), "height vary: {h}");
+        // M71/M82: representation-selected responses advertise `Vary: Accept, Accept-Charset`.
+        assert!(h.contains("Vary: Accept, Accept-Charset\r\n"), "height vary: {h}");
         assert!(body_of(&h).starts_with("{\"height\":\""), "height body: {h}");
 
         let a = get(rpc_addr, "/account/1?format=json").await;
@@ -5941,8 +6056,8 @@ mod tests {
         // the pre-M66 plaintext response (text/plain, bare decimal height).
         let plain = get(rpc_addr, "/height").await;
         assert!(plain.contains("Content-Type: text/plain; charset=utf-8\r\n"), "plain ct: {plain}");
-        // M71: the text representation also carries `Vary: Accept`.
-        assert!(plain.contains("Vary: Accept\r\n"), "plain vary: {plain}");
+        // M71/M82: the text representation also carries `Vary: Accept, Accept-Charset`.
+        assert!(plain.contains("Vary: Accept, Accept-Charset\r\n"), "plain vary: {plain}");
         assert!(body_of(&plain).chars().all(|c| c.is_ascii_digit()), "plain body: {plain}");
 
         let _ = std::fs::remove_dir_all(&dir);
@@ -6056,8 +6171,8 @@ mod tests {
         let x = get(rpc_addr, "/height", Some("application/xml")).await;
         assert!(x.starts_with("HTTP/1.1 406 Not Acceptable"), "xml: {x}");
         assert!(x.contains("Content-Type: application/json\r\n"), "xml ct: {x}");
-        // M71: the negotiated-error path varies by `Accept` too.
-        assert!(x.contains("Vary: Accept\r\n"), "xml vary: {x}");
+        // M71/M82: the negotiated-error path varies by `Accept, Accept-Charset` too.
+        assert!(x.contains("Vary: Accept, Accept-Charset\r\n"), "xml vary: {x}");
         assert!(body_of(&x).contains("\"error\":\"not_acceptable\""), "xml body is JSON error: {x}");
         assert!(body_of(&x).contains("application/json"), "xml body lists json: {x}");
         assert!(body_of(&x).contains("text/plain"), "xml body lists text: {x}");
@@ -6081,6 +6196,70 @@ mod tests {
         assert!(q.contains("Content-Type: application/json\r\n"), "query-wins ct: {q}");
 
         // Head invariant: no Accept header ⇒ byte-identical plaintext (never 406).
+        let plain = get(rpc_addr, "/height", None).await;
+        assert!(plain.starts_with("HTTP/1.1 200 OK"), "plain: {plain}");
+        assert!(plain.contains("Content-Type: text/plain; charset=utf-8\r\n"), "plain ct: {plain}");
+        assert!(body_of(&plain).chars().all(|c| c.is_ascii_digit()), "plain body: {plain}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn rpc_charset_406_over_tcp() {
+        // M82: Accept-Charset negotiation (RFC 7231 §5.3.3). We emit UTF-8 only, so a header
+        // that accepts utf-8 (or `*`) is served, one that rules it out answers 406 with a
+        // machine-readable charset list, and a missing header stays plaintext (never 406).
+        let dir = tmp_dir("rpc-charset-406");
+        let mut cfg = node_config(23, 20231, &[23], dir.clone());
+        let rpc_addr = "127.0.0.1:20241";
+        cfg.rpc = Some(crate::config::RpcConfig { enabled: true, listen: rpc_addr.into() });
+        let mut genesis = test_genesis();
+        genesis.validators = vec![(23, kp(23).public(), 1)]; // quorum 1 ⇒ self-commit
+        let node = Node::start(cfg, genesis, Some(kp(23))).await.expect("start node");
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            if node.status().await.map(|(h, _)| h >= 1).unwrap_or(false) {
+                break;
+            }
+            assert!(tokio::time::Instant::now() < deadline, "node never produced a block");
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+
+        async fn get(addr: &str, path: &str, charset: Option<&str>) -> String {
+            let charset_line = charset.map(|c| format!("Accept-Charset: {c}\r\n")).unwrap_or_default();
+            let req = format!(
+                "GET {path} HTTP/1.1\r\nHost: localhost\r\n{charset_line}Connection: close\r\n\r\n"
+            );
+            let mut s = TcpStream::connect(addr).await.expect("connect rpc");
+            s.write_all(req.as_bytes()).await.expect("send get");
+            let mut resp = Vec::new();
+            s.read_to_end(&mut resp).await.expect("read response");
+            String::from_utf8_lossy(&resp).into_owned()
+        }
+        fn body_of(resp: &str) -> &str {
+            resp.rsplit("\r\n\r\n").next().unwrap_or("")
+        }
+
+        // Accept-Charset: utf-8 ⇒ 200, our only charset.
+        let ok = get(rpc_addr, "/height", Some("utf-8")).await;
+        assert!(ok.starts_with("HTTP/1.1 200 OK"), "utf-8: {ok}");
+        assert!(ok.contains("Content-Type: text/plain; charset=utf-8\r\n"), "utf-8 ct: {ok}");
+
+        // A charset that rules out utf-8 ⇒ 406 with a machine-readable charset list.
+        let bad = get(rpc_addr, "/height", Some("iso-8859-1")).await;
+        assert!(bad.starts_with("HTTP/1.1 406 Not Acceptable"), "iso: {bad}");
+        assert!(bad.contains("Content-Type: application/json\r\n"), "iso ct: {bad}");
+        assert!(bad.contains("Vary: Accept, Accept-Charset\r\n"), "iso vary: {bad}");
+        assert!(body_of(&bad).contains("\"error\":\"not_acceptable\""), "iso body: {bad}");
+        assert!(body_of(&bad).contains("utf-8"), "iso body lists utf-8: {bad}");
+
+        // An explicit utf-8;q=0 is also a rejection ⇒ 406.
+        let q0 = get(rpc_addr, "/height", Some("utf-8;q=0")).await;
+        assert!(q0.starts_with("HTTP/1.1 406 Not Acceptable"), "q0: {q0}");
+        assert!(q0.contains("Content-Type: application/json\r\n"), "q0 ct: {q0}");
+
+        // Head invariant: no Accept-Charset header ⇒ byte-identical plaintext (never 406).
         let plain = get(rpc_addr, "/height", None).await;
         assert!(plain.starts_with("HTTP/1.1 200 OK"), "plain: {plain}");
         assert!(plain.contains("Content-Type: text/plain; charset=utf-8\r\n"), "plain ct: {plain}");
