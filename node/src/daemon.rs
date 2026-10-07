@@ -428,6 +428,12 @@ enum Cmd {
     QueryAccounts {
         reply: oneshot::Sender<Vec<(u64, Account)>>,
     },
+    /// M85: list all reviewers (id + reputation) for the plain read-class RPC directory —
+    /// the list sibling of the single `/reviewer/{id}` plain read. Always a (possibly
+    /// empty) list.
+    QueryReviewers {
+        reply: oneshot::Sender<Vec<(u64, f32)>>,
+    },
     /// M61: serve a heterogeneous proof batch + the certified head it verifies
     /// against, for the verifiable batch read RPC. `None` ⇒ `serve_batch` rejected
     /// (over `MAX_BATCH_ITEMS` or a degenerate Diff range) or no certified head
@@ -1101,6 +1107,12 @@ async fn run_actor(mut actor: Actor, mut rx: mpsc::UnboundedReceiver<Cmd>) {
                     .map(|(&id, a)| (id, a.clone()))
                     .collect();
                 let _ = reply.send(accounts);
+            }
+            Cmd::QueryReviewers { reply } => {
+                // M85: snapshot the id-sorted reviewer reputation map for the list directory.
+                let reviewers =
+                    actor.node.chain.state.reviewers.iter().map(|(&id, &r)| (id, r)).collect();
+                let _ = reply.send(reviewers);
             }
             Cmd::QueryBatch { items, reply } => {
                 let _ = reply.send(actor.node.batch(items));
@@ -1910,6 +1922,9 @@ enum GetRoute {
     /// M84: `GET /accounts` — the plain (unverified) balances directory (id + balance +
     /// stats + pubkey), the list sibling of `Account(u64)`.
     Accounts,
+    /// M85: `GET /reviewers` — the plain (unverified) reviewer directory (id + reputation),
+    /// the list sibling of `Plain(Reviewer, id)`.
+    Reviewers,
     NotFound,
 }
 
@@ -2162,6 +2177,9 @@ fn route_get(path: &str) -> GetRoute {
         // M84: the plain account/balances directory. Exact-match here, so it never collides
         // with the M58/M59 `/account/` prefix below (`…account` + `s`, not `…account` + `/`).
         "/accounts" => GetRoute::Accounts,
+        // M85: the plain reviewer directory. Exact-match here, so it never collides with
+        // the M60/M65 `/reviewer/` prefix below (`…reviewer` + `s`, not `…reviewer` + `/`).
+        "/reviewers" => GetRoute::Reviewers,
         p => {
             if let Some(rest) = p.strip_prefix("/account/") {
                 // M59: `{id}/proof` is the verifiable read; a bare `{id}` is the M58
@@ -2514,6 +2532,28 @@ fn json_account_listing(accounts: &[(u64, Account)]) -> String {
     let items = accounts
         .iter()
         .map(|(id, a)| json_account(*id, a))
+        .collect::<Vec<_>>()
+        .join(",");
+    format!("[{items}]")
+}
+
+/// M85: render the reviewer directory as grep-friendly `key=value` lines, one per reviewer
+/// (empty string when there are none). Reuses `format_entity` per item — same line shape as
+/// the single `/reviewer/{id}` plain read.
+fn format_reviewer_listing(reviewers: &[(u64, f32)]) -> String {
+    reviewers
+        .iter()
+        .map(|&(id, reputation)| format_entity(&EntityView::Reviewer { id, reputation }))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// M85: `GET /reviewers?format=json` — the JSON sibling of [`format_reviewer_listing`]. A
+/// JSON **array** of objects (`[]` when empty), reusing `json_entity` per item.
+fn json_reviewer_listing(reviewers: &[(u64, f32)]) -> String {
+    let items = reviewers
+        .iter()
+        .map(|&(id, reputation)| json_entity(&EntityView::Reviewer { id, reputation }))
         .collect::<Vec<_>>()
         .join(",");
     format!("[{items}]")
@@ -3295,6 +3335,36 @@ async fn serve_rpc_conn(mut stream: TcpStream, cmd: mpsc::UnboundedSender<Cmd>) 
                                 fmt,
                                 &format_page(&format_account_listing(page), total, next),
                                 &json_page(&json_account_listing(page), total, next),
+                            )
+                        }
+                        Err(_) => http_response("503 Service Unavailable", "node stopped"),
+                    }
+                }
+            }
+            GetRoute::Reviewers => {
+                // M85: plain reviewer directory — always a (possibly empty) `200`. Fourth
+                // consumer of the pagination stack (after `/bridge/locks`, `/validators`,
+                // `/accounts`), reusing `format_entity`/`json_entity` per item.
+                let (reply, rx) = oneshot::channel();
+                if cmd.send(Cmd::QueryReviewers { reply }).is_err() {
+                    http_response("503 Service Unavailable", "node stopped")
+                } else {
+                    match rx.await {
+                        Ok(listing) => {
+                            let offset = usize_param(query, "offset").unwrap_or(0);
+                            let limit = Some(effective_limit(usize_param(query, "limit")));
+                            let total = listing.len();
+                            let page = paginate(&listing, offset, limit);
+                            let start = offset.min(total);
+                            let next = if start + page.len() < total {
+                                Some(start + page.len())
+                            } else {
+                                None
+                            };
+                            ok_body(
+                                fmt,
+                                &format_page(&format_reviewer_listing(page), total, next),
+                                &json_page(&json_reviewer_listing(page), total, next),
                             )
                         }
                         Err(_) => http_response("503 Service Unavailable", "node stopped"),
@@ -5560,6 +5630,85 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn rpc_reviewers_list_over_tcp() {
+        // M85: the reviewer directory over real TCP — the fourth list endpoint, reusing the
+        // pagination stack + the existing `format_entity`/`json_entity` per-item renderers.
+        // `test_genesis` carries three reviewers (10,11,12 @ rep 1.0), a populated body.
+        let dir = tmp_dir("rpc-reviewers-list");
+        let mut cfg = node_config(26, 20271, &[26], dir.clone());
+        let rpc_addr = "127.0.0.1:20281";
+        cfg.rpc = Some(crate::config::RpcConfig { enabled: true, listen: rpc_addr.into() });
+        let mut genesis = test_genesis();
+        genesis.validators = vec![(26, kp(26).public(), 1)]; // quorum 1 ⇒ self-commit
+        let node = Node::start(cfg, genesis, Some(kp(26))).await.expect("start node");
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            if node.status().await.map(|(h, _)| h >= 1).unwrap_or(false) {
+                break;
+            }
+            assert!(tokio::time::Instant::now() < deadline, "node never produced a block");
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+
+        async fn get(addr: &str, path: &str) -> String {
+            let req = format!("GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
+            let mut s = TcpStream::connect(addr).await.expect("connect rpc");
+            s.write_all(req.as_bytes()).await.expect("send get");
+            let mut resp = Vec::new();
+            s.read_to_end(&mut resp).await.expect("read response");
+            String::from_utf8_lossy(&resp).into_owned()
+        }
+        fn body_of(resp: &str) -> &str {
+            resp.split_once("\r\n\r\n").map(|(_, b)| b).unwrap_or("")
+        }
+
+        // The three id-sorted genesis reviewers, each at reputation 1.0.
+        let want = [(10u64, 1.0f32), (11, 1.0), (12, 1.0)];
+        let text_lines = want
+            .iter()
+            .map(|&(id, reputation)| format_entity(&EntityView::Reviewer { id, reputation }))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let json_items = want
+            .iter()
+            .map(|&(id, reputation)| json_entity(&EntityView::Reviewer { id, reputation }))
+            .collect::<Vec<_>>()
+            .join(",");
+
+        // Plain directory → 200 with all three reviewers (id order).
+        let resp = get(rpc_addr, "/reviewers").await;
+        assert!(resp.starts_with("HTTP/1.1 200 OK"), "reviewers status: {resp}");
+        assert_eq!(body_of(&resp), format!("total=3\n{text_lines}"), "reviewer text envelope");
+
+        // JSON representation → the `total`/`next`/`items` envelope with the reviewers.
+        let as_json = get(rpc_addr, "/reviewers?format=json").await;
+        assert!(as_json.starts_with("HTTP/1.1 200 OK"), "reviewers json status: {as_json}");
+        assert!(as_json.contains("Content-Type: application/json\r\n"), "json ct: {as_json}");
+        assert_eq!(
+            body_of(&as_json),
+            format!("{{\"total\":\"3\",\"next\":null,\"items\":[{json_items}]}}"),
+            "reviewer JSON envelope"
+        );
+
+        // `?offset=1&limit=1` windows the middle reviewer, with a `next` cursor.
+        let mid = get(rpc_addr, "/reviewers?offset=1&limit=1").await;
+        assert!(mid.starts_with("HTTP/1.1 200 OK"), "offset status: {mid}");
+        assert_eq!(
+            body_of(&mid),
+            format!("total=3\nnext=2\n{}", format_entity(&EntityView::Reviewer { id: 11, reputation: 1.0 })),
+            "middle window → total=3, next=2, one line"
+        );
+
+        // `?offset=3` windows past the last reviewer → empty page, no `next`.
+        let past = get(rpc_addr, "/reviewers?offset=3").await;
+        assert!(past.starts_with("HTTP/1.1 200 OK"), "offset-past status: {past}");
+        assert_eq!(body_of(&past), "total=3", "offset past end → total=3, empty page");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
     async fn rpc_plain_entities_over_tcp() {
         // M65: plain reviewer/validator/graph reads over real TCP. Unlike bridge locks,
         // `test_genesis` carries real reviewers (10,11,12), validators (21-24), and a
@@ -6057,6 +6206,29 @@ mod tests {
     }
 
     #[test]
+    fn reviewer_listing_renders() {
+        // M85: the empty directory renders `""` (text) / `[]` (json); two reviewers render
+        // one `format_entity`-shaped line each (text) and a two-object array (json), reusing
+        // the exact single-item `EntityView::Reviewer` renderers.
+        assert_eq!(format_reviewer_listing(&[]), "");
+        assert_eq!(json_reviewer_listing(&[]), "[]");
+
+        let reviewers = vec![(10u64, 1.0f32), (11u64, 0.5f32)];
+        let ev = |id, reputation| EntityView::Reviewer { id, reputation };
+
+        // Text listing is exactly the per-item lines joined by `\n`.
+        assert_eq!(
+            format_reviewer_listing(&reviewers),
+            format!("{}\n{}", format_entity(&ev(10, 1.0)), format_entity(&ev(11, 0.5))),
+        );
+        // JSON listing is exactly the per-item objects wrapped in an array.
+        assert_eq!(
+            json_reviewer_listing(&reviewers),
+            format!("[{},{}]", json_entity(&ev(10, 1.0)), json_entity(&ev(11, 0.5))),
+        );
+    }
+
+    #[test]
     fn error_body_renders() {
         // M67: `error_body` is status-agnostic — Text is the bare message with a
         // text/plain type; Json is {"error":"<msg>"} with application/json, the message
@@ -6207,6 +6379,18 @@ mod tests {
         // M58/M59 single-account routes still resolve to their own variants.
         assert!(matches!(route_get("/account/7"), GetRoute::Account(7)));
         assert!(matches!(route_get("/account/7/proof"), GetRoute::AccountProof(7)));
+    }
+
+    #[test]
+    fn route_get_parses_reviewers() {
+        // M85: `/reviewers` is a plain directory read — an exact match, distinct from the
+        // M60/M65 `/reviewer/{id}` prefix route (char after `…reviewer` is `s`, not `/`). A
+        // trailing slash is not the directory, so it falls through to the health fallback.
+        assert!(matches!(route_get("/reviewers"), GetRoute::Reviewers));
+        assert!(matches!(route_get("/reviewers/"), GetRoute::Health));
+        // M65/M60 single-reviewer routes still resolve to their own variants.
+        assert!(matches!(route_get("/reviewer/10"), GetRoute::Plain(ProofKind::Reviewer, 10)));
+        assert!(matches!(route_get("/reviewer/10/proof"), GetRoute::Proof(ProofKind::Reviewer, 10)));
     }
 
     #[test]
