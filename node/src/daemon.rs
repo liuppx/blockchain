@@ -2320,15 +2320,16 @@ fn json_lock_listing(locks: &[(u64, u64, crate::BridgeLock)]) -> String {
     format!("[{items}]")
 }
 
-// ---- M67/M74/M75/M76: JSON renderers for the proof / batch reads. ----------------
+// ---- M67/M74/M75/M76/M77: JSON renderers for the proof / batch / lock reads. --------
 // M67 serialized every proof envelope to one opaque `hex(encode_*)` blob dropped into
 // a named JSON field — self-verifying, but useless to a JSON client that only wants a
 // height or a state root without pulling in the binary codec. M74 decoded the
 // `certified_header` sub-envelope (shared by the proof and batch reads); M75 decoded
 // the `proof_entry` field (typed leaf + merkle path), so the account/entity proof read
 // is fully structured; M76 decodes the `batch_envelope` field (all four
-// `BatchResponseItem` variants: Inclusion / Knn / Range / Diff). The still-opaque parts
-// (`range_blocks`, `lock_envelope`) remain hex pending M77+. All pure (no I/O).
+// `BatchResponseItem` variants: Inclusion / Knn / Range / Diff); M77 decodes the
+// `lock_envelope` field (bridge-lock proof read), so only `range_blocks` remains opaque
+// hex (pending M78). All pure (no I/O).
 
 /// M74: a `ValidatorUpdate` as `{"id","pubkey","power"}`.
 fn json_validator_update(u: &crate::validator::ValidatorUpdate) -> String {
@@ -2627,12 +2628,42 @@ fn json_batch_envelope(env: &BatchResponseEnvelope) -> String {
     )
 }
 
-/// M67: `{"lock_envelope":"<hex>"}` — the JSON twin of [`format_lock`].
-fn json_lock(env: &crate::bridge::LockEnvelope) -> String {
+/// M77: a `BridgeLock` as all six fields (incl. `signature` — this is a proof, so full
+/// fidelity). Distinct from [`json_lock_listing`]'s flattened directory shape (which
+/// interleaves `lock_id`/`height` and omits the signature).
+fn json_bridge_lock(l: &crate::BridgeLock) -> String {
     format!(
-        "{{\"lock_envelope\":{}}}",
-        json_str(&crate::hash::hex(&crate::net::encode_lock_envelope(env))),
+        "{{\"account\":{},\"amount\":{},\"dest_chain\":{},\"dest_account\":{},\
+         \"nonce\":{},\"signature\":{}}}",
+        json_u64(l.account),
+        json_u64(l.amount),
+        json_str(&crate::hash::hex(&l.dest_chain)),
+        json_u64(l.dest_account),
+        json_u64(l.nonce),
+        json_str(&crate::hash::hex(&l.signature)),
     )
+}
+
+/// M77: the self-contained bridge-lock proof envelope — certified source header + cert +
+/// tracked validator set + the lock + its merkle inclusion path. Reuses the M74/M75/M76
+/// header/commit/validator-set/merkle renderers; only `lock` needs a new helper.
+fn json_lock_envelope(env: &crate::bridge::LockEnvelope) -> String {
+    format!(
+        "{{\"source_header\":{},\"source_cert\":{},\"source_tracked_set\":{},\
+         \"lock_id\":{},\"lock\":{},\"proof\":{}}}",
+        json_block_header(&env.source_header),
+        json_commit(&env.source_cert),
+        json_validator_set(&env.source_tracked_set),
+        json_u64(env.lock_id),
+        json_bridge_lock(&env.lock),
+        json_merkle_proof(&env.proof),
+    )
+}
+
+/// M67/M77: `{"lock_envelope":{…}}` — the JSON twin of [`format_lock`]. The envelope is
+/// now a structured object (M77); the text sibling still carries it as opaque hex.
+fn json_lock(env: &crate::bridge::LockEnvelope) -> String {
+    format!("{{\"lock_envelope\":{}}}", json_lock_envelope(env))
 }
 
 /// M67/M74/M76: `{"certified_header":{…},"batch_envelope":{…},"range_blocks":"<hex>"}`
@@ -5391,10 +5422,11 @@ mod tests {
             ),
         );
 
-        // Lock envelope: single hex field matching `format_lock`.
+        // Lock envelope (M77): `lock_envelope` is now a structured object wrapping
+        // `json_lock_envelope` (header/commit/validator-set/lock/merkle); the text
+        // sibling `format_lock` still carries it as hex.
         let env = node.serve_lock(0).expect("serve_lock");
-        let lock_hex = crate::hash::hex(&crate::net::encode_lock_envelope(&env));
-        assert_eq!(json_lock(&env), format!("{{\"lock_envelope\":\"{lock_hex}\"}}"));
+        assert_eq!(json_lock(&env), format!("{{\"lock_envelope\":{}}}", json_lock_envelope(&env)));
 
         // Batch (M74/M76): structured `certified_header` + `batch_envelope`, hex `range_blocks`.
         let (bch, benv, range) = node
@@ -6886,6 +6918,75 @@ mod tests {
         assert!(j.contains("\"diff\":{\"added\":[{\"node_id\":\"7\""), "{j}");
         assert!(j.contains("\"tracked_set_h1\":[{\"id\":\"21\",\"pubkey\":"), "{j}");
         assert!(j.contains("\"tracked_set_h2\":[]"), "{j}");
+
+        // Braces balance.
+        let opens = j.chars().filter(|&c| c == '{').count();
+        let closes = j.chars().filter(|&c| c == '}').count();
+        assert_eq!(opens, closes, "unbalanced braces: {j}");
+    }
+
+    #[test]
+    fn json_lock_envelope_structured() {
+        // M77: `json_lock_envelope` renders the self-contained bridge-lock proof as a
+        // structured object — certified source header + cert + tracked validator set +
+        // the lock (all six fields incl. signature) + its merkle inclusion path. Reuses
+        // json_block_header/json_commit/json_validator_set/json_merkle_proof; only the
+        // `lock` leaf needs the new `json_bridge_lock`. `json_lock` wraps it in one field.
+        let hdr = |height: u64| crate::codec::BlockHeader {
+            height,
+            prev_hash: [0u8; 32],
+            timestamp_days: 0.0,
+            next_validators_root: [0u8; 32],
+            state_root: [0u8; 32],
+            accounts_root: [0u8; 32],
+            graph_root: [0u8; 32],
+            bridge_root: [0u8; 32],
+            validator_updates: vec![],
+            txs_commitment: [0u8; 32],
+            stake_ops_commitment: [0u8; 32],
+            evidence_commitment: [0u8; 32],
+            bridge_locks_commitment: [0u8; 32],
+            bridge_headers_commitment: [0u8; 32],
+            bridge_redeems_commitment: [0u8; 32],
+        };
+        let cert = |height: u64| Commit { height, round: 0, block_hash: [0u8; 32], precommits: vec![] };
+        let env = crate::bridge::LockEnvelope {
+            source_header: hdr(5),
+            source_cert: cert(5),
+            source_tracked_set: crate::validator::ValidatorSet::new(vec![crate::validator::Validator {
+                id: 21,
+                pubkey: kp(21).public(),
+                power: 2,
+            }]),
+            lock_id: 3,
+            lock: crate::BridgeLock {
+                account: 1,
+                amount: 4_000_000,
+                dest_chain: [0xAB; 32],
+                dest_account: 7,
+                nonce: 2,
+                signature: [9u8; 64],
+            },
+            proof: crate::merkle::Proof {
+                steps: vec![crate::merkle::Step::Left([1u8; 32]), crate::merkle::Step::Right([2u8; 32])],
+            },
+        };
+        let j = json_lock(&env);
+
+        // One-field wrap + structured sub-envelopes.
+        assert!(j.starts_with("{\"lock_envelope\":{"), "{j}");
+        assert!(j.contains("\"source_header\":{\"height\":\"5\""), "{j}");
+        assert!(j.contains("\"source_cert\":{"), "{j}");
+        assert!(j.contains("\"source_tracked_set\":[{\"id\":\"21\",\"pubkey\":"), "{j}");
+        assert!(j.contains("\"lock_id\":\"3\""), "{j}");
+
+        // The lock leaf: all six fields incl. signature.
+        assert!(j.contains("\"lock\":{\"account\":\"1\",\"amount\":\"4000000\",\"dest_chain\":\""), "{j}");
+        assert!(j.contains("\"dest_account\":\"7\",\"nonce\":\"2\",\"signature\":\""), "{j}");
+
+        // Merkle inclusion path.
+        assert!(j.contains("\"proof\":{\"steps\":[{\"side\":\"left\",\"hash\":\""), "{j}");
+        assert!(j.contains("{\"side\":\"right\",\"hash\":\""), "{j}");
 
         // Braces balance.
         let opens = j.chars().filter(|&c| c == '{').count();
