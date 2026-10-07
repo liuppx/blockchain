@@ -416,6 +416,12 @@ enum Cmd {
     QueryLocks {
         reply: oneshot::Sender<crate::light::LockListing>,
     },
+    /// M83: list the active validator set (id + power + pubkey) for the plain read-class
+    /// RPC directory — the list sibling of the single `/validator/{id}` plain read. Always
+    /// a (possibly empty) list.
+    QueryValidators {
+        reply: oneshot::Sender<Vec<crate::validator::Validator>>,
+    },
     /// M61: serve a heterogeneous proof batch + the certified head it verifies
     /// against, for the verifiable batch read RPC. `None` ⇒ `serve_batch` rejected
     /// (over `MAX_BATCH_ITEMS` or a degenerate Diff range) or no certified head
@@ -1073,6 +1079,10 @@ async fn run_actor(mut actor: Actor, mut rx: mpsc::UnboundedReceiver<Cmd>) {
             }
             Cmd::QueryLocks { reply } => {
                 let _ = reply.send(actor.node.lock_listing());
+            }
+            Cmd::QueryValidators { reply } => {
+                // M83: read the validator set straight from state, like QueryEntity.
+                let _ = reply.send(actor.node.chain.state.validators.validators().to_vec());
             }
             Cmd::QueryBatch { items, reply } => {
                 let _ = reply.send(actor.node.batch(items));
@@ -1876,6 +1886,9 @@ enum GetRoute {
     /// M64: `GET /bridge/locks` — the plain (unverified) directory of every bridge
     /// lock on the chain (id + height + fields), so a client can discover ids.
     BridgeLocks,
+    /// M83: `GET /validators` — the plain (unverified) directory of the active
+    /// validator set (id + power + pubkey), the list sibling of `Plain(Validator, id)`.
+    Validators,
     NotFound,
 }
 
@@ -2122,6 +2135,9 @@ fn route_get(path: &str) -> GetRoute {
         // M64: the plain bridge-lock directory. Exact-match here, so it never collides
         // with the M63 `/bridge/lock/` prefix below (`…lock` + `s`, not `…lock` + `/`).
         "/bridge/locks" => GetRoute::BridgeLocks,
+        // M83: the plain validator-set directory. Exact-match here, so it never collides
+        // with the M60/M65 `/validator/` prefix below (`…validator` + `s`, not `…validator` + `/`).
+        "/validators" => GetRoute::Validators,
         p => {
             if let Some(rest) = p.strip_prefix("/account/") {
                 // M59: `{id}/proof` is the verifiable read; a bare `{id}` is the M58
@@ -2420,6 +2436,36 @@ fn json_lock_listing(locks: &[(u64, u64, crate::BridgeLock)]) -> String {
                 json_str(&crate::hash::hex(&l.dest_chain)),
                 json_u64(l.dest_account),
                 json_u64(l.nonce),
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+    format!("[{items}]")
+}
+
+/// M83: render the validator set as grep-friendly `key=value` lines, one per validator
+/// (empty string when the set is empty). Plain/unverified, like `format_lock_listing` — a
+/// client verifies any single validator via `/validator/{id}/proof`.
+fn format_validator_listing(vs: &[crate::validator::Validator]) -> String {
+    vs.iter()
+        .map(|v| {
+            format!("validator_id={} power={} pubkey={}", v.id, v.power, crate::hash::hex(&v.pubkey))
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// M83: `GET /validators?format=json` — the JSON sibling of [`format_validator_listing`].
+/// A JSON **array** of objects (`[]` when the set is empty, mirroring `json_lock_listing`).
+fn json_validator_listing(vs: &[crate::validator::Validator]) -> String {
+    let items = vs
+        .iter()
+        .map(|v| {
+            format!(
+                "{{\"validator_id\":{},\"power\":{},\"pubkey\":{}}}",
+                json_u64(v.id),
+                json_u64(v.power),
+                json_str(&crate::hash::hex(&v.pubkey)),
             )
         })
         .collect::<Vec<_>>()
@@ -3143,6 +3189,36 @@ async fn serve_rpc_conn(mut stream: TcpStream, cmd: mpsc::UnboundedSender<Cmd>) 
                                 fmt,
                                 &format_page(&format_lock_listing(page), total, next),
                                 &json_page(&json_lock_listing(page), total, next),
+                            )
+                        }
+                        Err(_) => http_response("503 Service Unavailable", "node stopped"),
+                    }
+                }
+            }
+            GetRoute::Validators => {
+                // M83: plain validator-set directory — always a (possibly empty) `200`.
+                // Reuses the whole M72/M79/M81 pagination stack verbatim, the second
+                // consumer after `/bridge/locks` (proving the renderers are generic).
+                let (reply, rx) = oneshot::channel();
+                if cmd.send(Cmd::QueryValidators { reply }).is_err() {
+                    http_response("503 Service Unavailable", "node stopped")
+                } else {
+                    match rx.await {
+                        Ok(listing) => {
+                            let offset = usize_param(query, "offset").unwrap_or(0);
+                            let limit = Some(effective_limit(usize_param(query, "limit")));
+                            let total = listing.len();
+                            let page = paginate(&listing, offset, limit);
+                            let start = offset.min(total);
+                            let next = if start + page.len() < total {
+                                Some(start + page.len())
+                            } else {
+                                None
+                            };
+                            ok_body(
+                                fmt,
+                                &format_page(&format_validator_listing(page), total, next),
+                                &json_page(&json_validator_listing(page), total, next),
                             )
                         }
                         Err(_) => http_response("503 Service Unavailable", "node stopped"),
@@ -5256,6 +5332,79 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn rpc_validators_list_over_tcp() {
+        // M83: the validator-set directory over real TCP — the second list endpoint,
+        // reusing the whole M72/M79/M81 pagination stack. Unlike `/bridge/locks` on a
+        // live chain, the set is non-empty (the single genesis validator), so this
+        // exercises the populated listing + envelope end to end.
+        let dir = tmp_dir("rpc-validators-list");
+        let mut cfg = node_config(24, 20111, &[24], dir.clone());
+        let rpc_addr = "127.0.0.1:20121";
+        cfg.rpc = Some(crate::config::RpcConfig { enabled: true, listen: rpc_addr.into() });
+        let mut genesis = test_genesis();
+        genesis.validators = vec![(24, kp(24).public(), 1)]; // quorum 1 ⇒ self-commit
+        let node = Node::start(cfg, genesis, Some(kp(24))).await.expect("start node");
+
+        // Wait for a certified head (the route is reachable regardless, but this keeps
+        // the setup symmetric with the bridge-locks test).
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            if node.status().await.map(|(h, _)| h >= 1).unwrap_or(false) {
+                break;
+            }
+            assert!(tokio::time::Instant::now() < deadline, "node never produced a block");
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+
+        async fn get(addr: &str, path: &str) -> String {
+            let req = format!("GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
+            let mut s = TcpStream::connect(addr).await.expect("connect rpc");
+            s.write_all(req.as_bytes()).await.expect("send get");
+            let mut resp = Vec::new();
+            s.read_to_end(&mut resp).await.expect("read response");
+            String::from_utf8_lossy(&resp).into_owned()
+        }
+        fn body_of(resp: &str) -> &str {
+            resp.split_once("\r\n\r\n").map(|(_, b)| b).unwrap_or("")
+        }
+        let pubkey_hex = crate::hash::hex(&kp(24).public());
+
+        // Plain directory → 200 with the single genesis validator.
+        let resp = get(rpc_addr, "/validators").await;
+        assert!(resp.starts_with("HTTP/1.1 200 OK"), "validators status: {resp}");
+        assert_eq!(
+            body_of(&resp),
+            format!("total=1\nvalidator_id=24 power=1 pubkey={pubkey_hex}"),
+            "single-validator text envelope"
+        );
+
+        // JSON representation → the `total`/`next`/`items` envelope with the validator.
+        let as_json = get(rpc_addr, "/validators?format=json").await;
+        assert!(as_json.starts_with("HTTP/1.1 200 OK"), "validators json status: {as_json}");
+        assert!(as_json.contains("Content-Type: application/json\r\n"), "json ct: {as_json}");
+        assert_eq!(
+            body_of(&as_json),
+            format!(
+                "{{\"total\":\"1\",\"next\":null,\"items\":\
+                 [{{\"validator_id\":\"24\",\"power\":\"1\",\"pubkey\":\"{pubkey_hex}\"}}]}}"
+            ),
+            "single-validator JSON envelope"
+        );
+
+        // `?offset=1` windows past the only validator → empty page, no `next` (end reached).
+        let past = get(rpc_addr, "/validators?offset=1").await;
+        assert!(past.starts_with("HTTP/1.1 200 OK"), "offset status: {past}");
+        assert_eq!(body_of(&past), "total=1", "offset past end → total=1, empty page");
+
+        // `?limit=0` is an explicit empty page, but another page remains → `next=0`.
+        let empty = get(rpc_addr, "/validators?limit=0").await;
+        assert!(empty.starts_with("HTTP/1.1 200 OK"), "limit=0 status: {empty}");
+        assert_eq!(body_of(&empty), "total=1\nnext=0", "limit=0 → empty page with next=0");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
     async fn rpc_plain_entities_over_tcp() {
         // M65: plain reviewer/validator/graph reads over real TCP. Unlike bridge locks,
         // `test_genesis` carries real reviewers (10,11,12), validators (21-24), and a
@@ -5678,6 +5827,41 @@ mod tests {
     }
 
     #[test]
+    fn validator_listing_renders() {
+        // M83: the empty set renders `""` (text) / `[]` (json) like the lock listing;
+        // two validators render one grep-friendly `key=value` line each (text) and a
+        // two-object array (json), with the pubkey as lowercase hex.
+        use crate::validator::Validator;
+        assert_eq!(format_validator_listing(&[]), "");
+        assert_eq!(json_validator_listing(&[]), "[]");
+
+        let vs = vec![
+            Validator { id: 21, pubkey: [0xAB; 32], power: 5 },
+            Validator { id: 22, pubkey: [0x01; 32], power: u64::MAX },
+        ];
+        let hex_ab = crate::hash::hex(&[0xABu8; 32]);
+        let hex_01 = crate::hash::hex(&[0x01u8; 32]);
+
+        let t = format_validator_listing(&vs);
+        assert_eq!(
+            t,
+            format!(
+                "validator_id=21 power=5 pubkey={hex_ab}\n\
+                 validator_id=22 power=18446744073709551615 pubkey={hex_01}"
+            ),
+        );
+
+        let j = json_validator_listing(&vs);
+        assert_eq!(
+            j,
+            format!(
+                "[{{\"validator_id\":\"21\",\"power\":\"5\",\"pubkey\":\"{hex_ab}\"}},\
+                 {{\"validator_id\":\"22\",\"power\":\"18446744073709551615\",\"pubkey\":\"{hex_01}\"}}]"
+            ),
+        );
+    }
+
+    #[test]
     fn error_body_renders() {
         // M67: `error_body` is status-agnostic — Text is the bare message with a
         // text/plain type; Json is {"error":"<msg>"} with application/json, the message
@@ -5802,6 +5986,19 @@ mod tests {
         // M63 single-lock route still resolves to its own variant (no regression).
         assert!(matches!(route_get("/bridge/lock/0/proof"), GetRoute::BridgeLock(0)));
         assert!(matches!(route_get("/bridge/lock/0"), GetRoute::NotFound));
+    }
+
+    #[test]
+    fn route_get_parses_validators() {
+        // M83: `/validators` is a plain directory read — an exact match, distinct from
+        // the M60/M65 `/validator/{id}` prefix route (char after `…validator` is `s`,
+        // not `/`). A trailing slash is not the directory, so it falls through to the
+        // M58 health liveness fallback like any unknown path.
+        assert!(matches!(route_get("/validators"), GetRoute::Validators));
+        assert!(matches!(route_get("/validators/"), GetRoute::Health));
+        // M60/M65 single-validator routes still resolve to their own variants.
+        assert!(matches!(route_get("/validator/21"), GetRoute::Plain(ProofKind::Validator, 21)));
+        assert!(matches!(route_get("/validator/21/proof"), GetRoute::Proof(ProofKind::Validator, 21)));
     }
 
     #[test]
