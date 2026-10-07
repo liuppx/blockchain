@@ -1910,6 +1910,13 @@ fn usize_param(query: &str, key: &str) -> Option<usize> {
         .and_then(|(_, v)| v.parse::<usize>().ok())
 }
 
+/// M81: default page size when a request omits `?limit` (supersedes the M72/M79
+/// "absent limit ⇒ whole listing" RPC behavior — a read can no longer return an
+/// unbounded body by omitting the param).
+const DEFAULT_PAGE_LIMIT: usize = 50;
+/// M81: hard upper bound on a requested `?limit` (defensive cap on response size).
+const MAX_PAGE_LIMIT: usize = 500;
+
 /// M72: apply an `offset`/`limit` window to a slice, clamped to bounds with
 /// saturating arithmetic (huge params can't overflow). `offset` past the end ⇒
 /// empty; `limit == None` ⇒ through the end; `limit == Some(0)` ⇒ empty. Pure and
@@ -1921,6 +1928,17 @@ fn paginate<T>(items: &[T], offset: usize, limit: Option<usize>) -> &[T] {
         None => items.len(),
     };
     &items[start..end]
+}
+
+/// M81: resolve the effective page size from an optional requested `?limit`:
+/// absent ⇒ `DEFAULT_PAGE_LIMIT`; present ⇒ clamped down to `MAX_PAGE_LIMIT`.
+/// `Some(0)` stays `0` (an explicit empty page, as `paginate` already honors).
+/// Pure, so it is unit-tested directly.
+fn effective_limit(requested: Option<usize>) -> usize {
+    match requested {
+        Some(l) => l.min(MAX_PAGE_LIMIT),
+        None => DEFAULT_PAGE_LIMIT,
+    }
 }
 
 /// M69: outcome of `Accept`-header negotiation (RFC 7231 §5.3 q-values).
@@ -3022,8 +3040,12 @@ async fn serve_rpc_conn(mut stream: TcpStream, cmd: mpsc::UnboundedSender<Cmd>) 
                             // page in the `total`/`next` envelope — `total` is the full
                             // unwindowed count, `next` the offset to request for the
                             // following page (none once the window reaches the end).
+                            // M81: an absent `?limit` now falls back to
+                            // `DEFAULT_PAGE_LIMIT` and any requested limit is clamped to
+                            // `MAX_PAGE_LIMIT` (no read can return an unbounded body); the
+                            // `next` envelope still signals the remaining pages.
                             let offset = usize_param(query, "offset").unwrap_or(0);
-                            let limit = usize_param(query, "limit");
+                            let limit = Some(effective_limit(usize_param(query, "limit")));
                             let total = listing.len();
                             let page = paginate(&listing, offset, limit);
                             let start = offset.min(total);
@@ -5308,6 +5330,18 @@ mod tests {
         assert_eq!(paginate(&items, 10, Some(3)), &[] as &[i32]); // offset past end
         assert_eq!(paginate(&items, 0, Some(99)), &items[..]); // limit clamps to len
         assert_eq!(paginate(&items, usize::MAX, Some(usize::MAX)), &[] as &[i32]); // no overflow
+    }
+
+    #[test]
+    fn effective_limit_caps_and_defaults() {
+        // M81: absent `?limit` falls back to the default; a requested limit is clamped
+        // to the max; an explicit `0` stays an empty page (as `paginate` honors).
+        assert_eq!(effective_limit(None), DEFAULT_PAGE_LIMIT); // absent ⇒ default
+        assert_eq!(effective_limit(Some(2)), 2); // under the cap ⇒ honored
+        assert_eq!(effective_limit(Some(0)), 0); // explicit empty page preserved
+        assert_eq!(effective_limit(Some(MAX_PAGE_LIMIT)), MAX_PAGE_LIMIT); // at the cap
+        assert_eq!(effective_limit(Some(MAX_PAGE_LIMIT + 1)), MAX_PAGE_LIMIT); // clamped
+        assert_eq!(effective_limit(Some(usize::MAX)), MAX_PAGE_LIMIT); // huge ⇒ cap
     }
 
     #[test]
