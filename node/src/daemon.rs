@@ -1801,10 +1801,17 @@ fn http_response_ct(status_line: &str, content_type: &str, body: &str) -> String
 /// `406 Not Acceptable` body per RFC 7231 §6.5.6.
 const OFFERED_MEDIA_TYPES: [&str; 2] = ["application/json", "text/plain"];
 
-/// M70: RFC 7231 §6.5.6 — the `406` body, listing the representations we can emit
-/// so a client that was refused can see what to request instead.
-fn not_acceptable_body() -> String {
-    format!("not acceptable; available: {}", OFFERED_MEDIA_TYPES.join(", "))
+/// M70/M80: RFC 7231 §6.5.6 — the `406` body as a machine-readable JSON object listing
+/// the representations we can emit, from the single OFFERED_MEDIA_TYPES source of truth.
+/// Always JSON: a 406 only fires on an explicit unsatisfiable `Accept`, so there is no
+/// representation preference to honor for the error body.
+fn not_acceptable_json() -> String {
+    let available = OFFERED_MEDIA_TYPES
+        .iter()
+        .map(|t| json_str(t))
+        .collect::<Vec<_>>()
+        .join(",");
+    format!("{{\"error\":\"not_acceptable\",\"available\":[{available}]}}")
 }
 
 /// Accept loop for the ingress RPC endpoint. Mirrors [`run_metrics`]: each
@@ -2880,10 +2887,13 @@ async fn serve_rpc_conn(mut stream: TcpStream, cmd: mpsc::UnboundedSender<Cmd>) 
     let fmt = match resolve_format(query, head) {
         Some(f) => f,
         None => {
-            // M69/M70: Accept present but no offered representation acceptable —
-            // list what we *can* emit (RFC 7231 §6.5.6).
+            // M69/M70/M80: Accept present but no offered representation acceptable — list
+            // what we *can* emit (RFC 7231 §6.5.6) as a machine-readable JSON object.
             let _ = stream
-                .write_all(http_response("406 Not Acceptable", &not_acceptable_body()).as_bytes())
+                .write_all(
+                    http_response_ct("406 Not Acceptable", "application/json", &not_acceptable_json())
+                        .as_bytes(),
+                )
                 .await;
             let _ = stream.flush().await;
             return;
@@ -5434,11 +5444,12 @@ mod tests {
     }
 
     #[test]
-    fn not_acceptable_body_lists_representations() {
-        // M70: the 406 body enumerates every representation we can emit (RFC 7231
-        // §6.5.6), from the single OFFERED_MEDIA_TYPES source of truth.
-        let body = not_acceptable_body();
-        assert_eq!(body, "not acceptable; available: application/json, text/plain");
+    fn not_acceptable_json_lists_representations() {
+        // M70/M80: the 406 body is a machine-readable JSON object enumerating every
+        // representation we can emit (RFC 7231 §6.5.6), from the single OFFERED_MEDIA_TYPES
+        // source of truth.
+        let body = not_acceptable_json();
+        assert_eq!(body, "{\"error\":\"not_acceptable\",\"available\":[\"application/json\",\"text/plain\"]}");
         assert!(body.contains("application/json"));
         assert!(body.contains("text/plain"));
         // JSON is listed first (it wins the negotiation q-tie when named).
@@ -6006,19 +6017,22 @@ mod tests {
             resp.rsplit("\r\n\r\n").next().unwrap_or("")
         }
 
-        // An Accept we cannot satisfy ⇒ 406, with a text/plain error body that
-        // lists the representations we *can* emit (M70, RFC 7231 §6.5.6).
+        // An Accept we cannot satisfy ⇒ 406, with a machine-readable JSON error body that
+        // lists the representations we *can* emit (M70/M80, RFC 7231 §6.5.6).
         let x = get(rpc_addr, "/height", Some("application/xml")).await;
         assert!(x.starts_with("HTTP/1.1 406 Not Acceptable"), "xml: {x}");
-        assert!(x.contains("Content-Type: text/plain; charset=utf-8\r\n"), "xml ct: {x}");
+        assert!(x.contains("Content-Type: application/json\r\n"), "xml ct: {x}");
         // M71: the negotiated-error path varies by `Accept` too.
         assert!(x.contains("Vary: Accept\r\n"), "xml vary: {x}");
+        assert!(body_of(&x).contains("\"error\":\"not_acceptable\""), "xml body is JSON error: {x}");
         assert!(body_of(&x).contains("application/json"), "xml body lists json: {x}");
         assert!(body_of(&x).contains("text/plain"), "xml body lists text: {x}");
 
         // An explicit q=0 rejects our JSON type ⇒ 406 (no text alternative offered).
         let z = get(rpc_addr, "/height", Some("application/json;q=0")).await;
         assert!(z.starts_with("HTTP/1.1 406 Not Acceptable"), "q0: {z}");
+        assert!(z.contains("Content-Type: application/json\r\n"), "q0 ct: {z}");
+        assert!(body_of(&z).contains("\"error\":\"not_acceptable\""), "q0 body is JSON error: {z}");
         assert!(body_of(&z).contains("application/json"), "q0 body lists json: {z}");
         assert!(body_of(&z).contains("text/plain"), "q0 body lists text: {z}");
 
