@@ -440,6 +440,12 @@ enum Cmd {
     QueryGraphNodes {
         reply: oneshot::Sender<Vec<crate::engine::GraphNode>>,
     },
+    /// M87: list every validator's bonded stake (validator_id + bonded micro-$COG) for
+    /// the plain read-class RPC directory — a read sibling of `/validators` exposing the
+    /// raw stake that backs voting power. Always a (possibly empty) list.
+    QueryBonds {
+        reply: oneshot::Sender<Vec<(u64, u64)>>,
+    },
     /// M61: serve a heterogeneous proof batch + the certified head it verifies
     /// against, for the verifiable batch read RPC. `None` ⇒ `serve_batch` rejected
     /// (over `MAX_BATCH_ITEMS` or a degenerate Diff range) or no certified head
@@ -1123,6 +1129,12 @@ async fn run_actor(mut actor: Actor, mut rx: mpsc::UnboundedReceiver<Cmd>) {
             Cmd::QueryGraphNodes { reply } => {
                 // M86: snapshot the insertion-ordered graph node vector (node_id == index).
                 let _ = reply.send(actor.node.chain.state.graph.nodes.clone());
+            }
+            Cmd::QueryBonds { reply } => {
+                // M87: snapshot the id-sorted per-validator bonded-stake map for the directory.
+                let bonds =
+                    actor.node.chain.state.bonds.iter().map(|(&id, &amt)| (id, amt)).collect();
+                let _ = reply.send(bonds);
             }
             Cmd::QueryBatch { items, reply } => {
                 let _ = reply.send(actor.node.batch(items));
@@ -1938,6 +1950,10 @@ enum GetRoute {
     /// M86: `GET /graph` — the plain (unverified) cognitive-graph directory (node_id +
     /// domain + embedding), the list sibling of `Plain(GraphNode, id)`.
     GraphNodes,
+    /// M87: `GET /bonds` — the per-validator bonded-stake directory (validator_id +
+    /// bonded micro-$COG), a read sibling of `/validators` that exposes the raw stake
+    /// backing voting power rather than the power itself. No single-read sibling.
+    Bonds,
     NotFound,
 }
 
@@ -2197,6 +2213,9 @@ fn route_get(path: &str) -> GetRoute {
         // (single reads/proofs) is handled in the fallthrough arm below, where `/graph/`
         // with an empty id already resolves to `NotFound`.
         "/graph" => GetRoute::GraphNodes,
+        // M87: the per-validator bonded-stake directory. Exact-match; there is no
+        // `/bond/` single-read prefix, so `/bonds/` simply falls through to `Health`.
+        "/bonds" => GetRoute::Bonds,
         p => {
             if let Some(rest) = p.strip_prefix("/account/") {
                 // M59: `{id}/proof` is the verifiable read; a bare `{id}` is the M58
@@ -2605,6 +2624,44 @@ fn json_graph_listing(nodes: &[crate::engine::GraphNode]) -> String {
                 embedding: n.embedding,
             })
         })
+        .collect::<Vec<_>>()
+        .join(",");
+    format!("[{items}]")
+}
+
+/// M87: render one validator's bonded stake as a grep-friendly `key=value` line
+/// (`kind=bond validator_id=… bonded=…`). Standalone (no `EntityView` — a bond is a
+/// plain state value, not a merkle-proof entity). Pure for direct unit testing.
+fn format_bond(id: u64, bonded: u64) -> String {
+    format!("kind=bond validator_id={id} bonded={bonded}")
+}
+
+/// M87: the JSON sibling of [`format_bond`] — a single object with lossless quoted-u64
+/// scalars, matching the `kind`-tagged shape of the other list-read items.
+fn json_bond(id: u64, bonded: u64) -> String {
+    format!(
+        "{{\"kind\":\"bond\",\"validator_id\":{},\"bonded\":{}}}",
+        json_u64(id),
+        json_u64(bonded),
+    )
+}
+
+/// M87: render the per-validator bonded-stake directory as grep-friendly lines, one per
+/// validator (empty string when there are none). Reuses `format_bond` per item.
+fn format_bond_listing(bonds: &[(u64, u64)]) -> String {
+    bonds
+        .iter()
+        .map(|&(id, bonded)| format_bond(id, bonded))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// M87: `GET /bonds?format=json` — the JSON sibling of [`format_bond_listing`]. A JSON
+/// **array** of objects (`[]` when empty), reusing `json_bond` per item.
+fn json_bond_listing(bonds: &[(u64, u64)]) -> String {
+    let items = bonds
+        .iter()
+        .map(|&(id, bonded)| json_bond(id, bonded))
         .collect::<Vec<_>>()
         .join(",");
     format!("[{items}]")
@@ -3447,6 +3504,37 @@ async fn serve_rpc_conn(mut stream: TcpStream, cmd: mpsc::UnboundedSender<Cmd>) 
                                 fmt,
                                 &format_page(&format_graph_listing(page), total, next),
                                 &json_page(&json_graph_listing(page), total, next),
+                            )
+                        }
+                        Err(_) => http_response("503 Service Unavailable", "node stopped"),
+                    }
+                }
+            }
+            GetRoute::Bonds => {
+                // M87: per-validator bonded-stake directory — always a (possibly empty)
+                // `200`. Sixth consumer of the pagination stack (after `/bridge/locks`,
+                // `/validators`, `/accounts`, `/reviewers`, `/graph`), reusing
+                // `format_bond`/`json_bond` per item.
+                let (reply, rx) = oneshot::channel();
+                if cmd.send(Cmd::QueryBonds { reply }).is_err() {
+                    http_response("503 Service Unavailable", "node stopped")
+                } else {
+                    match rx.await {
+                        Ok(listing) => {
+                            let offset = usize_param(query, "offset").unwrap_or(0);
+                            let limit = Some(effective_limit(usize_param(query, "limit")));
+                            let total = listing.len();
+                            let page = paginate(&listing, offset, limit);
+                            let start = offset.min(total);
+                            let next = if start + page.len() < total {
+                                Some(start + page.len())
+                            } else {
+                                None
+                            };
+                            ok_body(
+                                fmt,
+                                &format_page(&format_bond_listing(page), total, next),
+                                &json_page(&json_bond_listing(page), total, next),
                             )
                         }
                         Err(_) => http_response("503 Service Unavailable", "node stopped"),
@@ -5852,6 +5940,60 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn rpc_bonds_list_over_tcp() {
+        // M87: the per-validator bonded-stake directory over real TCP — the sixth list
+        // endpoint, reusing the pagination stack + the new `format_bond`/`json_bond` per-item
+        // renderers. Genesis seeds the validator set directly (power, not bonds), and bonds
+        // only grow via on-chain `StakeOp`s, so a fresh chain's `/bonds` is live-but-empty —
+        // exactly the state this asserts end to end (route → Cmd → `state.bonds` → envelope).
+        let dir = tmp_dir("rpc-bonds-list");
+        let mut cfg = node_config(28, 20311, &[28], dir.clone());
+        let rpc_addr = "127.0.0.1:20321";
+        cfg.rpc = Some(crate::config::RpcConfig { enabled: true, listen: rpc_addr.into() });
+        let mut genesis = test_genesis();
+        genesis.validators = vec![(28, kp(28).public(), 1)]; // quorum 1 ⇒ self-commit
+        let node = Node::start(cfg, genesis, Some(kp(28))).await.expect("start node");
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            if node.status().await.map(|(h, _)| h >= 1).unwrap_or(false) {
+                break;
+            }
+            assert!(tokio::time::Instant::now() < deadline, "node never produced a block");
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+
+        async fn get(addr: &str, path: &str) -> String {
+            let req = format!("GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
+            let mut s = TcpStream::connect(addr).await.expect("connect rpc");
+            s.write_all(req.as_bytes()).await.expect("send get");
+            let mut resp = Vec::new();
+            s.read_to_end(&mut resp).await.expect("read response");
+            String::from_utf8_lossy(&resp).into_owned()
+        }
+        fn body_of(resp: &str) -> &str {
+            resp.split_once("\r\n\r\n").map(|(_, b)| b).unwrap_or("")
+        }
+
+        // Plain directory → 200 with an empty page (no bonds at genesis, only the `total` head).
+        let resp = get(rpc_addr, "/bonds").await;
+        assert!(resp.starts_with("HTTP/1.1 200 OK"), "bonds status: {resp}");
+        assert_eq!(body_of(&resp), "total=0", "bonds text envelope (empty directory)");
+
+        // JSON representation → the `total`/`next`/`items` envelope with an empty array.
+        let as_json = get(rpc_addr, "/bonds?format=json").await;
+        assert!(as_json.starts_with("HTTP/1.1 200 OK"), "bonds json status: {as_json}");
+        assert!(as_json.contains("Content-Type: application/json\r\n"), "json ct: {as_json}");
+        assert_eq!(
+            body_of(&as_json),
+            "{\"total\":\"0\",\"next\":null,\"items\":[]}",
+            "bonds JSON envelope (empty directory)"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
     async fn rpc_plain_entities_over_tcp() {
         // M65: plain reviewer/validator/graph reads over real TCP. Unlike bridge locks,
         // `test_genesis` carries real reviewers (10,11,12), validators (21-24), and a
@@ -6576,6 +6718,46 @@ mod tests {
         // M65/M60 single-node routes still resolve to their own variants.
         assert!(matches!(route_get("/graph/0"), GetRoute::Plain(ProofKind::GraphNode, 0)));
         assert!(matches!(route_get("/graph/0/proof"), GetRoute::Proof(ProofKind::GraphNode, 0)));
+    }
+
+    #[test]
+    fn route_get_parses_bonds() {
+        // M87: `/bonds` is a plain directory read — an exact match. There is no `/bond/`
+        // single-read prefix, so a trailing slash simply falls through to the health
+        // fallback (not `NotFound`, unlike `/graph/`).
+        assert!(matches!(route_get("/bonds"), GetRoute::Bonds));
+        assert!(matches!(route_get("/bonds/"), GetRoute::Health));
+        // Sibling list reads still resolve to their own variants (no collision).
+        assert!(matches!(route_get("/validators"), GetRoute::Validators));
+        assert!(matches!(route_get("/accounts"), GetRoute::Accounts));
+    }
+
+    #[test]
+    fn bond_listing_renders() {
+        // M87: two validators' bonds render one grep-friendly line each (id order) and a
+        // JSON array of `kind=bond` objects with lossless quoted-u64 scalars; the empty
+        // set yields an empty text body and `[]`.
+        let bonds = vec![(7u64, 3_000_000u64), (9u64, 500_000u64)];
+        let text = format_bond_listing(&bonds);
+        assert_eq!(
+            text,
+            "kind=bond validator_id=7 bonded=3000000\nkind=bond validator_id=9 bonded=500000"
+        );
+        let json = json_bond_listing(&bonds);
+        assert_eq!(
+            json,
+            "[{\"kind\":\"bond\",\"validator_id\":\"7\",\"bonded\":\"3000000\"},\
+{\"kind\":\"bond\",\"validator_id\":\"9\",\"bonded\":\"500000\"}]"
+        );
+        // Single-item renderers match what the listing emits per entry.
+        assert_eq!(format_bond(7, 3_000_000), "kind=bond validator_id=7 bonded=3000000");
+        assert_eq!(
+            json_bond(9, 500_000),
+            "{\"kind\":\"bond\",\"validator_id\":\"9\",\"bonded\":\"500000\"}"
+        );
+        // Empty set ⇒ empty text, `[]` JSON.
+        assert_eq!(format_bond_listing(&[]), "");
+        assert_eq!(json_bond_listing(&[]), "[]");
     }
 
     #[test]
