@@ -12,6 +12,7 @@
 //!   cargo run --release --bin node -- slashing         # slash an equivocating validator's bonded stake to the treasury
 //!   cargo run --release --bin node -- run  --config F # networked tokio daemon (TCP P2P gossip)
 //!   cargo run --release --bin node -- localnet         # in-process tokio testnet converges over real sockets
+//!   cargo run --release --bin node -- keygen --out F   # generate (or derive) an ed25519 keypair seed file + pubkey
 //!   cargo run --release --bin node -- status --dir DIR # replay log, print state
 //!   cargo run --release --bin node -- certs  --dir DIR # persist certified chain, re-verify finality
 //!
@@ -236,6 +237,7 @@ fn main() {
         "run" => cmd_run(config_arg(&args)),
         "submit-tx" => cmd_submit_tx(config_arg(&args), tx_arg(&args)),
         "encode-tx" => cmd_encode_tx(&args),
+        "keygen" => cmd_keygen(&args),
         "localnet" => cmd_localnet(),
         "status" => cmd_status(dir_arg(&args)),
         "certs" => cmd_certs(dir_arg(&args)),
@@ -311,6 +313,7 @@ fn usage() {
     eprintln!("  node run    --config F  run the networked BFT daemon (tokio TCP P2P): load config/genesis/validator key, gossip votes + sync/verify over sockets");
     eprintln!("  node submit-tx --config F --tx F  submit a codec-encoded tx to a running daemon's [rpc] ingress endpoint; print accepted hash or reject reason");
     eprintln!("  node encode-tx --key-file F --out F --author N --domain N --stake N --embedding f,..(DIM) --review R:S.. --repl-success N --repl-total N --timestamp-days F [--config F]  author+sign a tx offline into a submit-tx file; print its hash");
+    eprintln!("  node keygen --out F [--seed HEX]  generate (or derive from a 64-hex seed) an ed25519 keypair; write the seed file (for encode-tx --key-file) and print the pubkey");
     eprintln!("  node localnet           spin up an in-process tokio testnet (4 validators, no sequencer) and show all nodes converge via distributed BFT voting over real sockets");
     eprintln!("  node status --dir DIR   replay the block log and print state");
     eprintln!("  node certs  --dir DIR   persist a certified chain (blocks+certs) and re-verify finality on reload");
@@ -2947,6 +2950,39 @@ fn cmd_encode_tx(args: &[String]) {
     println!("out {out_path}");
 }
 
+/// M73: derive the hex seed + hex ed25519 public key for a 32-byte seed. Pure (no
+/// RNG, no I/O) so keygen's core is unit-tested deterministically; `cmd_keygen`
+/// handles seed sourcing (CSPRNG or `--seed`) and the `--out` file. The returned
+/// seed hex is exactly the 64-char form `encode-tx --key-file` consumes.
+fn keygen_derive(seed: [u8; 32]) -> (String, String) {
+    let kp = Keypair::from_seed(seed);
+    (hex(&seed), hex(&kp.public()))
+}
+
+/// M73: generate (or derive from `--seed <64hex>`) an ed25519 keypair offline.
+/// Writes the 64-hex seed to `--out` (consumable by `encode-tx --key-file`) and
+/// prints the derived pubkey hex (paste into a genesis `accounts` entry).
+fn cmd_keygen(args: &[String]) {
+    let out_path = req_arg(args, "--out");
+
+    // Seed source: an explicit `--seed <64hex>` (deterministic / recover a pubkey),
+    // else 32 fresh CSPRNG bytes. `--seed` reuses the same decoder + BadHex errors
+    // as `encode-tx --key-file`, so the two tools agree on the seed format.
+    let seed = match opt_arg(args, "--seed") {
+        Some(s) => config::decode_seed(s.trim(), "--seed").unwrap_or_else(|e| fail_msg("decode seed", &e)),
+        None => {
+            let mut s = [0u8; 32];
+            getrandom::getrandom(&mut s).unwrap_or_else(|e| fail_msg("keygen rng", &e));
+            s
+        }
+    };
+
+    let (seed_hex, pub_hex) = keygen_derive(seed);
+    std::fs::write(out_path, &seed_hex).unwrap_or_else(|e| fail("write key file", e));
+    println!("pubkey {pub_hex}");
+    println!("out {out_path}");
+}
+
 /// End-to-end showcase on the production path: launch a small tokio testnet
 /// entirely in-process — **four validators (21..24), no sequencer** — wired over
 /// the **real** TCP transport on loopback. Each node owns one signing key and
@@ -3344,5 +3380,20 @@ mod tests {
             .map(|s| s.to_string())
             .collect();
         assert_eq!(multi_arg(&args, "--review"), vec!["10:0.9", "11:0.8"]);
+    }
+
+    #[test]
+    fn keygen_derive_round_trips() {
+        let seed = seed_for(7);
+        let (seed_hex, pub_hex) = keygen_derive(seed);
+        // The written seed hex decodes back through the same path `encode-tx
+        // --key-file` uses, so the generated file is a valid key file.
+        assert_eq!(config::decode_seed(&seed_hex, "--seed").expect("decode"), seed);
+        // The printed pubkey matches the direct Keypair API.
+        assert_eq!(pub_hex, hex(&Keypair::from_seed(seed).public()));
+        // Deterministic: same seed ⇒ identical outputs.
+        assert_eq!(keygen_derive(seed), (seed_hex, pub_hex));
+        // Distinct seeds ⇒ distinct pubkeys.
+        assert_ne!(keygen_derive(seed_for(7)).1, keygen_derive(seed_for(8)).1);
     }
 }

@@ -1777,11 +1777,15 @@ fn http_response(status_line: &str, body: &str) -> String {
 /// `text/plain; charset=utf-8` (via [`http_response`]); a `?format=json` read passes
 /// bare `application/json` (JSON is always UTF-8, so it carries no `charset` param).
 /// `Content-Length` is the UTF-8 byte length of `body`, exactly as before.
+/// M71: every response carries `Vary: Accept` (RFC 7231 §7.1.4) — the endpoint
+/// selects text vs JSON from the request's `Accept` header, so shared caches must
+/// key on it (lest a JSON body be replayed to a text client, or vice-versa).
 fn http_response_ct(status_line: &str, content_type: &str, body: &str) -> String {
     format!(
         "HTTP/1.1 {}\r\n\
          Content-Type: {}\r\n\
          Content-Length: {}\r\n\
+         Vary: Accept\r\n\
          Connection: close\r\n\
          \r\n\
          {}",
@@ -1790,6 +1794,17 @@ fn http_response_ct(status_line: &str, content_type: &str, body: &str) -> String
         body.len(),
         body,
     )
+}
+
+/// M70: the representations this RPC server can emit, in negotiation-preference
+/// order (named JSON wins the q-tie, so it is listed first). Used to build the
+/// `406 Not Acceptable` body per RFC 7231 §6.5.6.
+const OFFERED_MEDIA_TYPES: [&str; 2] = ["application/json", "text/plain"];
+
+/// M70: RFC 7231 §6.5.6 — the `406` body, listing the representations we can emit
+/// so a client that was refused can see what to request instead.
+fn not_acceptable_body() -> String {
+    format!("not acceptable; available: {}", OFFERED_MEDIA_TYPES.join(", "))
 }
 
 /// Accept loop for the ingress RPC endpoint. Mirrors [`run_metrics`]: each
@@ -1863,16 +1878,150 @@ enum RespFormat {
     Json,
 }
 
-/// M66: parse `?format=…` out of a raw query string. `format=json` (exact, case
-/// sensitive) ⇒ `Json`; anything else — absent, empty, `format=text`, an unknown key
-/// or value — ⇒ `Text`. The first `format=` pair wins; later duplicates are ignored.
-fn response_format(query: &str) -> RespFormat {
+/// M66/M68: parse `?format=…` out of a raw query string. `format=json` (exact, case
+/// sensitive) ⇒ `Some(Json)`; any other present `format=` value — empty, `format=text`,
+/// an unknown value — ⇒ `Some(Text)`. The first `format=` pair wins; later duplicates
+/// are ignored. `None` when the query carries no `format=` pair at all, so the caller
+/// can fall back to `Accept`-header negotiation (M68).
+fn response_format(query: &str) -> Option<RespFormat> {
     for pair in query.split('&') {
         if let Some(v) = pair.strip_prefix("format=") {
-            return if v == "json" { RespFormat::Json } else { RespFormat::Text };
+            return Some(if v == "json" { RespFormat::Json } else { RespFormat::Text });
         }
     }
-    RespFormat::Text
+    None
+}
+
+/// M72: parse an optional `usize` query parameter (`<key>=<n>`) from a raw query
+/// string. The first pair whose key matches wins (mirrors `response_format`); a
+/// missing key or an unparseable value ⇒ `None`. Pure, so it is unit-tested directly.
+fn usize_param(query: &str, key: &str) -> Option<usize> {
+    query
+        .split('&')
+        .filter_map(|pair| pair.split_once('='))
+        .find(|(k, _)| *k == key)
+        .and_then(|(_, v)| v.parse::<usize>().ok())
+}
+
+/// M72: apply an `offset`/`limit` window to a slice, clamped to bounds with
+/// saturating arithmetic (huge params can't overflow). `offset` past the end ⇒
+/// empty; `limit == None` ⇒ through the end; `limit == Some(0)` ⇒ empty. Pure and
+/// generic so future list endpoints reuse it. Unit-tested directly.
+fn paginate<T>(items: &[T], offset: usize, limit: Option<usize>) -> &[T] {
+    let start = offset.min(items.len());
+    let end = match limit {
+        Some(l) => start.saturating_add(l).min(items.len()),
+        None => items.len(),
+    };
+    &items[start..end]
+}
+
+/// M69: outcome of `Accept`-header negotiation (RFC 7231 §5.3 q-values).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Negotiation {
+    /// No `Accept` header at all → the caller uses its default (`Text`).
+    Absent,
+    /// A representation is acceptable.
+    Use(RespFormat),
+    /// `Accept` present, but every offered type has `q=0` / is unmatched → `406`.
+    NotAcceptable,
+}
+
+/// M69: parse an RFC 7231 q-value into fixed-point milli-units (`0..=1000`), so q
+/// comparisons are integer and never trip `clippy::float_cmp`. A missing or malformed
+/// value defaults to `1000` (q=1.0, the RFC default weight); out-of-range values clamp.
+fn parse_qmilli(s: &str) -> u16 {
+    match s.trim().parse::<f32>() {
+        Ok(f) if f.is_finite() => (f.clamp(0.0, 1.0) * 1000.0).round() as u16,
+        _ => 1000,
+    }
+}
+
+/// M69: best `(q_milli, specificity)` for one concrete media type against an `Accept`
+/// value. specificity: `3` = exact `type/subtype`, `2` = `type/*`, `1` = `*/*`, `0` =
+/// no match. The most specific matching range wins (RFC 7231); ties on specificity
+/// break to the higher q.
+fn media_match(accept_value: &str, ty: &str, sub: &str) -> (u16, u8) {
+    let (mut best_q, mut best_spec) = (0u16, 0u8);
+    for range in accept_value.split(',') {
+        let mut parts = range.split(';');
+        let media = parts.next().unwrap_or("").trim();
+        let spec = match media.split_once('/') {
+            Some((t, s)) => {
+                let (t, s) = (t.trim(), s.trim());
+                if t.eq_ignore_ascii_case(ty) && s.eq_ignore_ascii_case(sub) {
+                    3
+                } else if t.eq_ignore_ascii_case(ty) && s == "*" {
+                    2
+                } else if t == "*" && s == "*" {
+                    1
+                } else {
+                    0
+                }
+            }
+            None => 0,
+        };
+        if spec == 0 {
+            continue;
+        }
+        let mut q = 1000u16;
+        for p in parts {
+            let p = p.trim();
+            if let Some(v) = p.strip_prefix("q=").or_else(|| p.strip_prefix("Q=")) {
+                q = parse_qmilli(v);
+            }
+        }
+        if spec > best_spec || (spec == best_spec && q > best_q) {
+            best_spec = spec;
+            best_q = q;
+        }
+    }
+    (best_q, best_spec)
+}
+
+/// M68/M69: content negotiation from the request `Accept:` header (case-insensitive
+/// name, modeled on `parse_content_length`). M69 honors RFC 7231 §5.3 q-values when
+/// choosing between the two representations we can emit (`application/json` and
+/// `text/plain`): the higher-q type wins; on an exact q tie, json is preferred only
+/// when it was *named* (specificity ≥ 2) so `application/json, text/plain` ⇒ Json while
+/// `*/*` ⇒ Text (browsers keep plaintext). If both types resolve to `q=0` (explicit
+/// `q=0`, or neither matched, e.g. `application/xml`) the request is `NotAcceptable`
+/// (⇒ `406`); a missing `Accept` header is `Absent` (⇒ the caller's default).
+fn accept_format(head: &str) -> Negotiation {
+    let mut value = None;
+    for line in head.split("\r\n") {
+        let Some((name, v)) = line.split_once(':') else { continue };
+        if name.trim().eq_ignore_ascii_case("accept") {
+            value = Some(v);
+            break;
+        }
+    }
+    let Some(value) = value else {
+        return Negotiation::Absent;
+    };
+    let (q_json, spec_json) = media_match(value, "application", "json");
+    let (q_text, _spec_text) = media_match(value, "text", "plain");
+    if q_json == 0 && q_text == 0 {
+        return Negotiation::NotAcceptable;
+    }
+    let use_json = q_json > q_text || (q_json == q_text && spec_json >= 2);
+    Negotiation::Use(if use_json { RespFormat::Json } else { RespFormat::Text })
+}
+
+/// M68/M69: resolve the response rendering. An explicit `?format=` query wins (the most
+/// specific, deliberate signal — and never 406s, as it is our own param); else negotiate
+/// the `Accept` header with q-values — no `Accept` ⇒ `Text` (so a request with neither
+/// keeps every response byte-identical to pre-M68); an unsatisfiable `Accept` ⇒ `None`,
+/// on which the caller emits `406 Not Acceptable`.
+fn resolve_format(query: &str, head: &str) -> Option<RespFormat> {
+    if let Some(f) = response_format(query) {
+        return Some(f);
+    }
+    match accept_format(head) {
+        Negotiation::Absent => Some(RespFormat::Text),
+        Negotiation::Use(f) => Some(f),
+        Negotiation::NotAcceptable => None,
+    }
 }
 
 fn route_get(path: &str) -> GetRoute {
@@ -2266,9 +2415,22 @@ async fn serve_rpc_conn(mut stream: TcpStream, cmd: mpsc::UnboundedSender<Cmd>) 
     let target = head.split_whitespace().nth(1).unwrap_or("");
     // M66: split any `?query` off the request target before routing, then read the
     // optional `?format=json`. A query-less target leaves `path` byte-identical, so
-    // pre-M66 routing and plaintext responses are unchanged.
+    // pre-M66 routing and plaintext responses are unchanged. M68: fall back to the
+    // `Accept` header when no `?format=` is present (query still wins). M69: honor
+    // RFC 7231 §5.3 q-values and answer `406` when the client accepts neither type.
     let (path, query) = split_query(target);
-    let fmt = response_format(query);
+    let fmt = match resolve_format(query, head) {
+        Some(f) => f,
+        None => {
+            // M69/M70: Accept present but no offered representation acceptable —
+            // list what we *can* emit (RFC 7231 §6.5.6).
+            let _ = stream
+                .write_all(http_response("406 Not Acceptable", &not_acceptable_body()).as_bytes())
+                .await;
+            let _ = stream.flush().await;
+            return;
+        }
+    };
 
     // M58: read-class GET routes. Each read routes through the single-owner actor via
     // the same local-oneshot pattern as the POST path below; a send failure (actor
@@ -2388,7 +2550,12 @@ async fn serve_rpc_conn(mut stream: TcpStream, cmd: mpsc::UnboundedSender<Cmd>) 
                 } else {
                     match rx.await {
                         Ok(listing) => {
-                            ok_body(fmt, &format_lock_listing(&listing), &json_lock_listing(&listing))
+                            // M72: optional `?offset=`/`?limit=` window; both absent ⇒
+                            // full listing, byte-identical to M64 (offset 0, unbounded).
+                            let offset = usize_param(query, "offset").unwrap_or(0);
+                            let limit = usize_param(query, "limit");
+                            let page = paginate(&listing, offset, limit);
+                            ok_body(fmt, &format_lock_listing(page), &json_lock_listing(page))
                         }
                         Err(_) => http_response("503 Service Unavailable", "node stopped"),
                     }
@@ -4479,6 +4646,18 @@ mod tests {
         assert!(resp.starts_with("HTTP/1.1 200 OK"), "bridge locks status: {resp}");
         assert_eq!(body_of(&resp), "", "empty chain → empty directory body");
 
+        // M72: pagination params don't break framing on the (empty) live chain — an
+        // empty window is still a 200 (window correctness over data: `paginate_windows`).
+        let paged = get(rpc_addr, "/bridge/locks?limit=1&offset=0").await;
+        assert!(paged.starts_with("HTTP/1.1 200 OK"), "paged status: {paged}");
+        assert!(paged.contains("Content-Type: text/plain; charset=utf-8\r\n"), "paged ct: {paged}");
+        assert_eq!(body_of(&paged), "", "empty window → empty body");
+
+        let paged_json = get(rpc_addr, "/bridge/locks?format=json&limit=0").await;
+        assert!(paged_json.starts_with("HTTP/1.1 200 OK"), "paged json status: {paged_json}");
+        assert!(paged_json.contains("Content-Type: application/json\r\n"), "paged json ct: {paged_json}");
+        assert_eq!(body_of(&paged_json), "[]", "empty window → empty JSON array");
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -4602,18 +4781,180 @@ mod tests {
 
     #[test]
     fn response_format_parses() {
-        // M66: only an exact, case-sensitive `format=json` selects JSON; everything
-        // else — absent, empty, `format=text`, wrong case, unknown key — stays Text.
-        assert_eq!(response_format("format=json"), RespFormat::Json);
-        assert_eq!(response_format(""), RespFormat::Text);
-        assert_eq!(response_format("format=text"), RespFormat::Text);
-        assert_eq!(response_format("format=JSON"), RespFormat::Text);
-        assert_eq!(response_format("foo=bar"), RespFormat::Text);
-        assert_eq!(response_format("format="), RespFormat::Text);
+        // M66/M68: only an exact, case-sensitive `format=json` selects JSON; any other
+        // present `format=` value stays Text; absence/unknown key ⇒ None (so M68 can
+        // fall back to the Accept header).
+        assert_eq!(response_format("format=json"), Some(RespFormat::Json));
+        assert_eq!(response_format(""), None);
+        assert_eq!(response_format("format=text"), Some(RespFormat::Text));
+        assert_eq!(response_format("format=JSON"), Some(RespFormat::Text));
+        assert_eq!(response_format("foo=bar"), None);
+        assert_eq!(response_format("format="), Some(RespFormat::Text));
         // Not the first pair.
-        assert_eq!(response_format("a=1&format=json"), RespFormat::Json);
+        assert_eq!(response_format("a=1&format=json"), Some(RespFormat::Json));
         // First `format=` wins — a later duplicate does not override it.
-        assert_eq!(response_format("format=text&format=json"), RespFormat::Text);
+        assert_eq!(response_format("format=text&format=json"), Some(RespFormat::Text));
+    }
+
+    #[test]
+    fn usize_param_parses() {
+        // M72: first matching key wins; missing key or unparseable value ⇒ None.
+        assert_eq!(usize_param("limit=5", "limit"), Some(5));
+        assert_eq!(usize_param("offset=10&limit=5", "limit"), Some(5));
+        assert_eq!(usize_param("offset=10&limit=5", "offset"), Some(10));
+        assert_eq!(usize_param("", "limit"), None);
+        assert_eq!(usize_param("foo=bar", "limit"), None);
+        assert_eq!(usize_param("limit=abc", "limit"), None);
+        assert_eq!(usize_param("limit=", "limit"), None);
+        // First pair with the matching key wins (a later duplicate does not override).
+        assert_eq!(usize_param("limit=3&limit=9", "limit"), Some(3));
+    }
+
+    #[test]
+    fn paginate_windows() {
+        // M72: offset/limit window clamps to bounds with saturating arithmetic.
+        let items = [0, 1, 2, 3, 4];
+        assert_eq!(paginate(&items, 0, None), &items[..]); // full
+        assert_eq!(paginate(&items, 0, Some(0)), &[] as &[i32]); // limit 0 ⇒ empty
+        assert_eq!(paginate(&items, 2, Some(2)), &[2, 3]); // mid window
+        assert_eq!(paginate(&items, 2, None), &[2, 3, 4]); // tail
+        assert_eq!(paginate(&items, 10, Some(3)), &[] as &[i32]); // offset past end
+        assert_eq!(paginate(&items, 0, Some(99)), &items[..]); // limit clamps to len
+        assert_eq!(paginate(&items, usize::MAX, Some(usize::MAX)), &[] as &[i32]); // no overflow
+    }
+
+    #[test]
+    fn accept_format_parses() {
+        // M68/M69: Accept-header negotiation. Every M68 behavior is preserved under the
+        // q-value algorithm: `application/json` named ⇒ Use(Json); any other explicit,
+        // satisfiable Accept ⇒ Use(Text); absent ⇒ Absent.
+        assert_eq!(
+            accept_format("GET / HTTP/1.1\r\nAccept: application/json\r\n\r\n"),
+            Negotiation::Use(RespFormat::Json)
+        );
+        // Case-insensitive header name.
+        assert_eq!(
+            accept_format("GET / HTTP/1.1\r\naccept: text/plain\r\n\r\n"),
+            Negotiation::Use(RespFormat::Text)
+        );
+        // `*/*` matches both types at equal q; the tie breaks to Text (json not named).
+        assert_eq!(
+            accept_format("GET / HTTP/1.1\r\nAccept: */*\r\n\r\n"),
+            Negotiation::Use(RespFormat::Text)
+        );
+        // `text/html, */*` likewise keeps plaintext.
+        assert_eq!(
+            accept_format("GET / HTTP/1.1\r\nAccept: text/html, */*\r\n\r\n"),
+            Negotiation::Use(RespFormat::Text)
+        );
+        // json named alongside text at equal q ⇒ json wins (specificity tie-break).
+        assert_eq!(
+            accept_format("GET / HTTP/1.1\r\nAccept: application/json, text/plain\r\n\r\n"),
+            Negotiation::Use(RespFormat::Json)
+        );
+        // No Accept header at all.
+        assert_eq!(
+            accept_format("GET / HTTP/1.1\r\nHost: x\r\n\r\n"),
+            Negotiation::Absent
+        );
+    }
+
+    #[test]
+    fn parse_qmilli_parses() {
+        // M69: RFC q-values parse into fixed-point milli-units (0..=1000); missing or
+        // malformed ⇒ the RFC default weight 1000; out-of-range values clamp.
+        assert_eq!(parse_qmilli("1"), 1000);
+        assert_eq!(parse_qmilli("1.0"), 1000);
+        assert_eq!(parse_qmilli("0.9"), 900);
+        assert_eq!(parse_qmilli("0.333"), 333);
+        assert_eq!(parse_qmilli("0"), 0);
+        assert_eq!(parse_qmilli(""), 1000);
+        assert_eq!(parse_qmilli("abc"), 1000);
+        assert_eq!(parse_qmilli("2.0"), 1000);
+        assert_eq!(parse_qmilli("-1"), 0);
+    }
+
+    #[test]
+    fn accept_format_qvalues() {
+        // M69: q-values weight the choice between the two types we can emit.
+        assert_eq!(
+            accept_format("Accept: text/plain;q=0.9, application/json;q=0.1\r\n"),
+            Negotiation::Use(RespFormat::Text)
+        );
+        assert_eq!(
+            accept_format("Accept: application/json;q=0.9, text/plain;q=0.1\r\n"),
+            Negotiation::Use(RespFormat::Json)
+        );
+        // q=0 explicitly rejects a type; both rejected / unmatched ⇒ 406.
+        assert_eq!(
+            accept_format("Accept: application/json;q=0\r\n"),
+            Negotiation::NotAcceptable
+        );
+        assert_eq!(
+            accept_format("Accept: application/xml\r\n"),
+            Negotiation::NotAcceptable
+        );
+        assert_eq!(
+            accept_format("Accept: */*;q=0\r\n"),
+            Negotiation::NotAcceptable
+        );
+        // More specific reference wins: `application/*;q=0.9` lifts json above a
+        // lower-q text, so json is chosen despite its own range being unlisted.
+        assert_eq!(
+            accept_format("Accept: text/plain;q=0.2, application/*;q=0.9\r\n"),
+            Negotiation::Use(RespFormat::Json)
+        );
+    }
+
+    #[test]
+    fn resolve_format_precedence() {
+        // M68/M69: explicit `?format=` query wins over the Accept header and never 406s.
+        assert_eq!(
+            resolve_format("format=text", "Accept: application/json\r\n"),
+            Some(RespFormat::Text)
+        );
+        assert_eq!(resolve_format("format=json", ""), Some(RespFormat::Json));
+        // Query overrides a would-be-406 Accept.
+        assert_eq!(
+            resolve_format("format=json", "Accept: application/xml\r\n"),
+            Some(RespFormat::Json)
+        );
+        // No query param ⇒ the Accept header decides.
+        assert_eq!(
+            resolve_format("", "Accept: application/json\r\n"),
+            Some(RespFormat::Json)
+        );
+        // Neither ⇒ Text default (every pre-M68 response stays byte-identical).
+        assert_eq!(resolve_format("", ""), Some(RespFormat::Text));
+        assert_eq!(resolve_format("a=1", "Host: x\r\n"), Some(RespFormat::Text));
+        // Accept present but unsatisfiable ⇒ None (caller emits 406).
+        assert_eq!(resolve_format("", "Accept: application/xml\r\n"), None);
+    }
+
+    #[test]
+    fn not_acceptable_body_lists_representations() {
+        // M70: the 406 body enumerates every representation we can emit (RFC 7231
+        // §6.5.6), from the single OFFERED_MEDIA_TYPES source of truth.
+        let body = not_acceptable_body();
+        assert_eq!(body, "not acceptable; available: application/json, text/plain");
+        assert!(body.contains("application/json"));
+        assert!(body.contains("text/plain"));
+        // JSON is listed first (it wins the negotiation q-tie when named).
+        assert!(body.find("application/json") < body.find("text/plain"));
+    }
+
+    #[test]
+    fn http_response_sets_vary_accept() {
+        // M71: every RPC response advertises `Vary: Accept` (RFC 7231 §7.1.4) so
+        // shared caches key on the Accept header, through the single builder.
+        let text = http_response("200 OK", "x");
+        assert!(text.contains("\r\nVary: Accept\r\n"), "text: {text}");
+        assert!(text.starts_with("HTTP/1.1 200 OK"), "text status: {text}");
+        assert!(text.contains("Content-Type: text/plain; charset=utf-8\r\n"), "text ct: {text}");
+        let json = http_response_ct("200 OK", "application/json", "{}");
+        assert!(json.contains("\r\nVary: Accept\r\n"), "json: {json}");
+        assert!(json.starts_with("HTTP/1.1 200 OK"), "json status: {json}");
+        assert!(json.contains("Content-Type: application/json\r\n"), "json ct: {json}");
     }
 
     #[test]
@@ -5014,6 +5355,8 @@ mod tests {
         let h = get(rpc_addr, "/height?format=json").await;
         assert!(h.starts_with("HTTP/1.1 200 OK"), "height: {h}");
         assert!(h.contains("Content-Type: application/json\r\n"), "height ct: {h}");
+        // M71: representation-selected responses advertise `Vary: Accept` for caches.
+        assert!(h.contains("Vary: Accept\r\n"), "height vary: {h}");
         assert!(body_of(&h).starts_with("{\"height\":\""), "height body: {h}");
 
         let a = get(rpc_addr, "/account/1?format=json").await;
@@ -5039,6 +5382,146 @@ mod tests {
         // Head invariant at the response layer: a query-less read is byte-identical to
         // the pre-M66 plaintext response (text/plain, bare decimal height).
         let plain = get(rpc_addr, "/height").await;
+        assert!(plain.contains("Content-Type: text/plain; charset=utf-8\r\n"), "plain ct: {plain}");
+        // M71: the text representation also carries `Vary: Accept`.
+        assert!(plain.contains("Vary: Accept\r\n"), "plain vary: {plain}");
+        assert!(body_of(&plain).chars().all(|c| c.is_ascii_digit()), "plain body: {plain}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn rpc_accept_header_over_tcp() {
+        // M68: standard HTTP content negotiation. `Accept: application/json` selects
+        // JSON with no query param; an explicit `?format=` still wins over Accept; and a
+        // request with neither stays byte-identical to the pre-M68 plaintext response.
+        let dir = tmp_dir("rpc-accept");
+        let mut cfg = node_config(21, 20191, &[21], dir.clone());
+        let rpc_addr = "127.0.0.1:20201";
+        cfg.rpc = Some(crate::config::RpcConfig { enabled: true, listen: rpc_addr.into() });
+        let mut genesis = test_genesis();
+        genesis.validators = vec![(21, kp(21).public(), 1)]; // quorum 1 ⇒ self-commit
+        let node = Node::start(cfg, genesis, Some(kp(21))).await.expect("start node");
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            if node.status().await.map(|(h, _)| h >= 1).unwrap_or(false) {
+                break;
+            }
+            assert!(tokio::time::Instant::now() < deadline, "node never produced a block");
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+
+        async fn get(addr: &str, path: &str, accept: Option<&str>) -> String {
+            let accept_line = accept.map(|a| format!("Accept: {a}\r\n")).unwrap_or_default();
+            let req = format!(
+                "GET {path} HTTP/1.1\r\nHost: localhost\r\n{accept_line}Connection: close\r\n\r\n"
+            );
+            let mut s = TcpStream::connect(addr).await.expect("connect rpc");
+            s.write_all(req.as_bytes()).await.expect("send get");
+            let mut resp = Vec::new();
+            s.read_to_end(&mut resp).await.expect("read response");
+            String::from_utf8_lossy(&resp).into_owned()
+        }
+        fn body_of(resp: &str) -> &str {
+            resp.rsplit("\r\n\r\n").next().unwrap_or("")
+        }
+
+        // Accept: application/json with no query param ⇒ JSON.
+        let h = get(rpc_addr, "/height", Some("application/json")).await;
+        assert!(h.starts_with("HTTP/1.1 200 OK"), "height: {h}");
+        assert!(h.contains("Content-Type: application/json\r\n"), "height ct: {h}");
+        assert!(body_of(&h).starts_with("{\"height\":\""), "height body: {h}");
+
+        let a = get(rpc_addr, "/account/1", Some("application/json")).await;
+        assert!(a.starts_with("HTTP/1.1 200 OK"), "account: {a}");
+        assert!(a.contains("Content-Type: application/json\r\n"), "account ct: {a}");
+        assert!(body_of(&a).starts_with("{\""), "account body: {a}");
+
+        // An explicit `?format=text` overrides `Accept: application/json`.
+        let q = get(rpc_addr, "/height?format=text", Some("application/json")).await;
+        assert!(q.contains("Content-Type: text/plain; charset=utf-8\r\n"), "query-wins ct: {q}");
+        assert!(body_of(&q).chars().all(|c| c.is_ascii_digit()), "query-wins body: {q}");
+
+        // A browser-style `Accept: text/html,*/*` keeps the plaintext representation.
+        let b = get(rpc_addr, "/height", Some("text/html,*/*")).await;
+        assert!(b.contains("Content-Type: text/plain; charset=utf-8\r\n"), "browser ct: {b}");
+        assert!(body_of(&b).chars().all(|c| c.is_ascii_digit()), "browser body: {b}");
+
+        // Head invariant: no Accept header and no query ⇒ byte-identical plaintext.
+        let plain = get(rpc_addr, "/height", None).await;
+        assert!(plain.contains("Content-Type: text/plain; charset=utf-8\r\n"), "plain ct: {plain}");
+        assert!(body_of(&plain).chars().all(|c| c.is_ascii_digit()), "plain body: {plain}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn rpc_406_over_tcp() {
+        // M69: RFC 7231 §5.3 q-values + `406 Not Acceptable`. An Accept that rules out
+        // both types we can emit answers 406; q-values weight the choice between them;
+        // an explicit `?format=` overrides a would-be-406; and no Accept stays plaintext.
+        let dir = tmp_dir("rpc-406");
+        let mut cfg = node_config(21, 20211, &[21], dir.clone());
+        let rpc_addr = "127.0.0.1:20221";
+        cfg.rpc = Some(crate::config::RpcConfig { enabled: true, listen: rpc_addr.into() });
+        let mut genesis = test_genesis();
+        genesis.validators = vec![(21, kp(21).public(), 1)]; // quorum 1 ⇒ self-commit
+        let node = Node::start(cfg, genesis, Some(kp(21))).await.expect("start node");
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            if node.status().await.map(|(h, _)| h >= 1).unwrap_or(false) {
+                break;
+            }
+            assert!(tokio::time::Instant::now() < deadline, "node never produced a block");
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+
+        async fn get(addr: &str, path: &str, accept: Option<&str>) -> String {
+            let accept_line = accept.map(|a| format!("Accept: {a}\r\n")).unwrap_or_default();
+            let req = format!(
+                "GET {path} HTTP/1.1\r\nHost: localhost\r\n{accept_line}Connection: close\r\n\r\n"
+            );
+            let mut s = TcpStream::connect(addr).await.expect("connect rpc");
+            s.write_all(req.as_bytes()).await.expect("send get");
+            let mut resp = Vec::new();
+            s.read_to_end(&mut resp).await.expect("read response");
+            String::from_utf8_lossy(&resp).into_owned()
+        }
+        fn body_of(resp: &str) -> &str {
+            resp.rsplit("\r\n\r\n").next().unwrap_or("")
+        }
+
+        // An Accept we cannot satisfy ⇒ 406, with a text/plain error body that
+        // lists the representations we *can* emit (M70, RFC 7231 §6.5.6).
+        let x = get(rpc_addr, "/height", Some("application/xml")).await;
+        assert!(x.starts_with("HTTP/1.1 406 Not Acceptable"), "xml: {x}");
+        assert!(x.contains("Content-Type: text/plain; charset=utf-8\r\n"), "xml ct: {x}");
+        // M71: the negotiated-error path varies by `Accept` too.
+        assert!(x.contains("Vary: Accept\r\n"), "xml vary: {x}");
+        assert!(body_of(&x).contains("application/json"), "xml body lists json: {x}");
+        assert!(body_of(&x).contains("text/plain"), "xml body lists text: {x}");
+
+        // An explicit q=0 rejects our JSON type ⇒ 406 (no text alternative offered).
+        let z = get(rpc_addr, "/height", Some("application/json;q=0")).await;
+        assert!(z.starts_with("HTTP/1.1 406 Not Acceptable"), "q0: {z}");
+        assert!(body_of(&z).contains("application/json"), "q0 body lists json: {z}");
+        assert!(body_of(&z).contains("text/plain"), "q0 body lists text: {z}");
+
+        // Weighted preference: JSON outranks text ⇒ 200 + application/json.
+        let w = get(rpc_addr, "/height", Some("text/plain;q=0.3, application/json;q=0.9")).await;
+        assert!(w.starts_with("HTTP/1.1 200 OK"), "weighted: {w}");
+        assert!(w.contains("Content-Type: application/json\r\n"), "weighted ct: {w}");
+
+        // An explicit `?format=json` overrides a would-be-406 Accept.
+        let q = get(rpc_addr, "/height?format=json", Some("application/xml")).await;
+        assert!(q.starts_with("HTTP/1.1 200 OK"), "query-wins: {q}");
+        assert!(q.contains("Content-Type: application/json\r\n"), "query-wins ct: {q}");
+
+        // Head invariant: no Accept header ⇒ byte-identical plaintext (never 406).
+        let plain = get(rpc_addr, "/height", None).await;
+        assert!(plain.starts_with("HTTP/1.1 200 OK"), "plain: {plain}");
         assert!(plain.contains("Content-Type: text/plain; charset=utf-8\r\n"), "plain ct: {plain}");
         assert!(body_of(&plain).chars().all(|c| c.is_ascii_digit()), "plain body: {plain}");
 
