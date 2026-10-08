@@ -1964,7 +1964,7 @@ fn http_response_ct(status_line: &str, content_type: &str, body: &str) -> String
         "HTTP/1.1 {}\r\n\
          Content-Type: {}\r\n\
          Content-Length: {}\r\n\
-         Vary: Accept, Accept-Charset\r\n\
+         Vary: Accept, Accept-Charset, Accept-Encoding\r\n\
          Connection: close\r\n\
          \r\n\
          {}",
@@ -2030,7 +2030,7 @@ fn apply_etag(resp: String, if_none_match: Option<&str>) -> String {
     let etag = format!("\"{}\"", crate::hash::hex(&crate::hash::sha256(body.as_bytes())));
     if if_none_match == Some(etag.as_str()) {
         return format!(
-            "HTTP/1.1 304 Not Modified\r\nETag: {etag}\r\nVary: Accept, Accept-Charset\r\nConnection: close\r\n\r\n"
+            "HTTP/1.1 304 Not Modified\r\nETag: {etag}\r\nVary: Accept, Accept-Charset, Accept-Encoding\r\nConnection: close\r\n\r\n"
         );
     }
     format!("{head}\r\nETag: {etag}\r\n\r\n{body}")
@@ -2067,6 +2067,21 @@ fn not_acceptable_charset_json() -> String {
         .collect::<Vec<_>>()
         .join(",");
     format!("{{\"error\":\"not_acceptable\",\"available_charsets\":[{available}]}}")
+}
+
+/// M109: the content-codings this RPC server can emit. We never compress, so the only
+/// coding is `identity` (RFC 7231 §5.3.4). Single source of truth for the `406` body.
+const OFFERED_ENCODINGS: [&str; 1] = ["identity"];
+
+/// M109: RFC 7231 §6.5.6 — the `406` body when `Accept-Encoding` refuses `identity` (the
+/// only coding we emit). Same machine-readable error shape as the other negotiation 406s.
+fn not_acceptable_encoding_json() -> String {
+    let available = OFFERED_ENCODINGS
+        .iter()
+        .map(|c| json_str(c))
+        .collect::<Vec<_>>()
+        .join(",");
+    format!("{{\"error\":\"not_acceptable\",\"available_encodings\":[{available}]}}")
 }
 
 /// Accept loop for the ingress RPC endpoint. Mirrors [`run_metrics`]: each
@@ -2409,6 +2424,37 @@ fn charset_acceptable(head: &str) -> bool {
     }
     let Some(value) = value else { return true }; // absent ⇒ no constraint
     OFFERED_CHARSETS.iter().any(|c| charset_q(value, c) > 0)
+}
+
+/// M109: `Accept-Encoding` negotiation (RFC 7231 §5.3.4). We never compress, so the only
+/// representation we emit is `identity`. Per the spec, `identity` is acceptable **by default**
+/// even when a present `Accept-Encoding` doesn't mention it — unless it is *specifically*
+/// refused, i.e. an explicit `identity;q=0`, or a `*;q=0` with no overriding `identity` entry.
+/// So, unlike charset, a list like `gzip` (identity unmentioned, no `*`) still accepts identity.
+fn encoding_acceptable(head: &str) -> bool {
+    let Some(value) = header_value(head, "accept-encoding") else { return true };
+    let mut identity_q: Option<u16> = None;
+    let mut star_q: Option<u16> = None;
+    for range in value.split(',') {
+        let mut parts = range.split(';');
+        let token = parts.next().unwrap_or("").trim();
+        let mut q = 1000u16;
+        for p in parts {
+            let p = p.trim();
+            if let Some(v) = p.strip_prefix("q=").or_else(|| p.strip_prefix("Q=")) {
+                q = parse_qmilli(v);
+            }
+        }
+        if token.eq_ignore_ascii_case("identity") {
+            identity_q = Some(q);
+        } else if token == "*" {
+            star_q = Some(q);
+        }
+    }
+    match identity_q {
+        Some(q) => q > 0,                                  // an explicit identity entry decides
+        None => star_q.map(|q| q > 0).unwrap_or(true),     // else `*` decides; else default-accept
+    }
 }
 
 fn route_get(path: &str) -> GetRoute {
@@ -3790,6 +3836,28 @@ async fn serve_rpc_conn(mut stream: TcpStream, cmd: mpsc::UnboundedSender<Cmd>) 
                         "406 Not Acceptable",
                         "application/json",
                         &not_acceptable_charset_json(),
+                    ),
+                )
+                .as_bytes(),
+            )
+            .await;
+        let _ = stream.flush().await;
+        return;
+    }
+
+    // M109: Accept-Encoding negotiation (RFC 7231 §5.3.4). We only emit `identity`
+    // (uncompressed); a header that specifically refuses it ⇒ 406 with the machine-readable
+    // list of codings we can emit. Checked after charset and before routing, gating every
+    // method uniformly (absent, or identity-acceptable, keeps responses unchanged bar `Vary`).
+    if !encoding_acceptable(head) {
+        let _ = stream
+            .write_all(
+                maybe_head(
+                    is_head,
+                    http_response_ct(
+                        "406 Not Acceptable",
+                        "application/json",
+                        &not_acceptable_encoding_json(),
                     ),
                 )
                 .as_bytes(),
@@ -7773,16 +7841,56 @@ mod tests {
     }
 
     #[test]
+    fn encoding_negotiation_honors_identity() {
+        // M109: we only emit `identity`. Per RFC 7231 §5.3.4, identity is acceptable by
+        // default even when unmentioned — refused only by an explicit `identity;q=0` or a
+        // `*;q=0` with no overriding identity entry.
+        let head = |ae: &str| format!("GET / HTTP/1.1\r\nHost: x\r\nAccept-Encoding: {ae}\r\n\r\n");
+        assert!(encoding_acceptable("GET / HTTP/1.1\r\nHost: x\r\n\r\n")); // absent ⇒ true
+        assert!(encoding_acceptable(&head("identity")));
+        assert!(encoding_acceptable(&head("IDENTITY"))); // case-insensitive
+        assert!(encoding_acceptable(&head("gzip"))); // identity unmentioned ⇒ still acceptable
+        assert!(encoding_acceptable(&head("gzip, deflate"))); // ditto, default-accept
+        assert!(encoding_acceptable(&head("identity;q=0.5")));
+        assert!(encoding_acceptable(&head("*"))); // wildcard allows
+        assert!(encoding_acceptable(&head("gzip, identity;q=1"))); // explicit identity ok
+        assert!(encoding_acceptable(&head("*;q=0, identity;q=1"))); // identity overrides `*;q=0`
+        assert!(!encoding_acceptable(&head("identity;q=0"))); // explicitly refused
+        assert!(!encoding_acceptable(&head("*;q=0"))); // `*;q=0` with no identity override
+        assert!(!encoding_acceptable(&head("gzip, *;q=0"))); // ditto
+
+        // The 406 body lists the codings we can emit.
+        assert_eq!(
+            not_acceptable_encoding_json(),
+            "{\"error\":\"not_acceptable\",\"available_encodings\":[\"identity\"]}"
+        );
+    }
+
+    #[test]
+    fn encoding_406_head_keeps_headers_drops_body() {
+        // M109: the Accept-Encoding 406 also routes through `maybe_head`, so a conditional HEAD
+        // that refuses identity gets the full 406 header block but no body.
+        let body = not_acceptable_encoding_json();
+        let full = http_response_ct("406 Not Acceptable", "application/json", &body);
+        let head = maybe_head(true, full);
+        assert!(head.starts_with("HTTP/1.1 406 Not Acceptable\r\n"), "{head}");
+        assert!(head.contains("Content-Type: application/json\r\n"), "{head}");
+        assert!(head.contains(&format!("Content-Length: {}\r\n", body.len())), "{head}");
+        assert!(head.ends_with("\r\n\r\n"), "{head}");
+        assert!(!head.contains("available_encodings"), "HEAD must drop the 406 body: {head}");
+    }
+
+    #[test]
     fn http_response_sets_vary_accept() {
         // M71/M82: every RPC response advertises `Vary: Accept, Accept-Charset`
         // (RFC 7231 §7.1.4) so shared caches key on both negotiation inputs, through
         // the single builder.
         let text = http_response("200 OK", "x");
-        assert!(text.contains("\r\nVary: Accept, Accept-Charset\r\n"), "text: {text}");
+        assert!(text.contains("\r\nVary: Accept, Accept-Charset, Accept-Encoding\r\n"), "text: {text}");
         assert!(text.starts_with("HTTP/1.1 200 OK"), "text status: {text}");
         assert!(text.contains("Content-Type: text/plain; charset=utf-8\r\n"), "text ct: {text}");
         let json = http_response_ct("200 OK", "application/json", "{}");
-        assert!(json.contains("\r\nVary: Accept, Accept-Charset\r\n"), "json: {json}");
+        assert!(json.contains("\r\nVary: Accept, Accept-Charset, Accept-Encoding\r\n"), "json: {json}");
         assert!(json.starts_with("HTTP/1.1 200 OK"), "json status: {json}");
         assert!(json.contains("Content-Type: application/json\r\n"), "json ct: {json}");
     }
@@ -8533,7 +8641,7 @@ vote_b.validator=5 vote_b.height=9 vote_b.round=2 vote_b.block_hash={b_h} vote_b
         assert!(head.starts_with("HTTP/1.1 200 OK\r\n"));
         assert!(head.contains("Content-Type: application/json\r\n"));
         assert!(head.contains("Content-Length: 13\r\n"));
-        assert!(head.contains("Vary: Accept, Accept-Charset\r\n"));
+        assert!(head.contains("Vary: Accept, Accept-Charset, Accept-Encoding\r\n"));
         // …but no body follows the terminator.
         assert!(head.ends_with("\r\n\r\n"));
         assert!(!head.contains("{\"total\":\"3\"}"));
@@ -8835,7 +8943,7 @@ vote_b.validator=5 vote_b.height=9 vote_b.round=2 vote_b.block_hash={b_h} vote_b
         assert!(h.starts_with("HTTP/1.1 200 OK"), "height: {h}");
         assert!(h.contains("Content-Type: application/json\r\n"), "height ct: {h}");
         // M71/M82: representation-selected responses advertise `Vary: Accept, Accept-Charset`.
-        assert!(h.contains("Vary: Accept, Accept-Charset\r\n"), "height vary: {h}");
+        assert!(h.contains("Vary: Accept, Accept-Charset, Accept-Encoding\r\n"), "height vary: {h}");
         assert!(body_of(&h).starts_with("{\"height\":\""), "height body: {h}");
 
         let a = get(rpc_addr, "/account/1?format=json").await;
@@ -8865,7 +8973,7 @@ vote_b.validator=5 vote_b.height=9 vote_b.round=2 vote_b.block_hash={b_h} vote_b
         let plain = get(rpc_addr, "/height").await;
         assert!(plain.contains("Content-Type: text/plain; charset=utf-8\r\n"), "plain ct: {plain}");
         // M71/M82: the text representation also carries `Vary: Accept, Accept-Charset`.
-        assert!(plain.contains("Vary: Accept, Accept-Charset\r\n"), "plain vary: {plain}");
+        assert!(plain.contains("Vary: Accept, Accept-Charset, Accept-Encoding\r\n"), "plain vary: {plain}");
         assert!(body_of(&plain).chars().all(|c| c.is_ascii_digit()), "plain body: {plain}");
 
         let _ = std::fs::remove_dir_all(&dir);
@@ -8980,7 +9088,7 @@ vote_b.validator=5 vote_b.height=9 vote_b.round=2 vote_b.block_hash={b_h} vote_b
         assert!(x.starts_with("HTTP/1.1 406 Not Acceptable"), "xml: {x}");
         assert!(x.contains("Content-Type: application/json\r\n"), "xml ct: {x}");
         // M71/M82: the negotiated-error path varies by `Accept, Accept-Charset` too.
-        assert!(x.contains("Vary: Accept, Accept-Charset\r\n"), "xml vary: {x}");
+        assert!(x.contains("Vary: Accept, Accept-Charset, Accept-Encoding\r\n"), "xml vary: {x}");
         assert!(body_of(&x).contains("\"error\":\"not_acceptable\""), "xml body is JSON error: {x}");
         assert!(body_of(&x).contains("application/json"), "xml body lists json: {x}");
         assert!(body_of(&x).contains("text/plain"), "xml body lists text: {x}");
@@ -9058,7 +9166,7 @@ vote_b.validator=5 vote_b.height=9 vote_b.round=2 vote_b.block_hash={b_h} vote_b
         let bad = get(rpc_addr, "/height", Some("iso-8859-1")).await;
         assert!(bad.starts_with("HTTP/1.1 406 Not Acceptable"), "iso: {bad}");
         assert!(bad.contains("Content-Type: application/json\r\n"), "iso ct: {bad}");
-        assert!(bad.contains("Vary: Accept, Accept-Charset\r\n"), "iso vary: {bad}");
+        assert!(bad.contains("Vary: Accept, Accept-Charset, Accept-Encoding\r\n"), "iso vary: {bad}");
         assert!(body_of(&bad).contains("\"error\":\"not_acceptable\""), "iso body: {bad}");
         assert!(body_of(&bad).contains("utf-8"), "iso body lists utf-8: {bad}");
 
@@ -9072,6 +9180,62 @@ vote_b.validator=5 vote_b.height=9 vote_b.round=2 vote_b.block_hash={b_h} vote_b
         assert!(plain.starts_with("HTTP/1.1 200 OK"), "plain: {plain}");
         assert!(plain.contains("Content-Type: text/plain; charset=utf-8\r\n"), "plain ct: {plain}");
         assert!(body_of(&plain).chars().all(|c| c.is_ascii_digit()), "plain body: {plain}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn rpc_encoding_406_over_tcp() {
+        // M109: Accept-Encoding negotiation over real TCP. We emit identity only; a header that
+        // refuses identity ⇒ 406 with a machine-readable encoding list, while identity /
+        // default-accept / absent all stay 200.
+        let dir = tmp_dir("rpc-encoding-406");
+        // node_config p2p listen = 20731 + (42-21) = 20752; keep the RPC port clear.
+        let mut cfg = node_config(42, 20731, &[42], dir.clone());
+        let rpc_addr = "127.0.0.1:20761";
+        cfg.rpc = Some(crate::config::RpcConfig { enabled: true, listen: rpc_addr.into() });
+        let mut genesis = test_genesis();
+        genesis.validators = vec![(42, kp(42).public(), 1)]; // quorum 1 ⇒ self-commit
+        let node = Node::start(cfg, genesis, Some(kp(42))).await.expect("start node");
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            if node.status().await.map(|(h, _)| h >= 1).unwrap_or(false) {
+                break;
+            }
+            assert!(tokio::time::Instant::now() < deadline, "node never produced a block");
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+
+        async fn get(addr: &str, path: &str, enc: Option<&str>) -> String {
+            let enc_line = enc.map(|c| format!("Accept-Encoding: {c}\r\n")).unwrap_or_default();
+            let req = format!("GET {path} HTTP/1.1\r\nHost: localhost\r\n{enc_line}Connection: close\r\n\r\n");
+            let mut s = TcpStream::connect(addr).await.expect("connect rpc");
+            s.write_all(req.as_bytes()).await.expect("send get");
+            let mut resp = Vec::new();
+            s.read_to_end(&mut resp).await.expect("read response");
+            String::from_utf8_lossy(&resp).into_owned()
+        }
+        fn body_of(resp: &str) -> &str {
+            resp.rsplit("\r\n\r\n").next().unwrap_or("")
+        }
+
+        // identity, gzip (identity default-accepted), and absent all ⇒ 200.
+        for ae in [Some("identity"), Some("gzip"), None] {
+            let ok = get(rpc_addr, "/height", ae).await;
+            assert!(ok.starts_with("HTTP/1.1 200 OK"), "{ae:?} should be 200: {ok}");
+        }
+
+        // identity;q=0 explicitly refuses our only coding ⇒ 406 with a machine-readable list.
+        let bad = get(rpc_addr, "/height", Some("identity;q=0")).await;
+        assert!(bad.starts_with("HTTP/1.1 406 Not Acceptable"), "identity;q=0: {bad}");
+        assert!(bad.contains("Content-Type: application/json\r\n"), "406 ct: {bad}");
+        assert!(bad.contains("Vary: Accept, Accept-Charset, Accept-Encoding\r\n"), "406 vary: {bad}");
+        assert!(body_of(&bad).contains("\"available_encodings\":[\"identity\"]"), "406 body: {bad}");
+
+        // `*;q=0` (no identity override) also refuses ⇒ 406.
+        let star = get(rpc_addr, "/height", Some("*;q=0")).await;
+        assert!(star.starts_with("HTTP/1.1 406 Not Acceptable"), "*;q=0: {star}");
 
         let _ = std::fs::remove_dir_all(&dir);
     }
