@@ -969,6 +969,18 @@ M83–M91 收口了读面列表端点篮子；M92 转向 **HTTP 语义补全**�
 
 **已知边界（顺延至 M93+）**：读面列表端点篮子已收口、HTTP `HEAD` 已补；剩余：游标分页、`Accept-Encoding`（压缩须引新依赖）；keygen 篮子（助记词 / BIP-39、口令 keystore、现成 genesis 条目、密钥轮换、keyfile `0600`）；共识 / wire 篮子（破 head 不变量）：**货币费用** + 费用优先排序、nonce / 序列号反重放；连同运维篮子：证书/密钥轮换与落盘、follower 认证、指标端 TLS、OTel/push exporter、每-sink 独立 rotation 覆盖、时延直方图。
 
+## HTTP `OPTIONS` 方法支持（Milestone 93）
+
+M92 补了 `HEAD`；M93 续补 HTTP 方法语义——`OPTIONS`。此前 `OPTIONS` 不是 `GET`/`HEAD`/`POST`，落入「非 POST ⇒ 健康探针」回落、回 `200 OK`/`ok`——没有按 RFC 9110 §9.3.7 告知客户端本服务**支持哪些方法**。M93 补齐：`OPTIONS` 回 `204 No Content` + `Allow: GET, HEAD, OPTIONS, POST` 首部、无 body。纯 HTTP 层改动、**无新依赖**、无 wire/共识/状态变更、无新读语义，`[rpc]`/`localnet` head 不变量（`44309755…ea04ba`，RPC 默认关）不受影响。
+
+- **纯函数 + 单一真相源**：新增常量 `ALLOWED_METHODS = "GET, HEAD, OPTIONS, POST"`（`Allow` 首部的唯一真相源）+ 纯函数 `options_response()`——回 `204 No Content`（按定义无消息体，故不发 `Content-Length`）+ `Allow` 首部。纯函数、可直接单测。
+- **早于协商应答**：在请求解析处（拆出 `path`/`query` 后、`resolve_format` 协商**之前**）加 `if method == "OPTIONS"` 分支直接写 `options_response` 并返回——因为 OPTIONS 不返回任何表示，没有 `Accept`/`Accept-Charset` 可协商；带敌意 `Accept` 的 OPTIONS 也不应被打成 `406`，而应如实回能力集。
+- **其余路径不变**：`route_get`/`GetRoute` 一字未改；`GET`/`HEAD`（M92）/`POST` 路径逐字节不变；其余未知方法（`PUT`/`DELETE` 等）**刻意保留**此前的 `200`/`ok` 健康探针回落（任意方法可探活，是既有特性，不改）。OPTIONS 是唯一获特判的非 GET/HEAD/POST 方法。
+- **测试（+3 → 448）**：新纯 `options_response_advertises_allow`（断言 `204` 状态行、`Allow` 列全四法、无 `Content-Length`、无 body）、新 TCP `rpc_options_over_tcp`（`/accounts`·`/` 回 `204`+`Allow` 无 body；带 `Accept: application/xml` 的 OPTIONS 仍回 `204` 证明应答早于协商；`id=34`：p2p listen `20461+13=20474`、RPC 用 20481）、新 TCP `rpc_unsupported_method_is_health_probe`（`PUT /accounts` 仍回 `200`/`ok`，锁定刻意回落不回归；`id=35`：p2p listen `20491+14=20505`、RPC 用 20511）。
+- **不变量保持**：纯 HTTP 响应整形、无 `serde_json`、无引擎 / codec / crypto / wire / 共识 / 状态变更、无新依赖，故 `localnet` 逐字节同块、head 仍 `44309755…ea04ba`。
+
+**已知边界（顺延至 M94+）**：读面列表端点篮子已收口、HTTP `HEAD`/`OPTIONS` 已补；剩余：游标分页、`Accept-Encoding`（压缩须引新依赖）、未知方法 `405`（与健康探针语义取舍）；keygen 篮子（助记词 / BIP-39、口令 keystore、现成 genesis 条目、密钥轮换、keyfile `0600`）；共识 / wire 篮子（破 head 不变量）：**货币费用** + 费用优先排序、nonce / 序列号反重放；连同运维篮子：证书/密钥轮换与落盘、follower 认证、指标端 TLS、OTel/push exporter、每-sink 独立 rotation 覆盖、时延直方图。
+
 ## 持久化与重放（Milestone 7）
 
 节点状态不再只活在内存里：区块以**追加式日志**（`DIR/blocks.log`）落盘，重启后从创世**重放**日志即可重建**逐字节相同**的状态。
@@ -1741,5 +1753,6 @@ peer_exchange_disabled_stays_seeded                   同链拓扑关发现 → 
 - ~~M90 待处理罚没证据池列表 `GET /evidence`——加第九个分页列表读 `GET /evidence` 暂存下一出块的待处理罚没证据池（成对冲突 precommit 投票），是 `/stake-ops`（M89）的待处理池读兄弟、无单读兄弟；新增文本渲染器 `format_vote`（`vote_a.`/`vote_b.` 前缀扁平化、镜像既有 `json_vote`）+ `format_slash_evidence` + 两薄包装 `format_evidence_listing`/`json_evidence_listing`（JSON 逐项复用既有 `json_slash_evidence`、空集 ⇒ `""`/`[]`），仅加一路由臂（`/evidence` 精确匹配；无 `/evidence/` 前缀故 `/evidence/` 回落 `Health`）+ `Cmd::QueryEvidence`（actor 读既有 `node.pending_evidence()` 视图），逐字复用 `total`/`next` 信封 + `Accept`/`Accept-Charset` 协商；新纯测 `route_get_parses_evidence`/`evidence_listing_renders` + TCP `rpc_evidence_list_over_tcp`（池仅由等价双签证据暂存入列故新链 `/evidence` live-but-empty，端到端断言空池信封），共 439 测、localnet head 不变~~ ✅
 - ~~M91 连接节点列表 `GET /peers`——加第十个分页列表读 `GET /peers` 连接节点目录（peer id + 已知监听地址），是守护层读（节点连接存于 actor、非链状态）、无单读兄弟、收口读面列表端点篮子；新增独立渲染器 `format_peer`/`json_peer`（已知地址逐字、未知地址文本 `unknown` / JSON `null`）+ 两薄包装 `format_peer_listing`/`json_peer_listing`（空集 ⇒ `""`/`[]`），仅加一路由臂（`/peers` 精确匹配；无 `/peer/` 前缀故 `/peers/` 回落 `Health`）+ `Cmd::QueryPeers`（actor 由 `outbound`+`addrs` 两图构建 id 升序快照），逐字复用 `total`/`next` 信封 + `Accept`/`Accept-Charset` 协商；新纯测 `route_get_parses_peers`/`peer_listing_renders` + TCP `rpc_peers_list_over_tcp`（单节点无配置对端故新链 `/peers` live-but-empty，端到端断言空目录信封），共 442 测、localnet head 不变~~ ✅
 - ~~M92 HTTP `HEAD` 方法支持——此前 `GET`/`HEAD` 共用一条读路由臂、HEAD 却返回整个响应体（违反 RFC 9110 §9.3.2）；M92 补齐——新增纯函数 `maybe_head(is_head, resp)` 在 `\r\n\r\n` 处截去 body 只留首部块（`Content-Length` 仍广告 GET body 字节数），`is_head==false` 为恒等（GET 逐字节不变），请求解析处一次性求出 `is_head`、三处写出点（两个协商 `406` + 读路由块）统一经 `maybe_head` 剥身；路由与 `GetRoute` 一字未改；新纯测 `maybe_head_strips_body_keeps_headers`/`maybe_head_strips_negotiation_406_body` + TCP `rpc_head_mirrors_get_without_body`（`/height` 标量读与 `/accounts` 列表读：HEAD 首部与 GET 逐字节同、`Content-Length` 等于 GET body 长、HEAD 无 body），共 445 测、localnet head 不变~~ ✅
+- ~~M93 HTTP `OPTIONS` 方法支持——此前 `OPTIONS` 落入「非 POST ⇒ 健康探针」回 `200`/`ok`、未告知所支持方法；M93 按 RFC 9110 §9.3.7 补齐——`OPTIONS` 回 `204 No Content` + `Allow: GET, HEAD, OPTIONS, POST` 首部、无 body，在 `Accept`/`Accept-Charset` 协商之前应答（无可协商表示），新增单一真相源常量 `ALLOWED_METHODS` + 纯函数 `options_response`；路由与 `GetRoute` 一字未改、GET/HEAD/POST 不受影响、其余未知方法刻意保留健康探针回落；新纯测 `options_response_advertises_allow` + TCP `rpc_options_over_tcp`（`/accounts`·`/` 回 204+Allow 无 body、敌意 `Accept` 仍回 204）+ TCP `rpc_unsupported_method_is_health_probe`（PUT 仍回 `200`/`ok`），共 448 测、localnet head 不变~~ ✅
 
-……；运维篮子剩余（货币费用（独立共识里程碑）、费用优先出块排序、nonce 反重放、读面列表端点篮子已收口、HTTP `HEAD` 已补、游标分页、`Accept-Encoding`（压缩须依赖）、RPC auth/TLS、证书/密钥轮换与落盘、follower 认证、每-sink 独立 rotation 覆盖、OTEL/结构化日志 exporter、指标端 TLS、指标 push exporter/直方图/每-peer/每-轮次时延序列）顺延至 M93+，每步仍遵循"可运行、可测试、契约一致"。
+……；运维篮子剩余（货币费用（独立共识里程碑）、费用优先出块排序、nonce 反重放、读面列表端点篮子已收口、HTTP `HEAD`/`OPTIONS` 已补、游标分页、`Accept-Encoding`（压缩须依赖）、未知方法 `405`、RPC auth/TLS、证书/密钥轮换与落盘、follower 认证、每-sink 独立 rotation 覆盖、OTEL/结构化日志 exporter、指标端 TLS、指标 push exporter/直方图/每-peer/每-轮次时延序列）顺延至 M94+，每步仍遵循"可运行、可测试、契约一致"。

@@ -1922,6 +1922,23 @@ fn maybe_head(is_head: bool, resp: String) -> String {
     }
 }
 
+/// M93: the HTTP methods this RPC server serves, in a canonical `Allow`-header order.
+/// Single source of truth for the `OPTIONS` response (RFC 9110 §9.3.7 / §10.2.1).
+const ALLOWED_METHODS: &str = "GET, HEAD, OPTIONS, POST";
+
+/// M93: RFC 9110 §9.3.7 — an `OPTIONS` response advertises the server's capabilities via an
+/// `Allow` header and carries no body (`204 No Content`, which by definition has no message
+/// body, so no `Content-Length` is sent). Pure (no I/O) for direct unit testing.
+fn options_response() -> String {
+    format!(
+        "HTTP/1.1 204 No Content\r\n\
+         Allow: {}\r\n\
+         Connection: close\r\n\
+         \r\n",
+        ALLOWED_METHODS,
+    )
+}
+
 /// M70: the representations this RPC server can emit, in negotiation-preference
 /// order (named JSON wins the q-tie, so it is listed first). Used to build the
 /// `406 Not Acceptable` body per RFC 7231 §6.5.6.
@@ -1974,6 +1991,8 @@ async fn run_rpc(listener: TcpListener, my_id: u64, cmd: mpsc::UnboundedSender<C
 ///   unrecognized path falls back to a `200 OK`/`"ok"` health probe. M92: a `HEAD`
 ///   mirrors the matching `GET` — identical headers (status, `Content-Type`,
 ///   `Content-Length`, `Vary`), no body (RFC 9110 §9.3.2);
+/// - M93: an `OPTIONS` returns `204 No Content` with an `Allow` header advertising the
+///   served methods (RFC 9110 §9.3.7), answered before content negotiation;
 /// - any other non-`POST` method returns the `200 OK`/`"ok"` health probe;
 /// - a `POST` reads the body (bounded by `Content-Length`, capped at
 ///   [`MAX_RPC_BODY`]), decodes it as raw `codec::encode_tx` bytes, and submits
@@ -3446,6 +3465,14 @@ async fn serve_rpc_conn(mut stream: TcpStream, cmd: mpsc::UnboundedSender<Cmd>) 
     // `Accept` header when no `?format=` is present (query still wins). M69: honor
     // RFC 7231 §5.3 q-values and answer `406` when the client accepts neither type.
     let (path, query) = split_query(target);
+    // M93: RFC 9110 §9.3.7 — `OPTIONS` advertises the methods this server serves via an
+    // `Allow` header and sends no body. Answered here, before `Accept`/`Accept-Charset`
+    // negotiation, since OPTIONS returns no representation and so has nothing to negotiate.
+    if method.eq_ignore_ascii_case("OPTIONS") {
+        let _ = stream.write_all(options_response().as_bytes()).await;
+        let _ = stream.flush().await;
+        return;
+    }
     let fmt = match resolve_format(query, head) {
         Some(f) => f,
         None => {
@@ -6639,6 +6666,91 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn rpc_options_over_tcp() {
+        // M93: OPTIONS over real TCP — 204 No Content + an `Allow` header listing the served
+        // methods, no body, on both a read path and the root.
+        let dir = tmp_dir("rpc-options");
+        // node_config p2p listen = 20461 + (34-21) = 20474; keep the RPC port clear.
+        let mut cfg = node_config(34, 20461, &[34], dir.clone());
+        let rpc_addr = "127.0.0.1:20481";
+        cfg.rpc = Some(crate::config::RpcConfig { enabled: true, listen: rpc_addr.into() });
+        let mut genesis = test_genesis();
+        genesis.validators = vec![(34, kp(34).public(), 1)]; // quorum 1 ⇒ self-commit
+        let node = Node::start(cfg, genesis, Some(kp(34))).await.expect("start node");
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            if node.status().await.map(|(h, _)| h >= 1).unwrap_or(false) {
+                break;
+            }
+            assert!(tokio::time::Instant::now() < deadline, "node never produced a block");
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+
+        async fn req(addr: &str, method: &str, path: &str, extra: &str) -> String {
+            let r = format!("{method} {path} HTTP/1.1\r\nHost: localhost\r\n{extra}Connection: close\r\n\r\n");
+            let mut s = TcpStream::connect(addr).await.expect("connect rpc");
+            s.write_all(r.as_bytes()).await.expect("send");
+            let mut resp = Vec::new();
+            s.read_to_end(&mut resp).await.expect("read response");
+            String::from_utf8_lossy(&resp).into_owned()
+        }
+        fn body_of(resp: &str) -> &str {
+            resp.split_once("\r\n\r\n").map(|(_, b)| b).unwrap_or("")
+        }
+
+        for path in ["/accounts", "/"] {
+            let resp = req(rpc_addr, "OPTIONS", path, "").await;
+            assert!(resp.starts_with("HTTP/1.1 204 No Content\r\n"), "OPTIONS {path}: {resp}");
+            assert!(resp.contains("Allow: GET, HEAD, OPTIONS, POST\r\n"), "OPTIONS {path} Allow: {resp}");
+            assert_eq!(body_of(&resp), "", "OPTIONS {path} must not send a body");
+        }
+
+        // OPTIONS is answered before content negotiation: a hostile `Accept` that would make a
+        // GET return `406` still yields the 204 capabilities response.
+        let hostile = req(rpc_addr, "OPTIONS", "/accounts", "Accept: application/xml\r\n").await;
+        assert!(hostile.starts_with("HTTP/1.1 204 No Content\r\n"), "OPTIONS ignores Accept: {hostile}");
+        assert!(hostile.contains("Allow: GET, HEAD, OPTIONS, POST\r\n"), "{hostile}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn rpc_unsupported_method_is_health_probe() {
+        // M93: OPTIONS is the only non-GET/HEAD/POST method given special handling. Other
+        // methods (e.g. PUT) deliberately keep the pre-existing `200 OK`/`"ok"` health-probe
+        // fallback — exercised here so that intentional behavior can't regress silently.
+        let dir = tmp_dir("rpc-unsupported-method");
+        // node_config p2p listen = 20491 + (35-21) = 20505; keep the RPC port clear.
+        let mut cfg = node_config(35, 20491, &[35], dir.clone());
+        let rpc_addr = "127.0.0.1:20511";
+        cfg.rpc = Some(crate::config::RpcConfig { enabled: true, listen: rpc_addr.into() });
+        let mut genesis = test_genesis();
+        genesis.validators = vec![(35, kp(35).public(), 1)]; // quorum 1 ⇒ self-commit
+        let node = Node::start(cfg, genesis, Some(kp(35))).await.expect("start node");
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            if node.status().await.map(|(h, _)| h >= 1).unwrap_or(false) {
+                break;
+            }
+            assert!(tokio::time::Instant::now() < deadline, "node never produced a block");
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+
+        let r = "PUT /accounts HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n";
+        let mut s = TcpStream::connect(rpc_addr).await.expect("connect rpc");
+        s.write_all(r.as_bytes()).await.expect("send");
+        let mut resp = Vec::new();
+        s.read_to_end(&mut resp).await.expect("read response");
+        let resp = String::from_utf8_lossy(&resp);
+        assert!(resp.starts_with("HTTP/1.1 200 OK"), "PUT falls back to health probe: {resp}");
+        assert_eq!(resp.split_once("\r\n\r\n").map(|(_, b)| b), Some("ok"), "probe body: {resp}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
     async fn rpc_plain_entities_over_tcp() {
         // M65: plain reviewer/validator/graph reads over real TCP. Unlike bridge locks,
         // `test_genesis` carries real reviewers (10,11,12), validators (21-24), and a
@@ -7629,6 +7741,23 @@ vote_b.validator=5 vote_b.height=9 vote_b.round=2 vote_b.block_hash={b_h} vote_b
             assert!(head.ends_with("\r\n\r\n"), "{head}");
             assert!(!head.contains(&body), "406 HEAD must not send a body: {head}");
         }
+    }
+
+    #[test]
+    fn options_response_advertises_allow() {
+        // M93: RFC 9110 §9.3.7 — OPTIONS returns 204 No Content with an `Allow` header listing
+        // the served methods, and no body.
+        let resp = options_response();
+        assert!(resp.starts_with("HTTP/1.1 204 No Content\r\n"), "{resp}");
+        assert!(resp.contains(&format!("Allow: {ALLOWED_METHODS}\r\n")), "{resp}");
+        // The advertised set is exactly the methods the server handles.
+        for m in ["GET", "HEAD", "OPTIONS", "POST"] {
+            assert!(ALLOWED_METHODS.contains(m), "Allow must list {m}: {ALLOWED_METHODS}");
+        }
+        // 204 carries no body (and thus no Content-Length) — the headers end the response.
+        assert!(resp.ends_with("\r\n\r\n"), "{resp}");
+        assert!(!resp.contains("Content-Length"), "204 has no body: {resp}");
+        assert_eq!(resp.split_once("\r\n\r\n").map(|(_, b)| b), Some(""), "no body: {resp}");
     }
 
     #[test]
