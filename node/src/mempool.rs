@@ -94,6 +94,14 @@ impl Mempool {
         self.pending.contains_key(hash)
     }
 
+    /// M111: a hash-ordered snapshot of the pending pool as `(content hash, author)` pairs —
+    /// a lightweight directory for the `GET /mempool` read (the full tx bodies are large; a
+    /// client that wants one fetches it by hash). `pending` is a `BTreeMap` keyed by hash, so
+    /// the order is deterministic and stable.
+    pub fn pending_summaries(&self) -> Vec<(Hash, u64)> {
+        self.pending.iter().map(|(h, tx)| (*h, tx.author)).collect()
+    }
+
     /// Admit a transaction after static validation against `chain`'s current
     /// state (signature, known account/reviewers, well-formed reviews, stake
     /// covered). Returns the tx hash on success. Duplicates (same content hash)

@@ -477,6 +477,10 @@ enum Cmd {
         hash: crate::Hash,
         reply: oneshot::Sender<bool>,
     },
+    /// M111: snapshot the pending-tx directory (hash + author) for the `/mempool` list read.
+    QueryMempool {
+        reply: oneshot::Sender<Vec<(crate::Hash, u64)>>,
+    },
     /// M104: snapshot the money-supply totals for the `/supply` read.
     QuerySupply {
         reply: oneshot::Sender<SupplyView>,
@@ -1210,6 +1214,10 @@ async fn run_actor(mut actor: Actor, mut rx: mpsc::UnboundedReceiver<Cmd>) {
                 // M103: ask the Mempool directly (already behind the actor's sole-writer
                 // lock, so no race with concurrent admission / builder-removal).
                 let _ = reply.send(actor.node.mempool.contains(&hash));
+            }
+            Cmd::QueryMempool { reply } => {
+                // M111: snapshot the pending-tx directory (hash-ordered hash + author).
+                let _ = reply.send(actor.node.mempool.pending_summaries());
             }
             Cmd::QuerySupply { reply } => {
                 // M104: snapshot the supply-conservation totals from committed state.
@@ -2171,6 +2179,10 @@ enum GetRoute {
     /// answer to the M89 list endpoint (which exposes the pool's *contents*). The hash is
     /// 64-hex; malformed ⇒ 404 (see [`parse_hash`]).
     MempoolContains(crate::Hash),
+    /// M111: `GET /mempool` — the pending-tx directory (content hash + author), the missing
+    /// pending-pool list beside `/stake-ops` (M89) and `/evidence` (M90). Exact-match; the
+    /// `/mempool/{hash}` membership read is the prefix sibling.
+    MempoolList,
     /// M104: `GET /supply` — the money-supply snapshot (supply, treasury, bonded,
     /// bridge_locked, bridge_minted). Lets a client audit the supply-conservation invariant
     /// from cert-signed state. Exact-match; no id.
@@ -2506,6 +2518,9 @@ fn route_get(path: &str) -> GetRoute {
         "/info" => GetRoute::Info,
         // M110: the node software version. Exact-match; no id, no prefix sibling.
         "/version" => GetRoute::Version,
+        // M111: the pending-tx directory. Exact-match here, so it never collides with the
+        // M103 `/mempool/{hash}` membership prefix below (`…mempool` exact, not `…mempool/`).
+        "/mempool" => GetRoute::MempoolList,
         p => {
             if let Some(rest) = p.strip_prefix("/account/") {
                 // M59: `{id}/proof` is the verifiable read; a bare `{id}` is the M58
@@ -3178,6 +3193,35 @@ fn format_peer_listing(peers: &[(u64, Option<String>)]) -> String {
 /// **array** of objects (`[]` when empty), reusing `json_peer` per item.
 fn json_peer_listing(peers: &[(u64, Option<String>)]) -> String {
     let items = peers.iter().map(|(id, addr)| json_peer(*id, addr)).collect::<Vec<_>>().join(",");
+    format!("[{items}]")
+}
+
+/// M111: render one pending-tx summary (content hash + author) as a grep-friendly line.
+/// The full tx is fetched by hash; this directory is deliberately a lightweight index.
+fn format_pending_tx(hash: &crate::Hash, author: u64) -> String {
+    format!("kind=pending_tx hash={} author={author}", crate::hash::hex(hash))
+}
+
+/// M111: the JSON sibling of [`format_pending_tx`] — a `{"kind":"pending_tx",…}` object with
+/// a quoted-hex hash and a lossless quoted-u64 author.
+fn json_pending_tx(hash: &crate::Hash, author: u64) -> String {
+    format!(
+        "{{\"kind\":\"pending_tx\",\"hash\":{},\"author\":{}}}",
+        json_str(&crate::hash::hex(hash)),
+        json_u64(author),
+    )
+}
+
+/// M111: render the pending-tx directory as grep-friendly lines, one per tx (empty string
+/// when the pool is empty). Reuses `format_pending_tx`; hash order.
+fn format_mempool_listing(txs: &[(crate::Hash, u64)]) -> String {
+    txs.iter().map(|(h, a)| format_pending_tx(h, *a)).collect::<Vec<_>>().join("\n")
+}
+
+/// M111: `GET /mempool?format=json` — the JSON sibling of [`format_mempool_listing`]. A JSON
+/// **array** of objects (`[]` when empty), reusing `json_pending_tx` per item.
+fn json_mempool_listing(txs: &[(crate::Hash, u64)]) -> String {
+    let items = txs.iter().map(|(h, a)| json_pending_tx(h, *a)).collect::<Vec<_>>().join(",");
     format!("[{items}]")
 }
 
@@ -4322,6 +4366,36 @@ async fn serve_rpc_conn(mut stream: TcpStream, cmd: mpsc::UnboundedSender<Cmd>) 
                             bool_str(present),
                             &format!("{{\"pending\":{}}}", json_bool(present)),
                         ),
+                        Err(_) => http_response("503 Service Unavailable", "node stopped"),
+                    }
+                }
+            }
+            GetRoute::MempoolList => {
+                // M111: pending-tx directory (hash + author) — always a (possibly empty) `200`.
+                // The missing pending-pool list beside `/stake-ops` and `/evidence`; reuses the
+                // pagination stack + `format_pending_tx`/`json_pending_tx` per item.
+                let (reply, rx) = oneshot::channel();
+                if cmd.send(Cmd::QueryMempool { reply }).is_err() {
+                    http_response("503 Service Unavailable", "node stopped")
+                } else {
+                    match rx.await {
+                        Ok(listing) => {
+                            let offset = usize_param(query, "offset").unwrap_or(0);
+                            let limit = Some(effective_limit(usize_param(query, "limit")));
+                            let total = listing.len();
+                            let page = paginate(&listing, offset, limit);
+                            let start = offset.min(total);
+                            let next = if start + page.len() < total {
+                                Some(start + page.len())
+                            } else {
+                                None
+                            };
+                            ok_body(
+                                fmt,
+                                &format_page(&format_mempool_listing(page), total, next),
+                                &json_page(&json_mempool_listing(page), total, next),
+                            )
+                        }
                         Err(_) => http_response("503 Service Unavailable", "node stopped"),
                     }
                 }
@@ -7109,6 +7183,55 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn rpc_mempool_list_over_tcp() {
+        // M111: `GET /mempool` lists the pending-tx directory. A fresh pool is empty; after a
+        // valid tx is admitted it appears as a `pending_tx` entry with the right hash + author.
+        let dir = tmp_dir("rpc-mempool-list");
+        // node_config p2p listen = 20811 + (44-21) = 20834; keep the RPC port clear.
+        let mut cfg = node_config(44, 20811, &[44], dir.clone());
+        let rpc_addr = "127.0.0.1:20841";
+        cfg.rpc = Some(crate::config::RpcConfig { enabled: true, listen: rpc_addr.into() });
+        let mut genesis = test_genesis();
+        genesis.validators = vec![(44, kp(44).public(), 1)]; // quorum 1 ⇒ self-commit
+        let node = Node::start(cfg, genesis, Some(kp(44))).await.expect("start node");
+
+        async fn get(addr: &str, path: &str) -> String {
+            let req = format!("GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
+            let mut s = TcpStream::connect(addr).await.expect("connect rpc");
+            s.write_all(req.as_bytes()).await.expect("send get");
+            let mut resp = Vec::new();
+            s.read_to_end(&mut resp).await.expect("read response");
+            String::from_utf8_lossy(&resp).into_owned()
+        }
+        fn body_of(resp: &str) -> &str {
+            resp.split_once("\r\n\r\n").map(|(_, b)| b).unwrap_or("")
+        }
+
+        // Empty pool ⇒ `total=0`.
+        let empty = get(rpc_addr, "/mempool").await;
+        assert!(empty.starts_with("HTTP/1.1 200 OK"), "empty status: {empty}");
+        assert_eq!(body_of(&empty), "total=0", "fresh mempool is empty");
+
+        // Admit a valid tx, then it is listed with its hash + author.
+        let tx = test_tx(1, 0, 1);
+        let h = crate::hash::hex(&tx.hash());
+        node.submit_tx(tx).await.expect("actor alive").expect("valid tx admitted");
+
+        let listed = get(rpc_addr, "/mempool").await;
+        assert!(listed.starts_with("HTTP/1.1 200 OK"), "listed status: {listed}");
+        let body = body_of(&listed);
+        assert!(body.starts_with("total=1\n"), "one pending tx: {body}");
+        assert!(body.contains(&format!("kind=pending_tx hash={h} author=1")), "lists the tx: {body}");
+
+        // JSON representation wraps the same entry in the page envelope.
+        let as_json = get(rpc_addr, "/mempool?format=json").await;
+        let jbody = body_of(&as_json);
+        assert!(jbody.contains(&format!("\"hash\":\"{h}\",\"author\":\"1\"")), "mempool json: {jbody}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
     async fn rpc_supply_over_tcp() {
         // M104: `GET /supply` returns the money-supply snapshot from committed state. On a
         // fresh single-validator chain the supply equals the genesis endowments and the
@@ -8531,8 +8654,9 @@ vote_b.validator=5 vote_b.height=9 vote_b.round=2 vote_b.block_hash={b_h} vote_b
         assert!(matches!(route_get("/mempool/xyz"), GetRoute::NotFound), "non-hex ⇒ 404");
         assert!(matches!(route_get("/mempool/abcd"), GetRoute::NotFound), "short ⇒ 404");
         assert!(matches!(route_get("/mempool/"), GetRoute::NotFound), "empty hash ⇒ 404");
-        // A bare `/mempool` (no hash) is not a route — falls to the health catch-all.
-        assert!(matches!(route_get("/mempool"), GetRoute::Health));
+        // M111: a bare `/mempool` (no hash) is now the pending-tx directory, not the health
+        // catch-all — the membership read lives only under the `/mempool/{hash}` prefix.
+        assert!(matches!(route_get("/mempool"), GetRoute::MempoolList));
     }
 
     #[test]
@@ -8546,6 +8670,42 @@ vote_b.validator=5 vote_b.height=9 vote_b.round=2 vote_b.block_hash={b_h} vote_b
         assert_eq!(parse_hash("abc"), None); // wrong length
         assert_eq!(parse_hash(&"g".repeat(64)), None); // non-hex
         assert_eq!(parse_hash(&"a".repeat(63)), None); // one short
+    }
+
+    #[test]
+    fn route_get_parses_mempool_list() {
+        // M111: bare `/mempool` is the pending-tx directory (exact match); `/mempool/{hash}`
+        // stays the M103 membership read; a malformed hash under the prefix ⇒ 404.
+        assert!(matches!(route_get("/mempool"), GetRoute::MempoolList));
+        let h = crate::hash::hex(&[0x5au8; 32]);
+        assert!(matches!(route_get(&format!("/mempool/{h}")), GetRoute::MempoolContains(_)));
+        assert!(matches!(route_get("/mempool/bad"), GetRoute::NotFound));
+    }
+
+    #[test]
+    fn mempool_listing_renders() {
+        // M111: two pending txs render one grep line each (hash order) and a JSON array of
+        // `kind=pending_tx` objects; the empty pool yields an empty text body and `[]`.
+        let a = [0x11u8; 32];
+        let b = [0x22u8; 32];
+        let txs = vec![(a, 7u64), (b, 9u64)];
+        let ah = crate::hash::hex(&a);
+        let bh = crate::hash::hex(&b);
+        assert_eq!(
+            format_mempool_listing(&txs),
+            format!("kind=pending_tx hash={ah} author=7\nkind=pending_tx hash={bh} author=9")
+        );
+        assert_eq!(
+            json_mempool_listing(&txs),
+            format!(
+                "[{{\"kind\":\"pending_tx\",\"hash\":\"{ah}\",\"author\":\"7\"}},{{\"kind\":\"pending_tx\",\"hash\":\"{bh}\",\"author\":\"9\"}}]"
+            )
+        );
+        // Single-item renderers match the listing's per-entry output.
+        assert_eq!(format_pending_tx(&a, 7), format!("kind=pending_tx hash={ah} author=7"));
+        // Empty pool ⇒ empty text, `[]` JSON.
+        assert_eq!(format_mempool_listing(&[]), "");
+        assert_eq!(json_mempool_listing(&[]), "[]");
     }
 
     #[test]
