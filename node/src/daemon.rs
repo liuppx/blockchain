@@ -458,6 +458,12 @@ enum Cmd {
     QueryStakeOps {
         reply: oneshot::Sender<Vec<crate::StakeOp>>,
     },
+    /// M90: list the pending slashing-evidence pool (staged for the next proposed block)
+    /// for the plain read-class RPC directory — a pending-pool read sibling of
+    /// `/stake-ops`. Always a (possibly empty) list.
+    QueryEvidence {
+        reply: oneshot::Sender<Vec<crate::SlashEvidence>>,
+    },
     /// M61: serve a heterogeneous proof batch + the certified head it verifies
     /// against, for the verifiable batch read RPC. `None` ⇒ `serve_batch` rejected
     /// (over `MAX_BATCH_ITEMS` or a degenerate Diff range) or no certified head
@@ -1155,6 +1161,10 @@ async fn run_actor(mut actor: Actor, mut rx: mpsc::UnboundedReceiver<Cmd>) {
             Cmd::QueryStakeOps { reply } => {
                 // M89: snapshot the pending stake-op pool staged for the next block.
                 let _ = reply.send(actor.node.pending_stake_ops().to_vec());
+            }
+            Cmd::QueryEvidence { reply } => {
+                // M90: snapshot the pending slashing-evidence pool staged for the next block.
+                let _ = reply.send(actor.node.pending_evidence().to_vec());
             }
             Cmd::QueryBatch { items, reply } => {
                 let _ = reply.send(actor.node.batch(items));
@@ -1982,6 +1992,10 @@ enum GetRoute {
     /// + signature) staged for the next proposed block. The first *pending-pool* read
     /// (mempool-side, not committed state); no single-read sibling.
     StakeOps,
+    /// M90: `GET /evidence` — the pending slashing-evidence pool (pairs of conflicting
+    /// precommit votes) staged for the next proposed block. A pending-pool read sibling
+    /// of `/stake-ops`; no single-read sibling.
+    Evidence,
     NotFound,
 }
 
@@ -2250,6 +2264,9 @@ fn route_get(path: &str) -> GetRoute {
         // M89: the pending stake-op pool. Exact-match; there is no `/stake-op/` single-read
         // prefix, so `/stake-ops/` simply falls through to `Health`.
         "/stake-ops" => GetRoute::StakeOps,
+        // M90: the pending slashing-evidence pool. Exact-match; there is no `/evidence/`
+        // single-read prefix, so `/evidence/` simply falls through to `Health`.
+        "/evidence" => GetRoute::Evidence,
         p => {
             if let Some(rest) = p.strip_prefix("/account/") {
                 // M59: `{id}/proof` is the verifiable read; a bare `{id}` is the M58
@@ -2762,6 +2779,50 @@ fn format_stakeop_listing(ops: &[crate::StakeOp]) -> String {
 /// JSON **array** of objects (`[]` when empty), reusing the existing `json_stake_op` per item.
 fn json_stakeop_listing(ops: &[crate::StakeOp]) -> String {
     let items = ops.iter().map(json_stake_op).collect::<Vec<_>>().join(",");
+    format!("[{items}]")
+}
+
+/// M90: render one consensus vote as grep-friendly `<prefix>key=value` pairs, mirroring
+/// the fields of [`json_vote`]. The `prefix` namespaces the two votes of a slash-evidence
+/// pair (`vote_a.` / `vote_b.`) on one flat line. Pure for direct unit testing.
+fn format_vote(prefix: &str, v: &crate::consensus::Vote) -> String {
+    let vote_type = match v.vote_type {
+        crate::consensus::VoteType::Prevote => "prevote",
+        crate::consensus::VoteType::Precommit => "precommit",
+    };
+    format!(
+        "{p}validator={} {p}height={} {p}round={} {p}block_hash={} {p}vote_type={vote_type} {p}signature={}",
+        v.validator,
+        v.height,
+        v.round,
+        crate::hash::hex(&v.block_hash),
+        crate::hash::hex(&v.signature),
+        p = prefix,
+    )
+}
+
+/// M90: render one pending slashing-evidence entry as a grep-friendly `key=value` line —
+/// the two conflicting votes flattened under `vote_a.`/`vote_b.` prefixes, mirroring the
+/// nested shape of [`json_slash_evidence`]. Standalone (a pending-pool value, not a
+/// merkle-proof entity). Pure for direct unit testing.
+fn format_slash_evidence(e: &crate::SlashEvidence) -> String {
+    format!(
+        "kind=evidence {} {}",
+        format_vote("vote_a.", &e.vote_a),
+        format_vote("vote_b.", &e.vote_b)
+    )
+}
+
+/// M90: render the pending slashing-evidence pool as grep-friendly lines, one per entry
+/// (empty string when the pool is empty). Reuses `format_slash_evidence`; staging order.
+fn format_evidence_listing(evidence: &[crate::SlashEvidence]) -> String {
+    evidence.iter().map(format_slash_evidence).collect::<Vec<_>>().join("\n")
+}
+
+/// M90: `GET /evidence?format=json` — the JSON sibling of [`format_evidence_listing`]. A
+/// JSON **array** of objects (`[]` when empty), reusing the existing `json_slash_evidence`.
+fn json_evidence_listing(evidence: &[crate::SlashEvidence]) -> String {
+    let items = evidence.iter().map(json_slash_evidence).collect::<Vec<_>>().join(",");
     format!("[{items}]")
 }
 
@@ -3695,6 +3756,36 @@ async fn serve_rpc_conn(mut stream: TcpStream, cmd: mpsc::UnboundedSender<Cmd>) 
                                 fmt,
                                 &format_page(&format_stakeop_listing(page), total, next),
                                 &json_page(&json_stakeop_listing(page), total, next),
+                            )
+                        }
+                        Err(_) => http_response("503 Service Unavailable", "node stopped"),
+                    }
+                }
+            }
+            GetRoute::Evidence => {
+                // M90: pending slashing-evidence pool — always a (possibly empty) `200`. Ninth
+                // consumer of the pagination stack and the second pending-pool read (after
+                // `/stake-ops`), reusing `format_slash_evidence`/`json_slash_evidence` per item.
+                let (reply, rx) = oneshot::channel();
+                if cmd.send(Cmd::QueryEvidence { reply }).is_err() {
+                    http_response("503 Service Unavailable", "node stopped")
+                } else {
+                    match rx.await {
+                        Ok(listing) => {
+                            let offset = usize_param(query, "offset").unwrap_or(0);
+                            let limit = Some(effective_limit(usize_param(query, "limit")));
+                            let total = listing.len();
+                            let page = paginate(&listing, offset, limit);
+                            let start = offset.min(total);
+                            let next = if start + page.len() < total {
+                                Some(start + page.len())
+                            } else {
+                                None
+                            };
+                            ok_body(
+                                fmt,
+                                &format_page(&format_evidence_listing(page), total, next),
+                                &json_page(&json_evidence_listing(page), total, next),
                             )
                         }
                         Err(_) => http_response("503 Service Unavailable", "node stopped"),
@@ -6262,6 +6353,60 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn rpc_evidence_list_over_tcp() {
+        // M90: the pending slashing-evidence pool over real TCP — the ninth list endpoint and
+        // the second pending-pool read, reusing the pagination stack + `format_slash_evidence`/
+        // `json_slash_evidence`. The pool only fills when equivocation evidence is staged, so a
+        // fresh chain's `/evidence` is live-but-empty — asserted end to end
+        // (route → Cmd → `pending_evidence()` → envelope).
+        let dir = tmp_dir("rpc-evidence-list");
+        let mut cfg = node_config(31, 20371, &[31], dir.clone());
+        let rpc_addr = "127.0.0.1:20391";
+        cfg.rpc = Some(crate::config::RpcConfig { enabled: true, listen: rpc_addr.into() });
+        let mut genesis = test_genesis();
+        genesis.validators = vec![(31, kp(31).public(), 1)]; // quorum 1 ⇒ self-commit
+        let node = Node::start(cfg, genesis, Some(kp(31))).await.expect("start node");
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            if node.status().await.map(|(h, _)| h >= 1).unwrap_or(false) {
+                break;
+            }
+            assert!(tokio::time::Instant::now() < deadline, "node never produced a block");
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+
+        async fn get(addr: &str, path: &str) -> String {
+            let req = format!("GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
+            let mut s = TcpStream::connect(addr).await.expect("connect rpc");
+            s.write_all(req.as_bytes()).await.expect("send get");
+            let mut resp = Vec::new();
+            s.read_to_end(&mut resp).await.expect("read response");
+            String::from_utf8_lossy(&resp).into_owned()
+        }
+        fn body_of(resp: &str) -> &str {
+            resp.split_once("\r\n\r\n").map(|(_, b)| b).unwrap_or("")
+        }
+
+        // Plain directory → 200 with an empty page (no staged evidence at genesis).
+        let resp = get(rpc_addr, "/evidence").await;
+        assert!(resp.starts_with("HTTP/1.1 200 OK"), "evidence status: {resp}");
+        assert_eq!(body_of(&resp), "total=0", "evidence text envelope (empty pool)");
+
+        // JSON representation → the `total`/`next`/`items` envelope with an empty array.
+        let as_json = get(rpc_addr, "/evidence?format=json").await;
+        assert!(as_json.starts_with("HTTP/1.1 200 OK"), "evidence json status: {as_json}");
+        assert!(as_json.contains("Content-Type: application/json\r\n"), "json ct: {as_json}");
+        assert_eq!(
+            body_of(&as_json),
+            "{\"total\":\"0\",\"next\":null,\"items\":[]}",
+            "evidence JSON envelope (empty pool)"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
     async fn rpc_plain_entities_over_tcp() {
         // M65: plain reviewer/validator/graph reads over real TCP. Unlike bridge locks,
         // `test_genesis` carries real reviewers (10,11,12), validators (21-24), and a
@@ -7125,6 +7270,55 @@ account=9 kind=unbond amount=500000 signature={sig_hex}"
         // Empty pool ⇒ empty text, `[]` JSON.
         assert_eq!(format_stakeop_listing(&[]), "");
         assert_eq!(json_stakeop_listing(&[]), "[]");
+    }
+
+    #[test]
+    fn route_get_parses_evidence() {
+        // M90: `/evidence` is a plain directory read — an exact match. There is no
+        // `/evidence/` single-read prefix, so a trailing slash falls through to the health
+        // fallback (like `/stake-ops/`, not `NotFound`).
+        assert!(matches!(route_get("/evidence"), GetRoute::Evidence));
+        assert!(matches!(route_get("/evidence/"), GetRoute::Health));
+        // Sibling list reads still resolve to their own variants (no collision).
+        assert!(matches!(route_get("/stake-ops"), GetRoute::StakeOps));
+        assert!(matches!(route_get("/unbonding"), GetRoute::Unbonding));
+    }
+
+    #[test]
+    fn evidence_listing_renders() {
+        // M90: one pending evidence entry renders a grep-friendly line with both votes
+        // flattened under `vote_a.`/`vote_b.`, and a JSON array reusing `json_slash_evidence`;
+        // the empty pool yields an empty text body and `[]`.
+        let vote = |block_hash: crate::Hash, vt| crate::consensus::Vote {
+            validator: 5,
+            height: 9,
+            round: 2,
+            block_hash,
+            vote_type: vt,
+            signature: [0u8; 64],
+        };
+        let ev = crate::SlashEvidence {
+            vote_a: vote([0xaa; 32], crate::consensus::VoteType::Precommit),
+            vote_b: vote([0xbb; 32], crate::consensus::VoteType::Precommit),
+        };
+        let a_h = crate::hash::hex(&[0xaa; 32]);
+        let b_h = crate::hash::hex(&[0xbb; 32]);
+        let sig = crate::hash::hex(&[0u8; 64]);
+        let text = format_evidence_listing(std::slice::from_ref(&ev));
+        assert_eq!(
+            text,
+            format!(
+                "kind=evidence \
+vote_a.validator=5 vote_a.height=9 vote_a.round=2 vote_a.block_hash={a_h} vote_a.vote_type=precommit vote_a.signature={sig} \
+vote_b.validator=5 vote_b.height=9 vote_b.round=2 vote_b.block_hash={b_h} vote_b.vote_type=precommit vote_b.signature={sig}"
+            )
+        );
+        // The listing's JSON items are byte-identical to the existing single-evidence renderer.
+        let json = json_evidence_listing(std::slice::from_ref(&ev));
+        assert_eq!(json, format!("[{}]", json_slash_evidence(&ev)));
+        // Empty pool ⇒ empty text, `[]` JSON.
+        assert_eq!(format_evidence_listing(&[]), "");
+        assert_eq!(json_evidence_listing(&[]), "[]");
     }
 
     #[test]
