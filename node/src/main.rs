@@ -245,6 +245,7 @@ fn main() {
         "localnet" => cmd_localnet(),
         "status" => cmd_status(dir_arg(&args)),
         "inspect-block" => cmd_inspect_block(&args),
+        "inspect-cert" => cmd_inspect_cert(&args),
         "certs" => cmd_certs(dir_arg(&args)),
         "-h" | "--help" | "help" => usage(),
         other => {
@@ -327,6 +328,7 @@ fn usage() {
     eprintln!("  node localnet           spin up an in-process tokio testnet (4 validators, no sequencer) and show all nodes converge via distributed BFT voting over real sockets");
     eprintln!("  node status --dir DIR   replay the block log and print state");
     eprintln!("  node inspect-block --dir DIR [--height N]  read the persisted block log and print a per-block summary, or (with --height) one block's header + contents + tx hashes");
+    eprintln!("  node inspect-cert  --dir DIR [--height N]  read the persisted cert log and print a per-cert summary, or (with --height) one finality certificate's height/round/block_hash + precommit voters");
     eprintln!("  node certs  --dir DIR   persist a certified chain (blocks+certs) and re-verify finality on reload");
 }
 
@@ -2935,6 +2937,67 @@ fn cmd_inspect_block(args: &[String]) {
     }
 }
 
+/// M101: render a persisted finality-certificate log for offline inspection — the cert-log
+/// companion to `inspect-block` (`certs.log` beside `blocks.log`). `height == None` lists each
+/// `Commit` with its round, block hash, and precommit count; `Some(h)` prints one cert's
+/// height/round/block_hash + every precommit's voter id and vote type. This is a *structural*
+/// view (who signed what) — it does not re-verify the > 2/3 quorum, which needs the
+/// height-specific validator set (`node certs` does that end to end). Certs match by their own
+/// `height` field. Pure for unit testing; `cmd_inspect_cert` is the log-reading shell.
+fn inspect_cert(certs: &[Commit], height: Option<u64>) -> Result<String, String> {
+    match height {
+        None => {
+            let mut out = format!("certs {}", certs.len());
+            for c in certs {
+                out.push_str(&format!(
+                    "\nheight {} round {} precommits {} block_hash {}",
+                    c.height,
+                    c.round,
+                    c.precommits.len(),
+                    hex(&c.block_hash),
+                ));
+            }
+            Ok(out)
+        }
+        Some(h) => {
+            let c = certs
+                .iter()
+                .find(|c| c.height == h)
+                .ok_or_else(|| format!("no cert at height {h} (log has {} cert(s))", certs.len()))?;
+            let mut out = format!(
+                "height {}\nround {}\nblock_hash {}\nprecommits {}",
+                c.height,
+                c.round,
+                hex(&c.block_hash),
+                c.precommits.len(),
+            );
+            for (i, v) in c.precommits.iter().enumerate() {
+                let vote_type = match v.vote_type {
+                    VoteType::Prevote => "prevote",
+                    VoteType::Precommit => "precommit",
+                };
+                out.push_str(&format!("\nprecommit {i} validator {} round {} vote_type {vote_type}", v.validator, v.round));
+            }
+            Ok(out)
+        }
+    }
+}
+
+/// M101: `node inspect-cert --dir DIR [--height N]` — read `{dir}/certs.log` and print the
+/// [`inspect_cert`] rendering. Read-only (opens the log, binds nothing).
+fn cmd_inspect_cert(args: &[String]) {
+    let dir = dir_arg(args);
+    let path = format!("{dir}/certs.log");
+    let log = CertLog::open(&path).unwrap_or_else(|e| fail("open cert log", e));
+    let certs = log.read_all().unwrap_or_else(|e| fail("read cert log", e));
+    let height = opt_arg(args, "--height")
+        .map(|h| h.parse::<u64>().unwrap_or_else(|_| fail_msg("--height", &format!("`{h}` is not a u64"))));
+    match inspect_cert(&certs, height) {
+        Ok(s) => println!("{s}"),
+        Err(e) => fail_msg("inspect-cert", &e),
+    }
+}
+
 fn cmd_run(config_path: String) {
     // M44: load the config first, then install the subscriber from its optional
     // `[logging]` section (absent ⇒ the M37 default). Config-load errors print via
@@ -4058,5 +4121,48 @@ mod tests {
         // M100: a height with no block is a returned error (not a panic).
         let blocks = vec![test_block(1, vec![])];
         assert!(inspect_block(&blocks, Some(99)).is_err(), "missing height must error");
+    }
+
+    // M101: a finality cert at `height` signed by `voters` (all precommits, round 0).
+    fn test_commit(height: u64, voters: &[u64]) -> Commit {
+        let bh = [height as u8; 32];
+        Commit {
+            height,
+            round: 0,
+            block_hash: bh,
+            precommits: voters
+                .iter()
+                .map(|&v| Vote::signed(v, height, 0, bh, VoteType::Precommit, &kp(v)))
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn inspect_cert_lists_all_certs() {
+        // M101: with no --height, a one-line summary per cert (round, precommit count, hash).
+        let certs = vec![test_commit(1, &[21, 22, 23]), test_commit(2, &[21, 22])];
+        let out = inspect_cert(&certs, None).expect("list");
+        assert!(out.starts_with("certs 2\n"), "{out}");
+        assert!(out.contains(&format!("height 1 round 0 precommits 3 block_hash {}", hex(&[1u8; 32]))), "{out}");
+        assert!(out.contains("height 2 round 0 precommits 2"), "{out}");
+    }
+
+    #[test]
+    fn inspect_cert_detail_prints_voters() {
+        // M101: --height prints the cert's fields + each precommit's voter id and vote type.
+        let certs = vec![test_commit(1, &[21, 22, 23])];
+        let out = inspect_cert(&certs, Some(1)).expect("detail");
+        assert!(out.starts_with("height 1\n"), "{out}");
+        assert!(out.contains(&format!("block_hash {}\n", hex(&[1u8; 32]))), "{out}");
+        assert!(out.contains("precommits 3\n"), "{out}");
+        assert!(out.contains("precommit 0 validator 21 round 0 vote_type precommit"), "{out}");
+        assert!(out.contains("precommit 2 validator 23 round 0 vote_type precommit"), "{out}");
+    }
+
+    #[test]
+    fn inspect_cert_missing_height_errors() {
+        // M101: a height with no cert is a returned error (not a panic).
+        let certs = vec![test_commit(1, &[21])];
+        assert!(inspect_cert(&certs, Some(99)).is_err(), "missing height must error");
     }
 }
