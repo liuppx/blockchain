@@ -485,6 +485,10 @@ enum Cmd {
     QueryParams {
         reply: oneshot::Sender<ParamsView>,
     },
+    /// M106: read this node's chain identity (`genesis_hash`) for the `/genesis` read.
+    QueryGenesisHash {
+        reply: oneshot::Sender<crate::Hash>,
+    },
     /// M61: serve a heterogeneous proof batch + the certified head it verifies
     /// against, for the verifiable batch read RPC. `None` ⇒ `serve_batch` rejected
     /// (over `MAX_BATCH_ITEMS` or a degenerate Diff range) or no certified head
@@ -1230,6 +1234,10 @@ async fn run_actor(mut actor: Actor, mut rx: mpsc::UnboundedReceiver<Cmd>) {
                     fresh_min: s.params.fresh_min,
                     delta_k_min: s.params.delta_k_min,
                 });
+            }
+            Cmd::QueryGenesisHash { reply } => {
+                // M106: this node's chain identity, stamped into state at genesis_split.
+                let _ = reply.send(actor.node.chain.state.genesis_hash);
             }
             Cmd::QueryBatch { items, reply } => {
                 let _ = reply.send(actor.node.batch(items));
@@ -2115,6 +2123,10 @@ enum GetRoute {
     /// bps) stamped into committed state. Lets a client see which policy produced a given
     /// chain without diffing the genesis. Exact-match; no id.
     Params,
+    /// M106: `GET /genesis` — this node's chain identity (`genesis_hash`). The on-wire analog
+    /// of the `genesis-hash` CLI: a connecting client confirms *which chain* this node serves
+    /// (so it never submits to the wrong one). Exact-match; no id.
+    GenesisHash,
     NotFound,
 }
 
@@ -2393,6 +2405,8 @@ fn route_get(path: &str) -> GetRoute {
         "/supply" => GetRoute::Supply,
         // M105: the governance/economic knobs. Exact-match; no id, no prefix sibling.
         "/params" => GetRoute::Params,
+        // M106: this node's chain identity. Exact-match; no id, no prefix sibling.
+        "/genesis" => GetRoute::GenesisHash,
         p => {
             if let Some(rest) = p.strip_prefix("/account/") {
                 // M59: `{id}/proof` is the verifiable read; a bare `{id}` is the M58
@@ -2659,6 +2673,16 @@ fn json_height(h: u64) -> String {
 /// `GET /head?format=json` → `{"head":"<hex>"}`.
 fn json_head(head: &[u8; 32]) -> String {
     format!("{{\"head\":{}}}", json_str(&crate::hash::hex(head)))
+}
+
+/// M106: render this node's chain identity as a grep-friendly `genesis_hash={hex}` line.
+fn format_genesis(gh: &crate::Hash) -> String {
+    format!("genesis_hash={}", crate::hash::hex(gh))
+}
+
+/// M106: `GET /genesis?format=json` — the JSON sibling, `{"genesis_hash":"<hex>"}`.
+fn json_genesis(gh: &crate::Hash) -> String {
+    format!("{{\"genesis_hash\":{}}}", json_str(&crate::hash::hex(gh)))
 }
 
 /// `GET /account/{id}?format=json` — the JSON sibling of [`format_account`].
@@ -4159,6 +4183,18 @@ async fn serve_rpc_conn(mut stream: TcpStream, cmd: mpsc::UnboundedSender<Cmd>) 
                 } else {
                     match rx.await {
                         Ok(p) => ok_body(fmt, &format_params(&p), &json_params(&p)),
+                        Err(_) => http_response("503 Service Unavailable", "node stopped"),
+                    }
+                }
+            }
+            GetRoute::GenesisHash => {
+                // M106: chain identity from committed state — always a `200`.
+                let (reply, rx) = oneshot::channel();
+                if cmd.send(Cmd::QueryGenesisHash { reply }).is_err() {
+                    http_response("503 Service Unavailable", "node stopped")
+                } else {
+                    match rx.await {
+                        Ok(gh) => ok_body(fmt, &format_genesis(&gh), &json_genesis(&gh)),
                         Err(_) => http_response("503 Service Unavailable", "node stopped"),
                     }
                 }
@@ -6993,6 +7029,54 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn rpc_genesis_over_tcp() {
+        // M106: `GET /genesis` returns the node's chain identity — exactly the `genesis_hash`
+        // that `ChainState::genesis` stamps for the same genesis the node was started with.
+        let dir = tmp_dir("rpc-genesis");
+        // node_config p2p listen = 20611 + (39-21) = 20629; keep the RPC port clear.
+        let mut cfg = node_config(39, 20611, &[39], dir.clone());
+        let rpc_addr = "127.0.0.1:20641";
+        cfg.rpc = Some(crate::config::RpcConfig { enabled: true, listen: rpc_addr.into() });
+        let mut genesis = test_genesis();
+        genesis.validators = vec![(39, kp(39).public(), 1)]; // quorum 1 ⇒ self-commit
+        // Independently stamp the same genesis to know the expected identity.
+        let (_state, expected_gh) = crate::ChainState::genesis(genesis.clone());
+        let node = Node::start(cfg, genesis, Some(kp(39))).await.expect("start node");
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            if node.status().await.map(|(h, _)| h >= 1).unwrap_or(false) {
+                break;
+            }
+            assert!(tokio::time::Instant::now() < deadline, "node never produced a block");
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+
+        async fn get(addr: &str, path: &str) -> String {
+            let req = format!("GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
+            let mut s = TcpStream::connect(addr).await.expect("connect rpc");
+            s.write_all(req.as_bytes()).await.expect("send get");
+            let mut resp = Vec::new();
+            s.read_to_end(&mut resp).await.expect("read response");
+            String::from_utf8_lossy(&resp).into_owned()
+        }
+        fn body_of(resp: &str) -> &str {
+            resp.split_once("\r\n\r\n").map(|(_, b)| b).unwrap_or("")
+        }
+
+        let h = crate::hash::hex(&expected_gh);
+        let resp = get(rpc_addr, "/genesis").await;
+        assert!(resp.starts_with("HTTP/1.1 200 OK"), "genesis status: {resp}");
+        assert_eq!(body_of(&resp), format!("genesis_hash={h}"), "genesis text identity");
+
+        let as_json = get(rpc_addr, "/genesis?format=json").await;
+        assert!(as_json.contains("Content-Type: application/json\r\n"), "json ct: {as_json}");
+        assert_eq!(body_of(&as_json), format!("{{\"genesis_hash\":\"{h}\"}}"), "genesis JSON identity");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
     async fn rpc_head_mirrors_get_without_body() {
         // M92: a HEAD request mirrors the matching GET — same status + headers (crucially the
         // GET body's Content-Length) but no body (RFC 9110 §9.3.2). Exercised end to end over
@@ -8161,6 +8245,25 @@ vote_b.validator=5 vote_b.height=9 vote_b.round=2 vote_b.block_hash={b_h} vote_b
         assert!(json.contains("\"n_review_min\":\"3\""), "{json}");
         assert!(json.contains("\"n_min\":\"5\""), "{json}");
         assert!(json.contains("\"delta_k_min\":0"), "{json}");
+    }
+
+    #[test]
+    fn route_get_parses_genesis() {
+        // M106: `/genesis` is an exact-match read; a trailing slash is not the route (health).
+        assert!(matches!(route_get("/genesis"), GetRoute::GenesisHash));
+        assert!(matches!(route_get("/genesis/"), GetRoute::Health));
+        // No collision with sibling exact reads.
+        assert!(matches!(route_get("/params"), GetRoute::Params));
+        assert!(matches!(route_get("/supply"), GetRoute::Supply));
+    }
+
+    #[test]
+    fn genesis_renders_text_and_json() {
+        // M106: the chain identity renders a grep line and a quoted-hex JSON object.
+        let gh = [0x7au8; 32];
+        let h = crate::hash::hex(&gh);
+        assert_eq!(format_genesis(&gh), format!("genesis_hash={h}"));
+        assert_eq!(json_genesis(&gh), format!("{{\"genesis_hash\":\"{h}\"}}"));
     }
 
     #[test]
