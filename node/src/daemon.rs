@@ -1906,6 +1906,22 @@ fn http_response_ct(status_line: &str, content_type: &str, body: &str) -> String
     )
 }
 
+/// M92: RFC 9110 §9.3.2 — a `HEAD` response carries the identical header block to the `GET`
+/// it mirrors (same status line, `Content-Type`, `Content-Length`, `Vary`) but MUST NOT
+/// send a message body. Given a fully-rendered `GET` response, return just its header block
+/// (through the blank line terminating the headers), dropping the body; `Content-Length`
+/// still advertises the body the GET would have sent. `is_head == false` returns the
+/// response unchanged. Pure (no I/O) for direct unit testing.
+fn maybe_head(is_head: bool, resp: String) -> String {
+    if !is_head {
+        return resp;
+    }
+    match resp.find("\r\n\r\n") {
+        Some(i) => resp[..i + 4].to_string(),
+        None => resp,
+    }
+}
+
 /// M70: the representations this RPC server can emit, in negotiation-preference
 /// order (named JSON wins the q-tie, so it is listed first). Used to build the
 /// `406 Not Acceptable` body per RFC 7231 §6.5.6.
@@ -1954,8 +1970,11 @@ async fn run_rpc(listener: TcpListener, my_id: u64, cmd: mpsc::UnboundedSender<C
 }
 
 /// Serve one ingress request. Reads the request headers (bounded), then:
-/// - a non-`POST` method (e.g. `GET`/`HEAD`) returns `200 OK`/`"ok"` — doubling
-///   as a health probe;
+/// - a `GET` method routes through the read-class routes ([`route_get`]); an
+///   unrecognized path falls back to a `200 OK`/`"ok"` health probe. M92: a `HEAD`
+///   mirrors the matching `GET` — identical headers (status, `Content-Type`,
+///   `Content-Length`, `Vary`), no body (RFC 9110 §9.3.2);
+/// - any other non-`POST` method returns the `200 OK`/`"ok"` health probe;
 /// - a `POST` reads the body (bounded by `Content-Length`, capped at
 ///   [`MAX_RPC_BODY`]), decodes it as raw `codec::encode_tx` bytes, and submits
 ///   it through the actor: `200`/hash on admission, `400` on a decode error,
@@ -3416,6 +3435,10 @@ async fn serve_rpc_conn(mut stream: TcpStream, cmd: mpsc::UnboundedSender<Cmd>) 
         return;
     };
     let method = head.split_whitespace().next().unwrap_or("");
+    // M92: RFC 9110 §9.3.2 — HEAD mirrors GET's headers but sends no body. Captured once
+    // here so every write site below (the two negotiation `406`s and the read-route block)
+    // can strip the body uniformly via `maybe_head`.
+    let is_head = method.eq_ignore_ascii_case("HEAD");
     let target = head.split_whitespace().nth(1).unwrap_or("");
     // M66: split any `?query` off the request target before routing, then read the
     // optional `?format=json`. A query-less target leaves `path` byte-identical, so
@@ -3430,8 +3453,11 @@ async fn serve_rpc_conn(mut stream: TcpStream, cmd: mpsc::UnboundedSender<Cmd>) 
             // what we *can* emit (RFC 7231 §6.5.6) as a machine-readable JSON object.
             let _ = stream
                 .write_all(
-                    http_response_ct("406 Not Acceptable", "application/json", &not_acceptable_json())
-                        .as_bytes(),
+                    maybe_head(
+                        is_head,
+                        http_response_ct("406 Not Acceptable", "application/json", &not_acceptable_json()),
+                    )
+                    .as_bytes(),
                 )
                 .await;
             let _ = stream.flush().await;
@@ -3446,10 +3472,13 @@ async fn serve_rpc_conn(mut stream: TcpStream, cmd: mpsc::UnboundedSender<Cmd>) 
     if !charset_acceptable(head) {
         let _ = stream
             .write_all(
-                http_response_ct(
-                    "406 Not Acceptable",
-                    "application/json",
-                    &not_acceptable_charset_json(),
+                maybe_head(
+                    is_head,
+                    http_response_ct(
+                        "406 Not Acceptable",
+                        "application/json",
+                        &not_acceptable_charset_json(),
+                    ),
                 )
                 .as_bytes(),
             )
@@ -3881,6 +3910,8 @@ async fn serve_rpc_conn(mut stream: TcpStream, cmd: mpsc::UnboundedSender<Cmd>) 
             GetRoute::Health => http_response("200 OK", "ok"),
             GetRoute::NotFound => http_response("404 Not Found", "not found"),
         };
+        // M92: HEAD mirrors the GET header block but drops the body (RFC 9110 §9.3.2).
+        let resp = maybe_head(is_head, resp);
         let _ = stream.write_all(resp.as_bytes()).await;
         let _ = stream.flush().await;
         return;
@@ -6549,6 +6580,65 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn rpc_head_mirrors_get_without_body() {
+        // M92: a HEAD request mirrors the matching GET — same status + headers (crucially the
+        // GET body's Content-Length) but no body (RFC 9110 §9.3.2). Exercised end to end over
+        // real TCP against both a scalar read (`/height`) and a list read (`/accounts`).
+        let dir = tmp_dir("rpc-head");
+        // node_config derives the p2p listen port as `port_base + (id-21)` = 20431+12 = 20443;
+        // keep the RPC port clear of it.
+        let mut cfg = node_config(33, 20431, &[33], dir.clone());
+        let rpc_addr = "127.0.0.1:20451";
+        cfg.rpc = Some(crate::config::RpcConfig { enabled: true, listen: rpc_addr.into() });
+        let mut genesis = test_genesis();
+        genesis.validators = vec![(33, kp(33).public(), 1)]; // quorum 1 ⇒ self-commit
+        let node = Node::start(cfg, genesis, Some(kp(33))).await.expect("start node");
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            if node.status().await.map(|(h, _)| h >= 1).unwrap_or(false) {
+                break;
+            }
+            assert!(tokio::time::Instant::now() < deadline, "node never produced a block");
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+
+        async fn req(addr: &str, method: &str, path: &str) -> String {
+            let r = format!("{method} {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
+            let mut s = TcpStream::connect(addr).await.expect("connect rpc");
+            s.write_all(r.as_bytes()).await.expect("send");
+            let mut resp = Vec::new();
+            s.read_to_end(&mut resp).await.expect("read response");
+            String::from_utf8_lossy(&resp).into_owned()
+        }
+        fn split(resp: &str) -> (&str, &str) {
+            resp.split_once("\r\n\r\n").unwrap_or((resp, ""))
+        }
+
+        for path in ["/height", "/accounts"] {
+            let get = req(rpc_addr, "GET", path).await;
+            let head = req(rpc_addr, "HEAD", path).await;
+            let (get_headers, get_body) = split(&get);
+            let (head_headers, head_body) = split(&head);
+
+            // Same status + headers (incl. the GET body's Content-Length), byte-identical.
+            assert!(get.starts_with("HTTP/1.1 200 OK"), "GET {path} status: {get}");
+            assert!(head.starts_with("HTTP/1.1 200 OK"), "HEAD {path} status: {head}");
+            assert_eq!(head_headers, get_headers, "HEAD {path} must mirror GET headers");
+            assert!(
+                head_headers.contains(&format!("Content-Length: {}\r\n", get_body.len())),
+                "HEAD {path} Content-Length must advertise the GET body ({} bytes): {head_headers}",
+                get_body.len()
+            );
+            // GET carries the body; HEAD does not.
+            assert!(!get_body.is_empty(), "GET {path} should have a body");
+            assert_eq!(head_body, "", "HEAD {path} must not send a body");
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
     async fn rpc_plain_entities_over_tcp() {
         // M65: plain reviewer/validator/graph reads over real TCP. Unlike bridge locks,
         // `test_genesis` carries real reviewers (10,11,12), validators (21-24), and a
@@ -7498,6 +7588,47 @@ vote_b.validator=5 vote_b.height=9 vote_b.round=2 vote_b.block_hash={b_h} vote_b
         // Empty directory ⇒ empty text, `[]` JSON.
         assert_eq!(format_peer_listing(&[]), "");
         assert_eq!(json_peer_listing(&[]), "[]");
+    }
+
+    #[test]
+    fn maybe_head_strips_body_keeps_headers() {
+        // M92: HEAD mirrors GET's header block (status + Content-Type + Content-Length + Vary)
+        // but drops the body (RFC 9110 §9.3.2). `Content-Length` still advertises the GET body.
+        let get = http_response_ct("200 OK", "application/json", "{\"total\":\"3\"}");
+        // Sanity: the GET response carries the body and a matching Content-Length.
+        assert!(get.ends_with("{\"total\":\"3\"}"));
+        assert!(get.contains("Content-Length: 13\r\n"));
+
+        let head = maybe_head(true, get.clone());
+        // Header block is byte-identical up to and including the blank-line terminator…
+        assert_eq!(head, get.split_once("\r\n\r\n").map(|(h, _)| format!("{h}\r\n\r\n")).unwrap());
+        // …so the status, Content-Type, the GET's Content-Length, and Vary all survive…
+        assert!(head.starts_with("HTTP/1.1 200 OK\r\n"));
+        assert!(head.contains("Content-Type: application/json\r\n"));
+        assert!(head.contains("Content-Length: 13\r\n"));
+        assert!(head.contains("Vary: Accept, Accept-Charset\r\n"));
+        // …but no body follows the terminator.
+        assert!(head.ends_with("\r\n\r\n"));
+        assert!(!head.contains("{\"total\":\"3\"}"));
+
+        // `is_head == false` is the identity (GET path unchanged, byte-for-byte).
+        assert_eq!(maybe_head(false, get.clone()), get);
+    }
+
+    #[test]
+    fn maybe_head_strips_negotiation_406_body() {
+        // M92: the two content-negotiation `406` write sites also route through `maybe_head`,
+        // so a HEAD that fails `Accept`/`Accept-Charset` negotiation still gets the full `406`
+        // header block (status + machine-readable Content-Type + Content-Length) but no body.
+        for body in [not_acceptable_json(), not_acceptable_charset_json()] {
+            let full = http_response_ct("406 Not Acceptable", "application/json", &body);
+            let head = maybe_head(true, full.clone());
+            assert!(head.starts_with("HTTP/1.1 406 Not Acceptable\r\n"), "{head}");
+            assert!(head.contains("Content-Type: application/json\r\n"), "{head}");
+            assert!(head.contains(&format!("Content-Length: {}\r\n", body.len())), "{head}");
+            assert!(head.ends_with("\r\n\r\n"), "{head}");
+            assert!(!head.contains(&body), "406 HEAD must not send a body: {head}");
+        }
     }
 
     #[test]
