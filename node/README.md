@@ -992,6 +992,18 @@ M92/M93 补了 HTTP 方法语义；M94 转向 **keygen 篮子**的第一项—�
 
 **已知边界（顺延至 M95+）**：keygen 篮子剩余：助记词 / BIP-39、口令加密 keystore、现成 genesis 条目生成、密钥轮换；读面列表端点篮子已收口、HTTP `HEAD`/`OPTIONS` 已补；剩余：游标分页、`Accept-Encoding`（压缩须引新依赖）、未知方法 `405`；共识 / wire 篮子（破 head 不变量）：**货币费用** + 费用优先排序、nonce / 序列号反重放；连同运维篮子：证书/密钥轮换与落盘、follower 认证、指标端 TLS、OTel/push exporter、每-sink 独立 rotation 覆盖、时延直方图。
 
+## keygen 现成 genesis 条目生成（Milestone 95）
+
+M94 收紧了密钥文件权限；M95 续补 keygen 篮子——**现成 genesis 条目生成**。`node keygen` 此前只打印 `pubkey <hex>`，把它放进 genesis 还得用户手拼一段 TOML（且字段名易错）。M95 让 keygen 在给出 `--genesis-id <id>` 时额外打印**可直接粘贴**进 `genesis.toml` 的条目。离线 CLI 工具（`main.rs`）纯字符串拼接，不触 RPC / 出块 / 重放路径，`localnet` head 不变量（`44309755…ea04ba`）天然不受影响。
+
+- **纯格式化函数**：`genesis_account_toml(id, balance_micro, pubkey_hex)` 渲染 `[[accounts]]` 块、`genesis_validator_toml(id, pubkey_hex, power)` 渲染 `[[validators]]` 块——字段名（`id`/`balance_micro`/`pubkey_hex`、`id`/`pubkey_hex`/`power`）**逐字镜像** `config::AccountConfig`/`ValidatorConfig` 的 serde 字段，故输出能被 `config::load_genesis` 原样读回。纯函数、可直接单测。
+- **参数解析隔离**：`keygen_genesis_entries(args, pubkey_hex) -> Option<String>`——`--genesis-id` 缺省 ⇒ `None`（keygen 保持原两行输出）；给了则恒出 `[[accounts]]`（`--balance <micro>` 默认 0），再给 `--power <p>` 则追加 `[[validators]]`。解析集中于此，`cmd_keygen` 只负责在拿到 pubkey 后打印其结果。
+- **接线**：`cmd_keygen` 在原 `pubkey`/`out` 两行之后，`if let Some(entries) = keygen_genesis_entries(args, &pub_hex) { print!("{entries}") }`。种子落盘（M94 的 `0600`）、派生、`--seed`/CSPRNG 来源一字未改，向后兼容（不传 `--genesis-id` 时逐字节同旧输出）。
+- **测试（+3 → 454）**：新纯 `genesis_entry_toml_renders_expected`（两个格式化函数的精确输出）/`keygen_genesis_entries_gated_on_id`（无 `--genesis-id` ⇒ `None`；仅 id ⇒ 账户块、balance 默认 0、无 validator；`--balance`+`--power` ⇒ 两块齐全带值）/`keygen_genesis_entry_round_trips_through_loader`（用生成条目拼出完整 genesis、经 `config::load_genesis`→`to_genesis` 还原 id/balance/pubkey/power）。测试在 bin 套件（`main.rs`）。
+- **不变量保持**：纯 CLI 字符串输出、无 `serde_json`、无引擎 / codec / crypto / wire / 共识 / 状态变更、无新依赖，RPC 与出块路径一字未动，故 `localnet` 逐字节同块、head 仍 `44309755…ea04ba`。
+
+**已知边界（顺延至 M96+）**：keygen 篮子剩余：助记词 / BIP-39、口令加密 keystore、密钥轮换（现成 genesis 条目已补、keyfile `0600` 已补）；读面列表端点篮子已收口、HTTP `HEAD`/`OPTIONS` 已补；剩余：游标分页、`Accept-Encoding`（压缩须引新依赖）、未知方法 `405`；共识 / wire 篮子（破 head 不变量）：**货币费用** + 费用优先排序、nonce / 序列号反重放；连同运维篮子：证书/密钥轮换与落盘、follower 认证、指标端 TLS、OTel/push exporter、每-sink 独立 rotation 覆盖、时延直方图。
+
 ## 持久化与重放（Milestone 7）
 
 节点状态不再只活在内存里：区块以**追加式日志**（`DIR/blocks.log`）落盘，重启后从创世**重放**日志即可重建**逐字节相同**的状态。
@@ -1766,5 +1778,6 @@ peer_exchange_disabled_stays_seeded                   同链拓扑关发现 → 
 - ~~M92 HTTP `HEAD` 方法支持——此前 `GET`/`HEAD` 共用一条读路由臂、HEAD 却返回整个响应体（违反 RFC 9110 §9.3.2）；M92 补齐——新增纯函数 `maybe_head(is_head, resp)` 在 `\r\n\r\n` 处截去 body 只留首部块（`Content-Length` 仍广告 GET body 字节数），`is_head==false` 为恒等（GET 逐字节不变），请求解析处一次性求出 `is_head`、三处写出点（两个协商 `406` + 读路由块）统一经 `maybe_head` 剥身；路由与 `GetRoute` 一字未改；新纯测 `maybe_head_strips_body_keeps_headers`/`maybe_head_strips_negotiation_406_body` + TCP `rpc_head_mirrors_get_without_body`（`/height` 标量读与 `/accounts` 列表读：HEAD 首部与 GET 逐字节同、`Content-Length` 等于 GET body 长、HEAD 无 body），共 445 测、localnet head 不变~~ ✅
 - ~~M93 HTTP `OPTIONS` 方法支持——此前 `OPTIONS` 落入「非 POST ⇒ 健康探针」回 `200`/`ok`、未告知所支持方法；M93 按 RFC 9110 §9.3.7 补齐——`OPTIONS` 回 `204 No Content` + `Allow: GET, HEAD, OPTIONS, POST` 首部、无 body，在 `Accept`/`Accept-Charset` 协商之前应答（无可协商表示），新增单一真相源常量 `ALLOWED_METHODS` + 纯函数 `options_response`；路由与 `GetRoute` 一字未改、GET/HEAD/POST 不受影响、其余未知方法刻意保留健康探针回落；新纯测 `options_response_advertises_allow` + TCP `rpc_options_over_tcp`（`/accounts`·`/` 回 204+Allow 无 body、敌意 `Accept` 仍回 204）+ TCP `rpc_unsupported_method_is_health_probe`（PUT 仍回 `200`/`ok`），共 448 测、localnet head 不变~~ ✅
 - ~~M94 keygen 密钥文件 `0600` 权限——`node keygen` 此前以 `std::fs::write` 默认权限（通常 `0644` 全局可读）落盘私钥种子（安全隐患）；M94 新增 `write_key_file`：Unix 上 `OpenOptionsExt::mode(0o600)` 创建时即置 owner-only（无全局可读窗口）+ `set_permissions(0o600)` 复申覆盖已存在文件，非 Unix 回落 `std::fs::write`，`cmd_keygen` 改调之、种子格式不变；新单测（`cfg(unix)`）`key_file_is_written_0600`/`key_file_overwrite_retightens_to_0600`/`key_file_round_trips_through_seed_decoder`，共 451 测、localnet head 不变~~ ✅
+- ~~M95 keygen 现成 genesis 条目生成——`node keygen` 此前只打印 pubkey、放进 genesis 须手拼 TOML；M95 在给出 `--genesis-id <id>`（+ 可选 `--balance`/`--power`）时额外打印可直接粘贴的 `[[accounts]]`（恒有）与 `[[validators]]`（有 `--power` 才加）条目；新增纯函数 `genesis_account_toml`/`genesis_validator_toml`（字段名逐字镜像 `config::AccountConfig`/`ValidatorConfig`）+ `keygen_genesis_entries`（`--genesis-id` 缺省 ⇒ `None`、keygen 原输出不变）；新单测 `genesis_entry_toml_renders_expected`/`keygen_genesis_entries_gated_on_id`/`keygen_genesis_entry_round_trips_through_loader`（经 `config::load_genesis`→`to_genesis` 还原），共 454 测、localnet head 不变~~ ✅
 
-……；运维篮子剩余（货币费用（独立共识里程碑）、费用优先出块排序、nonce 反重放、读面列表端点篮子已收口、HTTP `HEAD`/`OPTIONS` 已补、keyfile `0600` 已补、游标分页、`Accept-Encoding`（压缩须依赖）、未知方法 `405`、助记词/BIP-39、口令 keystore、RPC auth/TLS、证书/密钥轮换与落盘、follower 认证、每-sink 独立 rotation 覆盖、OTEL/结构化日志 exporter、指标端 TLS、指标 push exporter/直方图/每-peer/每-轮次时延序列）顺延至 M95+，每步仍遵循"可运行、可测试、契约一致"。
+……；运维篮子剩余（货币费用（独立共识里程碑）、费用优先出块排序、nonce 反重放、读面列表端点篮子已收口、HTTP `HEAD`/`OPTIONS` 已补、keyfile `0600` 已补、现成 genesis 条目已补、助记词/BIP-39、口令 keystore、密钥轮换、游标分页、`Accept-Encoding`（压缩须依赖）、未知方法 `405`、RPC auth/TLS、证书/密钥轮换与落盘、follower 认证、每-sink 独立 rotation 覆盖、OTEL/结构化日志 exporter、指标端 TLS、指标 push exporter/直方图/每-peer/每-轮次时延序列）顺延至 M96+，每步仍遵循"可运行、可测试、契约一致"。

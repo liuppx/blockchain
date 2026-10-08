@@ -2959,6 +2959,41 @@ fn keygen_derive(seed: [u8; 32]) -> (String, String) {
     (hex(&seed), hex(&kp.public()))
 }
 
+/// M95: render a ready-to-paste genesis `[[accounts]]` TOML entry. Field names mirror
+/// [`config::AccountConfig`] exactly (`id`/`balance_micro`/`pubkey_hex`), so the output
+/// parses straight back through [`config::load_genesis`]. Pure for direct unit testing.
+fn genesis_account_toml(id: u64, balance_micro: u64, pubkey_hex: &str) -> String {
+    format!("[[accounts]]\nid = {id}\nbalance_micro = {balance_micro}\npubkey_hex = \"{pubkey_hex}\"\n")
+}
+
+/// M95: render a ready-to-paste genesis `[[validators]]` TOML entry, mirroring
+/// [`config::ValidatorConfig`] (`id`/`pubkey_hex`/`power`). Pure for direct unit testing.
+fn genesis_validator_toml(id: u64, pubkey_hex: &str, power: u64) -> String {
+    format!("[[validators]]\nid = {id}\npubkey_hex = \"{pubkey_hex}\"\npower = {power}\n")
+}
+
+/// M95: optional genesis-entry emission for `cmd_keygen`. When `--genesis-id <id>` is
+/// given, build the `[[accounts]]` block (`--balance <micro>`, default 0) and, if
+/// `--power <p>` is also given, the `[[validators]]` block. Returns `None` when
+/// `--genesis-id` is absent (keygen keeps its original output). Pure for unit testing
+/// (parsing is isolated here; `cmd_keygen` only prints the result).
+fn keygen_genesis_entries(args: &[String], pubkey_hex: &str) -> Option<String> {
+    let id = opt_arg(args, "--genesis-id")?;
+    let id = id.parse::<u64>().unwrap_or_else(|_| fail_msg("--genesis-id", &format!("`{id}` is not a u64")));
+    let balance = match opt_arg(args, "--balance") {
+        Some(b) => b.parse::<u64>().unwrap_or_else(|_| fail_msg("--balance", &format!("`{b}` is not a u64"))),
+        None => 0,
+    };
+    let mut out = String::from("# genesis entry (paste into genesis.toml)\n");
+    out.push_str(&genesis_account_toml(id, balance, pubkey_hex));
+    if let Some(p) = opt_arg(args, "--power") {
+        let power = p.parse::<u64>().unwrap_or_else(|_| fail_msg("--power", &format!("`{p}` is not a u64")));
+        out.push('\n');
+        out.push_str(&genesis_validator_toml(id, pubkey_hex, power));
+    }
+    Some(out)
+}
+
 /// M94: write a private-key seed file with owner-only (`0600`) permissions. A key seed must
 /// never be world-readable: on Unix the file is *created* with mode `0600` (via
 /// `OpenOptionsExt::mode`, so there is no world-readable window between create and chmod),
@@ -2988,6 +3023,8 @@ fn write_key_file(path: &str, contents: &str) -> std::io::Result<()> {
 /// Writes the 64-hex seed to `--out` (consumable by `encode-tx --key-file`) and
 /// prints the derived pubkey hex (paste into a genesis `accounts` entry).
 /// M94: the seed file is written `0600` (owner-only) — see [`write_key_file`].
+/// M95: with `--genesis-id <id>` (+ optional `--balance`/`--power`), also print a
+/// ready-to-paste genesis `[[accounts]]` (and `[[validators]]`) TOML entry.
 fn cmd_keygen(args: &[String]) {
     let out_path = req_arg(args, "--out");
 
@@ -3007,6 +3044,9 @@ fn cmd_keygen(args: &[String]) {
     write_key_file(out_path, &seed_hex).unwrap_or_else(|e| fail("write key file", e));
     println!("pubkey {pub_hex}");
     println!("out {out_path}");
+    if let Some(entries) = keygen_genesis_entries(args, &pub_hex) {
+        print!("{entries}");
+    }
 }
 
 /// End-to-end showcase on the production path: launch a small tokio testnet
@@ -3477,5 +3517,65 @@ mod tests {
         let read_back = std::fs::read_to_string(p).unwrap();
         assert_eq!(config::decode_seed(read_back.trim(), "--seed").expect("decode"), seed);
         let _ = std::fs::remove_file(p);
+    }
+
+    #[test]
+    fn genesis_entry_toml_renders_expected() {
+        // M95: the emitted fragments use the exact field names the genesis parser expects.
+        assert_eq!(
+            genesis_account_toml(7, 1_000_000, "ab12"),
+            "[[accounts]]\nid = 7\nbalance_micro = 1000000\npubkey_hex = \"ab12\"\n"
+        );
+        assert_eq!(
+            genesis_validator_toml(7, "ab12", 5),
+            "[[validators]]\nid = 7\npubkey_hex = \"ab12\"\npower = 5\n"
+        );
+    }
+
+    #[test]
+    fn keygen_genesis_entries_gated_on_id() {
+        // M95: no `--genesis-id` ⇒ no genesis output (keygen keeps its original two lines).
+        let none: Vec<String> = vec!["--out".into(), "k".into()];
+        assert_eq!(keygen_genesis_entries(&none, "ab12"), None);
+
+        // `--genesis-id` alone ⇒ an accounts block (balance defaults to 0), no validators.
+        let acct: Vec<String> = vec!["--genesis-id".into(), "7".into()];
+        let out = keygen_genesis_entries(&acct, "ab12").expect("some");
+        assert!(out.contains("[[accounts]]\nid = 7\nbalance_micro = 0\npubkey_hex = \"ab12\"\n"), "{out}");
+        assert!(!out.contains("[[validators]]"), "no power ⇒ no validator block: {out}");
+
+        // `--balance` + `--power` ⇒ both blocks, with the given values.
+        let full: Vec<String> =
+            vec!["--genesis-id".into(), "7".into(), "--balance".into(), "42".into(), "--power".into(), "9".into()];
+        let out = keygen_genesis_entries(&full, "ab12").expect("some");
+        assert!(out.contains("balance_micro = 42"), "{out}");
+        assert!(out.contains("[[validators]]\nid = 7\npubkey_hex = \"ab12\"\npower = 9\n"), "{out}");
+    }
+
+    #[test]
+    fn keygen_genesis_entry_round_trips_through_loader() {
+        // M95: a complete genesis built from the emitted entries parses back through
+        // `config::load_genesis` → `to_genesis`, recovering the id/balance/pubkey/power.
+        let (_seed_hex, pub_hex) = keygen_derive(seed_for(11));
+        let args: Vec<String> =
+            vec!["--genesis-id".into(), "3".into(), "--balance".into(), "500".into(), "--power".into(), "2".into()];
+        let entries = keygen_genesis_entries(&args, &pub_hex).expect("some");
+        let toml = format!("base_emission_micro = 1000\nslash_bps = 500\n{entries}");
+
+        let mut path = std::env::temp_dir();
+        path.push(format!("zx-genesis-{}-{}.toml", std::process::id(), line!()));
+        let p = path.to_str().unwrap();
+        std::fs::write(p, &toml).unwrap();
+        let g = config::load_genesis(p).expect("load_genesis").to_genesis().expect("to_genesis");
+        let _ = std::fs::remove_file(p);
+
+        assert_eq!(g.accounts.len(), 1);
+        assert_eq!(g.accounts[0].0, 3);
+        assert_eq!(g.accounts[0].1, 500);
+        assert_eq!(hex(&g.accounts[0].2), pub_hex);
+        assert_eq!(g.validators.len(), 1);
+        assert_eq!(g.validators[0].0, 3);
+        assert_eq!(hex(&g.validators[0].1), pub_hex);
+        assert_eq!(g.validators[0].2, 2);
     }
 }
