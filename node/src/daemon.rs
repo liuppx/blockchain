@@ -2008,6 +2008,34 @@ fn options_response() -> String {
     )
 }
 
+/// M108: the value of request header `name` (case-insensitive), trimmed. `None` if absent.
+/// Scans the raw CRLF-split header block, like [`accept_format`] / [`charset_acceptable`].
+fn header_value<'a>(head: &'a str, name: &str) -> Option<&'a str> {
+    for line in head.split("\r\n") {
+        let Some((n, v)) = line.split_once(':') else { continue };
+        if n.trim().eq_ignore_ascii_case(name) {
+            return Some(v.trim());
+        }
+    }
+    None
+}
+
+/// M108: RFC 9110 §8.8.3 / §13.1.2 — attach a strong `ETag` validator (quoted hex of the
+/// body's SHA-256) to a rendered read response, and short-circuit to `304 Not Modified` when
+/// the request's `If-None-Match` already carries that tag. A conditional poller thus pays for
+/// the body only when it actually changed. Applied to `200` read responses only (error bodies
+/// carry no validator). The `304` repeats the validator + `Vary` and sends no body. Pure.
+fn apply_etag(resp: String, if_none_match: Option<&str>) -> String {
+    let Some((head, body)) = resp.split_once("\r\n\r\n") else { return resp };
+    let etag = format!("\"{}\"", crate::hash::hex(&crate::hash::sha256(body.as_bytes())));
+    if if_none_match == Some(etag.as_str()) {
+        return format!(
+            "HTTP/1.1 304 Not Modified\r\nETag: {etag}\r\nVary: Accept, Accept-Charset\r\nConnection: close\r\n\r\n"
+        );
+    }
+    format!("{head}\r\nETag: {etag}\r\n\r\n{body}")
+}
+
 /// M70: the representations this RPC server can emit, in negotiation-preference
 /// order (named JSON wins the q-tie, so it is listed first). Used to build the
 /// `406 Not Acceptable` body per RFC 7231 §6.5.6.
@@ -4260,6 +4288,13 @@ async fn serve_rpc_conn(mut stream: TcpStream, cmd: mpsc::UnboundedSender<Cmd>) 
             }
             GetRoute::Health => http_response("200 OK", "ok"),
             GetRoute::NotFound => http_response("404 Not Found", "not found"),
+        };
+        // M108: attach an ETag validator to successful reads and honor `If-None-Match`
+        // (RFC 9110). Applied before HEAD body-stripping so a conditional HEAD also 304s.
+        let resp = if resp.starts_with("HTTP/1.1 200 OK") {
+            apply_etag(resp, header_value(head, "if-none-match"))
+        } else {
+            resp
         };
         // M92: HEAD mirrors the GET header block but drops the body (RFC 9110 §9.3.2).
         let resp = maybe_head(is_head, resp);
@@ -7192,6 +7227,59 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn rpc_conditional_get_over_tcp() {
+        // M108: a read carries an ETag; re-requesting with that validator in `If-None-Match`
+        // yields a bodyless 304, while a stale validator yields the full 200 body.
+        let dir = tmp_dir("rpc-conditional-get");
+        // node_config p2p listen = 20691 + (41-21) = 20711; keep the RPC port clear.
+        let mut cfg = node_config(41, 20691, &[41], dir.clone());
+        let rpc_addr = "127.0.0.1:20721";
+        cfg.rpc = Some(crate::config::RpcConfig { enabled: true, listen: rpc_addr.into() });
+        let mut genesis = test_genesis();
+        genesis.validators = vec![(41, kp(41).public(), 1)]; // quorum 1 ⇒ self-commit
+        let _node = Node::start(cfg, genesis, Some(kp(41))).await.expect("start node");
+
+        async fn req(addr: &str, path: &str, inm: Option<&str>) -> String {
+            let cond = inm.map(|v| format!("If-None-Match: {v}\r\n")).unwrap_or_default();
+            let r = format!("GET {path} HTTP/1.1\r\nHost: localhost\r\n{cond}Connection: close\r\n\r\n");
+            let mut s = TcpStream::connect(addr).await.expect("connect rpc");
+            s.write_all(r.as_bytes()).await.expect("send");
+            let mut resp = Vec::new();
+            s.read_to_end(&mut resp).await.expect("read response");
+            String::from_utf8_lossy(&resp).into_owned()
+        }
+        fn etag_of(resp: &str) -> String {
+            resp.split("\r\n")
+                .find_map(|l| l.strip_prefix("ETag: "))
+                .expect("response carries an ETag")
+                .to_string()
+        }
+        fn body_of(resp: &str) -> &str {
+            resp.split_once("\r\n\r\n").map(|(_, b)| b).unwrap_or("")
+        }
+
+        // First read: 200 + an ETag + the body.
+        let first = req(rpc_addr, "/genesis", None).await;
+        assert!(first.starts_with("HTTP/1.1 200 OK"), "first status: {first}");
+        let etag = etag_of(&first);
+        assert!(etag.starts_with('"') && etag.ends_with('"'), "quoted etag: {etag}");
+        assert!(body_of(&first).starts_with("genesis_hash="), "first body: {first}");
+
+        // Conditional re-read with the matching validator → 304 Not Modified, no body.
+        let again = req(rpc_addr, "/genesis", Some(&etag)).await;
+        assert!(again.starts_with("HTTP/1.1 304 Not Modified"), "conditional status: {again}");
+        assert!(again.contains(&format!("ETag: {etag}\r\n")), "304 repeats etag: {again}");
+        assert_eq!(body_of(&again), "", "304 carries no body");
+
+        // A stale validator → the full 200 body again.
+        let stale = req(rpc_addr, "/genesis", Some("\"stale\"")).await;
+        assert!(stale.starts_with("HTTP/1.1 200 OK"), "stale status: {stale}");
+        assert!(body_of(&stale).starts_with("genesis_hash="), "stale body served: {stale}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
     async fn rpc_head_mirrors_get_without_body() {
         // M92: a HEAD request mirrors the matching GET — same status + headers (crucially the
         // GET body's Content-Length) but no body (RFC 9110 §9.3.2). Exercised end to end over
@@ -8468,6 +8556,43 @@ vote_b.validator=5 vote_b.height=9 vote_b.round=2 vote_b.block_hash={b_h} vote_b
             assert!(head.ends_with("\r\n\r\n"), "{head}");
             assert!(!head.contains(&body), "406 HEAD must not send a body: {head}");
         }
+    }
+
+    #[test]
+    fn header_value_extracts_case_insensitively() {
+        // M108: a header lookup is case-insensitive on the name and trims the value.
+        let head = "GET /x HTTP/1.1\r\nHost: localhost\r\nIf-None-Match: \"abc\"\r\nConnection: close";
+        assert_eq!(header_value(head, "if-none-match"), Some("\"abc\""));
+        assert_eq!(header_value(head, "IF-NONE-MATCH"), Some("\"abc\""));
+        assert_eq!(header_value(head, "host"), Some("localhost"));
+        assert_eq!(header_value(head, "x-missing"), None);
+    }
+
+    #[test]
+    fn apply_etag_attaches_validator_and_honors_if_none_match() {
+        // M108: a 200 read gains a strong ETag = quoted hex of the body's sha256; a matching
+        // `If-None-Match` short-circuits to a bodyless 304; a non-match keeps the body.
+        let resp = http_response_ct("200 OK", "text/plain; charset=utf-8", "height=7");
+        let etag = format!("\"{}\"", crate::hash::hex(&crate::hash::sha256(b"height=7")));
+
+        // No conditional header ⇒ the ETag is injected, the body is preserved.
+        let tagged = apply_etag(resp.clone(), None);
+        assert!(tagged.contains(&format!("ETag: {etag}\r\n")), "{tagged}");
+        assert_eq!(tagged.split_once("\r\n\r\n").map(|(_, b)| b), Some("height=7"), "{tagged}");
+        // Content-Length still advertises the body (the ETag header doesn't disturb it).
+        assert!(tagged.contains("Content-Length: 8\r\n"), "{tagged}");
+
+        // A matching validator ⇒ 304 Not Modified, no body, ETag repeated.
+        let not_modified = apply_etag(resp.clone(), Some(etag.as_str()));
+        assert!(not_modified.starts_with("HTTP/1.1 304 Not Modified\r\n"), "{not_modified}");
+        assert!(not_modified.contains(&format!("ETag: {etag}\r\n")), "{not_modified}");
+        assert!(not_modified.ends_with("\r\n\r\n"), "{not_modified}");
+        assert!(!not_modified.contains("height=7"), "304 carries no body: {not_modified}");
+
+        // A stale validator ⇒ the full 200 body (with its current ETag).
+        let stale = apply_etag(resp, Some("\"deadbeef\""));
+        assert!(stale.starts_with("HTTP/1.1 200 OK"), "{stale}");
+        assert_eq!(stale.split_once("\r\n\r\n").map(|(_, b)| b), Some("height=7"), "{stale}");
     }
 
     #[test]
