@@ -235,6 +235,7 @@ fn main() {
         "bridge" => cmd_bridge(),
         "redeem" => cmd_redeem(),
         "run" => cmd_run(config_arg(&args)),
+        "check-config" => cmd_check_config(config_arg(&args)),
         "submit-tx" => cmd_submit_tx(config_arg(&args), tx_arg(&args)),
         "encode-tx" => cmd_encode_tx(&args),
         "keygen" => cmd_keygen(&args),
@@ -311,9 +312,11 @@ fn usage() {
     eprintln!("  node bridge             trustless bridge: chain A locks to chain B, relayer ferries a cert-signed envelope, B's endpoint verifies + credits — no relayer trust");
     eprintln!("  node redeem             consensus-level redeem: B's producer follows A on-chain and mints from a source lock inside its state machine — the mint is BFT-enforced, not off-chain");
     eprintln!("  node run    --config F  run the networked BFT daemon (tokio TCP P2P): load config/genesis/validator key, gossip votes + sync/verify over sockets");
+    eprintln!("  node check-config --config F  dry-run: load + validate config, its genesis, and validator key (if any) without starting the daemon; print a summary or the first error");
     eprintln!("  node submit-tx --config F --tx F  submit a codec-encoded tx to a running daemon's [rpc] ingress endpoint; print accepted hash or reject reason");
     eprintln!("  node encode-tx --key-file F --out F --author N --domain N --stake N --embedding f,..(DIM) --review R:S.. --repl-success N --repl-total N --timestamp-days F [--config F]  author+sign a tx offline into a submit-tx file; print its hash");
     eprintln!("  node keygen --out F [--seed HEX]  generate (or derive from a 64-hex seed) an ed25519 keypair; write the seed file (for encode-tx --key-file) and print the pubkey");
+    eprintln!("  node keygen ... --genesis-id N [--balance MICRO] [--power P]  also print a ready-to-paste genesis [[accounts]] (and, with --power, [[validators]]) entry");
     eprintln!("  node localnet           spin up an in-process tokio testnet (4 validators, no sequencer) and show all nodes converge via distributed BFT voting over real sockets");
     eprintln!("  node status --dir DIR   replay the block log and print state");
     eprintln!("  node certs  --dir DIR   persist a certified chain (blocks+certs) and re-verify finality on reload");
@@ -2719,6 +2722,45 @@ use zhixing_node::light::ProofKind;
 /// no sequencer) from the `[validator]` section, builds a multi-thread tokio
 /// runtime, and blocks on `daemon::run` until Ctrl-C. `main()` stays sync so the
 /// ~20 in-memory demo commands are unaffected by the async runtime.
+/// M96: load + fully validate a node config and its referenced genesis — the same
+/// load/parse/convert/key-derive steps [`cmd_run`] performs, minus binding any socket or
+/// starting the actor. Returns a human-readable summary on success, or the first typed
+/// [`config::ConfigError`]. Pure (reads only the referenced files; no process exit, no
+/// network, no state) so it is unit-testable; [`cmd_check_config`] is the thin CLI shell.
+fn check_config(config_path: &str) -> Result<String, config::ConfigError> {
+    let cfg = config::load_node_config(config_path)?;
+    let gcfg = config::load_genesis(&cfg.genesis)?;
+    let genesis = gcfg.to_genesis()?;
+    // Validate the validator key material too (an enabled `[validator]` section) — a bad key
+    // should fail the dry-run, not first surface when `run` tries to vote.
+    let role = match cfg.validator.as_ref() {
+        Some(vc) if vc.enabled => {
+            vc.keypair()?;
+            "validator"
+        }
+        _ => "follower",
+    };
+    Ok(format!(
+        "ok config {config_path}\nnode id {}\nrole {role}\ngenesis {}\naccounts {}\nreviewers {}\nvalidators {}\npeers {}",
+        cfg.node.id,
+        cfg.genesis,
+        genesis.accounts.len(),
+        genesis.reviewers.len(),
+        genesis.validators.len(),
+        cfg.peers.len(),
+    ))
+}
+
+/// M96: `node check-config --config F` — dry-run config/genesis validation. Prints the
+/// [`check_config`] summary on success, or the typed error + exit 2 (the CLI idiom). Binds
+/// no socket and starts no actor, so it is safe to run against a production config anywhere.
+fn cmd_check_config(config_path: String) {
+    match check_config(&config_path) {
+        Ok(summary) => println!("{summary}"),
+        Err(e) => fail_msg("check-config", &e),
+    }
+}
+
 fn cmd_run(config_path: String) {
     // M44: load the config first, then install the subscriber from its optional
     // `[logging]` section (absent ⇒ the M37 default). Config-load errors print via
@@ -3577,5 +3619,69 @@ mod tests {
         assert_eq!(g.validators[0].0, 3);
         assert_eq!(hex(&g.validators[0].1), pub_hex);
         assert_eq!(g.validators[0].2, 2);
+    }
+
+    // M96: write a (genesis.toml, node config) pair into a unique temp dir; return the
+    // config path. `genesis` is an absolute path so the load is CWD-independent.
+    fn write_check_config_fixture(tag: &str, genesis_body: &str, validator_section: &str) -> (String, std::path::PathBuf) {
+        let mut dir = std::env::temp_dir();
+        dir.push(format!("zx-checkcfg-{}-{}-{tag}", std::process::id(), line!()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let gpath = dir.join("genesis.toml");
+        std::fs::write(&gpath, genesis_body).unwrap();
+        let cfg = format!(
+            "genesis = \"{}\"\n[node]\nid = 1\nlisten = \"127.0.0.1:9021\"\ndata_dir = \"{}/data\"\n{validator_section}",
+            gpath.to_str().unwrap(),
+            dir.to_str().unwrap(),
+        );
+        let cpath = dir.join("node.toml");
+        std::fs::write(&cpath, cfg).unwrap();
+        (cpath.to_str().unwrap().to_string(), dir)
+    }
+
+    fn valid_genesis_body(pub_hex: &str) -> String {
+        format!(
+            "base_emission_micro = 1000\nslash_bps = 500\n\
+[[accounts]]\nid = 1\nbalance_micro = 1000000\npubkey_hex = \"{pub_hex}\"\n\
+[[validators]]\nid = 1\npubkey_hex = \"{pub_hex}\"\npower = 1\n"
+        )
+    }
+
+    #[test]
+    fn check_config_ok_for_follower() {
+        // M96: a valid config with no `[validator]` section ⇒ Ok, role "follower", with the
+        // genesis entity counts summarized.
+        let (seed_hex, pub_hex) = keygen_derive(seed_for(1));
+        let _ = seed_hex;
+        let (cpath, dir) = write_check_config_fixture("follower", &valid_genesis_body(&pub_hex), "");
+        let summary = check_config(&cpath).expect("valid config");
+        assert!(summary.starts_with("ok config "), "{summary}");
+        assert!(summary.contains("\nrole follower\n"), "{summary}");
+        assert!(summary.contains("\naccounts 1\n"), "{summary}");
+        assert!(summary.contains("\nvalidators 1"), "{summary}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn check_config_ok_for_validator() {
+        // M96: an enabled `[validator]` with a valid seed ⇒ Ok, role "validator" (the key
+        // material is decoded as part of the dry-run).
+        let (seed_hex, pub_hex) = keygen_derive(seed_for(1));
+        let vsec = format!("[validator]\nenabled = true\nseed_hex = \"{seed_hex}\"\n");
+        let (cpath, dir) = write_check_config_fixture("validator", &valid_genesis_body(&pub_hex), &vsec);
+        let summary = check_config(&cpath).expect("valid validator config");
+        assert!(summary.contains("\nrole validator\n"), "{summary}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn check_config_surfaces_bad_genesis() {
+        // M96: a malformed genesis (non-hex pubkey) ⇒ Err, returned (not a panic/exit) so the
+        // dry-run reports the typed error rather than failing at daemon start.
+        let bad = "base_emission_micro = 1000\nslash_bps = 500\n\
+[[accounts]]\nid = 1\nbalance_micro = 1\npubkey_hex = \"nothex\"\n";
+        let (cpath, dir) = write_check_config_fixture("badgenesis", bad, "");
+        assert!(check_config(&cpath).is_err(), "bad genesis pubkey must fail the dry-run");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
