@@ -1298,6 +1298,20 @@ M116 的 `node rpc` 只能 GET。M117 补上写侧，让它成为**全能** RPC 
 
 **已知边界（顺延至 M118+）**：全能 RPC 客户端（`node rpc` GET/`--post`）+ 专用 `submit-tx` 已齐；tx 写路径、链读面已相当完整；内容协商三轴已齐（仅 `identity`，真压缩顺延）；离线工具篮子已补；运维篮子剩余：证书/密钥轮换与落盘、follower 认证、指标端 TLS、OTel/push exporter、每-sink 独立 rotation 覆盖、时延直方图；keygen 篮子剩余：助记词 / BIP-39、口令加密 keystore、密钥轮换；剩余：游标分页、未知方法 `405`；共识 / wire 篮子（破 head 不变量）：**货币费用** + 费用优先排序、nonce / 序列号反重放。
 
+## 端点发现 `GET /routes`（Milestone 118）
+
+从 M58 到此我们建了**几十个**读端点，但客户端无从**自我发现**有哪些可读——只能翻文档。M118 加 `GET /routes` 回一份**自文档化**的读端点索引：精确（无参）路径 + `{param}` 模板。纯静态列表，不触 wire/共识/状态，`[rpc]`/`localnet` head 不变量（`44309755…ea04ba`，RPC 默认关）不受影响。
+
+- **语义**：始终 `200`。文本每行一路径；JSON `{"routes":["/height","/info",…,"/block/{height}/txs"]}`。
+- **单一真相源**：`const READ_ROUTES: &[&str]`——精确路径在前、`{param}` 模板在后。纯渲染器 `format_routes`（`join("\n")`）/`json_routes`（字符串数组对象）。
+- **无 actor 往返**：索引是静态的，`GetRoute::Routes` 的 dispatch 臂直接 `ok_body` 应答——继 `OPTIONS`（M93）、`/version`（M110）之后第三个绕过 actor 的读。
+- **漂移守卫**：`/routes` 的老问题是「广告的路由与真实路由器脱节」。测试 `advertised_exact_routes_resolve` 遍历 `READ_ROUTES` 中每个**不含 `{`** 的精确路径、断言 `route_get(r)` **不**落 `Health`/`NotFound`——把发现索引钉死在实现上：删/改一个精确读却忘了更新 `READ_ROUTES`（或反之）即测试失败。模板（含 `{`）是文档、跳过此检。
+- **路由**：`enum GetRoute` 加 `Routes`；`route_get` 在 `/version` 之后加精确臂 `"/routes" => GetRoute::Routes`（`/routes/` 落 `Health`）。
+- **测试（+3 → 523）**：新纯 `route_get_parses_routes`（`/routes` ⇒ `Routes`、`/routes/` ⇒ `Health`）/`routes_index_lists_endpoints`（文本行数 == `READ_ROUTES.len()`、含 `/info`/`/block/{height}` 等；JSON 为 `{"routes":[…]}`）/`advertised_exact_routes_resolve`（漂移守卫）。
+- **不变量保持**：纯读面增量、静态列表、无 `serde_json`、无引擎 / codec / crypto / wire / 共识 / 状态变更、无新依赖，RPC 默认关，故 `localnet` 逐字节同块、head 仍 `44309755…ea04ba`。
+
+**已知边界（顺延至 M119+）**：RPC 自带端点发现（`/routes`）+ 全能客户端 + 完整链读/写面；内容协商三轴已齐（仅 `identity`，真压缩顺延）；离线工具篮子已补；运维篮子剩余：证书/密钥轮换与落盘、follower 认证、指标端 TLS、OTel/push exporter、每-sink 独立 rotation 覆盖、时延直方图；keygen 篮子剩余：助记词 / BIP-39、口令加密 keystore、密钥轮换；剩余：游标分页、未知方法 `405`；共识 / wire 篮子（破 head 不变量）：**货币费用** + 费用优先排序、nonce / 序列号反重放。
+
 ## 持久化与重放（Milestone 7）
 
 节点状态不再只活在内存里：区块以**追加式日志**（`DIR/blocks.log`）落盘，重启后从创世**重放**日志即可重建**逐字节相同**的状态。
@@ -2095,5 +2109,6 @@ peer_exchange_disabled_stays_seeded                   同链拓扑关发现 → 
 - ~~M115 交易预检 `POST /validate`——钱包提交前想先知道会不会被接受、不会的话为何，而 `/submit_tx` 真会入池泛洪；M115 加 `POST /validate` 只读预检：解码后对当前状态跑 `validate_tx`，不入池/不计数/不泛洪——`Ok` ⇒ 200/`valid`/`{"valid":true}`、`Err` ⇒ 422+原因、解码失败 ⇒ 400；`Cmd::ValidateTx` actor 调 `chain.state.validate_tx(&tx)` 纯读；POST 分发在 `/batch` 后、`/submit_tx` 前加 `/validate` 分支、body 读取与错误码同款；新 TCP `rpc_validate_accepts_valid_tx_without_admitting`（合法 ⇒ 200 valid + JSON，随后 `/mempool` 仍 total=0 证明不入池）/`rpc_validate_rejects_invalid_tx`（未知作者 ⇒ 422）/`rpc_validate_decode_error_is_400`（非 tx ⇒ 400），共 514 测、localnet head 不变~~ ✅
 - ~~M116 `node rpc` 读客户端——我们从 M58 起建的一整套读端点此前操作者侧只能靠 curl；M116 加 `node rpc --config F --path P` 免 curl 读客户端：连 config 启用的 `[rpc]` 端点、`GET P`、2xx 打印响应体、否则状态行 + 体到 stderr 并 exit 1，与 `submit-tx`（写）配成读/写一对；核心抽成纯函数 `rpc_get_request(host, path)`/`split_http_response(text) -> (status_line, body)`（无体 ⇒ 空，兼容 304/HEAD），`cmd_rpc` 为阻塞 `TcpStream` 薄壳，注册子命令 + usage；新纯测 `rpc_get_request_formats_an_http_get`/`split_http_response_extracts_status_and_body`/`split_http_response_handles_empty_body`，共 517 测、localnet head 不变~~ ✅
 - ~~M117 `node rpc --post FILE` 全能 RPC 客户端——M116 的 `node rpc` 只能 GET；M117 补写侧：`node rpc --config F --path /validate --post FILE` POST 文件原始字节到任一端点（codec-tx → `/submit_tx`/`/validate`、批量 → `/batch`），缺省仍 GET；新增纯函数 `rpc_post_request(host, path, body) -> Vec<u8>` 返回字节（非 String）故二进制 codec body 逐字节透传、`Content-Length` 为精确体长，`cmd_rpc` 按 `--post` 分流、响应处理不变，usage 更新 `[--post FILE]`；新纯测 `rpc_post_request_includes_content_length_and_body`/`rpc_post_request_preserves_binary_body`/`rpc_post_request_empty_body`，共 520 测、localnet head 不变~~ ✅
+- ~~M118 端点发现 `GET /routes`——建了几十个读端点却无从自我发现；M118 加 `GET /routes` 回自文档化索引（精确路径 + `{param}` 模板），静态列表故 dispatch 直接 `ok_body`、无 actor 往返；单一真相源 `const READ_ROUTES` + 纯渲染器 `format_routes`/`json_routes`，`GetRoute::Routes` + `route_get` 精确臂 `/routes`；漂移守卫 `advertised_exact_routes_resolve` 把发现索引钉死在真实路由器上；新纯测 `route_get_parses_routes`/`routes_index_lists_endpoints`/`advertised_exact_routes_resolve`，共 523 测、localnet head 不变~~ ✅
 
-……；运维篮子剩余（货币费用（独立共识里程碑）、费用优先出块排序、nonce 反重放、全能 RPC 客户端（`node rpc` GET/`--post`）+ 专用 `submit-tx` 已齐、tx 写路径与链读面已相当完整、读面列表端点篮子已收口、HTTP `HEAD`/`OPTIONS`/`ETag` 条件 GET/`Accept-Encoding`（identity）协商 已补、keyfile `0600` 已补、现成 genesis 条目已补、`check-config`/`genesis-hash`/`inspect-genesis`/`inspect-tx`/`pubkey`/`inspect-block`/`inspect-cert` 已补、助记词/BIP-39、口令 keystore、密钥轮换、游标分页、真压缩（gzip/deflate，须引新依赖）、未知方法 `405`、RPC auth/TLS、证书/密钥轮换与落盘、follower 认证、每-sink 独立 rotation 覆盖、OTEL/结构化日志 exporter、指标端 TLS、指标 push exporter/直方图/每-peer/每-轮次时延序列）顺延至 M118+，每步仍遵循"可运行、可测试、契约一致"。
+……；运维篮子剩余（货币费用（独立共识里程碑）、费用优先出块排序、nonce 反重放、RPC 自带端点发现（`/routes`）+ 全能客户端 + 完整链读/写面、读面列表端点篮子已收口、HTTP `HEAD`/`OPTIONS`/`ETag` 条件 GET/`Accept-Encoding`（identity）协商 已补、keyfile `0600` 已补、现成 genesis 条目已补、`check-config`/`genesis-hash`/`inspect-genesis`/`inspect-tx`/`pubkey`/`inspect-block`/`inspect-cert` 已补、助记词/BIP-39、口令 keystore、密钥轮换、游标分页、真压缩（gzip/deflate，须引新依赖）、未知方法 `405`、RPC auth/TLS、证书/密钥轮换与落盘、follower 认证、每-sink 独立 rotation 覆盖、OTEL/结构化日志 exporter、指标端 TLS、指标 push exporter/直方图/每-peer/每-轮次时延序列）顺延至 M119+，每步仍遵循"可运行、可测试、契约一致"。

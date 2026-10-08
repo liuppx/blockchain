@@ -2287,6 +2287,10 @@ enum GetRoute {
     /// check compatibility before relying on newer endpoints. Answered without the actor (the
     /// value never changes). Exact-match; no id.
     Version,
+    /// M118: `GET /routes` — a self-documenting index of the read endpoints this server serves
+    /// (exact paths + `{param}` templates). Answered without the actor (a static list).
+    /// Exact-match; no id.
+    Routes,
     NotFound,
 }
 
@@ -2602,6 +2606,8 @@ fn route_get(path: &str) -> GetRoute {
         "/info" => GetRoute::Info,
         // M110: the node software version. Exact-match; no id, no prefix sibling.
         "/version" => GetRoute::Version,
+        // M118: the read-endpoint discovery index. Exact-match; no id, no prefix sibling.
+        "/routes" => GetRoute::Routes,
         // M111: the pending-tx directory. Exact-match here, so it never collides with the
         // M103 `/mempool/{hash}` membership prefix below (`…mempool` exact, not `…mempool/`).
         "/mempool" => GetRoute::MempoolList,
@@ -3006,6 +3012,58 @@ fn format_version() -> String {
 /// M110: `GET /version?format=json` — the JSON sibling, `{"version":"<semver>"}`.
 fn json_version() -> String {
     format!("{{\"version\":{}}}", json_str(NODE_VERSION))
+}
+
+/// M118: the read endpoints this server serves — the `/routes` discovery index. Exact
+/// (no-param) paths come first (every one must resolve via [`route_get`] — guarded by the
+/// `advertised_exact_routes_resolve` test), then `{param}` templates for documentation. New
+/// read routes should be added here so clients can discover them.
+const READ_ROUTES: &[&str] = &[
+    // exact (no-param) reads — guarded against drift by a test
+    "/height",
+    "/head",
+    "/genesis",
+    "/info",
+    "/version",
+    "/routes",
+    "/supply",
+    "/params",
+    "/validators",
+    "/accounts",
+    "/reviewers",
+    "/graph",
+    "/bonds",
+    "/unbonding",
+    "/stake-ops",
+    "/evidence",
+    "/peers",
+    "/mempool",
+    "/bridge/locks",
+    // parameterized templates (documentation only)
+    "/account/{id}",
+    "/account/{id}/proof",
+    "/reviewer/{id}",
+    "/reviewer/{id}/proof",
+    "/validator/{id}",
+    "/validator/{id}/proof",
+    "/graph/{id}",
+    "/graph/{id}/proof",
+    "/bridge/lock/{id}/proof",
+    "/mempool/{hash}",
+    "/tx/{hash}",
+    "/block/{height}",
+    "/block/{height}/txs",
+];
+
+/// M118: render the route index as one path per line. Pure for unit testing.
+fn format_routes() -> String {
+    READ_ROUTES.join("\n")
+}
+
+/// M118: `GET /routes?format=json` — the JSON sibling, `{"routes":["…",…]}`.
+fn json_routes() -> String {
+    let items = READ_ROUTES.iter().map(|r| json_str(r)).collect::<Vec<_>>().join(",");
+    format!("{{\"routes\":[{items}]}}")
 }
 
 /// `GET /account/{id}?format=json` — the JSON sibling of [`format_account`].
@@ -4702,6 +4760,10 @@ async fn serve_rpc_conn(mut stream: TcpStream, cmd: mpsc::UnboundedSender<Cmd>) 
             GetRoute::Version => {
                 // M110: a compile-time constant — answered directly, no actor round-trip.
                 ok_body(fmt, &format_version(), &json_version())
+            }
+            GetRoute::Routes => {
+                // M118: a static discovery index — answered directly, no actor round-trip.
+                ok_body(fmt, &format_routes(), &json_routes())
             }
             GetRoute::Health => http_response("200 OK", "ok"),
             GetRoute::NotFound => http_response("404 Not Found", "not found"),
@@ -9549,6 +9611,42 @@ vote_b.validator=5 vote_b.height=9 vote_b.round=2 vote_b.block_hash={b_h} vote_b
         assert!(!v.is_empty(), "crate version must be set");
         assert_eq!(format_version(), format!("version={v}"));
         assert_eq!(json_version(), format!("{{\"version\":\"{v}\"}}"));
+    }
+
+    #[test]
+    fn route_get_parses_routes() {
+        // M118: `/routes` is an exact-match discovery read; a trailing slash is not the route.
+        assert!(matches!(route_get("/routes"), GetRoute::Routes));
+        assert!(matches!(route_get("/routes/"), GetRoute::Health));
+    }
+
+    #[test]
+    fn routes_index_lists_endpoints() {
+        // M118: the text index is one path per line; the JSON is a {"routes":[…]} array. Both
+        // advertise the same set, including exact reads and `{param}` templates.
+        let text = format_routes();
+        assert!(text.lines().count() == READ_ROUTES.len(), "one path per line");
+        for p in ["/info", "/supply", "/mempool", "/block/{height}", "/tx/{hash}"] {
+            assert!(text.lines().any(|l| l == p), "text index lists {p}: {text}");
+        }
+        let json = json_routes();
+        assert!(json.starts_with("{\"routes\":["), "{json}");
+        assert!(json.contains("\"/block/{height}/txs\""), "{json}");
+    }
+
+    #[test]
+    fn advertised_exact_routes_resolve() {
+        // M118: every exact (no-`{`) path advertised by `/routes` must actually resolve to a
+        // concrete read route — a drift guard tying the discovery index to the real router.
+        for &r in READ_ROUTES {
+            if r.contains('{') {
+                continue; // templates are documentation, not literal paths
+            }
+            assert!(
+                !matches!(route_get(r), GetRoute::Health | GetRoute::NotFound),
+                "advertised route {r} does not resolve (drifted from route_get)"
+            );
+        }
     }
 
     #[test]
