@@ -236,6 +236,7 @@ fn main() {
         "redeem" => cmd_redeem(),
         "run" => cmd_run(config_arg(&args)),
         "check-config" => cmd_check_config(config_arg(&args)),
+        "genesis-hash" => cmd_genesis_hash(config_arg(&args)),
         "submit-tx" => cmd_submit_tx(config_arg(&args), tx_arg(&args)),
         "encode-tx" => cmd_encode_tx(&args),
         "keygen" => cmd_keygen(&args),
@@ -313,6 +314,7 @@ fn usage() {
     eprintln!("  node redeem             consensus-level redeem: B's producer follows A on-chain and mints from a source lock inside its state machine — the mint is BFT-enforced, not off-chain");
     eprintln!("  node run    --config F  run the networked BFT daemon (tokio TCP P2P): load config/genesis/validator key, gossip votes + sync/verify over sockets");
     eprintln!("  node check-config --config F  dry-run: load + validate config, its genesis, and validator key (if any) without starting the daemon; print a summary or the first error");
+    eprintln!("  node genesis-hash --config F  print the chain identity derived from the config's genesis: genesis_hash + initial state_root + validator count (compare across operators before joining)");
     eprintln!("  node submit-tx --config F --tx F  submit a codec-encoded tx to a running daemon's [rpc] ingress endpoint; print accepted hash or reject reason");
     eprintln!("  node encode-tx --key-file F --out F --author N --domain N --stake N --embedding f,..(DIM) --review R:S.. --repl-success N --repl-total N --timestamp-days F [--config F]  author+sign a tx offline into a submit-tx file; print its hash");
     eprintln!("  node keygen --out F [--seed HEX]  generate (or derive from a 64-hex seed) an ed25519 keypair; write the seed file (for encode-tx --key-file) and print the pubkey");
@@ -2761,6 +2763,33 @@ fn cmd_check_config(config_path: String) {
     }
 }
 
+/// M97: derive the chain identity from a config's genesis — the `genesis_hash` (the head
+/// every honest node starts from), the initial `state_root`, and the genesis validator
+/// count. Two operators comparing these three before joining can confirm they agree on
+/// genesis byte-for-byte (a mismatched genesis means incompatible chains / failed sync).
+/// Loads + converts the genesis exactly as `cmd_run` does, then stamps it via
+/// [`ChainState::genesis`] — no socket, no actor. Pure for unit testing.
+fn genesis_identity(config_path: &str) -> Result<String, config::ConfigError> {
+    let cfg = config::load_node_config(config_path)?;
+    let genesis = config::load_genesis(&cfg.genesis)?.to_genesis()?;
+    let (state, gh) = ChainState::genesis(genesis);
+    Ok(format!(
+        "genesis_hash {}\nstate_root {}\nvalidators {}",
+        hex(&gh),
+        hex(&state.state_root()),
+        state.validators.validators().len(),
+    ))
+}
+
+/// M97: `node genesis-hash --config F` — print the chain identity for the config's genesis,
+/// or the typed error + exit 2. Reads only the referenced files; binds nothing.
+fn cmd_genesis_hash(config_path: String) {
+    match genesis_identity(&config_path) {
+        Ok(summary) => println!("{summary}"),
+        Err(e) => fail_msg("genesis-hash", &e),
+    }
+}
+
 fn cmd_run(config_path: String) {
     // M44: load the config first, then install the subscriber from its optional
     // `[logging]` section (absent ⇒ the M37 default). Config-load errors print via
@@ -3682,6 +3711,53 @@ mod tests {
 [[accounts]]\nid = 1\nbalance_micro = 1\npubkey_hex = \"nothex\"\n";
         let (cpath, dir) = write_check_config_fixture("badgenesis", bad, "");
         assert!(check_config(&cpath).is_err(), "bad genesis pubkey must fail the dry-run");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn genesis_hash_is_deterministic_and_matches_chainstate() {
+        // M97: the printed genesis_hash equals what `ChainState::genesis` stamps, and the same
+        // genesis yields the same identity every time.
+        let (_seed_hex, pub_hex) = keygen_derive(seed_for(1));
+        let body = valid_genesis_body(&pub_hex);
+        let (cpath, dir) = write_check_config_fixture("gh", &body, "");
+        let out = genesis_identity(&cpath).expect("valid genesis");
+
+        // Independently stamp the same genesis and confirm the hash line matches.
+        let genesis = config::load_genesis(&format!("{}/genesis.toml", dir.to_str().unwrap()))
+            .expect("load")
+            .to_genesis()
+            .expect("to_genesis");
+        let (_state, gh) = ChainState::genesis(genesis);
+        assert!(out.contains(&format!("genesis_hash {}\n", hex(&gh))), "{out}");
+        assert!(out.contains("\nvalidators 1"), "{out}");
+        // Deterministic: a second run over the same config prints identical output.
+        assert_eq!(genesis_identity(&cpath).expect("again"), out);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn genesis_hash_differs_for_different_genesis() {
+        // M97: changing the genesis (a different account pubkey) changes the genesis_hash —
+        // the identity is a function of the genesis contents.
+        let (_s1, pub_a) = keygen_derive(seed_for(1));
+        let (_s2, pub_b) = keygen_derive(seed_for(2));
+        let (cpath_a, dir_a) = write_check_config_fixture("gha", &valid_genesis_body(&pub_a), "");
+        let (cpath_b, dir_b) = write_check_config_fixture("ghb", &valid_genesis_body(&pub_b), "");
+        let a = genesis_identity(&cpath_a).expect("a");
+        let b = genesis_identity(&cpath_b).expect("b");
+        assert_ne!(a, b, "distinct genesis ⇒ distinct identity");
+        let _ = std::fs::remove_dir_all(&dir_a);
+        let _ = std::fs::remove_dir_all(&dir_b);
+    }
+
+    #[test]
+    fn genesis_hash_surfaces_bad_genesis() {
+        // M97: a malformed genesis is reported as a typed error (not a panic/exit).
+        let bad = "base_emission_micro = 1000\nslash_bps = 500\n\
+[[accounts]]\nid = 1\nbalance_micro = 1\npubkey_hex = \"nothex\"\n";
+        let (cpath, dir) = write_check_config_fixture("ghbad", bad, "");
+        assert!(genesis_identity(&cpath).is_err(), "bad genesis must fail");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

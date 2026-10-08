@@ -1017,6 +1017,18 @@ M94/M95 补了 keygen 篮子；M96 转向**运维篮子**——部署前配置�
 
 **已知边界（顺延至 M97+）**：运维篮子剩余：证书/密钥轮换与落盘、follower 认证、指标端 TLS、OTel/push exporter、每-sink 独立 rotation 覆盖、时延直方图；keygen 篮子剩余：助记词 / BIP-39、口令加密 keystore、密钥轮换；读面列表端点篮子已收口、HTTP `HEAD`/`OPTIONS` 已补、`check-config` 已补；剩余：游标分页、`Accept-Encoding`（压缩须引新依赖）、未知方法 `405`；共识 / wire 篮子（破 head 不变量）：**货币费用** + 费用优先排序、nonce / 序列号反重放。
 
+## `node genesis-hash` 链身份派生（Milestone 97）
+
+M96 加了配置干跑校验；M97 续补运维篮子——**链身份派生**。两名运营者加入同一网络前，须确认彼此的 genesis 逐字节一致，否则各自长出**互不兼容的链**（同步会停在缺口而非污染状态，但徒耗运维）。M97 加 `node genesis-hash --config F`：从 config 的 genesis 派生并打印三元链身份——`genesis_hash`（每个诚实节点的起点 head）、初始 `state_root`、创世验证人数——三者一致即确认 genesis 相同。离线只读派生，不触 RPC / 出块 / 重放路径，`localnet` head 不变量（`44309755…ea04ba`）天然不受影响。
+
+- **纯函数**：`genesis_identity(path) -> Result<String, config::ConfigError>`——如 `cmd_run`/`check_config` 一样 `load_node_config` → `load_genesis(&cfg.genesis)` → `to_genesis()`，再经 `ChainState::genesis(g)` 盖章取 `(state, gh)`（这正是每个节点启动时落到的创世态与起点 head），格式化为 `genesis_hash <hex>` / `state_root <hex(state.state_root())>` / `validators <state.validators 数>`。只读引用文件、无退出 / 网络 / 状态，可直接单测。
+- **薄 CLI 壳**：`cmd_genesis_hash(path)` 打印 `Ok`、`Err` 经 `fail_msg` + exit 2。
+- **注册**：`main` 分发加 `"genesis-hash" => cmd_genesis_hash(config_arg(&args))`；`usage()` 加对应行。
+- **测试（+3 → 460）**：新单测 `genesis_hash_is_deterministic_and_matches_chainstate`（打印的 `genesis_hash` 等于独立调用 `ChainState::genesis` 盖章出的 `gh`、`validators 1`、同 config 幂等）/`genesis_hash_differs_for_different_genesis`（换一个账户 pubkey ⇒ `genesis_hash` 不同，证明身份是 genesis 内容的函数）/`genesis_hash_surfaces_bad_genesis`（坏 genesis ⇒ 返回 `Err`）。复用 M96 的 `write_check_config_fixture`/`valid_genesis_body` 夹具，bin 测试套件。
+- **不变量保持**：离线只读派生、无 `serde_json`、无引擎 / codec / crypto / wire / 共识 / 状态变更、无新依赖，不绑端口 / 不启 actor，故 `localnet` 逐字节同块、head 仍 `44309755…ea04ba`。
+
+**已知边界（顺延至 M98+）**：运维篮子剩余：证书/密钥轮换与落盘、follower 认证、指标端 TLS、OTel/push exporter、每-sink 独立 rotation 覆盖、时延直方图（`check-config`/`genesis-hash` 已补）；keygen 篮子剩余：助记词 / BIP-39、口令加密 keystore、密钥轮换；读面列表端点篮子已收口、HTTP `HEAD`/`OPTIONS` 已补；剩余：游标分页、`Accept-Encoding`（压缩须引新依赖）、未知方法 `405`；共识 / wire 篮子（破 head 不变量）：**货币费用** + 费用优先排序、nonce / 序列号反重放。
+
 ## 持久化与重放（Milestone 7）
 
 节点状态不再只活在内存里：区块以**追加式日志**（`DIR/blocks.log`）落盘，重启后从创世**重放**日志即可重建**逐字节相同**的状态。
@@ -1793,5 +1805,6 @@ peer_exchange_disabled_stays_seeded                   同链拓扑关发现 → 
 - ~~M94 keygen 密钥文件 `0600` 权限——`node keygen` 此前以 `std::fs::write` 默认权限（通常 `0644` 全局可读）落盘私钥种子（安全隐患）；M94 新增 `write_key_file`：Unix 上 `OpenOptionsExt::mode(0o600)` 创建时即置 owner-only（无全局可读窗口）+ `set_permissions(0o600)` 复申覆盖已存在文件，非 Unix 回落 `std::fs::write`，`cmd_keygen` 改调之、种子格式不变；新单测（`cfg(unix)`）`key_file_is_written_0600`/`key_file_overwrite_retightens_to_0600`/`key_file_round_trips_through_seed_decoder`，共 451 测、localnet head 不变~~ ✅
 - ~~M95 keygen 现成 genesis 条目生成——`node keygen` 此前只打印 pubkey、放进 genesis 须手拼 TOML；M95 在给出 `--genesis-id <id>`（+ 可选 `--balance`/`--power`）时额外打印可直接粘贴的 `[[accounts]]`（恒有）与 `[[validators]]`（有 `--power` 才加）条目；新增纯函数 `genesis_account_toml`/`genesis_validator_toml`（字段名逐字镜像 `config::AccountConfig`/`ValidatorConfig`）+ `keygen_genesis_entries`（`--genesis-id` 缺省 ⇒ `None`、keygen 原输出不变）；新单测 `genesis_entry_toml_renders_expected`/`keygen_genesis_entries_gated_on_id`/`keygen_genesis_entry_round_trips_through_loader`（经 `config::load_genesis`→`to_genesis` 还原），共 454 测、localnet head 不变~~ ✅
 - ~~M96 `node check-config` 配置干跑校验——部署前无从一处性校验 config/genesis（错误要到 `node run` 启动甚至绑端口才暴露）；M96 加 `node check-config --config F` 干跑：执行 `cmd_run` 完全相同的加载/解析/转换/密钥派生（`load_node_config`→`load_genesis`→`to_genesis`→（enabled 时）`keypair`）但不绑端口/不启 actor，成功打印摘要（id/role/genesis/accounts·reviewers·validators·peers 计数）、失败打印首个 typed `ConfigError` + exit 2；核心抽成纯函数 `check_config(path) -> Result<String, ConfigError>`、`cmd_check_config` 为薄壳，注册子命令 + usage（并补 M95 keygen `--genesis-id` usage）；新单测 `check_config_ok_for_follower`/`check_config_ok_for_validator`/`check_config_surfaces_bad_genesis`，共 457 测、localnet head 不变~~ ✅
+- ~~M97 `node genesis-hash` 链身份派生——运营者加入同一网络前须确认 genesis 逐字节一致（否则是互不兼容的链）；M97 加 `node genesis-hash --config F` 从 config 的 genesis 派生并打印 `genesis_hash`（起点 head）+ 初始 `state_root` + 创世验证人数；核心抽成纯函数 `genesis_identity(path) -> Result<String, ConfigError>`（`load_node_config`→`load_genesis`→`to_genesis`→`ChainState::genesis` 盖章）、`cmd_genesis_hash` 为薄壳，注册子命令 + usage、不绑端口/不启 actor；新单测 `genesis_hash_is_deterministic_and_matches_chainstate`/`genesis_hash_differs_for_different_genesis`/`genesis_hash_surfaces_bad_genesis`，共 460 测、localnet head 不变~~ ✅
 
-……；运维篮子剩余（货币费用（独立共识里程碑）、费用优先出块排序、nonce 反重放、读面列表端点篮子已收口、HTTP `HEAD`/`OPTIONS` 已补、keyfile `0600` 已补、现成 genesis 条目已补、`check-config` 已补、助记词/BIP-39、口令 keystore、密钥轮换、游标分页、`Accept-Encoding`（压缩须依赖）、未知方法 `405`、RPC auth/TLS、证书/密钥轮换与落盘、follower 认证、每-sink 独立 rotation 覆盖、OTEL/结构化日志 exporter、指标端 TLS、指标 push exporter/直方图/每-peer/每-轮次时延序列）顺延至 M97+，每步仍遵循"可运行、可测试、契约一致"。
+……；运维篮子剩余（货币费用（独立共识里程碑）、费用优先出块排序、nonce 反重放、读面列表端点篮子已收口、HTTP `HEAD`/`OPTIONS` 已补、keyfile `0600` 已补、现成 genesis 条目已补、`check-config` 已补、`genesis-hash` 已补、助记词/BIP-39、口令 keystore、密钥轮换、游标分页、`Accept-Encoding`（压缩须依赖）、未知方法 `405`、RPC auth/TLS、证书/密钥轮换与落盘、follower 认证、每-sink 独立 rotation 覆盖、OTEL/结构化日志 exporter、指标端 TLS、指标 push exporter/直方图/每-peer/每-轮次时延序列）顺延至 M98+，每步仍遵循"可运行、可测试、契约一致"。
