@@ -782,7 +782,10 @@ fn decode_hex_n<const N: usize>(s: &str, field: &str) -> Result<[u8; N], ConfigE
     Ok(out)
 }
 
-fn decode_pubkey(s: &str, field: &str) -> Result<PubKey, ConfigError> {
+/// Decode a 64-hex ed25519 public key into its 32 bytes. Public so offline tooling
+/// (e.g. `node inspect-tx --pubkey`) can reuse the exact decoder + `BadHex` errors the
+/// genesis loader uses, keeping the key-hex format consistent across the CLI.
+pub fn decode_pubkey(s: &str, field: &str) -> Result<PubKey, ConfigError> {
     decode_hex_n::<32>(s, field)
 }
 

@@ -237,6 +237,7 @@ fn main() {
         "run" => cmd_run(config_arg(&args)),
         "check-config" => cmd_check_config(config_arg(&args)),
         "genesis-hash" => cmd_genesis_hash(config_arg(&args)),
+        "inspect-tx" => cmd_inspect_tx(&args),
         "submit-tx" => cmd_submit_tx(config_arg(&args), tx_arg(&args)),
         "encode-tx" => cmd_encode_tx(&args),
         "keygen" => cmd_keygen(&args),
@@ -317,6 +318,7 @@ fn usage() {
     eprintln!("  node genesis-hash --config F  print the chain identity derived from the config's genesis: genesis_hash + initial state_root + validator count (compare across operators before joining)");
     eprintln!("  node submit-tx --config F --tx F  submit a codec-encoded tx to a running daemon's [rpc] ingress endpoint; print accepted hash or reject reason");
     eprintln!("  node encode-tx --key-file F --out F --author N --domain N --stake N --embedding f,..(DIM) --review R:S.. --repl-success N --repl-total N --timestamp-days F [--config F]  author+sign a tx offline into a submit-tx file; print its hash");
+    eprintln!("  node inspect-tx --tx F [--pubkey HEX]  decode a codec-encoded tx file and print its fields + content hash; with --pubkey, also verify the signature (the read-side companion to encode-tx)");
     eprintln!("  node keygen --out F [--seed HEX]  generate (or derive from a 64-hex seed) an ed25519 keypair; write the seed file (for encode-tx --key-file) and print the pubkey");
     eprintln!("  node keygen ... --genesis-id N [--balance MICRO] [--power P]  also print a ready-to-paste genesis [[accounts]] (and, with --power, [[validators]]) entry");
     eprintln!("  node localnet           spin up an in-process tokio testnet (4 validators, no sequencer) and show all nodes converge via distributed BFT voting over real sockets");
@@ -2790,6 +2792,49 @@ fn cmd_genesis_hash(config_path: String) {
     }
 }
 
+/// M98: decode a `codec::encode_tx` file and render its fields + content hash in human form
+/// — the read-side companion to `encode-tx`. With `pubkey_hex` present, also verify the
+/// ed25519 signature over `tx_signing_bytes` against that account key (a tx file carries no
+/// pubkey; the chain looks it up by `author`, so verification needs the key supplied). The
+/// hash is what the mempool dedups on, so an operator can confirm a file matches an on-chain
+/// tx. Pure (decode/verify only) for unit testing; `cmd_inspect_tx` is the file-reading shell.
+fn inspect_tx(bytes: &[u8], pubkey_hex: Option<&str>) -> Result<String, String> {
+    let tx = zhixing_node::codec::decode_tx(bytes).map_err(|e| format!("decode tx: {e}"))?;
+    let mut out = format!(
+        "hash {}\nauthor {}\ndomain {}\nstake {}\nreviews {}\nrepl {}/{}\ntimestamp_days {}\nembedding_dim {}\nsignature {}\n",
+        hex(&tx.hash()),
+        tx.author,
+        tx.domain,
+        tx.stake,
+        tx.reviews.len(),
+        tx.repl_success,
+        tx.repl_total,
+        tx.timestamp_days,
+        tx.embedding.len(),
+        hex(&tx.signature),
+    );
+    match pubkey_hex {
+        Some(h) => {
+            let pk = config::decode_pubkey(h.trim(), "--pubkey").map_err(|e| format!("{e}"))?;
+            let ok = zhixing_node::crypto::verify(&pk, &zhixing_node::codec::tx_signing_bytes(&tx), &tx.signature);
+            out.push_str(&format!("signature_valid {ok}"));
+        }
+        None => out.push_str("signature_valid unknown (pass --pubkey <hex> to verify)"),
+    }
+    Ok(out)
+}
+
+/// M98: `node inspect-tx --tx F [--pubkey HEX]` — print a decoded tx file (and optionally
+/// verify its signature). Reads only the `--tx` file; binds nothing.
+fn cmd_inspect_tx(args: &[String]) {
+    let tx_path = tx_arg(args);
+    let bytes = std::fs::read(&tx_path).unwrap_or_else(|e| fail("read tx file", e));
+    match inspect_tx(&bytes, opt_arg(args, "--pubkey")) {
+        Ok(summary) => println!("{summary}"),
+        Err(e) => fail_msg("inspect-tx", &e),
+    }
+}
+
 fn cmd_run(config_path: String) {
     // M44: load the config first, then install the subscriber from its optional
     // `[logging]` section (absent ⇒ the M37 default). Config-load errors print via
@@ -3759,5 +3804,60 @@ mod tests {
         let (cpath, dir) = write_check_config_fixture("ghbad", bad, "");
         assert!(genesis_identity(&cpath).is_err(), "bad genesis must fail");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // M98: build a signed tx and its canonical encoding for inspect-tx tests.
+    fn signed_tx_bytes(author: u64, kp: &Keypair) -> Vec<u8> {
+        let tx = SubmissionTx {
+            author,
+            embedding: [0.0f32; DIM],
+            domain: 2,
+            stake: 1000,
+            reviews: vec![],
+            repl_success: 1,
+            repl_total: 2,
+            timestamp_days: 10.0,
+            signature: [0u8; 64],
+        }
+        .signed(kp);
+        zhixing_node::codec::encode_tx(&tx)
+    }
+
+    #[test]
+    fn inspect_tx_renders_fields_and_hash() {
+        // M98: a decoded tx prints its fields + content hash; without a pubkey the signature
+        // validity is reported as unknown (a tx file carries no key).
+        let kp = Keypair::from_seed(seed_for(1));
+        let bytes = signed_tx_bytes(5, &kp);
+        let out = inspect_tx(&bytes, None).expect("decode");
+        assert!(out.contains("author 5\n"), "{out}");
+        assert!(out.contains("domain 2\n"), "{out}");
+        assert!(out.contains("stake 1000\n"), "{out}");
+        assert!(out.contains(&format!("embedding_dim {DIM}\n")), "{out}");
+        // The printed hash matches the tx's own content hash.
+        let tx = zhixing_node::codec::decode_tx(&bytes).unwrap();
+        assert!(out.contains(&format!("hash {}\n", hex(&tx.hash()))), "{out}");
+        assert!(out.contains("signature_valid unknown"), "{out}");
+    }
+
+    #[test]
+    fn inspect_tx_verifies_signature_with_pubkey() {
+        // M98: with the author's pubkey, the correct key verifies true and a wrong key false.
+        let kp = Keypair::from_seed(seed_for(1));
+        let bytes = signed_tx_bytes(5, &kp);
+        let good = inspect_tx(&bytes, Some(&hex(&kp.public()))).expect("decode");
+        assert!(good.contains("signature_valid true"), "{good}");
+        let wrong = Keypair::from_seed(seed_for(2));
+        let bad = inspect_tx(&bytes, Some(&hex(&wrong.public()))).expect("decode");
+        assert!(bad.contains("signature_valid false"), "{bad}");
+    }
+
+    #[test]
+    fn inspect_tx_surfaces_decode_and_pubkey_errors() {
+        // M98: undecodable bytes ⇒ Err; a decodable tx with a malformed --pubkey ⇒ Err.
+        assert!(inspect_tx(b"not a tx", None).is_err(), "garbage must fail to decode");
+        let kp = Keypair::from_seed(seed_for(1));
+        let bytes = signed_tx_bytes(5, &kp);
+        assert!(inspect_tx(&bytes, Some("nothex")).is_err(), "bad pubkey must error");
     }
 }
