@@ -487,6 +487,12 @@ enum Cmd {
         hash: crate::Hash,
         reply: oneshot::Sender<Option<u64>>,
     },
+    /// M113: read a committed block's header + body counts by height for `/block/{height}`.
+    /// `None` ⇒ no such committed block (past the tip, or genesis height 0).
+    QueryBlock {
+        height: u64,
+        reply: oneshot::Sender<Option<BlockSummary>>,
+    },
     /// M104: snapshot the money-supply totals for the `/supply` read.
     QuerySupply {
         reply: oneshot::Sender<SupplyView>,
@@ -1238,6 +1244,24 @@ async fn run_actor(mut actor: Actor, mut rx: mpsc::UnboundedReceiver<Cmd>) {
             Cmd::QueryTxHeight { hash, reply } => {
                 // M112: O(1) inclusion lookup against the node-local tx index.
                 let _ = reply.send(actor.tx_index.get(&hash).copied());
+            }
+            Cmd::QueryBlock { height, reply } => {
+                // M113: locate the committed block at `height` and summarize its header + body.
+                let summary = actor.node.blocks().iter().find(|b| b.height == height).map(|b| {
+                    BlockSummary {
+                        height: b.height,
+                        hash: b.hash(),
+                        prev_hash: b.prev_hash,
+                        timestamp_days: b.timestamp_days,
+                        state_root: b.state_root,
+                        accounts_root: b.accounts_root,
+                        n_txs: b.txs.len(),
+                        n_stake_ops: b.stake_ops.len(),
+                        n_evidence: b.slashing_evidence.len(),
+                        n_validator_updates: b.validator_updates.len(),
+                    }
+                });
+                let _ = reply.send(summary);
             }
             Cmd::QuerySupply { reply } => {
                 // M104: snapshot the supply-conservation totals from committed state.
@@ -2207,6 +2231,10 @@ enum GetRoute {
     /// content hash mined? Pairs with `/mempool/{hash}` (pending): a wallet polls both to
     /// follow a submission from pool → block. 64-hex hash; malformed ⇒ 404.
     TxHeight(crate::Hash),
+    /// M113: `GET /block/{height}` — a committed block's header + body counts, the on-wire
+    /// companion to the `inspect-block` CLI. A height past the tip (or genesis, height 0,
+    /// which has no log block) ⇒ 404. Non-numeric ⇒ 404.
+    Block(u64),
     /// M104: `GET /supply` — the money-supply snapshot (supply, treasury, bonded,
     /// bridge_locked, bridge_minted). Lets a client audit the supply-conservation invariant
     /// from cert-signed state. Exact-match; no id.
@@ -2580,6 +2608,10 @@ fn route_get(path: &str) -> GetRoute {
                 // M112: `/tx/{hash}` is a committed-inclusion read — at which height (if any)
                 // was this tx mined? A malformed hash ⇒ 404.
                 parse_hash(rest).map(GetRoute::TxHeight).unwrap_or(GetRoute::NotFound)
+            } else if let Some(rest) = p.strip_prefix("/block/") {
+                // M113: `/block/{height}` is a committed-block read. A non-numeric height ⇒ 404;
+                // a height with no committed block is a 404 produced by the handler.
+                rest.parse::<u64>().map(GetRoute::Block).unwrap_or(GetRoute::NotFound)
             } else {
                 GetRoute::Health
             }
@@ -2813,6 +2845,59 @@ fn json_tx_height(height: Option<u64>) -> String {
         Some(h) => format!("{{\"height\":{}}}", json_u64(h)),
         None => "{\"height\":null}".to_string(),
     }
+}
+
+/// M113: a committed block's header + body counts, for the `/block/{height}` read. The full
+/// tx/op bodies are large and self-addressable (`/tx/{hash}`); this is the lightweight index.
+struct BlockSummary {
+    height: u64,
+    hash: crate::Hash,
+    prev_hash: crate::Hash,
+    timestamp_days: f32,
+    state_root: crate::Hash,
+    accounts_root: crate::Hash,
+    n_txs: usize,
+    n_stake_ops: usize,
+    n_evidence: usize,
+    n_validator_updates: usize,
+}
+
+/// M113: render a block summary as grep-friendly `key=value` lines (hashes as hex, counts
+/// lossless). Pure for direct unit testing.
+fn format_block_summary(b: &BlockSummary) -> String {
+    format!(
+        "height={}\nhash={}\nprev_hash={}\ntimestamp_days={}\nstate_root={}\naccounts_root={}\n\
+txs={}\nstake_ops={}\nevidence={}\nvalidator_updates={}",
+        b.height,
+        crate::hash::hex(&b.hash),
+        crate::hash::hex(&b.prev_hash),
+        json_f32(b.timestamp_days),
+        crate::hash::hex(&b.state_root),
+        crate::hash::hex(&b.accounts_root),
+        b.n_txs,
+        b.n_stake_ops,
+        b.n_evidence,
+        b.n_validator_updates,
+    )
+}
+
+/// M113: `GET /block/{height}?format=json` — the JSON sibling, a single object (counts as
+/// lossless quoted-u64, hashes as quoted hex).
+fn json_block_summary(b: &BlockSummary) -> String {
+    format!(
+        "{{\"height\":{},\"hash\":{},\"prev_hash\":{},\"timestamp_days\":{},\"state_root\":{},\"accounts_root\":{},\
+\"txs\":{},\"stake_ops\":{},\"evidence\":{},\"validator_updates\":{}}}",
+        json_u64(b.height),
+        json_str(&crate::hash::hex(&b.hash)),
+        json_str(&crate::hash::hex(&b.prev_hash)),
+        json_f32(b.timestamp_days),
+        json_str(&crate::hash::hex(&b.state_root)),
+        json_str(&crate::hash::hex(&b.accounts_root)),
+        json_u64(b.n_txs as u64),
+        json_u64(b.n_stake_ops as u64),
+        json_u64(b.n_evidence as u64),
+        json_u64(b.n_validator_updates as u64),
+    )
 }
 
 /// An f32 as a JSON number token, or `null` when non-finite (`inf`/`NaN` are not valid
@@ -4425,6 +4510,20 @@ async fn serve_rpc_conn(mut stream: TcpStream, cmd: mpsc::UnboundedSender<Cmd>) 
                 } else {
                     match rx.await {
                         Ok(height) => ok_body(fmt, &format_tx_height(height), &json_tx_height(height)),
+                        Err(_) => http_response("503 Service Unavailable", "node stopped"),
+                    }
+                }
+            }
+            GetRoute::Block(height) => {
+                // M113: committed-block read — the header + body counts, or 404 when there is
+                // no committed block at `height` (past the tip, or genesis height 0).
+                let (reply, rx) = oneshot::channel();
+                if cmd.send(Cmd::QueryBlock { height, reply }).is_err() {
+                    http_response("503 Service Unavailable", "node stopped")
+                } else {
+                    match rx.await {
+                        Ok(Some(b)) => ok_body(fmt, &format_block_summary(&b), &json_block_summary(&b)),
+                        Ok(None) => http_response("404 Not Found", "block not found"),
                         Err(_) => http_response("503 Service Unavailable", "node stopped"),
                     }
                 }
@@ -7360,6 +7459,68 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn rpc_block_read_over_tcp() {
+        // M113: `GET /block/{height}` returns a committed block's header + counts; a height
+        // past the tip (and genesis height 0) ⇒ 404, and a non-numeric height ⇒ 404.
+        let dir = tmp_dir("rpc-block-read");
+        // node_config p2p listen = 20891 + (46-21) = 20916; keep the RPC port clear.
+        let mut cfg = node_config(46, 20891, &[46], dir.clone());
+        let rpc_addr = "127.0.0.1:20921";
+        cfg.rpc = Some(crate::config::RpcConfig { enabled: true, listen: rpc_addr.into() });
+        let mut genesis = test_genesis();
+        genesis.validators = vec![(46, kp(46).public(), 1)]; // quorum 1 ⇒ self-commit
+        let node = Node::start(cfg, genesis, Some(kp(46))).await.expect("start node");
+
+        // Wait until the chain has at least one committed block.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        let tip = loop {
+            if let Some((h, _)) = node.status().await {
+                if h >= 1 {
+                    break h;
+                }
+            }
+            assert!(tokio::time::Instant::now() < deadline, "node never produced a block");
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        };
+
+        async fn get(addr: &str, path: &str) -> String {
+            let req = format!("GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
+            let mut s = TcpStream::connect(addr).await.expect("connect rpc");
+            s.write_all(req.as_bytes()).await.expect("send get");
+            let mut resp = Vec::new();
+            s.read_to_end(&mut resp).await.expect("read response");
+            String::from_utf8_lossy(&resp).into_owned()
+        }
+        fn body_of(resp: &str) -> &str {
+            resp.split_once("\r\n\r\n").map(|(_, b)| b).unwrap_or("")
+        }
+
+        // Block 1 exists → 200 with a `height=1` summary.
+        let b1 = get(rpc_addr, "/block/1").await;
+        assert!(b1.starts_with("HTTP/1.1 200 OK"), "block 1 status: {b1}");
+        let body = body_of(&b1);
+        assert!(body.starts_with("height=1\n"), "block 1 body: {body}");
+        assert!(body.contains("\nhash="), "block 1 has a hash: {body}");
+        assert!(body.contains("\ntxs="), "block 1 has a tx count: {body}");
+
+        // JSON form of the same block.
+        let b1_json = get(rpc_addr, "/block/1?format=json").await;
+        assert!(body_of(&b1_json).starts_with("{\"height\":\"1\","), "block 1 json: {b1_json}");
+
+        // Genesis (height 0) has no log block ⇒ 404.
+        let b0 = get(rpc_addr, "/block/0").await;
+        assert!(b0.starts_with("HTTP/1.1 404 Not Found"), "block 0 ⇒ 404: {b0}");
+
+        // A height far past the tip ⇒ 404; a non-numeric height ⇒ 404.
+        let past = get(rpc_addr, &format!("/block/{}", tip + 10_000)).await;
+        assert!(past.starts_with("HTTP/1.1 404 Not Found"), "future height ⇒ 404: {past}");
+        let nan = get(rpc_addr, "/block/notanumber").await;
+        assert!(nan.starts_with("HTTP/1.1 404 Not Found"), "non-numeric ⇒ 404: {nan}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
     async fn rpc_supply_over_tcp() {
         // M104: `GET /supply` returns the money-supply snapshot from committed state. On a
         // fresh single-validator chain the supply equals the genesis endowments and the
@@ -8829,6 +8990,45 @@ vote_b.validator=5 vote_b.height=9 vote_b.round=2 vote_b.block_hash={b_h} vote_b
         assert_eq!(json_tx_height(Some(5)), "{\"height\":\"5\"}");
         assert_eq!(format_tx_height(None), "absent");
         assert_eq!(json_tx_height(None), "{\"height\":null}");
+    }
+
+    #[test]
+    fn route_get_parses_block() {
+        // M113: `/block/{height}` parses a u64 height; non-numeric or empty ⇒ 404.
+        assert!(matches!(route_get("/block/7"), GetRoute::Block(7)));
+        assert!(matches!(route_get("/block/0"), GetRoute::Block(0)));
+        assert!(matches!(route_get("/block/abc"), GetRoute::NotFound), "non-numeric ⇒ 404");
+        assert!(matches!(route_get("/block/"), GetRoute::NotFound), "empty ⇒ 404");
+    }
+
+    #[test]
+    fn block_summary_renders_text_and_json() {
+        // M113: a block summary renders header hashes + body counts as text lines and a JSON
+        // object (counts lossless quoted-u64, hashes quoted hex).
+        let b = BlockSummary {
+            height: 3,
+            hash: [0x11u8; 32],
+            prev_hash: [0x22u8; 32],
+            timestamp_days: 0.0,
+            state_root: [0x33u8; 32],
+            accounts_root: [0x44u8; 32],
+            n_txs: 2,
+            n_stake_ops: 1,
+            n_evidence: 0,
+            n_validator_updates: 0,
+        };
+        let hh = crate::hash::hex(&[0x11u8; 32]);
+        let text = format_block_summary(&b);
+        assert!(text.starts_with("height=3\n"), "{text}");
+        assert!(text.contains(&format!("hash={hh}\n")), "{text}");
+        assert!(text.contains("txs=2\n"), "{text}");
+        assert!(text.ends_with("validator_updates=0"), "{text}");
+
+        let json = json_block_summary(&b);
+        assert!(json.contains("\"height\":\"3\""), "{json}");
+        assert!(json.contains(&format!("\"hash\":\"{hh}\"")), "{json}");
+        assert!(json.contains("\"txs\":\"2\""), "{json}");
+        assert!(json.contains("\"stake_ops\":\"1\""), "{json}");
     }
 
     #[test]
