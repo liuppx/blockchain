@@ -464,6 +464,12 @@ enum Cmd {
     QueryEvidence {
         reply: oneshot::Sender<Vec<crate::SlashEvidence>>,
     },
+    /// M91: list the connected-peer directory (peer id + known listen address) for the
+    /// plain read-class RPC. A daemon-level read built from the actor's `outbound` +
+    /// `addrs` maps. Always a (possibly empty) list, id-sorted.
+    QueryPeers {
+        reply: oneshot::Sender<Vec<(u64, Option<String>)>>,
+    },
     /// M61: serve a heterogeneous proof batch + the certified head it verifies
     /// against, for the verifiable batch read RPC. `None` ⇒ `serve_batch` rejected
     /// (over `MAX_BATCH_ITEMS` or a degenerate Diff range) or no certified head
@@ -1165,6 +1171,17 @@ async fn run_actor(mut actor: Actor, mut rx: mpsc::UnboundedReceiver<Cmd>) {
             Cmd::QueryEvidence { reply } => {
                 // M90: snapshot the pending slashing-evidence pool staged for the next block.
                 let _ = reply.send(actor.node.pending_evidence().to_vec());
+            }
+            Cmd::QueryPeers { reply } => {
+                // M91: snapshot the connected-peer directory (id-sorted), pairing each
+                // outbound peer id with its known listen address (M39 address book), if any.
+                let mut peers: Vec<(u64, Option<String>)> = actor
+                    .outbound
+                    .keys()
+                    .map(|&id| (id, actor.addrs.get(&id).cloned()))
+                    .collect();
+                peers.sort_by_key(|&(id, _)| id);
+                let _ = reply.send(peers);
             }
             Cmd::QueryBatch { items, reply } => {
                 let _ = reply.send(actor.node.batch(items));
@@ -1996,6 +2013,10 @@ enum GetRoute {
     /// precommit votes) staged for the next proposed block. A pending-pool read sibling
     /// of `/stake-ops`; no single-read sibling.
     Evidence,
+    /// M91: `GET /peers` — the connected-peer directory (peer id + known listen address).
+    /// A daemon-level read (peers live on the actor, not in chain state); no single-read
+    /// sibling. Closes the read-surface basket of list endpoints.
+    Peers,
     NotFound,
 }
 
@@ -2267,6 +2288,9 @@ fn route_get(path: &str) -> GetRoute {
         // M90: the pending slashing-evidence pool. Exact-match; there is no `/evidence/`
         // single-read prefix, so `/evidence/` simply falls through to `Health`.
         "/evidence" => GetRoute::Evidence,
+        // M91: the connected-peer directory. Exact-match; there is no `/peer/` single-read
+        // prefix, so `/peers/` simply falls through to `Health`.
+        "/peers" => GetRoute::Peers,
         p => {
             if let Some(rest) = p.strip_prefix("/account/") {
                 // M59: `{id}/proof` is the verifiable read; a bare `{id}` is the M58
@@ -2823,6 +2847,38 @@ fn format_evidence_listing(evidence: &[crate::SlashEvidence]) -> String {
 /// JSON **array** of objects (`[]` when empty), reusing the existing `json_slash_evidence`.
 fn json_evidence_listing(evidence: &[crate::SlashEvidence]) -> String {
     let items = evidence.iter().map(json_slash_evidence).collect::<Vec<_>>().join(",");
+    format!("[{items}]")
+}
+
+/// M91: render one connected peer as a grep-friendly `key=value` line (`kind=peer id=…
+/// addr=…`). The listen address is the M39 address-book entry; an unknown address renders
+/// as the literal `unknown`. Standalone (a daemon-level value, not a chain entity). Pure.
+fn format_peer(id: u64, addr: &Option<String>) -> String {
+    let addr = addr.as_deref().unwrap_or("unknown");
+    format!("kind=peer id={id} addr={addr}")
+}
+
+/// M91: the JSON sibling of [`format_peer`] — a single object with a lossless quoted-u64
+/// `id` and an `addr` that is a JSON string when known or bare `null` when unknown
+/// (mirroring the `next=null` convention of the page envelope).
+fn json_peer(id: u64, addr: &Option<String>) -> String {
+    let addr = match addr {
+        Some(a) => json_str(a),
+        None => "null".to_string(),
+    };
+    format!("{{\"kind\":\"peer\",\"id\":{},\"addr\":{}}}", json_u64(id), addr)
+}
+
+/// M91: render the connected-peer directory as grep-friendly lines, one per peer (empty
+/// string when none are connected). Reuses `format_peer` per item; id order.
+fn format_peer_listing(peers: &[(u64, Option<String>)]) -> String {
+    peers.iter().map(|(id, addr)| format_peer(*id, addr)).collect::<Vec<_>>().join("\n")
+}
+
+/// M91: `GET /peers?format=json` — the JSON sibling of [`format_peer_listing`]. A JSON
+/// **array** of objects (`[]` when empty), reusing `json_peer` per item.
+fn json_peer_listing(peers: &[(u64, Option<String>)]) -> String {
+    let items = peers.iter().map(|(id, addr)| json_peer(*id, addr)).collect::<Vec<_>>().join(",");
     format!("[{items}]")
 }
 
@@ -3786,6 +3842,36 @@ async fn serve_rpc_conn(mut stream: TcpStream, cmd: mpsc::UnboundedSender<Cmd>) 
                                 fmt,
                                 &format_page(&format_evidence_listing(page), total, next),
                                 &json_page(&json_evidence_listing(page), total, next),
+                            )
+                        }
+                        Err(_) => http_response("503 Service Unavailable", "node stopped"),
+                    }
+                }
+            }
+            GetRoute::Peers => {
+                // M91: connected-peer directory — always a (possibly empty) `200`. Tenth
+                // consumer of the pagination stack and the first daemon-level read (peers live
+                // on the actor, not chain state), reusing `format_peer`/`json_peer` per item.
+                let (reply, rx) = oneshot::channel();
+                if cmd.send(Cmd::QueryPeers { reply }).is_err() {
+                    http_response("503 Service Unavailable", "node stopped")
+                } else {
+                    match rx.await {
+                        Ok(listing) => {
+                            let offset = usize_param(query, "offset").unwrap_or(0);
+                            let limit = Some(effective_limit(usize_param(query, "limit")));
+                            let total = listing.len();
+                            let page = paginate(&listing, offset, limit);
+                            let start = offset.min(total);
+                            let next = if start + page.len() < total {
+                                Some(start + page.len())
+                            } else {
+                                None
+                            };
+                            ok_body(
+                                fmt,
+                                &format_page(&format_peer_listing(page), total, next),
+                                &json_page(&json_peer_listing(page), total, next),
                             )
                         }
                         Err(_) => http_response("503 Service Unavailable", "node stopped"),
@@ -6407,6 +6493,62 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn rpc_peers_list_over_tcp() {
+        // M91: the connected-peer directory over real TCP — the tenth list endpoint and the
+        // first daemon-level read (peers live on the actor, not chain state), reusing the
+        // pagination stack + `format_peer`/`json_peer`. A single-node localnet has no
+        // configured peers, so `outbound` is empty and `/peers` is live-but-empty — asserted
+        // end to end (route → Cmd → actor `outbound`/`addrs` → envelope).
+        let dir = tmp_dir("rpc-peers-list");
+        // node_config derives the p2p listen port as `port_base + (id-21)` = 20401+11 = 20412;
+        // keep the RPC port clear of it.
+        let mut cfg = node_config(32, 20401, &[32], dir.clone());
+        let rpc_addr = "127.0.0.1:20421";
+        cfg.rpc = Some(crate::config::RpcConfig { enabled: true, listen: rpc_addr.into() });
+        let mut genesis = test_genesis();
+        genesis.validators = vec![(32, kp(32).public(), 1)]; // quorum 1 ⇒ self-commit
+        let node = Node::start(cfg, genesis, Some(kp(32))).await.expect("start node");
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            if node.status().await.map(|(h, _)| h >= 1).unwrap_or(false) {
+                break;
+            }
+            assert!(tokio::time::Instant::now() < deadline, "node never produced a block");
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+
+        async fn get(addr: &str, path: &str) -> String {
+            let req = format!("GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
+            let mut s = TcpStream::connect(addr).await.expect("connect rpc");
+            s.write_all(req.as_bytes()).await.expect("send get");
+            let mut resp = Vec::new();
+            s.read_to_end(&mut resp).await.expect("read response");
+            String::from_utf8_lossy(&resp).into_owned()
+        }
+        fn body_of(resp: &str) -> &str {
+            resp.split_once("\r\n\r\n").map(|(_, b)| b).unwrap_or("")
+        }
+
+        // Plain directory → 200 with an empty page (no connected peers on a solo node).
+        let resp = get(rpc_addr, "/peers").await;
+        assert!(resp.starts_with("HTTP/1.1 200 OK"), "peers status: {resp}");
+        assert_eq!(body_of(&resp), "total=0", "peers text envelope (no peers)");
+
+        // JSON representation → the `total`/`next`/`items` envelope with an empty array.
+        let as_json = get(rpc_addr, "/peers?format=json").await;
+        assert!(as_json.starts_with("HTTP/1.1 200 OK"), "peers json status: {as_json}");
+        assert!(as_json.contains("Content-Type: application/json\r\n"), "json ct: {as_json}");
+        assert_eq!(
+            body_of(&as_json),
+            "{\"total\":\"0\",\"next\":null,\"items\":[]}",
+            "peers JSON envelope (no peers)"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
     async fn rpc_plain_entities_over_tcp() {
         // M65: plain reviewer/validator/graph reads over real TCP. Unlike bridge locks,
         // `test_genesis` carries real reviewers (10,11,12), validators (21-24), and a
@@ -7319,6 +7461,43 @@ vote_b.validator=5 vote_b.height=9 vote_b.round=2 vote_b.block_hash={b_h} vote_b
         // Empty pool ⇒ empty text, `[]` JSON.
         assert_eq!(format_evidence_listing(&[]), "");
         assert_eq!(json_evidence_listing(&[]), "[]");
+    }
+
+    #[test]
+    fn route_get_parses_peers() {
+        // M91: `/peers` is a plain directory read — an exact match. There is no `/peer/`
+        // single-read prefix, so a trailing slash falls through to the health fallback
+        // (like `/evidence/`, not `NotFound`).
+        assert!(matches!(route_get("/peers"), GetRoute::Peers));
+        assert!(matches!(route_get("/peers/"), GetRoute::Health));
+        // Sibling list reads still resolve to their own variants (no collision).
+        assert!(matches!(route_get("/evidence"), GetRoute::Evidence));
+        assert!(matches!(route_get("/stake-ops"), GetRoute::StakeOps));
+    }
+
+    #[test]
+    fn peer_listing_renders() {
+        // M91: two connected peers render one grep-friendly line each (id order); a known
+        // address renders verbatim, an unknown one as `unknown` in text and `null` in JSON.
+        // The empty directory yields an empty text body and `[]`.
+        let peers = vec![(7u64, Some("127.0.0.1:9000".to_string())), (9u64, None)];
+        let text = format_peer_listing(&peers);
+        assert_eq!(
+            text,
+            "kind=peer id=7 addr=127.0.0.1:9000\nkind=peer id=9 addr=unknown"
+        );
+        let json = json_peer_listing(&peers);
+        assert_eq!(
+            json,
+            "[{\"kind\":\"peer\",\"id\":\"7\",\"addr\":\"127.0.0.1:9000\"},\
+{\"kind\":\"peer\",\"id\":\"9\",\"addr\":null}]"
+        );
+        // Single-item renderers match what the listing emits per entry.
+        assert_eq!(format_peer(7, &Some("127.0.0.1:9000".to_string())), "kind=peer id=7 addr=127.0.0.1:9000");
+        assert_eq!(json_peer(9, &None), "{\"kind\":\"peer\",\"id\":\"9\",\"addr\":null}");
+        // Empty directory ⇒ empty text, `[]` JSON.
+        assert_eq!(format_peer_listing(&[]), "");
+        assert_eq!(json_peer_listing(&[]), "[]");
     }
 
     #[test]
