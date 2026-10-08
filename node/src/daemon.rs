@@ -481,6 +481,10 @@ enum Cmd {
     QuerySupply {
         reply: oneshot::Sender<SupplyView>,
     },
+    /// M105: snapshot the governance/economic knobs (ΔK params + base emission + slash bps).
+    QueryParams {
+        reply: oneshot::Sender<ParamsView>,
+    },
     /// M61: serve a heterogeneous proof batch + the certified head it verifies
     /// against, for the verifiable batch read RPC. `None` ⇒ `serve_batch` rejected
     /// (over `MAX_BATCH_ITEMS` or a degenerate Diff range) or no certified head
@@ -1208,6 +1212,23 @@ async fn run_actor(mut actor: Actor, mut rx: mpsc::UnboundedReceiver<Cmd>) {
                     bonded: s.bonded,
                     bridge_locked: s.bridge_locked,
                     bridge_minted: s.bridge_minted,
+                });
+            }
+            Cmd::QueryParams { reply } => {
+                // M105: snapshot the governance/economic knobs from committed state.
+                let s = &actor.node.chain.state;
+                let _ = reply.send(ParamsView {
+                    base_emission_micro: s.base_emission_micro,
+                    slash_bps: s.slash_bps,
+                    tau_dup: s.params.tau_dup,
+                    n_review_min: s.params.n_review_min,
+                    c_cap: s.params.c_cap,
+                    n_min: s.params.n_min,
+                    lam: s.params.lam,
+                    bonus_max: s.params.bonus_max,
+                    decay: s.params.decay,
+                    fresh_min: s.params.fresh_min,
+                    delta_k_min: s.params.delta_k_min,
                 });
             }
             Cmd::QueryBatch { items, reply } => {
@@ -2090,6 +2111,10 @@ enum GetRoute {
     /// bridge_locked, bridge_minted). Lets a client audit the supply-conservation invariant
     /// from cert-signed state. Exact-match; no id.
     Supply,
+    /// M105: `GET /params` — the governance/economic knobs (ΔK params + base emission + slash
+    /// bps) stamped into committed state. Lets a client see which policy produced a given
+    /// chain without diffing the genesis. Exact-match; no id.
+    Params,
     NotFound,
 }
 
@@ -2366,6 +2391,8 @@ fn route_get(path: &str) -> GetRoute {
         "/peers" => GetRoute::Peers,
         // M104: the money-supply snapshot. Exact-match; no id, no prefix sibling.
         "/supply" => GetRoute::Supply,
+        // M105: the governance/economic knobs. Exact-match; no id, no prefix sibling.
+        "/params" => GetRoute::Params,
         p => {
             if let Some(rest) = p.strip_prefix("/account/") {
                 // M59: `{id}/proof` is the verifiable read; a bare `{id}` is the M58
@@ -3018,6 +3045,64 @@ fn json_supply(s: &SupplyView) -> String {
         json_u64(s.bonded),
         json_u64(s.bridge_locked),
         json_u64(s.bridge_minted),
+    )
+}
+
+/// M105: the governance/economic knobs stamped into committed state. The ΔK engine owns
+/// its parameter set; we snapshot it for the `/params` read so a client can see which
+/// policy produced a given chain without diffing the genesis.
+struct ParamsView {
+    base_emission_micro: u64,
+    slash_bps: u32,
+    tau_dup: f32,
+    n_review_min: usize,
+    c_cap: f32,
+    n_min: usize,
+    lam: f32,
+    bonus_max: f32,
+    decay: f32,
+    fresh_min: f32,
+    delta_k_min: f32,
+}
+
+/// M105: render the params snapshot as grep-friendly `key=value` lines (one per knob, with
+/// the integer ones lossless and the f32 ones via `json_f32` so NaN/inf can't leak).
+fn format_params(p: &ParamsView) -> String {
+    let mut out = format!(
+        "base_emission_micro={}\nslash_bps={}",
+        p.base_emission_micro, p.slash_bps,
+    );
+    out.push_str(&format!(
+        "\ntau_dup={}\nn_review_min={}\nc_cap={}\nn_min={}\nlam={}\nbonus_max={}\ndecay={}\nfresh_min={}\ndelta_k_min={}",
+        json_f32(p.tau_dup),
+        p.n_review_min,
+        json_f32(p.c_cap),
+        p.n_min,
+        json_f32(p.lam),
+        json_f32(p.bonus_max),
+        json_f32(p.decay),
+        json_f32(p.fresh_min),
+        json_f32(p.delta_k_min),
+    ));
+    out
+}
+
+/// M105: `GET /params?format=json` — the JSON sibling as a single quoted-u64 / JSON-number
+/// object, mirroring the field names of [`ParamsView`].
+fn json_params(p: &ParamsView) -> String {
+    format!(
+        "{{\"base_emission_micro\":{},\"slash_bps\":{},\"tau_dup\":{},\"n_review_min\":{},\"c_cap\":{},\"n_min\":{},\"lam\":{},\"bonus_max\":{},\"decay\":{},\"fresh_min\":{},\"delta_k_min\":{}}}",
+        json_u64(p.base_emission_micro),
+        json_u64(p.slash_bps as u64),
+        json_f32(p.tau_dup),
+        json_u64(p.n_review_min as u64),
+        json_f32(p.c_cap),
+        json_u64(p.n_min as u64),
+        json_f32(p.lam),
+        json_f32(p.bonus_max),
+        json_f32(p.decay),
+        json_f32(p.fresh_min),
+        json_f32(p.delta_k_min),
     )
 }
 
@@ -4062,6 +4147,18 @@ async fn serve_rpc_conn(mut stream: TcpStream, cmd: mpsc::UnboundedSender<Cmd>) 
                 } else {
                     match rx.await {
                         Ok(s) => ok_body(fmt, &format_supply(&s), &json_supply(&s)),
+                        Err(_) => http_response("503 Service Unavailable", "node stopped"),
+                    }
+                }
+            }
+            GetRoute::Params => {
+                // M105: governance/economic knobs from committed state — always a `200`.
+                let (reply, rx) = oneshot::channel();
+                if cmd.send(Cmd::QueryParams { reply }).is_err() {
+                    http_response("503 Service Unavailable", "node stopped")
+                } else {
+                    match rx.await {
+                        Ok(p) => ok_body(fmt, &format_params(&p), &json_params(&p)),
                         Err(_) => http_response("503 Service Unavailable", "node stopped"),
                     }
                 }
@@ -6842,6 +6939,60 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn rpc_params_over_tcp() {
+        // M105: `GET /params` returns the governance/economic knobs. A fresh single-validator
+        // chain carries the engine's `DeltaKParams::default()` and the genesis's emission/slash.
+        let dir = tmp_dir("rpc-params");
+        // node_config p2p listen = 20581 + (38-21) = 20597; keep the RPC port clear.
+        let mut cfg = node_config(38, 20581, &[38], dir.clone());
+        let rpc_addr = "127.0.0.1:20601";
+        cfg.rpc = Some(crate::config::RpcConfig { enabled: true, listen: rpc_addr.into() });
+        let mut genesis = test_genesis();
+        genesis.validators = vec![(38, kp(38).public(), 1)]; // quorum 1 ⇒ self-commit
+        let node = Node::start(cfg, genesis, Some(kp(38))).await.expect("start node");
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            if node.status().await.map(|(h, _)| h >= 1).unwrap_or(false) {
+                break;
+            }
+            assert!(tokio::time::Instant::now() < deadline, "node never produced a block");
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+
+        async fn get(addr: &str, path: &str) -> String {
+            let req = format!("GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
+            let mut s = TcpStream::connect(addr).await.expect("connect rpc");
+            s.write_all(req.as_bytes()).await.expect("send get");
+            let mut resp = Vec::new();
+            s.read_to_end(&mut resp).await.expect("read response");
+            String::from_utf8_lossy(&resp).into_owned()
+        }
+        fn body_of(resp: &str) -> &str {
+            resp.split_once("\r\n\r\n").map(|(_, b)| b).unwrap_or("")
+        }
+
+        let resp = get(rpc_addr, "/params").await;
+        assert!(resp.starts_with("HTTP/1.1 200 OK"), "params status: {resp}");
+        let body = body_of(&resp);
+        // Every knob appears at least once in the grep body.
+        for k in &["base_emission_micro=", "slash_bps=", "tau_dup=", "n_review_min=", "c_cap=", "n_min=", "lam=", "bonus_max=", "decay=", "fresh_min=", "delta_k_min="] {
+            assert!(body.contains(k), "missing {k} in {body}");
+        }
+
+        // JSON representation is a single object mirroring the same keys.
+        let as_json = get(rpc_addr, "/params?format=json").await;
+        assert!(as_json.contains("Content-Type: application/json\r\n"), "json ct: {as_json}");
+        let jbody = body_of(&as_json);
+        assert!(jbody.starts_with("{\"base_emission_micro\":\""), "params json: {jbody}");
+        for k in &["\"base_emission_micro\":", "\"slash_bps\":", "\"tau_dup\":", "\"n_review_min\":", "\"c_cap\":", "\"n_min\":", "\"lam\":", "\"bonus_max\":", "\"decay\":", "\"fresh_min\":", "\"delta_k_min\":"] {
+            assert!(jbody.contains(k), "missing {k} in {jbody}");
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
     async fn rpc_head_mirrors_get_without_body() {
         // M92: a HEAD request mirrors the matching GET — same status + headers (crucially the
         // GET body's Content-Length) but no body (RFC 9110 §9.3.2). Exercised end to end over
@@ -7968,6 +8119,48 @@ vote_b.validator=5 vote_b.height=9 vote_b.round=2 vote_b.block_hash={b_h} vote_b
             json_supply(&s),
             "{\"supply\":\"1000000\",\"treasury\":\"2000\",\"bonded\":\"50000\",\"bridge_locked\":\"300\",\"bridge_minted\":\"42\"}"
         );
+    }
+
+    #[test]
+    fn route_get_parses_params() {
+        // M105: `/params` is an exact-match read; a trailing slash is not the route (health).
+        assert!(matches!(route_get("/params"), GetRoute::Params));
+        assert!(matches!(route_get("/params/"), GetRoute::Health));
+        // No collision with sibling exact reads.
+        assert!(matches!(route_get("/supply"), GetRoute::Supply));
+    }
+
+    #[test]
+    fn params_renders_text_and_json() {
+        // M105: the knobs render one grep line per field; the JSON sibling mirrors the
+        // field names as a quoted-u64 / JSON-number object.
+        let p = ParamsView {
+            base_emission_micro: 1_000,
+            slash_bps: 500,
+            tau_dup: 0.95,
+            n_review_min: 3,
+            c_cap: 0.5,
+            n_min: 5,
+            lam: 0.2,
+            bonus_max: 2.5,
+            decay: 0.01,
+            fresh_min: 0.4,
+            delta_k_min: 0.0,
+        };
+        let text = format_params(&p);
+        assert!(text.starts_with("base_emission_micro=1000\nslash_bps=500\n"), "{text}");
+        assert!(text.contains("tau_dup=0.95\n"), "{text}");
+        assert!(text.contains("n_review_min=3\n"), "{text}");
+        assert!(text.contains("n_min=5\n"), "{text}");
+        assert!(text.ends_with("delta_k_min=0"), "{text}");
+
+        let json = json_params(&p);
+        assert!(json.contains("\"base_emission_micro\":\"1000\""), "{json}");
+        assert!(json.contains("\"slash_bps\":\"500\""), "{json}");
+        assert!(json.contains("\"tau_dup\":0.95"), "{json}");
+        assert!(json.contains("\"n_review_min\":\"3\""), "{json}");
+        assert!(json.contains("\"n_min\":\"5\""), "{json}");
+        assert!(json.contains("\"delta_k_min\":0"), "{json}");
     }
 
     #[test]
