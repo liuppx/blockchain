@@ -489,6 +489,10 @@ enum Cmd {
     QueryGenesisHash {
         reply: oneshot::Sender<crate::Hash>,
     },
+    /// M107: read the handshake aggregate (identity + tip) for the `/info` read, atomically.
+    QueryInfo {
+        reply: oneshot::Sender<InfoView>,
+    },
     /// M61: serve a heterogeneous proof batch + the certified head it verifies
     /// against, for the verifiable batch read RPC. `None` ⇒ `serve_batch` rejected
     /// (over `MAX_BATCH_ITEMS` or a degenerate Diff range) or no certified head
@@ -1238,6 +1242,15 @@ async fn run_actor(mut actor: Actor, mut rx: mpsc::UnboundedReceiver<Cmd>) {
             Cmd::QueryGenesisHash { reply } => {
                 // M106: this node's chain identity, stamped into state at genesis_split.
                 let _ = reply.send(actor.node.chain.state.genesis_hash);
+            }
+            Cmd::QueryInfo { reply } => {
+                // M107: identity + tip in one atomic snapshot (the actor task is the sole
+                // writer, so these three reads are mutually consistent).
+                let _ = reply.send(InfoView {
+                    genesis_hash: actor.node.chain.state.genesis_hash,
+                    height: actor.node.height(),
+                    head: actor.node.head(),
+                });
             }
             Cmd::QueryBatch { items, reply } => {
                 let _ = reply.send(actor.node.batch(items));
@@ -2127,6 +2140,10 @@ enum GetRoute {
     /// of the `genesis-hash` CLI: a connecting client confirms *which chain* this node serves
     /// (so it never submits to the wrong one). Exact-match; no id.
     GenesisHash,
+    /// M107: `GET /info` — a one-round-trip handshake aggregate: chain identity
+    /// (`genesis_hash`) + tip (`height` + `head`). Saves a light client three separate calls
+    /// to `/genesis`, `/height`, `/head`. Exact-match; no id.
+    Info,
     NotFound,
 }
 
@@ -2407,6 +2424,8 @@ fn route_get(path: &str) -> GetRoute {
         "/params" => GetRoute::Params,
         // M106: this node's chain identity. Exact-match; no id, no prefix sibling.
         "/genesis" => GetRoute::GenesisHash,
+        // M107: the handshake aggregate (identity + tip). Exact-match; no id, no prefix sibling.
+        "/info" => GetRoute::Info,
         p => {
             if let Some(rest) = p.strip_prefix("/account/") {
                 // M59: `{id}/proof` is the verifiable read; a bare `{id}` is the M58
@@ -2683,6 +2702,34 @@ fn format_genesis(gh: &crate::Hash) -> String {
 /// M106: `GET /genesis?format=json` — the JSON sibling, `{"genesis_hash":"<hex>"}`.
 fn json_genesis(gh: &crate::Hash) -> String {
     format!("{{\"genesis_hash\":{}}}", json_str(&crate::hash::hex(gh)))
+}
+
+/// M107: the `/info` handshake aggregate — chain identity + current tip.
+struct InfoView {
+    genesis_hash: crate::Hash,
+    height: u64,
+    head: crate::Hash,
+}
+
+/// M107: render the handshake aggregate as three grep-friendly lines.
+fn format_info(i: &InfoView) -> String {
+    format!(
+        "genesis_hash={}\nheight={}\nhead={}",
+        crate::hash::hex(&i.genesis_hash),
+        i.height,
+        crate::hash::hex(&i.head),
+    )
+}
+
+/// M107: `GET /info?format=json` — the JSON sibling, a single object (height lossless
+/// quoted-u64, hashes as quoted hex).
+fn json_info(i: &InfoView) -> String {
+    format!(
+        "{{\"genesis_hash\":{},\"height\":{},\"head\":{}}}",
+        json_str(&crate::hash::hex(&i.genesis_hash)),
+        json_u64(i.height),
+        json_str(&crate::hash::hex(&i.head)),
+    )
 }
 
 /// `GET /account/{id}?format=json` — the JSON sibling of [`format_account`].
@@ -4195,6 +4242,18 @@ async fn serve_rpc_conn(mut stream: TcpStream, cmd: mpsc::UnboundedSender<Cmd>) 
                 } else {
                     match rx.await {
                         Ok(gh) => ok_body(fmt, &format_genesis(&gh), &json_genesis(&gh)),
+                        Err(_) => http_response("503 Service Unavailable", "node stopped"),
+                    }
+                }
+            }
+            GetRoute::Info => {
+                // M107: identity + tip handshake aggregate — always a `200`.
+                let (reply, rx) = oneshot::channel();
+                if cmd.send(Cmd::QueryInfo { reply }).is_err() {
+                    http_response("503 Service Unavailable", "node stopped")
+                } else {
+                    match rx.await {
+                        Ok(i) => ok_body(fmt, &format_info(&i), &json_info(&i)),
                         Err(_) => http_response("503 Service Unavailable", "node stopped"),
                     }
                 }
@@ -7077,6 +7136,62 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn rpc_info_over_tcp() {
+        // M107: `GET /info` aggregates identity + tip. On a live chain the reported
+        // genesis_hash matches `ChainState::genesis`, the height is >= 1, and the per-field
+        // values match what `/genesis`, `/height`, `/head` return individually.
+        let dir = tmp_dir("rpc-info");
+        // node_config p2p listen = 20651 + (40-21) = 20670; keep the RPC port clear.
+        let mut cfg = node_config(40, 20651, &[40], dir.clone());
+        let rpc_addr = "127.0.0.1:20681";
+        cfg.rpc = Some(crate::config::RpcConfig { enabled: true, listen: rpc_addr.into() });
+        let mut genesis = test_genesis();
+        genesis.validators = vec![(40, kp(40).public(), 1)]; // quorum 1 ⇒ self-commit
+        let (_state, expected_gh) = crate::ChainState::genesis(genesis.clone());
+        let node = Node::start(cfg, genesis, Some(kp(40))).await.expect("start node");
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            if node.status().await.map(|(h, _)| h >= 1).unwrap_or(false) {
+                break;
+            }
+            assert!(tokio::time::Instant::now() < deadline, "node never produced a block");
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+
+        async fn get(addr: &str, path: &str) -> String {
+            let req = format!("GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
+            let mut s = TcpStream::connect(addr).await.expect("connect rpc");
+            s.write_all(req.as_bytes()).await.expect("send get");
+            let mut resp = Vec::new();
+            s.read_to_end(&mut resp).await.expect("read response");
+            String::from_utf8_lossy(&resp).into_owned()
+        }
+        fn body_of(resp: &str) -> &str {
+            resp.split_once("\r\n\r\n").map(|(_, b)| b).unwrap_or("")
+        }
+
+        let info = get(rpc_addr, "/info").await;
+        assert!(info.starts_with("HTTP/1.1 200 OK"), "info status: {info}");
+        let body = body_of(&info).to_string();
+        // Identity line matches the independently-stamped genesis_hash.
+        assert!(body.contains(&format!("genesis_hash={}", crate::hash::hex(&expected_gh))), "info identity: {body}");
+        // The per-field lines match the individual endpoints.
+        let height_body = body_of(&get(rpc_addr, "/height").await).to_string();
+        let head_body = body_of(&get(rpc_addr, "/head").await).to_string();
+        assert!(body.contains(&format!("height={height_body}")), "info height matches /height: {body}");
+        assert!(body.contains(&format!("head={head_body}")), "info head matches /head: {body}");
+
+        // JSON aggregate carries the same three fields.
+        let as_json = get(rpc_addr, "/info?format=json").await;
+        let jbody = body_of(&as_json);
+        assert!(jbody.starts_with("{\"genesis_hash\":\""), "info json: {jbody}");
+        assert!(jbody.contains(&format!("\"head\":\"{head_body}\"")), "info json head: {jbody}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
     async fn rpc_head_mirrors_get_without_body() {
         // M92: a HEAD request mirrors the matching GET — same status + headers (crucially the
         // GET body's Content-Length) but no body (RFC 9110 §9.3.2). Exercised end to end over
@@ -8264,6 +8379,29 @@ vote_b.validator=5 vote_b.height=9 vote_b.round=2 vote_b.block_hash={b_h} vote_b
         let h = crate::hash::hex(&gh);
         assert_eq!(format_genesis(&gh), format!("genesis_hash={h}"));
         assert_eq!(json_genesis(&gh), format!("{{\"genesis_hash\":\"{h}\"}}"));
+    }
+
+    #[test]
+    fn route_get_parses_info() {
+        // M107: `/info` is an exact-match read; a trailing slash is not the route (health).
+        assert!(matches!(route_get("/info"), GetRoute::Info));
+        assert!(matches!(route_get("/info/"), GetRoute::Health));
+        // No collision with sibling exact reads.
+        assert!(matches!(route_get("/genesis"), GetRoute::GenesisHash));
+    }
+
+    #[test]
+    fn info_renders_text_and_json() {
+        // M107: the handshake aggregate renders three grep lines and a JSON object; the fields
+        // are byte-identical to the individual `/genesis`, `/height`, `/head` renderings.
+        let i = InfoView { genesis_hash: [0x11u8; 32], height: 7, head: [0x22u8; 32] };
+        let gh = crate::hash::hex(&[0x11u8; 32]);
+        let hd = crate::hash::hex(&[0x22u8; 32]);
+        assert_eq!(format_info(&i), format!("genesis_hash={gh}\nheight=7\nhead={hd}"));
+        assert_eq!(
+            json_info(&i),
+            format!("{{\"genesis_hash\":\"{gh}\",\"height\":\"7\",\"head\":\"{hd}\"}}")
+        );
     }
 
     #[test]
