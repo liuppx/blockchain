@@ -238,6 +238,7 @@ fn main() {
         "check-config" => cmd_check_config(config_arg(&args)),
         "genesis-hash" => cmd_genesis_hash(config_arg(&args)),
         "inspect-tx" => cmd_inspect_tx(&args),
+        "pubkey" => cmd_pubkey(&args),
         "submit-tx" => cmd_submit_tx(config_arg(&args), tx_arg(&args)),
         "encode-tx" => cmd_encode_tx(&args),
         "keygen" => cmd_keygen(&args),
@@ -321,6 +322,7 @@ fn usage() {
     eprintln!("  node inspect-tx --tx F [--pubkey HEX]  decode a codec-encoded tx file and print its fields + content hash; with --pubkey, also verify the signature (the read-side companion to encode-tx)");
     eprintln!("  node keygen --out F [--seed HEX]  generate (or derive from a 64-hex seed) an ed25519 keypair; write the seed file (for encode-tx --key-file) and print the pubkey");
     eprintln!("  node keygen ... --genesis-id N [--balance MICRO] [--power P]  also print a ready-to-paste genesis [[accounts]] (and, with --power, [[validators]]) entry");
+    eprintln!("  node pubkey (--key-file F | --seed HEX) [--genesis-id N ...]  derive + print the pubkey for an existing seed WITHOUT writing a file (read-only; pairs with inspect-tx --pubkey)");
     eprintln!("  node localnet           spin up an in-process tokio testnet (4 validators, no sequencer) and show all nodes converge via distributed BFT voting over real sockets");
     eprintln!("  node status --dir DIR   replay the block log and print state");
     eprintln!("  node certs  --dir DIR   persist a certified chain (blocks+certs) and re-verify finality on reload");
@@ -2835,6 +2837,33 @@ fn cmd_inspect_tx(args: &[String]) {
     }
 }
 
+/// M99: derive the ed25519 public-key hex from a 64-hex seed (the format `keygen` writes and
+/// `encode-tx --key-file` consumes). Reuses `config::decode_seed` for identical parsing +
+/// `BadHex` errors. Pure for unit testing.
+fn derive_pubkey(seed_hex: &str, field: &str) -> Result<String, config::ConfigError> {
+    let seed = config::decode_seed(seed_hex.trim(), field)?;
+    Ok(hex(&Keypair::from_seed(seed).public()))
+}
+
+/// M99: `node pubkey (--key-file F | --seed HEX) [--genesis-id N ...]` — derive and print the
+/// pubkey for an existing seed **without writing any file** (unlike `keygen`, which recovers a
+/// pubkey only as a side effect of writing a seed file). Read-only; pairs with
+/// `inspect-tx --pubkey`. With `--genesis-id`, also prints the M95 genesis entry.
+fn cmd_pubkey(args: &[String]) {
+    let (seed_hex, field) = if let Some(s) = opt_arg(args, "--seed") {
+        (s.to_string(), "--seed")
+    } else if let Some(path) = opt_arg(args, "--key-file") {
+        (std::fs::read_to_string(path).unwrap_or_else(|e| fail("read key file", e)), "--key-file")
+    } else {
+        fail_msg("pubkey", &"requires --key-file <path> or --seed <64hex>");
+    };
+    let pub_hex = derive_pubkey(&seed_hex, field).unwrap_or_else(|e| fail_msg("pubkey", &e));
+    println!("pubkey {pub_hex}");
+    if let Some(entries) = keygen_genesis_entries(args, &pub_hex) {
+        print!("{entries}");
+    }
+}
+
 fn cmd_run(config_path: String) {
     // M44: load the config first, then install the subscriber from its optional
     // `[logging]` section (absent ⇒ the M37 default). Config-load errors print via
@@ -3859,5 +3888,39 @@ mod tests {
         let kp = Keypair::from_seed(seed_for(1));
         let bytes = signed_tx_bytes(5, &kp);
         assert!(inspect_tx(&bytes, Some("nothex")).is_err(), "bad pubkey must error");
+    }
+
+    #[test]
+    fn derive_pubkey_matches_keygen() {
+        // M99: deriving the pubkey from a seed hex equals both the direct Keypair API and the
+        // keygen path's pubkey for the same seed.
+        let seed = seed_for(5);
+        let (seed_hex, pub_hex) = keygen_derive(seed);
+        assert_eq!(derive_pubkey(&seed_hex, "--seed").expect("derive"), pub_hex);
+        assert_eq!(derive_pubkey(&seed_hex, "--seed").expect("derive"), hex(&Keypair::from_seed(seed).public()));
+        // A trailing newline (as a key file carries) is tolerated.
+        assert_eq!(derive_pubkey(&format!("{seed_hex}\n"), "--key-file").expect("derive"), pub_hex);
+    }
+
+    #[test]
+    fn derive_pubkey_surfaces_bad_seed() {
+        // M99: a non-hex / wrong-length seed is a typed error (not a panic).
+        assert!(derive_pubkey("nothex", "--seed").is_err());
+        assert!(derive_pubkey("abcd", "--seed").is_err(), "too short must fail");
+    }
+
+    #[test]
+    fn derive_pubkey_reads_keygen_written_file() {
+        // M99: the pubkey derived from a seed file written by `write_key_file` (the keygen
+        // path) matches the expected pubkey — `node pubkey --key-file` round-trips keygen's out.
+        let seed = seed_for(9);
+        let (seed_hex, pub_hex) = keygen_derive(seed);
+        let mut path = std::env::temp_dir();
+        path.push(format!("zx-pubkey-{}-{}.key", std::process::id(), line!()));
+        let p = path.to_str().unwrap();
+        write_key_file(p, &seed_hex).expect("write");
+        let contents = std::fs::read_to_string(p).unwrap();
+        assert_eq!(derive_pubkey(&contents, "--key-file").expect("derive"), pub_hex);
+        let _ = std::fs::remove_file(p);
     }
 }
