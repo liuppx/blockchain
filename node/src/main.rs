@@ -2959,9 +2959,35 @@ fn keygen_derive(seed: [u8; 32]) -> (String, String) {
     (hex(&seed), hex(&kp.public()))
 }
 
+/// M94: write a private-key seed file with owner-only (`0600`) permissions. A key seed must
+/// never be world-readable: on Unix the file is *created* with mode `0600` (via
+/// `OpenOptionsExt::mode`, so there is no world-readable window between create and chmod),
+/// and `0600` is re-asserted afterwards to cover the case where the path already existed with
+/// wider bits (where the creation `mode` is a no-op). On non-Unix targets it falls back to a
+/// plain write (the platform has no POSIX mode to set).
+#[cfg(unix)]
+fn write_key_file(path: &str, contents: &str) -> std::io::Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+    let mut f = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(path)?;
+    f.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+    f.write_all(contents.as_bytes())
+}
+
+#[cfg(not(unix))]
+fn write_key_file(path: &str, contents: &str) -> std::io::Result<()> {
+    std::fs::write(path, contents)
+}
+
 /// M73: generate (or derive from `--seed <64hex>`) an ed25519 keypair offline.
 /// Writes the 64-hex seed to `--out` (consumable by `encode-tx --key-file`) and
 /// prints the derived pubkey hex (paste into a genesis `accounts` entry).
+/// M94: the seed file is written `0600` (owner-only) — see [`write_key_file`].
 fn cmd_keygen(args: &[String]) {
     let out_path = req_arg(args, "--out");
 
@@ -2978,7 +3004,7 @@ fn cmd_keygen(args: &[String]) {
     };
 
     let (seed_hex, pub_hex) = keygen_derive(seed);
-    std::fs::write(out_path, &seed_hex).unwrap_or_else(|e| fail("write key file", e));
+    write_key_file(out_path, &seed_hex).unwrap_or_else(|e| fail("write key file", e));
     println!("pubkey {pub_hex}");
     println!("out {out_path}");
 }
@@ -3395,5 +3421,61 @@ mod tests {
         assert_eq!(keygen_derive(seed), (seed_hex, pub_hex));
         // Distinct seeds ⇒ distinct pubkeys.
         assert_ne!(keygen_derive(seed_for(7)).1, keygen_derive(seed_for(8)).1);
+    }
+
+    // M94: a unique temp path per test case (no external tempfile dependency).
+    #[cfg(unix)]
+    fn tmp_key_path(tag: &str) -> std::path::PathBuf {
+        let mut p = std::env::temp_dir();
+        p.push(format!("zx-keyfile-{}-{}-{tag}", std::process::id(), line!()));
+        p
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn key_file_is_written_0600() {
+        use std::os::unix::fs::PermissionsExt;
+        let path = tmp_key_path("fresh");
+        let p = path.to_str().unwrap();
+        let _ = std::fs::remove_file(p);
+        write_key_file(p, "deadbeef").expect("write");
+        // A freshly created key file is owner-rw only (no group/other bits).
+        let mode = std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "fresh key file must be 0600, got {mode:o}");
+        assert_eq!(std::fs::read_to_string(p).unwrap(), "deadbeef");
+        let _ = std::fs::remove_file(p);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn key_file_overwrite_retightens_to_0600() {
+        use std::os::unix::fs::PermissionsExt;
+        let path = tmp_key_path("overwrite");
+        let p = path.to_str().unwrap();
+        // Pre-create a world-readable file: the creation `mode` would be a no-op, so the
+        // explicit re-assert is what must re-tighten it to 0600.
+        std::fs::write(p, "old").unwrap();
+        std::fs::set_permissions(p, std::fs::Permissions::from_mode(0o644)).unwrap();
+        write_key_file(p, "cafe").expect("overwrite");
+        let mode = std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "overwrite must re-tighten to 0600, got {mode:o}");
+        // Content is fully replaced (truncated), not appended.
+        assert_eq!(std::fs::read_to_string(p).unwrap(), "cafe");
+        let _ = std::fs::remove_file(p);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn key_file_round_trips_through_seed_decoder() {
+        // The 0600-written seed hex is still consumable by the `--seed` / `--key-file` decoder.
+        let path = tmp_key_path("roundtrip");
+        let p = path.to_str().unwrap();
+        let _ = std::fs::remove_file(p);
+        let seed = seed_for(42);
+        let (seed_hex, _pub_hex) = keygen_derive(seed);
+        write_key_file(p, &seed_hex).expect("write");
+        let read_back = std::fs::read_to_string(p).unwrap();
+        assert_eq!(config::decode_seed(read_back.trim(), "--seed").expect("decode"), seed);
+        let _ = std::fs::remove_file(p);
     }
 }

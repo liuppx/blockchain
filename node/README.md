@@ -981,6 +981,17 @@ M92 补了 `HEAD`；M93 续补 HTTP 方法语义——`OPTIONS`。此前 `OPTION
 
 **已知边界（顺延至 M94+）**：读面列表端点篮子已收口、HTTP `HEAD`/`OPTIONS` 已补；剩余：游标分页、`Accept-Encoding`（压缩须引新依赖）、未知方法 `405`（与健康探针语义取舍）；keygen 篮子（助记词 / BIP-39、口令 keystore、现成 genesis 条目、密钥轮换、keyfile `0600`）；共识 / wire 篮子（破 head 不变量）：**货币费用** + 费用优先排序、nonce / 序列号反重放；连同运维篮子：证书/密钥轮换与落盘、follower 认证、指标端 TLS、OTel/push exporter、每-sink 独立 rotation 覆盖、时延直方图。
 
+## keygen 密钥文件 `0600` 权限（Milestone 94）
+
+M92/M93 补了 HTTP 方法语义；M94 转向 **keygen 篮子**的第一项——密钥文件权限。`node keygen` 把 64-hex 私钥种子以 `std::fs::write(out_path, …)` 落盘，用的是进程默认权限（典型 `0644`，**全局可读**）；私钥种子全局可读是实打实的安全隐患（同机任何用户可读走，派生出签名权）。M94 收紧为 `0600`（仅属主读写）。离线 CLI 工具（`main.rs`）改动，不触 RPC / 出块 / 重放路径，`localnet` head 不变量（`44309755…ea04ba`）天然不受影响。
+
+- **`write_key_file(path, contents)`**：Unix 上用 `OpenOptions` + `OpenOptionsExt::mode(0o600)` **在创建时即**把文件置为 owner-only——创建与 chmod 之间**无全局可读窗口**（不同于「先 write 后 chmod」的 TOCTOU 式裸露）；随后再 `File::set_permissions(0o600)` 复申一次，覆盖「路径已存在且权限更宽」的情形（此时创建用的 `mode` 是 no-op，须显式回紧）。非 Unix 目标回落 `std::fs::write`（平台无 POSIX mode 可设）。
+- **接线**：`cmd_keygen` 把 `std::fs::write(out_path, &seed_hex)` 换成 `write_key_file(out_path, &seed_hex)`，其余（种子来源 `--seed`/CSPRNG、派生、打印 pubkey）一字未改。种子格式仍是 `encode-tx --key-file`/`--seed` 解码器认的 64-hex，向后兼容。
+- **测试（+3 → 451）**：新单测（均 `#[cfg(unix)]`）`key_file_is_written_0600`（新建文件 mode & 0o777 == 0o600、内容正确）/`key_file_overwrite_retightens_to_0600`（预置 `0644` 文件覆盖后回紧到 0600、内容被截断替换而非追加——正是「复申」分支的覆盖）/`key_file_round_trips_through_seed_decoder`（0600 写出的种子读回后仍可被 `config::decode_seed` 消费，证明权限收紧不破坏格式）。测试在 bin 测试套件（`main.rs`），无外部 tempfile 依赖（自造唯一临时路径）。
+- **不变量保持**：纯 CLI 落盘权限改动、无 `serde_json`、无引擎 / codec / crypto / wire / 共识 / 状态变更、无新依赖，RPC 与出块路径一字未动，故 `localnet` 逐字节同块、head 仍 `44309755…ea04ba`。
+
+**已知边界（顺延至 M95+）**：keygen 篮子剩余：助记词 / BIP-39、口令加密 keystore、现成 genesis 条目生成、密钥轮换；读面列表端点篮子已收口、HTTP `HEAD`/`OPTIONS` 已补；剩余：游标分页、`Accept-Encoding`（压缩须引新依赖）、未知方法 `405`；共识 / wire 篮子（破 head 不变量）：**货币费用** + 费用优先排序、nonce / 序列号反重放；连同运维篮子：证书/密钥轮换与落盘、follower 认证、指标端 TLS、OTel/push exporter、每-sink 独立 rotation 覆盖、时延直方图。
+
 ## 持久化与重放（Milestone 7）
 
 节点状态不再只活在内存里：区块以**追加式日志**（`DIR/blocks.log`）落盘，重启后从创世**重放**日志即可重建**逐字节相同**的状态。
@@ -1754,5 +1765,6 @@ peer_exchange_disabled_stays_seeded                   同链拓扑关发现 → 
 - ~~M91 连接节点列表 `GET /peers`——加第十个分页列表读 `GET /peers` 连接节点目录（peer id + 已知监听地址），是守护层读（节点连接存于 actor、非链状态）、无单读兄弟、收口读面列表端点篮子；新增独立渲染器 `format_peer`/`json_peer`（已知地址逐字、未知地址文本 `unknown` / JSON `null`）+ 两薄包装 `format_peer_listing`/`json_peer_listing`（空集 ⇒ `""`/`[]`），仅加一路由臂（`/peers` 精确匹配；无 `/peer/` 前缀故 `/peers/` 回落 `Health`）+ `Cmd::QueryPeers`（actor 由 `outbound`+`addrs` 两图构建 id 升序快照），逐字复用 `total`/`next` 信封 + `Accept`/`Accept-Charset` 协商；新纯测 `route_get_parses_peers`/`peer_listing_renders` + TCP `rpc_peers_list_over_tcp`（单节点无配置对端故新链 `/peers` live-but-empty，端到端断言空目录信封），共 442 测、localnet head 不变~~ ✅
 - ~~M92 HTTP `HEAD` 方法支持——此前 `GET`/`HEAD` 共用一条读路由臂、HEAD 却返回整个响应体（违反 RFC 9110 §9.3.2）；M92 补齐——新增纯函数 `maybe_head(is_head, resp)` 在 `\r\n\r\n` 处截去 body 只留首部块（`Content-Length` 仍广告 GET body 字节数），`is_head==false` 为恒等（GET 逐字节不变），请求解析处一次性求出 `is_head`、三处写出点（两个协商 `406` + 读路由块）统一经 `maybe_head` 剥身；路由与 `GetRoute` 一字未改；新纯测 `maybe_head_strips_body_keeps_headers`/`maybe_head_strips_negotiation_406_body` + TCP `rpc_head_mirrors_get_without_body`（`/height` 标量读与 `/accounts` 列表读：HEAD 首部与 GET 逐字节同、`Content-Length` 等于 GET body 长、HEAD 无 body），共 445 测、localnet head 不变~~ ✅
 - ~~M93 HTTP `OPTIONS` 方法支持——此前 `OPTIONS` 落入「非 POST ⇒ 健康探针」回 `200`/`ok`、未告知所支持方法；M93 按 RFC 9110 §9.3.7 补齐——`OPTIONS` 回 `204 No Content` + `Allow: GET, HEAD, OPTIONS, POST` 首部、无 body，在 `Accept`/`Accept-Charset` 协商之前应答（无可协商表示），新增单一真相源常量 `ALLOWED_METHODS` + 纯函数 `options_response`；路由与 `GetRoute` 一字未改、GET/HEAD/POST 不受影响、其余未知方法刻意保留健康探针回落；新纯测 `options_response_advertises_allow` + TCP `rpc_options_over_tcp`（`/accounts`·`/` 回 204+Allow 无 body、敌意 `Accept` 仍回 204）+ TCP `rpc_unsupported_method_is_health_probe`（PUT 仍回 `200`/`ok`），共 448 测、localnet head 不变~~ ✅
+- ~~M94 keygen 密钥文件 `0600` 权限——`node keygen` 此前以 `std::fs::write` 默认权限（通常 `0644` 全局可读）落盘私钥种子（安全隐患）；M94 新增 `write_key_file`：Unix 上 `OpenOptionsExt::mode(0o600)` 创建时即置 owner-only（无全局可读窗口）+ `set_permissions(0o600)` 复申覆盖已存在文件，非 Unix 回落 `std::fs::write`，`cmd_keygen` 改调之、种子格式不变；新单测（`cfg(unix)`）`key_file_is_written_0600`/`key_file_overwrite_retightens_to_0600`/`key_file_round_trips_through_seed_decoder`，共 451 测、localnet head 不变~~ ✅
 
-……；运维篮子剩余（货币费用（独立共识里程碑）、费用优先出块排序、nonce 反重放、读面列表端点篮子已收口、HTTP `HEAD`/`OPTIONS` 已补、游标分页、`Accept-Encoding`（压缩须依赖）、未知方法 `405`、RPC auth/TLS、证书/密钥轮换与落盘、follower 认证、每-sink 独立 rotation 覆盖、OTEL/结构化日志 exporter、指标端 TLS、指标 push exporter/直方图/每-peer/每-轮次时延序列）顺延至 M94+，每步仍遵循"可运行、可测试、契约一致"。
+……；运维篮子剩余（货币费用（独立共识里程碑）、费用优先出块排序、nonce 反重放、读面列表端点篮子已收口、HTTP `HEAD`/`OPTIONS` 已补、keyfile `0600` 已补、游标分页、`Accept-Encoding`（压缩须依赖）、未知方法 `405`、助记词/BIP-39、口令 keystore、RPC auth/TLS、证书/密钥轮换与落盘、follower 认证、每-sink 独立 rotation 覆盖、OTEL/结构化日志 exporter、指标端 TLS、指标 push exporter/直方图/每-peer/每-轮次时延序列）顺延至 M95+，每步仍遵循"可运行、可测试、契约一致"。
