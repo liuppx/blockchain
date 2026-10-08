@@ -477,6 +477,10 @@ enum Cmd {
         hash: crate::Hash,
         reply: oneshot::Sender<bool>,
     },
+    /// M104: snapshot the money-supply totals for the `/supply` read.
+    QuerySupply {
+        reply: oneshot::Sender<SupplyView>,
+    },
     /// M61: serve a heterogeneous proof batch + the certified head it verifies
     /// against, for the verifiable batch read RPC. `None` ⇒ `serve_batch` rejected
     /// (over `MAX_BATCH_ITEMS` or a degenerate Diff range) or no certified head
@@ -1194,6 +1198,17 @@ async fn run_actor(mut actor: Actor, mut rx: mpsc::UnboundedReceiver<Cmd>) {
                 // M103: ask the Mempool directly (already behind the actor's sole-writer
                 // lock, so no race with concurrent admission / builder-removal).
                 let _ = reply.send(actor.node.mempool.contains(&hash));
+            }
+            Cmd::QuerySupply { reply } => {
+                // M104: snapshot the supply-conservation totals from committed state.
+                let s = &actor.node.chain.state;
+                let _ = reply.send(SupplyView {
+                    supply: s.supply,
+                    treasury: s.treasury,
+                    bonded: s.bonded,
+                    bridge_locked: s.bridge_locked,
+                    bridge_minted: s.bridge_minted,
+                });
             }
             Cmd::QueryBatch { items, reply } => {
                 let _ = reply.send(actor.node.batch(items));
@@ -2071,6 +2086,10 @@ enum GetRoute {
     /// answer to the M89 list endpoint (which exposes the pool's *contents*). The hash is
     /// 64-hex; malformed ⇒ 404 (see [`parse_hash`]).
     MempoolContains(crate::Hash),
+    /// M104: `GET /supply` — the money-supply snapshot (supply, treasury, bonded,
+    /// bridge_locked, bridge_minted). Lets a client audit the supply-conservation invariant
+    /// from cert-signed state. Exact-match; no id.
+    Supply,
     NotFound,
 }
 
@@ -2345,6 +2364,8 @@ fn route_get(path: &str) -> GetRoute {
         // M91: the connected-peer directory. Exact-match; there is no `/peer/` single-read
         // prefix, so `/peers/` simply falls through to `Health`.
         "/peers" => GetRoute::Peers,
+        // M104: the money-supply snapshot. Exact-match; no id, no prefix sibling.
+        "/supply" => GetRoute::Supply,
         p => {
             if let Some(rest) = p.strip_prefix("/account/") {
                 // M59: `{id}/proof` is the verifiable read; a bare `{id}` is the M58
@@ -2966,6 +2987,38 @@ fn format_peer_listing(peers: &[(u64, Option<String>)]) -> String {
 fn json_peer_listing(peers: &[(u64, Option<String>)]) -> String {
     let items = peers.iter().map(|(id, addr)| json_peer(*id, addr)).collect::<Vec<_>>().join(",");
     format!("[{items}]")
+}
+
+/// M104: the supply-conservation totals exposed by `GET /supply`. All micro-$COG. The
+/// whitepaper invariant is `Σ account balances + treasury + bonded + bridge_locked == supply`
+/// (M78 `supply_conserved`); `bridge_minted` is an audit counter of cross-chain mints.
+struct SupplyView {
+    supply: u64,
+    treasury: u64,
+    bonded: u64,
+    bridge_locked: u64,
+    bridge_minted: u64,
+}
+
+/// M104: render the supply snapshot as a grep-friendly `key=value` line. Pure for testing.
+fn format_supply(s: &SupplyView) -> String {
+    format!(
+        "supply={} treasury={} bonded={} bridge_locked={} bridge_minted={}",
+        s.supply, s.treasury, s.bonded, s.bridge_locked, s.bridge_minted,
+    )
+}
+
+/// M104: `GET /supply?format=json` — the JSON sibling, a single object with lossless
+/// quoted-u64 scalars (matching the convention of the other reads).
+fn json_supply(s: &SupplyView) -> String {
+    format!(
+        "{{\"supply\":{},\"treasury\":{},\"bonded\":{},\"bridge_locked\":{},\"bridge_minted\":{}}}",
+        json_u64(s.supply),
+        json_u64(s.treasury),
+        json_u64(s.bonded),
+        json_u64(s.bridge_locked),
+        json_u64(s.bridge_minted),
+    )
 }
 
 /// M79: wrap a rendered JSON array page as `{"total":"N","next":"M"|null,"items":[…]}`.
@@ -3997,6 +4050,18 @@ async fn serve_rpc_conn(mut stream: TcpStream, cmd: mpsc::UnboundedSender<Cmd>) 
                             bool_str(present),
                             &format!("{{\"pending\":{}}}", json_bool(present)),
                         ),
+                        Err(_) => http_response("503 Service Unavailable", "node stopped"),
+                    }
+                }
+            }
+            GetRoute::Supply => {
+                // M104: money-supply snapshot from committed state — always a `200`.
+                let (reply, rx) = oneshot::channel();
+                if cmd.send(Cmd::QuerySupply { reply }).is_err() {
+                    http_response("503 Service Unavailable", "node stopped")
+                } else {
+                    match rx.await {
+                        Ok(s) => ok_body(fmt, &format_supply(&s), &json_supply(&s)),
                         Err(_) => http_response("503 Service Unavailable", "node stopped"),
                     }
                 }
@@ -6725,6 +6790,58 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn rpc_supply_over_tcp() {
+        // M104: `GET /supply` returns the money-supply snapshot from committed state. On a
+        // fresh single-validator chain the supply equals the genesis endowments and the
+        // slashed/bonded/bridge pools are zero; the JSON mirrors the text.
+        let dir = tmp_dir("rpc-supply");
+        // node_config p2p listen = 20551 + (37-21) = 20567; keep the RPC port clear.
+        let mut cfg = node_config(37, 20551, &[37], dir.clone());
+        let rpc_addr = "127.0.0.1:20571";
+        cfg.rpc = Some(crate::config::RpcConfig { enabled: true, listen: rpc_addr.into() });
+        let mut genesis = test_genesis();
+        genesis.validators = vec![(37, kp(37).public(), 1)]; // quorum 1 ⇒ self-commit
+        let node = Node::start(cfg, genesis, Some(kp(37))).await.expect("start node");
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            if node.status().await.map(|(h, _)| h >= 1).unwrap_or(false) {
+                break;
+            }
+            assert!(tokio::time::Instant::now() < deadline, "node never produced a block");
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+
+        async fn get(addr: &str, path: &str) -> String {
+            let req = format!("GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
+            let mut s = TcpStream::connect(addr).await.expect("connect rpc");
+            s.write_all(req.as_bytes()).await.expect("send get");
+            let mut resp = Vec::new();
+            s.read_to_end(&mut resp).await.expect("read response");
+            String::from_utf8_lossy(&resp).into_owned()
+        }
+        fn body_of(resp: &str) -> &str {
+            resp.split_once("\r\n\r\n").map(|(_, b)| b).unwrap_or("")
+        }
+
+        let resp = get(rpc_addr, "/supply").await;
+        assert!(resp.starts_with("HTTP/1.1 200 OK"), "supply status: {resp}");
+        let body = body_of(&resp);
+        // A fresh chain: zero slashed treasury, zero bonded/bridge pools; a nonzero supply.
+        assert!(body.starts_with("supply="), "supply text: {body}");
+        assert!(body.contains("treasury=0 bonded=0 bridge_locked=0 bridge_minted=0"), "fresh pools: {body}");
+
+        // JSON representation carries the same values as a quoted-u64 object.
+        let as_json = get(rpc_addr, "/supply?format=json").await;
+        assert!(as_json.contains("Content-Type: application/json\r\n"), "json ct: {as_json}");
+        let jbody = body_of(&as_json);
+        assert!(jbody.starts_with("{\"supply\":\""), "supply json: {jbody}");
+        assert!(jbody.contains("\"treasury\":\"0\",\"bonded\":\"0\",\"bridge_locked\":\"0\",\"bridge_minted\":\"0\""), "json pools: {jbody}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
     async fn rpc_head_mirrors_get_without_body() {
         // M92: a HEAD request mirrors the matching GET — same status + headers (crucially the
         // GET body's Content-Length) but no body (RFC 9110 §9.3.2). Exercised end to end over
@@ -7822,6 +7939,35 @@ vote_b.validator=5 vote_b.height=9 vote_b.round=2 vote_b.block_hash={b_h} vote_b
         assert_eq!(parse_hash("abc"), None); // wrong length
         assert_eq!(parse_hash(&"g".repeat(64)), None); // non-hex
         assert_eq!(parse_hash(&"a".repeat(63)), None); // one short
+    }
+
+    #[test]
+    fn route_get_parses_supply() {
+        // M104: `/supply` is an exact-match read; a trailing slash is not the route (health).
+        assert!(matches!(route_get("/supply"), GetRoute::Supply));
+        assert!(matches!(route_get("/supply/"), GetRoute::Health));
+        // No collision with sibling exact reads.
+        assert!(matches!(route_get("/peers"), GetRoute::Peers));
+    }
+
+    #[test]
+    fn supply_renders_text_and_json() {
+        // M104: the snapshot renders a grep line and a quoted-u64 JSON object.
+        let s = SupplyView {
+            supply: 1_000_000,
+            treasury: 2_000,
+            bonded: 50_000,
+            bridge_locked: 300,
+            bridge_minted: 42,
+        };
+        assert_eq!(
+            format_supply(&s),
+            "supply=1000000 treasury=2000 bonded=50000 bridge_locked=300 bridge_minted=42"
+        );
+        assert_eq!(
+            json_supply(&s),
+            "{\"supply\":\"1000000\",\"treasury\":\"2000\",\"bonded\":\"50000\",\"bridge_locked\":\"300\",\"bridge_minted\":\"42\"}"
+        );
     }
 
     #[test]
