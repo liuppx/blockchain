@@ -470,6 +470,13 @@ enum Cmd {
     QueryPeers {
         reply: oneshot::Sender<Vec<(u64, Option<String>)>>,
     },
+    /// M103: is the given content hash currently in the mempool? Returns `true` iff pending.
+    /// Pairs with the M89 list read (which exposes the pool's contents) — this is the
+    /// single-read answer to "did my submission land?".
+    QueryMempoolContains {
+        hash: crate::Hash,
+        reply: oneshot::Sender<bool>,
+    },
     /// M61: serve a heterogeneous proof batch + the certified head it verifies
     /// against, for the verifiable batch read RPC. `None` ⇒ `serve_batch` rejected
     /// (over `MAX_BATCH_ITEMS` or a degenerate Diff range) or no certified head
@@ -1182,6 +1189,11 @@ async fn run_actor(mut actor: Actor, mut rx: mpsc::UnboundedReceiver<Cmd>) {
                     .collect();
                 peers.sort_by_key(|&(id, _)| id);
                 let _ = reply.send(peers);
+            }
+            Cmd::QueryMempoolContains { hash, reply } => {
+                // M103: ask the Mempool directly (already behind the actor's sole-writer
+                // lock, so no race with concurrent admission / builder-removal).
+                let _ = reply.send(actor.node.mempool.contains(&hash));
             }
             Cmd::QueryBatch { items, reply } => {
                 let _ = reply.send(actor.node.batch(items));
@@ -2055,6 +2067,10 @@ enum GetRoute {
     /// A daemon-level read (peers live on the actor, not in chain state); no single-read
     /// sibling. Closes the read-surface basket of list endpoints.
     Peers,
+    /// M103: `GET /mempool/{hash}` — "is this tx content hash currently pending?" A single-read
+    /// answer to the M89 list endpoint (which exposes the pool's *contents*). The hash is
+    /// 64-hex; malformed ⇒ 404 (see [`parse_hash`]).
+    MempoolContains(crate::Hash),
     NotFound,
 }
 
@@ -2356,6 +2372,10 @@ fn route_get(path: &str) -> GetRoute {
                         .unwrap_or(GetRoute::NotFound),
                     None => GetRoute::NotFound,
                 }
+            } else if let Some(rest) = p.strip_prefix("/mempool/") {
+                // M103: `/mempool/{hash}` is a membership read — is this tx hash currently
+                // pending? A malformed (non-64-hex) hash ⇒ 404.
+                parse_hash(rest).map(GetRoute::MempoolContains).unwrap_or(GetRoute::NotFound)
             } else {
                 GetRoute::Health
             }
@@ -2377,6 +2397,22 @@ fn entity_route(rest: &str, kind: ProofKind) -> GetRoute {
             .map(|id| GetRoute::Plain(kind, id))
             .unwrap_or(GetRoute::NotFound),
     }
+}
+
+/// M103: parse a 64-hex content hash (the `Mempool` key type). Returns the 32 bytes on
+/// success; `None` on any malformed input (wrong length or non-hex). Pure, no I/O.
+fn parse_hash(s: &str) -> Option<crate::Hash> {
+    if s.len() != 64 || !s.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return None;
+    }
+    let mut out = [0u8; 32];
+    let bytes = s.as_bytes();
+    for i in 0..32 {
+        let hi = (bytes[2 * i] as char).to_digit(16)?;
+        let lo = (bytes[2 * i + 1] as char).to_digit(16)?;
+        out[i] = ((hi << 4) | lo) as u8;
+    }
+    Some(out)
 }
 
 /// M60: a short human label for a `ProofKind`, used in the `404` body of a verifiable
@@ -2543,6 +2579,18 @@ fn json_str(s: &str) -> String {
 /// A u64 as a JSON string (lossless for any consumer).
 fn json_u64(n: u64) -> String {
     json_str(&n.to_string())
+}
+
+/// M103: a `bool` as a JSON literal — `true` / `false`. Used by the mempool-membership read.
+fn json_bool(b: bool) -> String {
+    if b { "true".to_string() } else { "false".to_string() }
+}
+
+/// M103: a `bool` as a grep-friendly text body — `present` / `absent`. Avoids the
+/// `true`/`false` JSON literals that would render ambiguously to clients that don't
+/// negotiate `?format=json`.
+fn bool_str(b: bool) -> &'static str {
+    if b { "present" } else { "absent" }
 }
 
 /// An f32 as a JSON number token, or `null` when non-finite (`inf`/`NaN` are not valid
@@ -3930,6 +3978,25 @@ async fn serve_rpc_conn(mut stream: TcpStream, cmd: mpsc::UnboundedSender<Cmd>) 
                                 &json_page(&json_peer_listing(page), total, next),
                             )
                         }
+                        Err(_) => http_response("503 Service Unavailable", "node stopped"),
+                    }
+                }
+            }
+            GetRoute::MempoolContains(hash) => {
+                // M103: "is this content hash currently pending?" — the single-read answer to
+                // the M89 list endpoint (which exposes the pool's contents). Always a `200`,
+                // even when the answer is `false` (the hash was either never submitted or
+                // already landed in a block) — the read succeeded.
+                let (reply, rx) = oneshot::channel();
+                if cmd.send(Cmd::QueryMempoolContains { hash, reply }).is_err() {
+                    http_response("503 Service Unavailable", "node stopped")
+                } else {
+                    match rx.await {
+                        Ok(present) => ok_body(
+                            fmt,
+                            bool_str(present),
+                            &format!("{{\"pending\":{}}}", json_bool(present)),
+                        ),
                         Err(_) => http_response("503 Service Unavailable", "node stopped"),
                     }
                 }
@@ -6607,6 +6674,57 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn rpc_mempool_membership_over_tcp() {
+        // M103: `GET /mempool/{hash}` answers "is this tx pending?" — `present` for a tx just
+        // admitted into the pool, `absent` for any other hash, and `404` for a malformed hash.
+        let dir = tmp_dir("rpc-mempool-membership");
+        // node_config p2p listen = 20521 + (36-21) = 20536; keep the RPC port clear.
+        let mut cfg = node_config(36, 20521, &[36], dir.clone());
+        let rpc_addr = "127.0.0.1:20541";
+        cfg.rpc = Some(crate::config::RpcConfig { enabled: true, listen: rpc_addr.into() });
+        let mut genesis = test_genesis();
+        genesis.validators = vec![(36, kp(36).public(), 1)]; // quorum 1 ⇒ self-commit
+        let node = Node::start(cfg, genesis, Some(kp(36))).await.expect("start node");
+
+        // Admit a valid tx through the actor; capture its content hash (the mempool key).
+        let tx = test_tx(1, 0, 1);
+        let pending = tx.hash();
+        node.submit_tx(tx).await.expect("actor alive").expect("valid tx admitted");
+
+        async fn get(addr: &str, path: &str) -> String {
+            let req = format!("GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
+            let mut s = TcpStream::connect(addr).await.expect("connect rpc");
+            s.write_all(req.as_bytes()).await.expect("send get");
+            let mut resp = Vec::new();
+            s.read_to_end(&mut resp).await.expect("read response");
+            String::from_utf8_lossy(&resp).into_owned()
+        }
+        fn body_of(resp: &str) -> &str {
+            resp.split_once("\r\n\r\n").map(|(_, b)| b).unwrap_or("")
+        }
+
+        // The pending tx's hash → `present` (text) / `{"pending":true}` (JSON).
+        let h = crate::hash::hex(&pending);
+        let present = get(rpc_addr, &format!("/mempool/{h}")).await;
+        assert!(present.starts_with("HTTP/1.1 200 OK"), "present status: {present}");
+        assert_eq!(body_of(&present), "present", "pending tx ⇒ present");
+        let present_json = get(rpc_addr, &format!("/mempool/{h}?format=json")).await;
+        assert_eq!(body_of(&present_json), "{\"pending\":true}", "present JSON");
+
+        // Any other (well-formed) hash → `absent`, still a 200 (the read succeeded).
+        let other = crate::hash::hex(&[0x11u8; 32]);
+        let absent = get(rpc_addr, &format!("/mempool/{other}")).await;
+        assert!(absent.starts_with("HTTP/1.1 200 OK"), "absent status: {absent}");
+        assert_eq!(body_of(&absent), "absent", "unknown hash ⇒ absent");
+
+        // A malformed hash is a routing miss → 404.
+        let bad = get(rpc_addr, "/mempool/notahash").await;
+        assert!(bad.starts_with("HTTP/1.1 404 Not Found"), "malformed hash ⇒ 404: {bad}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
     async fn rpc_head_mirrors_get_without_body() {
         // M92: a HEAD request mirrors the matching GET — same status + headers (crucially the
         // GET body's Content-Length) but no body (RFC 9110 §9.3.2). Exercised end to end over
@@ -7675,6 +7793,35 @@ vote_b.validator=5 vote_b.height=9 vote_b.round=2 vote_b.block_hash={b_h} vote_b
         // Sibling list reads still resolve to their own variants (no collision).
         assert!(matches!(route_get("/evidence"), GetRoute::Evidence));
         assert!(matches!(route_get("/stake-ops"), GetRoute::StakeOps));
+    }
+
+    #[test]
+    fn route_get_parses_mempool_membership() {
+        // M103: `/mempool/{hash}` parses a 64-hex content hash into a membership read; a
+        // malformed hash (wrong length / non-hex) or a bare `/mempool` ⇒ not the route.
+        let h = crate::hash::hex(&[0xabu8; 32]);
+        match route_get(&format!("/mempool/{h}")) {
+            GetRoute::MempoolContains(bytes) => assert_eq!(bytes, [0xabu8; 32]),
+            _ => panic!("expected MempoolContains for a valid 64-hex hash"),
+        }
+        assert!(matches!(route_get("/mempool/xyz"), GetRoute::NotFound), "non-hex ⇒ 404");
+        assert!(matches!(route_get("/mempool/abcd"), GetRoute::NotFound), "short ⇒ 404");
+        assert!(matches!(route_get("/mempool/"), GetRoute::NotFound), "empty hash ⇒ 404");
+        // A bare `/mempool` (no hash) is not a route — falls to the health catch-all.
+        assert!(matches!(route_get("/mempool"), GetRoute::Health));
+    }
+
+    #[test]
+    fn parse_hash_roundtrips_and_rejects_malformed() {
+        // M103: parse_hash is the inverse of hash::hex for 32-byte inputs, and rejects anything
+        // that is not exactly 64 hex chars.
+        for seed in [[0u8; 32], [0xffu8; 32], [0x3cu8; 32]] {
+            assert_eq!(parse_hash(&crate::hash::hex(&seed)), Some(seed));
+        }
+        assert_eq!(parse_hash(""), None);
+        assert_eq!(parse_hash("abc"), None); // wrong length
+        assert_eq!(parse_hash(&"g".repeat(64)), None); // non-hex
+        assert_eq!(parse_hash(&"a".repeat(63)), None); // one short
     }
 
     #[test]
