@@ -481,6 +481,12 @@ enum Cmd {
     QueryMempool {
         reply: oneshot::Sender<Vec<(crate::Hash, u64)>>,
     },
+    /// M112: at which committed height (if any) was this tx content hash mined? `None` ⇒ not
+    /// in any committed block (still pending, never submitted, or dropped). For `/tx/{hash}`.
+    QueryTxHeight {
+        hash: crate::Hash,
+        reply: oneshot::Sender<Option<u64>>,
+    },
     /// M104: snapshot the money-supply totals for the `/supply` read.
     QuerySupply {
         reply: oneshot::Sender<SupplyView>,
@@ -701,6 +707,11 @@ struct Actor {
     clog: CertLog,
     /// Number of blocks already persisted (index into `node.blocks()`).
     appended: usize,
+    /// M112: content hash → committed block height, for the `GET /tx/{hash}` inclusion read.
+    /// Node-local (never folded into `state_root`), so it does not affect the head invariant.
+    /// Seeded from the replayed chain at construction and extended in [`Actor::persist`] as
+    /// each new block commits — avoids recomputing every tx's hash on every lookup.
+    tx_index: HashMap<crate::Hash, u64>,
     /// M35: consensus timing + empty-block policy, resolved from config at boot.
     timing: Timing,
     /// M39: known peer listen addresses (id → "host:port"), seeded from config
@@ -854,6 +865,11 @@ impl Actor {
             if let Err(e) = self.clog.append(&certs[self.appended]) {
                 error!(node = self.node.id, error = %e, "append cert failed");
                 return;
+            }
+            // M112: index this block's txs by content hash → height for `/tx/{hash}`.
+            let h = blocks[self.appended].height;
+            for tx in &blocks[self.appended].txs {
+                self.tx_index.insert(tx.hash(), h);
             }
             self.appended += 1;
             debug!(node = self.node.id, height = self.appended as u64, "block committed");
@@ -1218,6 +1234,10 @@ async fn run_actor(mut actor: Actor, mut rx: mpsc::UnboundedReceiver<Cmd>) {
             Cmd::QueryMempool { reply } => {
                 // M111: snapshot the pending-tx directory (hash-ordered hash + author).
                 let _ = reply.send(actor.node.mempool.pending_summaries());
+            }
+            Cmd::QueryTxHeight { hash, reply } => {
+                // M112: O(1) inclusion lookup against the node-local tx index.
+                let _ = reply.send(actor.tx_index.get(&hash).copied());
             }
             Cmd::QuerySupply { reply } => {
                 // M104: snapshot the supply-conservation totals from committed state.
@@ -2183,6 +2203,10 @@ enum GetRoute {
     /// pending-pool list beside `/stake-ops` (M89) and `/evidence` (M90). Exact-match; the
     /// `/mempool/{hash}` membership read is the prefix sibling.
     MempoolList,
+    /// M112: `GET /tx/{hash}` — the committed-inclusion read: at which height was this tx
+    /// content hash mined? Pairs with `/mempool/{hash}` (pending): a wallet polls both to
+    /// follow a submission from pool → block. 64-hex hash; malformed ⇒ 404.
+    TxHeight(crate::Hash),
     /// M104: `GET /supply` — the money-supply snapshot (supply, treasury, bonded,
     /// bridge_locked, bridge_minted). Lets a client audit the supply-conservation invariant
     /// from cert-signed state. Exact-match; no id.
@@ -2552,6 +2576,10 @@ fn route_get(path: &str) -> GetRoute {
                 // M103: `/mempool/{hash}` is a membership read — is this tx hash currently
                 // pending? A malformed (non-64-hex) hash ⇒ 404.
                 parse_hash(rest).map(GetRoute::MempoolContains).unwrap_or(GetRoute::NotFound)
+            } else if let Some(rest) = p.strip_prefix("/tx/") {
+                // M112: `/tx/{hash}` is a committed-inclusion read — at which height (if any)
+                // was this tx mined? A malformed hash ⇒ 404.
+                parse_hash(rest).map(GetRoute::TxHeight).unwrap_or(GetRoute::NotFound)
             } else {
                 GetRoute::Health
             }
@@ -2767,6 +2795,24 @@ fn json_bool(b: bool) -> String {
 /// negotiate `?format=json`.
 fn bool_str(b: bool) -> &'static str {
     if b { "present" } else { "absent" }
+}
+
+/// M112: render the `/tx/{hash}` inclusion answer — the committed height, or `absent` when
+/// the hash is in no committed block. Pure for direct unit testing.
+fn format_tx_height(height: Option<u64>) -> String {
+    match height {
+        Some(h) => format!("height={h}"),
+        None => "absent".to_string(),
+    }
+}
+
+/// M112: `GET /tx/{hash}?format=json` — the JSON sibling, `{"height":"N"}` when committed or
+/// `{"height":null}` when absent (mirroring the page envelope's bare-`null` convention).
+fn json_tx_height(height: Option<u64>) -> String {
+    match height {
+        Some(h) => format!("{{\"height\":{}}}", json_u64(h)),
+        None => "{\"height\":null}".to_string(),
+    }
 }
 
 /// An f32 as a JSON number token, or `null` when non-finite (`inf`/`NaN` are not valid
@@ -4370,6 +4416,19 @@ async fn serve_rpc_conn(mut stream: TcpStream, cmd: mpsc::UnboundedSender<Cmd>) 
                     }
                 }
             }
+            GetRoute::TxHeight(hash) => {
+                // M112: committed-inclusion read — the height this tx was mined at, or `absent`.
+                // Always a `200` (the lookup succeeded even when the hash is unknown).
+                let (reply, rx) = oneshot::channel();
+                if cmd.send(Cmd::QueryTxHeight { hash, reply }).is_err() {
+                    http_response("503 Service Unavailable", "node stopped")
+                } else {
+                    match rx.await {
+                        Ok(height) => ok_body(fmt, &format_tx_height(height), &json_tx_height(height)),
+                        Err(_) => http_response("503 Service Unavailable", "node stopped"),
+                    }
+                }
+            }
             GetRoute::MempoolList => {
                 // M111: pending-tx directory (hash + author) — always a (possibly empty) `200`.
                 // The missing pending-pool list beside `/stake-ops` and `/evidence`; reuses the
@@ -4717,6 +4776,14 @@ impl Node {
             ));
         }
         let appended = blocks.len();
+        // M112: seed the tx-inclusion index from the replayed chain (these blocks are already
+        // appended, so `persist` won't re-index them). Node-local; not part of `state_root`.
+        let mut tx_index: HashMap<crate::Hash, u64> = HashMap::new();
+        for b in &blocks {
+            for tx in &b.txs {
+                tx_index.insert(tx.hash(), b.height);
+            }
+        }
 
         let (cmd_tx, cmd_rx) = mpsc::unbounded_channel::<Cmd>();
 
@@ -4788,6 +4855,7 @@ impl Node {
             blog,
             clog,
             appended,
+            tx_index,
             timing,
             addrs,
             dialing,
@@ -7232,6 +7300,66 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn rpc_tx_inclusion_over_tcp() {
+        // M112: `GET /tx/{hash}` reports the committed height of a mined tx, and `absent` for an
+        // unknown hash. A single-validator node self-commits, so a submitted tx is mined within
+        // a few blocks; we poll `/tx/{hash}` until it reports a height.
+        let dir = tmp_dir("rpc-tx-inclusion");
+        // node_config p2p listen = 20851 + (45-21) = 20875; keep the RPC port clear.
+        let mut cfg = node_config(45, 20851, &[45], dir.clone());
+        let rpc_addr = "127.0.0.1:20881";
+        cfg.rpc = Some(crate::config::RpcConfig { enabled: true, listen: rpc_addr.into() });
+        let mut genesis = test_genesis();
+        genesis.validators = vec![(45, kp(45).public(), 1)]; // quorum 1 ⇒ self-commit
+        let node = Node::start(cfg, genesis, Some(kp(45))).await.expect("start node");
+
+        async fn get(addr: &str, path: &str) -> String {
+            let req = format!("GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
+            let mut s = TcpStream::connect(addr).await.expect("connect rpc");
+            s.write_all(req.as_bytes()).await.expect("send get");
+            let mut resp = Vec::new();
+            s.read_to_end(&mut resp).await.expect("read response");
+            String::from_utf8_lossy(&resp).into_owned()
+        }
+        fn body_of(resp: &str) -> &str {
+            resp.split_once("\r\n\r\n").map(|(_, b)| b).unwrap_or("")
+        }
+
+        // Submit a valid tx; capture its content hash.
+        let tx = test_tx(1, 0, 1);
+        let h = crate::hash::hex(&tx.hash());
+        node.submit_tx(tx).await.expect("actor alive").expect("valid tx admitted");
+
+        // Poll /tx/{hash} until it reports a committed height.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(8);
+        let committed = loop {
+            let body = body_of(&get(rpc_addr, &format!("/tx/{h}")).await).to_string();
+            if let Some(n) = body.strip_prefix("height=") {
+                break n.parse::<u64>().expect("height is a u64");
+            }
+            assert!(tokio::time::Instant::now() < deadline, "tx never mined: last body `{body}`");
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        };
+        assert!(committed >= 1, "committed at a real height, got {committed}");
+
+        // JSON form of the same read.
+        let as_json = get(rpc_addr, &format!("/tx/{h}?format=json")).await;
+        assert_eq!(body_of(&as_json), format!("{{\"height\":\"{committed}\"}}"), "tx json");
+
+        // An unknown hash is `absent` / null (still a 200).
+        let other = crate::hash::hex(&[0x33u8; 32]);
+        let absent = get(rpc_addr, &format!("/tx/{other}")).await;
+        assert!(absent.starts_with("HTTP/1.1 200 OK"), "absent status: {absent}");
+        assert_eq!(body_of(&absent), "absent", "unknown hash ⇒ absent");
+
+        // A malformed hash is a routing miss → 404.
+        let bad = get(rpc_addr, "/tx/notahash").await;
+        assert!(bad.starts_with("HTTP/1.1 404 Not Found"), "malformed ⇒ 404: {bad}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
     async fn rpc_supply_over_tcp() {
         // M104: `GET /supply` returns the money-supply snapshot from committed state. On a
         // fresh single-validator chain the supply equals the genesis endowments and the
@@ -8680,6 +8808,27 @@ vote_b.validator=5 vote_b.height=9 vote_b.round=2 vote_b.block_hash={b_h} vote_b
         let h = crate::hash::hex(&[0x5au8; 32]);
         assert!(matches!(route_get(&format!("/mempool/{h}")), GetRoute::MempoolContains(_)));
         assert!(matches!(route_get("/mempool/bad"), GetRoute::NotFound));
+    }
+
+    #[test]
+    fn route_get_parses_tx_height() {
+        // M112: `/tx/{hash}` is a committed-inclusion read; a malformed or empty hash ⇒ 404.
+        let h = crate::hash::hex(&[0x9au8; 32]);
+        match route_get(&format!("/tx/{h}")) {
+            GetRoute::TxHeight(bytes) => assert_eq!(bytes, [0x9au8; 32]),
+            _ => panic!("expected TxHeight for a valid 64-hex hash"),
+        }
+        assert!(matches!(route_get("/tx/bad"), GetRoute::NotFound), "non-hex ⇒ 404");
+        assert!(matches!(route_get("/tx/"), GetRoute::NotFound), "empty hash ⇒ 404");
+    }
+
+    #[test]
+    fn tx_height_renders_text_and_json() {
+        // M112: a committed tx reports its height; an unknown hash reports `absent` / null.
+        assert_eq!(format_tx_height(Some(5)), "height=5");
+        assert_eq!(json_tx_height(Some(5)), "{\"height\":\"5\"}");
+        assert_eq!(format_tx_height(None), "absent");
+        assert_eq!(json_tx_height(None), "{\"height\":null}");
     }
 
     #[test]
