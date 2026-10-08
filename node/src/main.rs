@@ -241,6 +241,7 @@ fn main() {
         "inspect-tx" => cmd_inspect_tx(&args),
         "pubkey" => cmd_pubkey(&args),
         "submit-tx" => cmd_submit_tx(config_arg(&args), tx_arg(&args)),
+        "rpc" => cmd_rpc(&args),
         "encode-tx" => cmd_encode_tx(&args),
         "keygen" => cmd_keygen(&args),
         "localnet" => cmd_localnet(),
@@ -322,6 +323,7 @@ fn usage() {
     eprintln!("  node genesis-hash --config F  print the chain identity derived from the config's genesis: genesis_hash + initial state_root + validator count (compare across operators before joining)");
     eprintln!("  node inspect-genesis --config F  dump the config's genesis contents: every account (id/balance/pubkey), reviewer, validator, plus params (the detail view to genesis-hash's identity)");
     eprintln!("  node submit-tx --config F --tx F  submit a codec-encoded tx to a running daemon's [rpc] ingress endpoint; print accepted hash or reject reason");
+    eprintln!("  node rpc --config F --path P  GET a read path (e.g. /info, /supply, /block/1) from the config's [rpc] endpoint and print the response body (curl-free client)");
     eprintln!("  node encode-tx --key-file F --out F --author N --domain N --stake N --embedding f,..(DIM) --review R:S.. --repl-success N --repl-total N --timestamp-days F [--config F]  author+sign a tx offline into a submit-tx file; print its hash");
     eprintln!("  node inspect-tx --tx F [--pubkey HEX]  decode a codec-encoded tx file and print its fields + content hash; with --pubkey, also verify the signature (the read-side companion to encode-tx)");
     eprintln!("  node keygen --out F [--seed HEX]  generate (or derive from a 64-hex seed) an ed25519 keypair; write the seed file (for encode-tx --key-file) and print the pubkey");
@@ -3117,6 +3119,55 @@ fn cmd_submit_tx(config_path: String, tx_path: String) {
     }
 }
 
+/// M116: format an HTTP/1.1 GET request for the read-RPC client. Pure for unit testing.
+fn rpc_get_request(host: &str, path: &str) -> String {
+    format!("GET {path} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n")
+}
+
+/// M116: split a raw HTTP response into `(status_line, body)` — the status line is the first
+/// line, the body is everything after the `\r\n\r\n` header terminator (empty when absent,
+/// e.g. a 304/HEAD). Pure for unit testing.
+fn split_http_response(text: &str) -> (&str, &str) {
+    let status_line = text.lines().next().unwrap_or("");
+    let body = text.split("\r\n\r\n").nth(1).unwrap_or("");
+    (status_line, body)
+}
+
+/// M116: `node rpc --config F --path P` — a curl-free read client. GETs `P` from the config's
+/// enabled `[rpc]` endpoint and prints the response body on a 2xx, or the status line + body
+/// on stderr (exit 1) otherwise. Reads only; the one-shot CLI needs no tokio runtime.
+fn cmd_rpc(args: &[String]) {
+    use std::io::{Read as _, Write as _};
+
+    let config_path = config_arg(args);
+    let path = req_arg(args, "--path");
+    let cfg = config::load_node_config(&config_path).unwrap_or_else(|e| fail_msg("load node config", &e));
+    let rpc = match cfg.rpc.as_ref().filter(|r| r.enabled) {
+        Some(r) => r,
+        None => fail_msg("rpc", &"config has no enabled [rpc] section (set [rpc] enabled = true on the daemon)"),
+    };
+    let addr = rpc.listen.clone();
+
+    let mut stream = std::net::TcpStream::connect(&addr).unwrap_or_else(|e| fail("connect rpc", e));
+    stream
+        .write_all(rpc_get_request(&addr, path).as_bytes())
+        .unwrap_or_else(|e| fail("send request", e));
+    let mut resp = Vec::new();
+    stream.read_to_end(&mut resp).unwrap_or_else(|e| fail("read response", e));
+    let text = String::from_utf8_lossy(&resp);
+    let (status_line, body) = split_http_response(&text);
+    let code = status_line.split_whitespace().nth(1).unwrap_or("");
+    if code.starts_with('2') {
+        println!("{body}");
+    } else {
+        eprintln!("{status_line}");
+        if !body.is_empty() {
+            eprintln!("{body}");
+        }
+        exit(1);
+    }
+}
+
 /// First `--flag value` occurrence, if present.
 fn opt_arg<'a>(args: &'a [String], flag: &str) -> Option<&'a str> {
     args.windows(2).find(|w| w[0] == flag).map(|w| w[1].as_str())
@@ -4048,6 +4099,35 @@ mod tests {
         let (cpath, dir) = write_check_config_fixture("igbad", bad, "");
         assert!(inspect_genesis(&cpath).is_err(), "bad genesis must fail");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn rpc_get_request_formats_an_http_get() {
+        // M116: the read client sends a well-formed close-delimited GET.
+        assert_eq!(
+            rpc_get_request("127.0.0.1:9000", "/info"),
+            "GET /info HTTP/1.1\r\nHost: 127.0.0.1:9000\r\nConnection: close\r\n\r\n"
+        );
+    }
+
+    #[test]
+    fn split_http_response_extracts_status_and_body() {
+        // M116: a full response splits into its status line and the body after the blank line.
+        let resp = "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n\r\nheight=7";
+        let (status, body) = split_http_response(resp);
+        assert_eq!(status, "HTTP/1.1 200 OK");
+        assert_eq!(body, "height=7");
+        // The status code token is the second whitespace field.
+        assert_eq!(status.split_whitespace().nth(1), Some("200"));
+    }
+
+    #[test]
+    fn split_http_response_handles_empty_body() {
+        // M116: a bodyless response (e.g. 304 / HEAD) yields an empty body, not a panic.
+        let resp = "HTTP/1.1 304 Not Modified\r\nETag: \"abc\"\r\n\r\n";
+        let (status, body) = split_http_response(resp);
+        assert_eq!(status, "HTTP/1.1 304 Not Modified");
+        assert_eq!(body, "");
     }
 
     // M98: build a signed tx and its canonical encoding for inspect-tx tests.
