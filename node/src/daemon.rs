@@ -372,6 +372,13 @@ enum Cmd {
         tx: Box<SubmissionTx>,
         reply: oneshot::Sender<Result<Hash, crate::ChainError>>,
     },
+    /// M115: a pre-flight validation — run `validate_tx` against current committed state
+    /// WITHOUT admitting the tx to the mempool. A wallet checks acceptability before
+    /// actually submitting. `Ok(())` ⇒ would be accepted; `Err` ⇒ would be rejected (reason).
+    ValidateTx {
+        tx: Box<SubmissionTx>,
+        reply: oneshot::Sender<Result<(), crate::ChainError>>,
+    },
     /// Periodic anti-entropy heartbeat.
     Announce,
     /// Read this node's (height, head) — used by the demo/tests.
@@ -1132,6 +1139,11 @@ async fn run_actor(mut actor: Actor, mut rx: mpsc::UnboundedReceiver<Cmd>) {
                         let _ = reply.send(Err(e));
                     }
                 }
+            }
+            Cmd::ValidateTx { tx, reply } => {
+                // M115: read-only pre-flight — static validation against current state, no
+                // admission, no counter bump, no gossip. Pure read of chain state.
+                let _ = reply.send(actor.node.chain.state.validate_tx(&tx));
             }
             Cmd::StartHeight { height } => actor.on_start_tick(height),
             Cmd::Timeout { height, step, round } => actor.on_timeout(height, step, round),
@@ -4769,6 +4781,56 @@ async fn serve_rpc_conn(mut stream: TcpStream, cmd: mpsc::UnboundedSender<Cmd>) 
         return;
     }
 
+    // M115: `POST /validate` is a pre-flight — decode the tx and run `validate_tx` against
+    // current state WITHOUT admitting it. `200`/valid, `400` on a decode error, `422`/reason
+    // on a validation reject (same shapes as `/submit_tx`, minus the admission side effect).
+    if path == "/validate" {
+        let Some(len) = parse_content_length(head) else {
+            let _ = stream.write_all(http_response("411 Length Required", "missing content-length").as_bytes()).await;
+            return;
+        };
+        if len > MAX_RPC_BODY {
+            let _ = stream.write_all(http_response("413 Payload Too Large", "tx too large").as_bytes()).await;
+            return;
+        }
+        let mut body: Vec<u8> = acc[header_end..].to_vec();
+        while body.len() < len {
+            match stream.read(&mut buf).await {
+                Ok(0) => break,
+                Ok(n) => body.extend_from_slice(&buf[..n]),
+                Err(_) => return,
+            }
+        }
+        if body.len() < len {
+            let _ = stream.write_all(http_response("400 Bad Request", "truncated body").as_bytes()).await;
+            return;
+        }
+        body.truncate(len);
+
+        let tx = match crate::codec::decode_tx(&body) {
+            Ok(tx) => tx,
+            Err(e) => {
+                let _ = stream.write_all(error_body(fmt, "400 Bad Request", &e.to_string()).as_bytes()).await;
+                let _ = stream.flush().await;
+                return;
+            }
+        };
+
+        let (reply, rx) = oneshot::channel();
+        if cmd.send(Cmd::ValidateTx { tx: Box::new(tx), reply }).is_err() {
+            let _ = stream.write_all(http_response("503 Service Unavailable", "node stopped").as_bytes()).await;
+            return;
+        }
+        let resp = match rx.await {
+            Ok(Ok(())) => ok_body(fmt, "valid", "{\"valid\":true}"),
+            Ok(Err(e)) => error_body(fmt, "422 Unprocessable Entity", &e.to_string()),
+            Err(_) => http_response("503 Service Unavailable", "node stopped"),
+        };
+        let _ = stream.write_all(resp.as_bytes()).await;
+        let _ = stream.flush().await;
+        return;
+    }
+
     // Determine how many body bytes to expect, capped.
     let Some(len) = parse_content_length(head) else {
         let _ = stream.write_all(http_response("411 Length Required", "missing content-length").as_bytes()).await;
@@ -7654,6 +7716,135 @@ mod tests {
         // A height with no committed block ⇒ 404.
         let past = get(rpc_addr, &format!("/block/{}/txs", height + 10_000)).await;
         assert!(past.starts_with("HTTP/1.1 404 Not Found"), "future height ⇒ 404: {past}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn rpc_validate_accepts_valid_tx_without_admitting() {
+        // M115: `POST /validate` is a pre-flight — a valid tx ⇒ 200 "valid" (text) /
+        // {"valid":true} (JSON), and the tx is NOT admitted to the mempool (the key behavior
+        // distinguishing it from /submit_tx).
+        let dir = tmp_dir("rpc-validate-ok");
+        // node_config p2p listen = 20971 + (48-21) = 20998; keep the RPC port clear.
+        let mut cfg = node_config(48, 20971, &[48], dir.clone());
+        let rpc_addr = "127.0.0.1:21001";
+        cfg.rpc = Some(crate::config::RpcConfig { enabled: true, listen: rpc_addr.into() });
+        let mut genesis = test_genesis();
+        genesis.validators = vec![(48, kp(48).public(), 1)]; // quorum 1 ⇒ self-commit
+        let _node = Node::start(cfg, genesis, Some(kp(48))).await.expect("start node");
+
+        async fn post(addr: &str, path: &str, body: &[u8]) -> String {
+            let mut req = format!(
+                "POST {path} HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            )
+            .into_bytes();
+            req.extend_from_slice(body);
+            let mut s = TcpStream::connect(addr).await.expect("connect rpc");
+            s.write_all(&req).await.expect("send post");
+            let mut resp = Vec::new();
+            s.read_to_end(&mut resp).await.expect("read response");
+            String::from_utf8_lossy(&resp).into_owned()
+        }
+        async fn get(addr: &str, path: &str) -> String {
+            let req = format!("GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
+            let mut s = TcpStream::connect(addr).await.expect("connect rpc");
+            s.write_all(req.as_bytes()).await.expect("send get");
+            let mut resp = Vec::new();
+            s.read_to_end(&mut resp).await.expect("read response");
+            String::from_utf8_lossy(&resp).into_owned()
+        }
+        fn body_of(resp: &str) -> &str {
+            resp.split_once("\r\n\r\n").map(|(_, b)| b).unwrap_or("")
+        }
+
+        let body = crate::codec::encode_tx(&test_tx(1, 0, 1));
+        let ok = post(rpc_addr, "/validate", &body).await;
+        assert!(ok.starts_with("HTTP/1.1 200 OK"), "valid status: {ok}");
+        assert_eq!(body_of(&ok), "valid", "valid text");
+
+        let ok_json = {
+            let mut req = format!(
+                "POST /validate?format=json HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            )
+            .into_bytes();
+            req.extend_from_slice(&body);
+            let mut s = TcpStream::connect(rpc_addr).await.expect("connect");
+            s.write_all(&req).await.expect("send");
+            let mut r = Vec::new();
+            s.read_to_end(&mut r).await.expect("read");
+            String::from_utf8_lossy(&r).into_owned()
+        };
+        assert_eq!(body_of(&ok_json), "{\"valid\":true}", "valid json");
+
+        // Pre-flight must NOT admit the tx: the mempool stays empty.
+        let mem = get(rpc_addr, "/mempool").await;
+        assert_eq!(body_of(&mem), "total=0", "validate must not admit: {mem}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn rpc_validate_rejects_invalid_tx() {
+        // M115: a tx from an unknown author fails static validation ⇒ 422 with a reason.
+        let dir = tmp_dir("rpc-validate-reject");
+        // node_config p2p listen = 21011 + (49-21) = 21039; keep the RPC port clear.
+        let mut cfg = node_config(49, 21011, &[49], dir.clone());
+        let rpc_addr = "127.0.0.1:21051";
+        cfg.rpc = Some(crate::config::RpcConfig { enabled: true, listen: rpc_addr.into() });
+        let mut genesis = test_genesis();
+        genesis.validators = vec![(49, kp(49).public(), 1)]; // quorum 1 ⇒ self-commit
+        let _node = Node::start(cfg, genesis, Some(kp(49))).await.expect("start node");
+
+        async fn post(addr: &str, path: &str, body: &[u8]) -> String {
+            let mut req = format!(
+                "POST {path} HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            )
+            .into_bytes();
+            req.extend_from_slice(body);
+            let mut s = TcpStream::connect(addr).await.expect("connect rpc");
+            s.write_all(&req).await.expect("send post");
+            let mut resp = Vec::new();
+            s.read_to_end(&mut resp).await.expect("read response");
+            String::from_utf8_lossy(&resp).into_owned()
+        }
+
+        // test_tx(99, ..) has an author with no genesis account ⇒ rejected.
+        let body = crate::codec::encode_tx(&test_tx(99, 1, 2));
+        let bad = post(rpc_addr, "/validate", &body).await;
+        assert!(bad.starts_with("HTTP/1.1 422 Unprocessable Entity"), "invalid ⇒ 422: {bad}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn rpc_validate_decode_error_is_400() {
+        // M115: a `/validate` body that is not a codec-encoded tx ⇒ 400 (same as `/submit_tx`).
+        let dir = tmp_dir("rpc-validate-400");
+        // node_config p2p listen = 21061 + (50-21) = 21090; keep the RPC port clear.
+        let mut cfg = node_config(50, 21061, &[50], dir.clone());
+        let rpc_addr = "127.0.0.1:21101";
+        cfg.rpc = Some(crate::config::RpcConfig { enabled: true, listen: rpc_addr.into() });
+        let mut genesis = test_genesis();
+        genesis.validators = vec![(50, kp(50).public(), 1)]; // quorum 1 ⇒ self-commit
+        let _node = Node::start(cfg, genesis, Some(kp(50))).await.expect("start node");
+
+        let body = b"not a tx";
+        let mut req = format!(
+            "POST /validate HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        )
+        .into_bytes();
+        req.extend_from_slice(body);
+        let mut s = TcpStream::connect(rpc_addr).await.expect("connect rpc");
+        s.write_all(&req).await.expect("send post");
+        let mut resp = Vec::new();
+        s.read_to_end(&mut resp).await.expect("read response");
+        let resp = String::from_utf8_lossy(&resp);
+        assert!(resp.starts_with("HTTP/1.1 400 Bad Request"), "garbage ⇒ 400: {resp}");
 
         let _ = std::fs::remove_dir_all(&dir);
     }
