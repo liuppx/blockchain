@@ -323,7 +323,7 @@ fn usage() {
     eprintln!("  node genesis-hash --config F  print the chain identity derived from the config's genesis: genesis_hash + initial state_root + validator count (compare across operators before joining)");
     eprintln!("  node inspect-genesis --config F  dump the config's genesis contents: every account (id/balance/pubkey), reviewer, validator, plus params (the detail view to genesis-hash's identity)");
     eprintln!("  node submit-tx --config F --tx F  submit a codec-encoded tx to a running daemon's [rpc] ingress endpoint; print accepted hash or reject reason");
-    eprintln!("  node rpc --config F --path P  GET a read path (e.g. /info, /supply, /block/1) from the config's [rpc] endpoint and print the response body (curl-free client)");
+    eprintln!("  node rpc --config F --path P [--post FILE]  send a request to the config's [rpc] endpoint and print the response body; GET by default, or POST FILE's raw bytes (e.g. /validate, /submit_tx, /batch)");
     eprintln!("  node encode-tx --key-file F --out F --author N --domain N --stake N --embedding f,..(DIM) --review R:S.. --repl-success N --repl-total N --timestamp-days F [--config F]  author+sign a tx offline into a submit-tx file; print its hash");
     eprintln!("  node inspect-tx --tx F [--pubkey HEX]  decode a codec-encoded tx file and print its fields + content hash; with --pubkey, also verify the signature (the read-side companion to encode-tx)");
     eprintln!("  node keygen --out F [--seed HEX]  generate (or derive from a 64-hex seed) an ed25519 keypair; write the seed file (for encode-tx --key-file) and print the pubkey");
@@ -3124,6 +3124,19 @@ fn rpc_get_request(host: &str, path: &str) -> String {
     format!("GET {path} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n")
 }
 
+/// M117: build a full HTTP/1.1 POST request (header block + raw body) for the RPC client's
+/// `--post` mode. Returns bytes (not a `String`) so a binary codec body passes through
+/// untouched; `Content-Length` is the exact body length. Pure for unit testing.
+fn rpc_post_request(host: &str, path: &str, body: &[u8]) -> Vec<u8> {
+    let mut req = format!(
+        "POST {path} HTTP/1.1\r\nHost: {host}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        body.len()
+    )
+    .into_bytes();
+    req.extend_from_slice(body);
+    req
+}
+
 /// M116: split a raw HTTP response into `(status_line, body)` — the status line is the first
 /// line, the body is everything after the `\r\n\r\n` header terminator (empty when absent,
 /// e.g. a 304/HEAD). Pure for unit testing.
@@ -3136,6 +3149,9 @@ fn split_http_response(text: &str) -> (&str, &str) {
 /// M116: `node rpc --config F --path P` — a curl-free read client. GETs `P` from the config's
 /// enabled `[rpc]` endpoint and prints the response body on a 2xx, or the status line + body
 /// on stderr (exit 1) otherwise. Reads only; the one-shot CLI needs no tokio runtime.
+/// M117: with `--post FILE`, sends a POST carrying the file's raw bytes (e.g. a codec-encoded
+/// tx to `/submit_tx` or `/validate`, a batch request to `/batch`) — one client for every
+/// GET or POST endpoint.
 fn cmd_rpc(args: &[String]) {
     use std::io::{Read as _, Write as _};
 
@@ -3149,9 +3165,19 @@ fn cmd_rpc(args: &[String]) {
     let addr = rpc.listen.clone();
 
     let mut stream = std::net::TcpStream::connect(&addr).unwrap_or_else(|e| fail("connect rpc", e));
-    stream
-        .write_all(rpc_get_request(&addr, path).as_bytes())
-        .unwrap_or_else(|e| fail("send request", e));
+    match opt_arg(args, "--post") {
+        Some(file) => {
+            let body = std::fs::read(file).unwrap_or_else(|e| fail("read post body", e));
+            stream
+                .write_all(&rpc_post_request(&addr, path, &body))
+                .unwrap_or_else(|e| fail("send request", e));
+        }
+        None => {
+            stream
+                .write_all(rpc_get_request(&addr, path).as_bytes())
+                .unwrap_or_else(|e| fail("send request", e));
+        }
+    }
     let mut resp = Vec::new();
     stream.read_to_end(&mut resp).unwrap_or_else(|e| fail("read response", e));
     let text = String::from_utf8_lossy(&resp);
@@ -4128,6 +4154,37 @@ mod tests {
         let (status, body) = split_http_response(resp);
         assert_eq!(status, "HTTP/1.1 304 Not Modified");
         assert_eq!(body, "");
+    }
+
+    #[test]
+    fn rpc_post_request_includes_content_length_and_body() {
+        // M117: a POST carries the body after a Content-Length header equal to its byte length.
+        let req = rpc_post_request("127.0.0.1:9000", "/validate", b"hello");
+        let text = String::from_utf8(req).unwrap();
+        assert!(text.starts_with("POST /validate HTTP/1.1\r\n"), "{text}");
+        assert!(text.contains("Host: 127.0.0.1:9000\r\n"), "{text}");
+        assert!(text.contains("Content-Length: 5\r\n"), "{text}");
+        assert!(text.ends_with("\r\n\r\nhello"), "{text}");
+    }
+
+    #[test]
+    fn rpc_post_request_preserves_binary_body() {
+        // M117: a binary (non-UTF-8) body — like a codec-encoded tx — passes through byte-for
+        // byte; the request is bytes, not a String, so nothing is mangled.
+        let body: Vec<u8> = vec![0x00, 0xff, 0x80, 0x01, 0xfe];
+        let req = rpc_post_request("h:1", "/submit_tx", &body);
+        assert!(req.ends_with(&body), "binary body preserved at the tail");
+        // Content-Length reflects the raw length.
+        assert!(String::from_utf8_lossy(&req).contains("Content-Length: 5\r\n"));
+    }
+
+    #[test]
+    fn rpc_post_request_empty_body() {
+        // M117: an empty body ⇒ Content-Length: 0 and nothing after the header terminator.
+        let req = rpc_post_request("h:1", "/x", b"");
+        let text = String::from_utf8(req).unwrap();
+        assert!(text.contains("Content-Length: 0\r\n"), "{text}");
+        assert!(text.ends_with("\r\n\r\n"), "{text}");
     }
 
     // M98: build a signed tx and its canonical encoding for inspect-tx tests.

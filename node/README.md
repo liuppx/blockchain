@@ -1285,6 +1285,19 @@ M53 的 `submit-tx` 是写侧 CLI 客户端（POST 一笔 tx 到运行中节点�
 
 **已知边界（顺延至 M117+）**：CLI 客户端读/写成对（`node rpc` 读 + `submit-tx` 写）；tx 写路径（预检/提交/生命周期读）已齐；链读面已相当完整；内容协商三轴已齐（仅 `identity`，真压缩顺延）；离线工具篮子已补；运维篮子剩余：证书/密钥轮换与落盘、follower 认证、指标端 TLS、OTel/push exporter、每-sink 独立 rotation 覆盖、时延直方图；keygen 篮子剩余：助记词 / BIP-39、口令加密 keystore、密钥轮换；剩余：游标分页、未知方法 `405`；共识 / wire 篮子（破 head 不变量）：**货币费用** + 费用优先排序、nonce / 序列号反重放。
 
+## `node rpc --post` 全能 RPC 客户端（Milestone 117）
+
+M116 的 `node rpc` 只能 GET。M117 补上写侧，让它成为**全能** RPC 客户端：`node rpc --config F --path /validate --post FILE` 把文件的原始字节 POST 到任一端点——codec-tx 发给 `/submit_tx` 或 `/validate`、批量请求发给 `/batch`——缺省无 `--post` 时仍是 GET。纯客户端，不触节点内部，`localnet` head 不变量（`44309755…ea04ba`）天然不受影响。
+
+- **二进制安全**：新增纯函数 `rpc_post_request(host, path, body: &[u8]) -> Vec<u8>` 返回**字节**（不是 `String`），故一个 codec 编码的 tx（含非 UTF-8 字节）逐字节透传、不被任何字符串转换损坏；`Content-Length` 等于体的精确字节数。
+- **分流**：`cmd_rpc` 按 `opt_arg(args, "--post")` 分流——有 ⇒ 读该文件为体、`rpc_post_request` 发 POST；无 ⇒ `rpc_get_request` 发 GET（M116）。响应处理（状态行/体切分、2xx stdout、否则 stderr + exit 1）两路共用、不变。
+- **usage**：`node rpc --config F --path P [--post FILE]`。
+- **与 `submit-tx` 的关系**：`submit-tx` 仍是**专用**的 tx 提交器（本地先 `decode_tx` 预检、打印「accepted hash / rejected reason」）；`node rpc --post` 是**通用**字节管道（任意 path + 任意体，原样回显响应）——专用便捷 vs 通用灵活，二者并存。
+- **测试（+3 → 520）**：新纯 `rpc_post_request_includes_content_length_and_body`（POST 头 + `Content-Length` + 体尾）/`rpc_post_request_preserves_binary_body`（`[0x00,0xff,0x80,…]` 体尾部逐字节保留、证明二进制安全）/`rpc_post_request_empty_body`（`Content-Length: 0` 且终止符后无字节）。
+- **不变量保持**：纯 CLI 客户端、无 `serde_json`、无引擎 / codec / crypto / wire / 共识 / 状态变更、无新依赖，不碰节点内部，故 `localnet` 逐字节同块、head 仍 `44309755…ea04ba`。
+
+**已知边界（顺延至 M118+）**：全能 RPC 客户端（`node rpc` GET/`--post`）+ 专用 `submit-tx` 已齐；tx 写路径、链读面已相当完整；内容协商三轴已齐（仅 `identity`，真压缩顺延）；离线工具篮子已补；运维篮子剩余：证书/密钥轮换与落盘、follower 认证、指标端 TLS、OTel/push exporter、每-sink 独立 rotation 覆盖、时延直方图；keygen 篮子剩余：助记词 / BIP-39、口令加密 keystore、密钥轮换；剩余：游标分页、未知方法 `405`；共识 / wire 篮子（破 head 不变量）：**货币费用** + 费用优先排序、nonce / 序列号反重放。
+
 ## 持久化与重放（Milestone 7）
 
 节点状态不再只活在内存里：区块以**追加式日志**（`DIR/blocks.log`）落盘，重启后从创世**重放**日志即可重建**逐字节相同**的状态。
@@ -2081,5 +2094,6 @@ peer_exchange_disabled_stays_seeded                   同链拓扑关发现 → 
 - ~~M114 区块交易列表 `GET /block/{height}/txs`——`/block/{height}`（M113）只给 tx 计数、给不出哪些 tx；M114 加其 list 兄弟列每笔 tx 的内容哈希 + 作者，据此 `/tx` 或自寻址取全体；`/block/` 前缀臂按 `strip_suffix("/txs")` 分流（有尾 ⇒ `BlockTxs(h)`、否则 ⇒ `Block(h)`）；`Cmd::QueryBlockTxs` actor 以 `blocks().find(.height==h)` 定位 map 成 `(hash, author)`（无块 ⇒ 404）；渲染器 `format_block_tx`/`json_block_tx`（`kind=tx`，区别 mempool 的 `kind=pending_tx`）+ 两薄包装，逐字复用分页信封 + 协商；新纯测 `route_get_parses_block_txs`/`block_tx_listing_renders` + TCP `rpc_block_txs_over_tcp`（submit 后轮询落块、列出 `kind=tx` 条目、JSON 同、无块 ⇒ 404），共 511 测、localnet head 不变~~ ✅
 - ~~M115 交易预检 `POST /validate`——钱包提交前想先知道会不会被接受、不会的话为何，而 `/submit_tx` 真会入池泛洪；M115 加 `POST /validate` 只读预检：解码后对当前状态跑 `validate_tx`，不入池/不计数/不泛洪——`Ok` ⇒ 200/`valid`/`{"valid":true}`、`Err` ⇒ 422+原因、解码失败 ⇒ 400；`Cmd::ValidateTx` actor 调 `chain.state.validate_tx(&tx)` 纯读；POST 分发在 `/batch` 后、`/submit_tx` 前加 `/validate` 分支、body 读取与错误码同款；新 TCP `rpc_validate_accepts_valid_tx_without_admitting`（合法 ⇒ 200 valid + JSON，随后 `/mempool` 仍 total=0 证明不入池）/`rpc_validate_rejects_invalid_tx`（未知作者 ⇒ 422）/`rpc_validate_decode_error_is_400`（非 tx ⇒ 400），共 514 测、localnet head 不变~~ ✅
 - ~~M116 `node rpc` 读客户端——我们从 M58 起建的一整套读端点此前操作者侧只能靠 curl；M116 加 `node rpc --config F --path P` 免 curl 读客户端：连 config 启用的 `[rpc]` 端点、`GET P`、2xx 打印响应体、否则状态行 + 体到 stderr 并 exit 1，与 `submit-tx`（写）配成读/写一对；核心抽成纯函数 `rpc_get_request(host, path)`/`split_http_response(text) -> (status_line, body)`（无体 ⇒ 空，兼容 304/HEAD），`cmd_rpc` 为阻塞 `TcpStream` 薄壳，注册子命令 + usage；新纯测 `rpc_get_request_formats_an_http_get`/`split_http_response_extracts_status_and_body`/`split_http_response_handles_empty_body`，共 517 测、localnet head 不变~~ ✅
+- ~~M117 `node rpc --post FILE` 全能 RPC 客户端——M116 的 `node rpc` 只能 GET；M117 补写侧：`node rpc --config F --path /validate --post FILE` POST 文件原始字节到任一端点（codec-tx → `/submit_tx`/`/validate`、批量 → `/batch`），缺省仍 GET；新增纯函数 `rpc_post_request(host, path, body) -> Vec<u8>` 返回字节（非 String）故二进制 codec body 逐字节透传、`Content-Length` 为精确体长，`cmd_rpc` 按 `--post` 分流、响应处理不变，usage 更新 `[--post FILE]`；新纯测 `rpc_post_request_includes_content_length_and_body`/`rpc_post_request_preserves_binary_body`/`rpc_post_request_empty_body`，共 520 测、localnet head 不变~~ ✅
 
-……；运维篮子剩余（货币费用（独立共识里程碑）、费用优先出块排序、nonce 反重放、CLI 读/写客户端成对（`node rpc` 读 + `submit-tx` 写）、tx 写路径（预检/提交/生命周期读）已齐、链读面已相当完整、读面列表端点篮子已收口、HTTP `HEAD`/`OPTIONS`/`ETag` 条件 GET/`Accept-Encoding`（identity）协商 已补、keyfile `0600` 已补、现成 genesis 条目已补、`check-config`/`genesis-hash`/`inspect-genesis`/`inspect-tx`/`pubkey`/`inspect-block`/`inspect-cert` 已补、助记词/BIP-39、口令 keystore、密钥轮换、游标分页、真压缩（gzip/deflate，须引新依赖）、未知方法 `405`、RPC auth/TLS、证书/密钥轮换与落盘、follower 认证、每-sink 独立 rotation 覆盖、OTEL/结构化日志 exporter、指标端 TLS、指标 push exporter/直方图/每-peer/每-轮次时延序列）顺延至 M117+，每步仍遵循"可运行、可测试、契约一致"。
+……；运维篮子剩余（货币费用（独立共识里程碑）、费用优先出块排序、nonce 反重放、全能 RPC 客户端（`node rpc` GET/`--post`）+ 专用 `submit-tx` 已齐、tx 写路径与链读面已相当完整、读面列表端点篮子已收口、HTTP `HEAD`/`OPTIONS`/`ETag` 条件 GET/`Accept-Encoding`（identity）协商 已补、keyfile `0600` 已补、现成 genesis 条目已补、`check-config`/`genesis-hash`/`inspect-genesis`/`inspect-tx`/`pubkey`/`inspect-block`/`inspect-cert` 已补、助记词/BIP-39、口令 keystore、密钥轮换、游标分页、真压缩（gzip/deflate，须引新依赖）、未知方法 `405`、RPC auth/TLS、证书/密钥轮换与落盘、follower 认证、每-sink 独立 rotation 覆盖、OTEL/结构化日志 exporter、指标端 TLS、指标 push exporter/直方图/每-peer/每-轮次时延序列）顺延至 M118+，每步仍遵循"可运行、可测试、契约一致"。
