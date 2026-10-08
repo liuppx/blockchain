@@ -2187,6 +2187,10 @@ enum GetRoute {
     /// (`genesis_hash`) + tip (`height` + `head`). Saves a light client three separate calls
     /// to `/genesis`, `/height`, `/head`. Exact-match; no id.
     Info,
+    /// M110: `GET /version` — the node software version (compile-time constant). A client can
+    /// check compatibility before relying on newer endpoints. Answered without the actor (the
+    /// value never changes). Exact-match; no id.
+    Version,
     NotFound,
 }
 
@@ -2500,6 +2504,8 @@ fn route_get(path: &str) -> GetRoute {
         "/genesis" => GetRoute::GenesisHash,
         // M107: the handshake aggregate (identity + tip). Exact-match; no id, no prefix sibling.
         "/info" => GetRoute::Info,
+        // M110: the node software version. Exact-match; no id, no prefix sibling.
+        "/version" => GetRoute::Version,
         p => {
             if let Some(rest) = p.strip_prefix("/account/") {
                 // M59: `{id}/proof` is the verifiable read; a bare `{id}` is the M58
@@ -2804,6 +2810,20 @@ fn json_info(i: &InfoView) -> String {
         json_u64(i.height),
         json_str(&crate::hash::hex(&i.head)),
     )
+}
+
+/// M110: the node software version — the crate version, resolved at compile time from
+/// `Cargo.toml`. A constant, so `/version` needs no actor round-trip.
+const NODE_VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// M110: render the `/version` read as a grep-friendly `version={semver}` line.
+fn format_version() -> String {
+    format!("version={NODE_VERSION}")
+}
+
+/// M110: `GET /version?format=json` — the JSON sibling, `{"version":"<semver>"}`.
+fn json_version() -> String {
+    format!("{{\"version\":{}}}", json_str(NODE_VERSION))
 }
 
 /// `GET /account/{id}?format=json` — the JSON sibling of [`format_account`].
@@ -4353,6 +4373,10 @@ async fn serve_rpc_conn(mut stream: TcpStream, cmd: mpsc::UnboundedSender<Cmd>) 
                         Err(_) => http_response("503 Service Unavailable", "node stopped"),
                     }
                 }
+            }
+            GetRoute::Version => {
+                // M110: a compile-time constant — answered directly, no actor round-trip.
+                ok_body(fmt, &format_version(), &json_version())
             }
             GetRoute::Health => http_response("200 OK", "ok"),
             GetRoute::NotFound => http_response("404 Not Found", "not found"),
@@ -7295,6 +7319,43 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn rpc_version_over_tcp() {
+        // M110: `GET /version` returns the crate version without touching the actor (it works
+        // even before the first block). Text and JSON both carry `CARGO_PKG_VERSION`.
+        let dir = tmp_dir("rpc-version");
+        // node_config p2p listen = 20771 + (43-21) = 20793; keep the RPC port clear.
+        let mut cfg = node_config(43, 20771, &[43], dir.clone());
+        let rpc_addr = "127.0.0.1:20801";
+        cfg.rpc = Some(crate::config::RpcConfig { enabled: true, listen: rpc_addr.into() });
+        let mut genesis = test_genesis();
+        genesis.validators = vec![(43, kp(43).public(), 1)]; // quorum 1 ⇒ self-commit
+        let _node = Node::start(cfg, genesis, Some(kp(43))).await.expect("start node");
+
+        async fn get(addr: &str, path: &str) -> String {
+            let req = format!("GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
+            let mut s = TcpStream::connect(addr).await.expect("connect rpc");
+            s.write_all(req.as_bytes()).await.expect("send get");
+            let mut resp = Vec::new();
+            s.read_to_end(&mut resp).await.expect("read response");
+            String::from_utf8_lossy(&resp).into_owned()
+        }
+        fn body_of(resp: &str) -> &str {
+            resp.split_once("\r\n\r\n").map(|(_, b)| b).unwrap_or("")
+        }
+
+        let v = env!("CARGO_PKG_VERSION");
+        let resp = get(rpc_addr, "/version").await;
+        assert!(resp.starts_with("HTTP/1.1 200 OK"), "version status: {resp}");
+        assert_eq!(body_of(&resp), format!("version={v}"), "version text");
+
+        let as_json = get(rpc_addr, "/version?format=json").await;
+        assert!(as_json.contains("Content-Type: application/json\r\n"), "json ct: {as_json}");
+        assert_eq!(body_of(&as_json), format!("{{\"version\":\"{v}\"}}"), "version JSON");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
     async fn rpc_conditional_get_over_tcp() {
         // M108: a read carries an ETag; re-requesting with that validator in `If-None-Match`
         // yields a bodyless 304, while a stale validator yields the full 200 body.
@@ -8598,6 +8659,25 @@ vote_b.validator=5 vote_b.height=9 vote_b.round=2 vote_b.block_hash={b_h} vote_b
             json_info(&i),
             format!("{{\"genesis_hash\":\"{gh}\",\"height\":\"7\",\"head\":\"{hd}\"}}")
         );
+    }
+
+    #[test]
+    fn route_get_parses_version() {
+        // M110: `/version` is an exact-match read; a trailing slash is not the route (health).
+        assert!(matches!(route_get("/version"), GetRoute::Version));
+        assert!(matches!(route_get("/version/"), GetRoute::Health));
+        // No collision with sibling exact reads.
+        assert!(matches!(route_get("/info"), GetRoute::Info));
+    }
+
+    #[test]
+    fn version_renders_crate_version() {
+        // M110: the version read reports the crate's Cargo version (non-empty, dotted semver),
+        // identical in text and JSON.
+        let v = env!("CARGO_PKG_VERSION");
+        assert!(!v.is_empty(), "crate version must be set");
+        assert_eq!(format_version(), format!("version={v}"));
+        assert_eq!(json_version(), format!("{{\"version\":\"{v}\"}}"));
     }
 
     #[test]
