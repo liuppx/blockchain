@@ -237,6 +237,7 @@ fn main() {
         "run" => cmd_run(config_arg(&args)),
         "check-config" => cmd_check_config(config_arg(&args)),
         "genesis-hash" => cmd_genesis_hash(config_arg(&args)),
+        "inspect-genesis" => cmd_inspect_genesis(config_arg(&args)),
         "inspect-tx" => cmd_inspect_tx(&args),
         "pubkey" => cmd_pubkey(&args),
         "submit-tx" => cmd_submit_tx(config_arg(&args), tx_arg(&args)),
@@ -319,6 +320,7 @@ fn usage() {
     eprintln!("  node run    --config F  run the networked BFT daemon (tokio TCP P2P): load config/genesis/validator key, gossip votes + sync/verify over sockets");
     eprintln!("  node check-config --config F  dry-run: load + validate config, its genesis, and validator key (if any) without starting the daemon; print a summary or the first error");
     eprintln!("  node genesis-hash --config F  print the chain identity derived from the config's genesis: genesis_hash + initial state_root + validator count (compare across operators before joining)");
+    eprintln!("  node inspect-genesis --config F  dump the config's genesis contents: every account (id/balance/pubkey), reviewer, validator, plus params (the detail view to genesis-hash's identity)");
     eprintln!("  node submit-tx --config F --tx F  submit a codec-encoded tx to a running daemon's [rpc] ingress endpoint; print accepted hash or reject reason");
     eprintln!("  node encode-tx --key-file F --out F --author N --domain N --stake N --embedding f,..(DIM) --review R:S.. --repl-success N --repl-total N --timestamp-days F [--config F]  author+sign a tx offline into a submit-tx file; print its hash");
     eprintln!("  node inspect-tx --tx F [--pubkey HEX]  decode a codec-encoded tx file and print its fields + content hash; with --pubkey, also verify the signature (the read-side companion to encode-tx)");
@@ -2798,6 +2800,43 @@ fn cmd_genesis_hash(config_path: String) {
     }
 }
 
+/// M102: dump a config's genesis contents in full — the detail view to `genesis-hash`'s
+/// identity triple. Lists every account (id/balance/pubkey), reviewer (id/reputation), and
+/// validator (id/power/pubkey), plus the scalar params and seed-node count, so a reviewer can
+/// eyeball exactly what a `genesis.toml` seeds before joining. Loads + converts the genesis
+/// exactly as `cmd_run` does (so a malformed genesis is reported), binding nothing. Pure.
+fn inspect_genesis(config_path: &str) -> Result<String, config::ConfigError> {
+    let cfg = config::load_node_config(config_path)?;
+    let g = config::load_genesis(&cfg.genesis)?.to_genesis()?;
+    let mut out = format!(
+        "genesis {}\nbase_emission_micro {}\nslash_bps {}\ntimestamp_days {}",
+        cfg.genesis, g.base_emission_micro, g.slash_bps, g.timestamp_days,
+    );
+    out.push_str(&format!("\naccounts {}", g.accounts.len()));
+    for (id, balance, pk) in &g.accounts {
+        out.push_str(&format!("\naccount {id} balance {balance} pubkey {}", hex(pk)));
+    }
+    out.push_str(&format!("\nreviewers {}", g.reviewers.len()));
+    for (id, reputation) in &g.reviewers {
+        out.push_str(&format!("\nreviewer {id} reputation {reputation}"));
+    }
+    out.push_str(&format!("\nvalidators {}", g.validators.len()));
+    for (id, pk, power) in &g.validators {
+        out.push_str(&format!("\nvalidator {id} power {power} pubkey {}", hex(pk)));
+    }
+    out.push_str(&format!("\nseed_nodes {}", g.seed_nodes.len()));
+    Ok(out)
+}
+
+/// M102: `node inspect-genesis --config F` — print the [`inspect_genesis`] dump, or the typed
+/// error + exit 2. Reads only the referenced files; binds nothing.
+fn cmd_inspect_genesis(config_path: String) {
+    match inspect_genesis(&config_path) {
+        Ok(summary) => println!("{summary}"),
+        Err(e) => fail_msg("inspect-genesis", &e),
+    }
+}
+
 /// M98: decode a `codec::encode_tx` file and render its fields + content hash in human form
 /// — the read-side companion to `encode-tx`. With `pubkey_hex` present, also verify the
 /// ed25519 signature over `tx_signing_bytes` against that account key (a tx file carries no
@@ -3966,6 +4005,48 @@ mod tests {
 [[accounts]]\nid = 1\nbalance_micro = 1\npubkey_hex = \"nothex\"\n";
         let (cpath, dir) = write_check_config_fixture("ghbad", bad, "");
         assert!(genesis_identity(&cpath).is_err(), "bad genesis must fail");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn inspect_genesis_lists_accounts_and_validators() {
+        // M102: the dump lists each account and validator with id/balance/power/pubkey, plus
+        // the scalar params.
+        let (_seed_hex, pub_hex) = keygen_derive(seed_for(1));
+        let (cpath, dir) = write_check_config_fixture("ig", &valid_genesis_body(&pub_hex), "");
+        let out = inspect_genesis(&cpath).expect("valid genesis");
+        assert!(out.contains("base_emission_micro 1000\n"), "{out}");
+        assert!(out.contains("slash_bps 500\n"), "{out}");
+        assert!(out.contains("accounts 1\n"), "{out}");
+        assert!(out.contains(&format!("account 1 balance 1000000 pubkey {pub_hex}")), "{out}");
+        assert!(out.contains("validators 1\n"), "{out}");
+        assert!(out.contains(&format!("validator 1 power 1 pubkey {pub_hex}")), "{out}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn inspect_genesis_lists_reviewers() {
+        // M102: a genesis carrying a reviewer lists it with its reputation (weight).
+        let (_seed_hex, pub_hex) = keygen_derive(seed_for(1));
+        let body = format!(
+            "base_emission_micro = 1000\nslash_bps = 500\n\
+[[accounts]]\nid = 1\nbalance_micro = 5\npubkey_hex = \"{pub_hex}\"\n\
+[[reviewers]]\nid = 10\nweight = 0.5\n"
+        );
+        let (cpath, dir) = write_check_config_fixture("igrev", &body, "");
+        let out = inspect_genesis(&cpath).expect("valid genesis");
+        assert!(out.contains("reviewers 1\n"), "{out}");
+        assert!(out.contains("reviewer 10 reputation 0.5"), "{out}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn inspect_genesis_surfaces_bad_genesis() {
+        // M102: a malformed genesis is a returned error (not a panic/exit).
+        let bad = "base_emission_micro = 1000\nslash_bps = 500\n\
+[[accounts]]\nid = 1\nbalance_micro = 1\npubkey_hex = \"nothex\"\n";
+        let (cpath, dir) = write_check_config_fixture("igbad", bad, "");
+        assert!(inspect_genesis(&cpath).is_err(), "bad genesis must fail");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
