@@ -493,6 +493,12 @@ enum Cmd {
         height: u64,
         reply: oneshot::Sender<Option<BlockSummary>>,
     },
+    /// M114: read the tx references (content hash + author) of a committed block by height for
+    /// `/block/{height}/txs`. `None` ⇒ no such committed block.
+    QueryBlockTxs {
+        height: u64,
+        reply: oneshot::Sender<Option<Vec<(crate::Hash, u64)>>>,
+    },
     /// M104: snapshot the money-supply totals for the `/supply` read.
     QuerySupply {
         reply: oneshot::Sender<SupplyView>,
@@ -1262,6 +1268,16 @@ async fn run_actor(mut actor: Actor, mut rx: mpsc::UnboundedReceiver<Cmd>) {
                     }
                 });
                 let _ = reply.send(summary);
+            }
+            Cmd::QueryBlockTxs { height, reply } => {
+                // M114: the tx references (hash + author) of the committed block at `height`.
+                let txs = actor
+                    .node
+                    .blocks()
+                    .iter()
+                    .find(|b| b.height == height)
+                    .map(|b| b.txs.iter().map(|tx| (tx.hash(), tx.author)).collect());
+                let _ = reply.send(txs);
             }
             Cmd::QuerySupply { reply } => {
                 // M104: snapshot the supply-conservation totals from committed state.
@@ -2235,6 +2251,10 @@ enum GetRoute {
     /// companion to the `inspect-block` CLI. A height past the tip (or genesis, height 0,
     /// which has no log block) ⇒ 404. Non-numeric ⇒ 404.
     Block(u64),
+    /// M114: `GET /block/{height}/txs` — the tx references (content hash + author) in that
+    /// committed block, the list sibling of `Block(height)` (which gives only the count). A
+    /// height with no committed block ⇒ 404.
+    BlockTxs(u64),
     /// M104: `GET /supply` — the money-supply snapshot (supply, treasury, bonded,
     /// bridge_locked, bridge_minted). Lets a client audit the supply-conservation invariant
     /// from cert-signed state. Exact-match; no id.
@@ -2609,9 +2629,13 @@ fn route_get(path: &str) -> GetRoute {
                 // was this tx mined? A malformed hash ⇒ 404.
                 parse_hash(rest).map(GetRoute::TxHeight).unwrap_or(GetRoute::NotFound)
             } else if let Some(rest) = p.strip_prefix("/block/") {
-                // M113: `/block/{height}` is a committed-block read. A non-numeric height ⇒ 404;
-                // a height with no committed block is a 404 produced by the handler.
-                rest.parse::<u64>().map(GetRoute::Block).unwrap_or(GetRoute::NotFound)
+                // M113/M114: `/block/{height}` is the header+counts read; `/block/{height}/txs`
+                // (M114) is the tx-reference list. A non-numeric height ⇒ 404; a height with no
+                // committed block is a 404 produced by the handler.
+                match rest.strip_suffix("/txs") {
+                    Some(hp) => hp.parse::<u64>().map(GetRoute::BlockTxs).unwrap_or(GetRoute::NotFound),
+                    None => rest.parse::<u64>().map(GetRoute::Block).unwrap_or(GetRoute::NotFound),
+                }
             } else {
                 GetRoute::Health
             }
@@ -3353,6 +3377,33 @@ fn format_mempool_listing(txs: &[(crate::Hash, u64)]) -> String {
 /// **array** of objects (`[]` when empty), reusing `json_pending_tx` per item.
 fn json_mempool_listing(txs: &[(crate::Hash, u64)]) -> String {
     let items = txs.iter().map(|(h, a)| json_pending_tx(h, *a)).collect::<Vec<_>>().join(",");
+    format!("[{items}]")
+}
+
+/// M114: render one committed-block tx reference (content hash + author) as a grep-friendly
+/// line. Like [`format_pending_tx`] but `kind=tx` (committed, not pending).
+fn format_block_tx(hash: &crate::Hash, author: u64) -> String {
+    format!("kind=tx hash={} author={author}", crate::hash::hex(hash))
+}
+
+/// M114: the JSON sibling of [`format_block_tx`].
+fn json_block_tx(hash: &crate::Hash, author: u64) -> String {
+    format!(
+        "{{\"kind\":\"tx\",\"hash\":{},\"author\":{}}}",
+        json_str(&crate::hash::hex(hash)),
+        json_u64(author),
+    )
+}
+
+/// M114: render a committed block's tx references as grep-friendly lines (empty string for an
+/// empty block). Reuses `format_block_tx`; block order (`build_block`'s canonical tx-hash sort).
+fn format_block_tx_listing(txs: &[(crate::Hash, u64)]) -> String {
+    txs.iter().map(|(h, a)| format_block_tx(h, *a)).collect::<Vec<_>>().join("\n")
+}
+
+/// M114: `GET /block/{height}/txs?format=json` — the JSON array sibling (`[]` when empty).
+fn json_block_tx_listing(txs: &[(crate::Hash, u64)]) -> String {
+    let items = txs.iter().map(|(h, a)| json_block_tx(h, *a)).collect::<Vec<_>>().join(",");
     format!("[{items}]")
 }
 
@@ -4523,6 +4574,36 @@ async fn serve_rpc_conn(mut stream: TcpStream, cmd: mpsc::UnboundedSender<Cmd>) 
                 } else {
                     match rx.await {
                         Ok(Some(b)) => ok_body(fmt, &format_block_summary(&b), &json_block_summary(&b)),
+                        Ok(None) => http_response("404 Not Found", "block not found"),
+                        Err(_) => http_response("503 Service Unavailable", "node stopped"),
+                    }
+                }
+            }
+            GetRoute::BlockTxs(height) => {
+                // M114: the tx references of a committed block — a paginated list, or 404 when
+                // there is no committed block at `height`.
+                let (reply, rx) = oneshot::channel();
+                if cmd.send(Cmd::QueryBlockTxs { height, reply }).is_err() {
+                    http_response("503 Service Unavailable", "node stopped")
+                } else {
+                    match rx.await {
+                        Ok(Some(listing)) => {
+                            let offset = usize_param(query, "offset").unwrap_or(0);
+                            let limit = Some(effective_limit(usize_param(query, "limit")));
+                            let total = listing.len();
+                            let page = paginate(&listing, offset, limit);
+                            let start = offset.min(total);
+                            let next = if start + page.len() < total {
+                                Some(start + page.len())
+                            } else {
+                                None
+                            };
+                            ok_body(
+                                fmt,
+                                &format_page(&format_block_tx_listing(page), total, next),
+                                &json_page(&json_block_tx_listing(page), total, next),
+                            )
+                        }
                         Ok(None) => http_response("404 Not Found", "block not found"),
                         Err(_) => http_response("503 Service Unavailable", "node stopped"),
                     }
@@ -7521,6 +7602,63 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn rpc_block_txs_over_tcp() {
+        // M114: `GET /block/{height}/txs` lists the tx references of a committed block. We
+        // submit a tx, wait until it is mined, then confirm `/block/{height}/txs` lists it.
+        let dir = tmp_dir("rpc-block-txs");
+        // node_config p2p listen = 20931 + (47-21) = 20957; keep the RPC port clear.
+        let mut cfg = node_config(47, 20931, &[47], dir.clone());
+        let rpc_addr = "127.0.0.1:20961";
+        cfg.rpc = Some(crate::config::RpcConfig { enabled: true, listen: rpc_addr.into() });
+        let mut genesis = test_genesis();
+        genesis.validators = vec![(47, kp(47).public(), 1)]; // quorum 1 ⇒ self-commit
+        let node = Node::start(cfg, genesis, Some(kp(47))).await.expect("start node");
+
+        async fn get(addr: &str, path: &str) -> String {
+            let req = format!("GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
+            let mut s = TcpStream::connect(addr).await.expect("connect rpc");
+            s.write_all(req.as_bytes()).await.expect("send get");
+            let mut resp = Vec::new();
+            s.read_to_end(&mut resp).await.expect("read response");
+            String::from_utf8_lossy(&resp).into_owned()
+        }
+        fn body_of(resp: &str) -> &str {
+            resp.split_once("\r\n\r\n").map(|(_, b)| b).unwrap_or("")
+        }
+
+        // Submit a tx and wait until `/tx/{hash}` reports the mined height.
+        let tx = test_tx(1, 0, 1);
+        let h = crate::hash::hex(&tx.hash());
+        node.submit_tx(tx).await.expect("actor alive").expect("valid tx admitted");
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(8);
+        let height = loop {
+            let body = body_of(&get(rpc_addr, &format!("/tx/{h}")).await).to_string();
+            if let Some(n) = body.strip_prefix("height=") {
+                break n.parse::<u64>().expect("height u64");
+            }
+            assert!(tokio::time::Instant::now() < deadline, "tx never mined: `{body}`");
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        };
+
+        // That block's /txs lists our tx (as a committed `kind=tx` reference).
+        let listed = get(rpc_addr, &format!("/block/{height}/txs")).await;
+        assert!(listed.starts_with("HTTP/1.1 200 OK"), "block txs status: {listed}");
+        let body = body_of(&listed);
+        assert!(body.starts_with("total=1\n"), "one tx in the block: {body}");
+        assert!(body.contains(&format!("kind=tx hash={h} author=1")), "lists the tx: {body}");
+
+        // JSON form of the same list.
+        let as_json = get(rpc_addr, &format!("/block/{height}/txs?format=json")).await;
+        assert!(body_of(&as_json).contains(&format!("\"kind\":\"tx\",\"hash\":\"{h}\",\"author\":\"1\"")), "json: {as_json}");
+
+        // A height with no committed block ⇒ 404.
+        let past = get(rpc_addr, &format!("/block/{}/txs", height + 10_000)).await;
+        assert!(past.starts_with("HTTP/1.1 404 Not Found"), "future height ⇒ 404: {past}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
     async fn rpc_supply_over_tcp() {
         // M104: `GET /supply` returns the money-supply snapshot from committed state. On a
         // fresh single-validator chain the supply equals the genesis endowments and the
@@ -9029,6 +9167,39 @@ vote_b.validator=5 vote_b.height=9 vote_b.round=2 vote_b.block_hash={b_h} vote_b
         assert!(json.contains(&format!("\"hash\":\"{hh}\"")), "{json}");
         assert!(json.contains("\"txs\":\"2\""), "{json}");
         assert!(json.contains("\"stake_ops\":\"1\""), "{json}");
+    }
+
+    #[test]
+    fn route_get_parses_block_txs() {
+        // M114: `/block/{height}/txs` is the tx-reference list; `/block/{height}` stays the
+        // header read; a non-numeric height under either shape ⇒ 404.
+        assert!(matches!(route_get("/block/7/txs"), GetRoute::BlockTxs(7)));
+        assert!(matches!(route_get("/block/0/txs"), GetRoute::BlockTxs(0)));
+        assert!(matches!(route_get("/block/7"), GetRoute::Block(7)));
+        assert!(matches!(route_get("/block/abc/txs"), GetRoute::NotFound), "non-numeric ⇒ 404");
+    }
+
+    #[test]
+    fn block_tx_listing_renders() {
+        // M114: committed-block tx references render `kind=tx` lines and a JSON array; empty
+        // block ⇒ empty text / `[]`.
+        let a = [0x11u8; 32];
+        let b = [0x22u8; 32];
+        let ah = crate::hash::hex(&a);
+        let bh = crate::hash::hex(&b);
+        let txs = vec![(a, 7u64), (b, 9u64)];
+        assert_eq!(
+            format_block_tx_listing(&txs),
+            format!("kind=tx hash={ah} author=7\nkind=tx hash={bh} author=9")
+        );
+        assert_eq!(
+            json_block_tx_listing(&txs),
+            format!(
+                "[{{\"kind\":\"tx\",\"hash\":\"{ah}\",\"author\":\"7\"}},{{\"kind\":\"tx\",\"hash\":\"{bh}\",\"author\":\"9\"}}]"
+            )
+        );
+        assert_eq!(format_block_tx_listing(&[]), "");
+        assert_eq!(json_block_tx_listing(&[]), "[]");
     }
 
     #[test]
