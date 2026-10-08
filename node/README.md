@@ -1312,6 +1312,21 @@ M116 的 `node rpc` 只能 GET。M117 补上写侧，让它成为**全能** RPC 
 
 **已知边界（顺延至 M119+）**：RPC 自带端点发现（`/routes`）+ 全能客户端 + 完整链读/写面；内容协商三轴已齐（仅 `identity`，真压缩顺延）；离线工具篮子已补；运维篮子剩余：证书/密钥轮换与落盘、follower 认证、指标端 TLS、OTel/push exporter、每-sink 独立 rotation 覆盖、时延直方图；keygen 篮子剩余：助记词 / BIP-39、口令加密 keystore、密钥轮换；剩余：游标分页、未知方法 `405`；共识 / wire 篮子（破 head 不变量）：**货币费用** + 费用优先排序、nonce / 序列号反重放。
 
+## 运营配置读 `GET /config`（Milestone 119）
+
+`/params`（M105）读的是**经济/ΔK** 旋钮（铸造、罚没、ΔK 门限……）。但运营者还想核对节点**实际在跑**的**运营**配置——共识计时、mempool 上限、这台是验证人还是跟随者。M119 加 `GET /config` 回这套运营参数。纯读面，不触 wire/共识/状态，`[rpc]`/`localnet` head 不变量（`44309755…ea04ba`，RPC 默认关）不受影响。
+
+- **字段**：`role`（validator|follower）、共识计时 `propose_timeout_ms`/`prevote_timeout_ms`/`precommit_timeout_ms`/`timeout_delta_ms`/`block_interval_ms`、空块策略 `create_empty_blocks`、mempool 上限 `mempool_capacity`/`mempool_per_account_limit`。
+- **`bound_str`**：mempool 上限的默认是 `usize::MAX`（未设 = 无界）。直接渲染会露出丑陋的 `18446744073709551615`；`bound_str` 把 `usize::MAX` 映射为 `unbounded`、否则为数字。JSON 侧把该字段统一渲染为**引号串**（`"unbounded"` 或 `"<n>"`），使有界/无界同形。
+- **渲染器**：新增 `ConfigView` 结构 + 纯渲染器 `format_config`（每行一 `key=value`）/`json_config`（计时 lossless 引号 u64、`create_empty_blocks` 裸 JSON bool、mempool 上限引号串），可直接单测。
+- **Cmd + actor**：`Cmd::QueryConfig { reply: oneshot::Sender<ConfigView> }`，actor 由 `actor.timing`（启动时从 `[consensus]` 解析）+ `actor.node.mempool.capacity()`/`per_account_limit()` + `actor.kp.is_some()` 拍快照。
+- **路由 + 发现**：`enum GetRoute` 加 `Config`、`route_get` 精确臂 `"/config" => GetRoute::Config`；`/config` 也加入 M118 的 `READ_ROUTES` 发现索引（受漂移守卫覆盖）。
+- **与 `/params` 的分工**：`/params` = 经济/共识**规则**旋钮（折入 `state_root`、链上共识状态）；`/config` = 本节点**运营**旋钮（来自本地 config / 启动解析、非共识状态）。一链上、一本地。
+- **测试（+3 → 526）**：新纯 `route_get_parses_config`（`/config` ⇒ `Config`、`/config/` ⇒ `Health`）/`config_renders_text_and_json`（含 `unbounded` 渲染 + `bound_str` 边界 `0`/`usize::MAX`），新 TCP `rpc_config_over_tcp`（validator 节点 ⇒ `role=validator`、全部计时/mempool 键齐备、JSON 同）。
+- **不变量保持**：纯读面增量、无 `serde_json`、无引擎 / codec / crypto / wire / 共识 / 状态变更、无新依赖，RPC 默认关，故 `localnet` 逐字节同块、head 仍 `44309755…ea04ba`。
+
+**已知边界（顺延至 M120+）**：读面两分已齐——`/params`（经济/共识规则）+ `/config`（本地运营配置）；RPC 自带端点发现 + 全能客户端 + 完整链读/写面；内容协商三轴已齐（仅 `identity`，真压缩顺延）；离线工具篮子已补；运维篮子剩余：证书/密钥轮换与落盘、follower 认证、指标端 TLS、OTel/push exporter、每-sink 独立 rotation 覆盖、时延直方图；keygen 篮子剩余：助记词 / BIP-39、口令加密 keystore、密钥轮换；剩余：游标分页、未知方法 `405`；共识 / wire 篮子（破 head 不变量）：**货币费用** + 费用优先排序、nonce / 序列号反重放。
+
 ## 持久化与重放（Milestone 7）
 
 节点状态不再只活在内存里：区块以**追加式日志**（`DIR/blocks.log`）落盘，重启后从创世**重放**日志即可重建**逐字节相同**的状态。
@@ -2110,5 +2125,6 @@ peer_exchange_disabled_stays_seeded                   同链拓扑关发现 → 
 - ~~M116 `node rpc` 读客户端——我们从 M58 起建的一整套读端点此前操作者侧只能靠 curl；M116 加 `node rpc --config F --path P` 免 curl 读客户端：连 config 启用的 `[rpc]` 端点、`GET P`、2xx 打印响应体、否则状态行 + 体到 stderr 并 exit 1，与 `submit-tx`（写）配成读/写一对；核心抽成纯函数 `rpc_get_request(host, path)`/`split_http_response(text) -> (status_line, body)`（无体 ⇒ 空，兼容 304/HEAD），`cmd_rpc` 为阻塞 `TcpStream` 薄壳，注册子命令 + usage；新纯测 `rpc_get_request_formats_an_http_get`/`split_http_response_extracts_status_and_body`/`split_http_response_handles_empty_body`，共 517 测、localnet head 不变~~ ✅
 - ~~M117 `node rpc --post FILE` 全能 RPC 客户端——M116 的 `node rpc` 只能 GET；M117 补写侧：`node rpc --config F --path /validate --post FILE` POST 文件原始字节到任一端点（codec-tx → `/submit_tx`/`/validate`、批量 → `/batch`），缺省仍 GET；新增纯函数 `rpc_post_request(host, path, body) -> Vec<u8>` 返回字节（非 String）故二进制 codec body 逐字节透传、`Content-Length` 为精确体长，`cmd_rpc` 按 `--post` 分流、响应处理不变，usage 更新 `[--post FILE]`；新纯测 `rpc_post_request_includes_content_length_and_body`/`rpc_post_request_preserves_binary_body`/`rpc_post_request_empty_body`，共 520 测、localnet head 不变~~ ✅
 - ~~M118 端点发现 `GET /routes`——建了几十个读端点却无从自我发现；M118 加 `GET /routes` 回自文档化索引（精确路径 + `{param}` 模板），静态列表故 dispatch 直接 `ok_body`、无 actor 往返；单一真相源 `const READ_ROUTES` + 纯渲染器 `format_routes`/`json_routes`，`GetRoute::Routes` + `route_get` 精确臂 `/routes`；漂移守卫 `advertised_exact_routes_resolve` 把发现索引钉死在真实路由器上；新纯测 `route_get_parses_routes`/`routes_index_lists_endpoints`/`advertised_exact_routes_resolve`，共 523 测、localnet head 不变~~ ✅
+- ~~M119 运营配置读 `GET /config`——`/params` 读经济/ΔK 旋钮，`/config` 读本节点实际在跑的运营配置：共识计时（propose/prevote/precommit/delta/block_interval ms + `create_empty_blocks`）+ mempool 上限（capacity/per_account_limit）+ 角色（validator|follower）；新增 `ConfigView` + 纯渲染器 `format_config`/`json_config`，`bound_str`（`usize::MAX` ⇒ `unbounded`、否则数字；JSON 引号串使有界/无界同形）；`Cmd::QueryConfig` actor 由 `actor.timing`/`node.mempool`/`kp.is_some()` 拍快照；`GetRoute::Config` + `route_get` 精确臂 `/config` + 入 `READ_ROUTES`；新纯测 `route_get_parses_config`/`config_renders_text_and_json` + TCP `rpc_config_over_tcp`，共 526 测、localnet head 不变~~ ✅
 
-……；运维篮子剩余（货币费用（独立共识里程碑）、费用优先出块排序、nonce 反重放、RPC 自带端点发现（`/routes`）+ 全能客户端 + 完整链读/写面、读面列表端点篮子已收口、HTTP `HEAD`/`OPTIONS`/`ETag` 条件 GET/`Accept-Encoding`（identity）协商 已补、keyfile `0600` 已补、现成 genesis 条目已补、`check-config`/`genesis-hash`/`inspect-genesis`/`inspect-tx`/`pubkey`/`inspect-block`/`inspect-cert` 已补、助记词/BIP-39、口令 keystore、密钥轮换、游标分页、真压缩（gzip/deflate，须引新依赖）、未知方法 `405`、RPC auth/TLS、证书/密钥轮换与落盘、follower 认证、每-sink 独立 rotation 覆盖、OTEL/结构化日志 exporter、指标端 TLS、指标 push exporter/直方图/每-peer/每-轮次时延序列）顺延至 M119+，每步仍遵循"可运行、可测试、契约一致"。
+……；运维篮子剩余（货币费用（独立共识里程碑）、费用优先出块排序、nonce 反重放、读面两分（`/params` 经济规则 + `/config` 本地运营）已齐、RPC 自带端点发现（`/routes`）+ 全能客户端 + 完整链读/写面、读面列表端点篮子已收口、HTTP `HEAD`/`OPTIONS`/`ETag` 条件 GET/`Accept-Encoding`（identity）协商 已补、keyfile `0600` 已补、现成 genesis 条目已补、`check-config`/`genesis-hash`/`inspect-genesis`/`inspect-tx`/`pubkey`/`inspect-block`/`inspect-cert` 已补、助记词/BIP-39、口令 keystore、密钥轮换、游标分页、真压缩（gzip/deflate，须引新依赖）、未知方法 `405`、RPC auth/TLS、证书/密钥轮换与落盘、follower 认证、每-sink 独立 rotation 覆盖、OTEL/结构化日志 exporter、指标端 TLS、指标 push exporter/直方图/每-peer/每-轮次时延序列）顺延至 M120+，每步仍遵循"可运行、可测试、契约一致"。

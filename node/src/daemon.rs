@@ -514,6 +514,10 @@ enum Cmd {
     QueryParams {
         reply: oneshot::Sender<ParamsView>,
     },
+    /// M119: snapshot the operational config (consensus timing + mempool bounds + role).
+    QueryConfig {
+        reply: oneshot::Sender<ConfigView>,
+    },
     /// M106: read this node's chain identity (`genesis_hash`) for the `/genesis` read.
     QueryGenesisHash {
         reply: oneshot::Sender<crate::Hash>,
@@ -1317,6 +1321,20 @@ async fn run_actor(mut actor: Actor, mut rx: mpsc::UnboundedReceiver<Cmd>) {
                     decay: s.params.decay,
                     fresh_min: s.params.fresh_min,
                     delta_k_min: s.params.delta_k_min,
+                });
+            }
+            Cmd::QueryConfig { reply } => {
+                // M119: operational config from the actor's resolved timing + mempool bounds.
+                let _ = reply.send(ConfigView {
+                    role: if actor.kp.is_some() { "validator" } else { "follower" },
+                    propose_timeout_ms: actor.timing.propose_ms,
+                    prevote_timeout_ms: actor.timing.prevote_ms,
+                    precommit_timeout_ms: actor.timing.precommit_ms,
+                    timeout_delta_ms: actor.timing.delta_ms,
+                    block_interval_ms: actor.timing.block_interval_ms,
+                    create_empty_blocks: actor.timing.create_empty_blocks,
+                    mempool_capacity: actor.node.mempool.capacity(),
+                    mempool_per_account_limit: actor.node.mempool.per_account_limit(),
                 });
             }
             Cmd::QueryGenesisHash { reply } => {
@@ -2291,6 +2309,10 @@ enum GetRoute {
     /// (exact paths + `{param}` templates). Answered without the actor (a static list).
     /// Exact-match; no id.
     Routes,
+    /// M119: `GET /config` — the node's effective *operational* config: consensus timing,
+    /// mempool bounds, and role (validator|follower). Distinct from `/params` (economic/ΔK
+    /// knobs). Lets an operator verify what is actually running. Exact-match; no id.
+    Config,
     NotFound,
 }
 
@@ -2608,6 +2630,8 @@ fn route_get(path: &str) -> GetRoute {
         "/version" => GetRoute::Version,
         // M118: the read-endpoint discovery index. Exact-match; no id, no prefix sibling.
         "/routes" => GetRoute::Routes,
+        // M119: the operational config snapshot. Exact-match; no id, no prefix sibling.
+        "/config" => GetRoute::Config,
         // M111: the pending-tx directory. Exact-match here, so it never collides with the
         // M103 `/mempool/{hash}` membership prefix below (`…mempool` exact, not `…mempool/`).
         "/mempool" => GetRoute::MempoolList,
@@ -3028,6 +3052,7 @@ const READ_ROUTES: &[&str] = &[
     "/routes",
     "/supply",
     "/params",
+    "/config",
     "/validators",
     "/accounts",
     "/reviewers",
@@ -3564,6 +3589,61 @@ fn json_params(p: &ParamsView) -> String {
         json_f32(p.decay),
         json_f32(p.fresh_min),
         json_f32(p.delta_k_min),
+    )
+}
+
+/// M119: the node's effective operational config (consensus timing + mempool bounds + role).
+struct ConfigView {
+    role: &'static str,
+    propose_timeout_ms: u64,
+    prevote_timeout_ms: u64,
+    precommit_timeout_ms: u64,
+    timeout_delta_ms: u64,
+    block_interval_ms: u64,
+    create_empty_blocks: bool,
+    mempool_capacity: usize,
+    mempool_per_account_limit: usize,
+}
+
+/// M119: render a mempool bound — a number, or `unbounded` when it is `usize::MAX` (the
+/// unset default), so the body never shows the raw sentinel `18446744073709551615`.
+fn bound_str(n: usize) -> String {
+    if n == usize::MAX { "unbounded".to_string() } else { n.to_string() }
+}
+
+/// M119: render the operational config as grep-friendly `key=value` lines. Pure for testing.
+fn format_config(c: &ConfigView) -> String {
+    format!(
+        "role={}\npropose_timeout_ms={}\nprevote_timeout_ms={}\nprecommit_timeout_ms={}\n\
+timeout_delta_ms={}\nblock_interval_ms={}\ncreate_empty_blocks={}\nmempool_capacity={}\nmempool_per_account_limit={}",
+        c.role,
+        c.propose_timeout_ms,
+        c.prevote_timeout_ms,
+        c.precommit_timeout_ms,
+        c.timeout_delta_ms,
+        c.block_interval_ms,
+        c.create_empty_blocks,
+        bound_str(c.mempool_capacity),
+        bound_str(c.mempool_per_account_limit),
+    )
+}
+
+/// M119: `GET /config?format=json` — the JSON sibling (timings lossless quoted-u64, the
+/// mempool bounds quoted strings so `unbounded` and a number share the shape, the policy
+/// flag a bare JSON bool).
+fn json_config(c: &ConfigView) -> String {
+    format!(
+        "{{\"role\":{},\"propose_timeout_ms\":{},\"prevote_timeout_ms\":{},\"precommit_timeout_ms\":{},\
+\"timeout_delta_ms\":{},\"block_interval_ms\":{},\"create_empty_blocks\":{},\"mempool_capacity\":{},\"mempool_per_account_limit\":{}}}",
+        json_str(c.role),
+        json_u64(c.propose_timeout_ms),
+        json_u64(c.prevote_timeout_ms),
+        json_u64(c.precommit_timeout_ms),
+        json_u64(c.timeout_delta_ms),
+        json_u64(c.block_interval_ms),
+        json_bool(c.create_empty_blocks),
+        json_str(&bound_str(c.mempool_capacity)),
+        json_str(&bound_str(c.mempool_per_account_limit)),
     )
 }
 
@@ -4729,6 +4809,18 @@ async fn serve_rpc_conn(mut stream: TcpStream, cmd: mpsc::UnboundedSender<Cmd>) 
                 } else {
                     match rx.await {
                         Ok(p) => ok_body(fmt, &format_params(&p), &json_params(&p)),
+                        Err(_) => http_response("503 Service Unavailable", "node stopped"),
+                    }
+                }
+            }
+            GetRoute::Config => {
+                // M119: operational config snapshot — always a `200`.
+                let (reply, rx) = oneshot::channel();
+                if cmd.send(Cmd::QueryConfig { reply }).is_err() {
+                    http_response("503 Service Unavailable", "node stopped")
+                } else {
+                    match rx.await {
+                        Ok(c) => ok_body(fmt, &format_config(&c), &json_config(&c)),
                         Err(_) => http_response("503 Service Unavailable", "node stopped"),
                     }
                 }
@@ -8018,6 +8110,47 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn rpc_config_over_tcp() {
+        // M119: `GET /config` reports the operational config. A node started with a validator
+        // key reports role=validator and the default consensus timings.
+        let dir = tmp_dir("rpc-config");
+        // node_config p2p listen = 21111 + (51-21) = 21141; keep the RPC port clear.
+        let mut cfg = node_config(51, 21111, &[51], dir.clone());
+        let rpc_addr = "127.0.0.1:21151";
+        cfg.rpc = Some(crate::config::RpcConfig { enabled: true, listen: rpc_addr.into() });
+        let mut genesis = test_genesis();
+        genesis.validators = vec![(51, kp(51).public(), 1)]; // quorum 1 ⇒ self-commit
+        let _node = Node::start(cfg, genesis, Some(kp(51))).await.expect("start node");
+
+        async fn get(addr: &str, path: &str) -> String {
+            let req = format!("GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
+            let mut s = TcpStream::connect(addr).await.expect("connect rpc");
+            s.write_all(req.as_bytes()).await.expect("send get");
+            let mut resp = Vec::new();
+            s.read_to_end(&mut resp).await.expect("read response");
+            String::from_utf8_lossy(&resp).into_owned()
+        }
+        fn body_of(resp: &str) -> &str {
+            resp.split_once("\r\n\r\n").map(|(_, b)| b).unwrap_or("")
+        }
+
+        let resp = get(rpc_addr, "/config").await;
+        assert!(resp.starts_with("HTTP/1.1 200 OK"), "config status: {resp}");
+        let body = body_of(&resp);
+        assert!(body.contains("role=validator\n"), "config role: {body}");
+        for k in &["propose_timeout_ms=", "prevote_timeout_ms=", "precommit_timeout_ms=", "timeout_delta_ms=", "block_interval_ms=", "create_empty_blocks=", "mempool_capacity=", "mempool_per_account_limit="] {
+            assert!(body.contains(k), "missing {k} in {body}");
+        }
+
+        let as_json = get(rpc_addr, "/config?format=json").await;
+        let jbody = body_of(&as_json);
+        assert!(jbody.starts_with("{\"role\":\"validator\","), "config json: {jbody}");
+        assert!(jbody.contains("\"create_empty_blocks\":"), "{jbody}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
     async fn rpc_genesis_over_tcp() {
         // M106: `GET /genesis` returns the node's chain identity — exactly the `genesis_hash`
         // that `ChainState::genesis` stamps for the same genesis the node was started with.
@@ -9550,6 +9683,47 @@ vote_b.validator=5 vote_b.height=9 vote_b.round=2 vote_b.block_hash={b_h} vote_b
         assert!(json.contains("\"n_review_min\":\"3\""), "{json}");
         assert!(json.contains("\"n_min\":\"5\""), "{json}");
         assert!(json.contains("\"delta_k_min\":0"), "{json}");
+    }
+
+    #[test]
+    fn route_get_parses_config() {
+        // M119: `/config` is an exact-match read; a trailing slash is not the route.
+        assert!(matches!(route_get("/config"), GetRoute::Config));
+        assert!(matches!(route_get("/config/"), GetRoute::Health));
+        assert!(matches!(route_get("/params"), GetRoute::Params));
+    }
+
+    #[test]
+    fn config_renders_text_and_json() {
+        // M119: operational config renders timing + role as text lines and a JSON object; an
+        // unbounded mempool limit renders as `unbounded`, a real bound as its number.
+        let c = ConfigView {
+            role: "validator",
+            propose_timeout_ms: 1000,
+            prevote_timeout_ms: 1000,
+            precommit_timeout_ms: 1000,
+            timeout_delta_ms: 500,
+            block_interval_ms: 1000,
+            create_empty_blocks: true,
+            mempool_capacity: usize::MAX,
+            mempool_per_account_limit: 32,
+        };
+        let text = format_config(&c);
+        assert!(text.starts_with("role=validator\n"), "{text}");
+        assert!(text.contains("block_interval_ms=1000\n"), "{text}");
+        assert!(text.contains("create_empty_blocks=true\n"), "{text}");
+        assert!(text.contains("mempool_capacity=unbounded\n"), "{text}");
+        assert!(text.ends_with("mempool_per_account_limit=32"), "{text}");
+
+        let json = json_config(&c);
+        assert!(json.contains("\"role\":\"validator\""), "{json}");
+        assert!(json.contains("\"propose_timeout_ms\":\"1000\""), "{json}");
+        assert!(json.contains("\"create_empty_blocks\":true"), "{json}");
+        assert!(json.contains("\"mempool_capacity\":\"unbounded\""), "{json}");
+        assert!(json.contains("\"mempool_per_account_limit\":\"32\""), "{json}");
+        // bound_str maps a real bound to its number, the sentinel to `unbounded`.
+        assert_eq!(bound_str(0), "0");
+        assert_eq!(bound_str(usize::MAX), "unbounded");
     }
 
     #[test]
