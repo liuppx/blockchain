@@ -244,6 +244,7 @@ fn main() {
         "keygen" => cmd_keygen(&args),
         "localnet" => cmd_localnet(),
         "status" => cmd_status(dir_arg(&args)),
+        "inspect-block" => cmd_inspect_block(&args),
         "certs" => cmd_certs(dir_arg(&args)),
         "-h" | "--help" | "help" => usage(),
         other => {
@@ -325,6 +326,7 @@ fn usage() {
     eprintln!("  node pubkey (--key-file F | --seed HEX) [--genesis-id N ...]  derive + print the pubkey for an existing seed WITHOUT writing a file (read-only; pairs with inspect-tx --pubkey)");
     eprintln!("  node localnet           spin up an in-process tokio testnet (4 validators, no sequencer) and show all nodes converge via distributed BFT voting over real sockets");
     eprintln!("  node status --dir DIR   replay the block log and print state");
+    eprintln!("  node inspect-block --dir DIR [--height N]  read the persisted block log and print a per-block summary, or (with --height) one block's header + contents + tx hashes");
     eprintln!("  node certs  --dir DIR   persist a certified chain (blocks+certs) and re-verify finality on reload");
 }
 
@@ -2864,6 +2866,75 @@ fn cmd_pubkey(args: &[String]) {
     }
 }
 
+/// M100: render a persisted block log for offline inspection — the read-side companion to
+/// `inspect-tx`, one level up (a block instead of a loose tx). `height == None` lists every
+/// block with its body counts; `Some(h)` prints one block's header (hash, prev, roots,
+/// timestamp) + contents counts + each tx's hash/author. Blocks are matched by their own
+/// `height` field (authoritative), not log index. Pure for unit testing; `cmd_inspect_block`
+/// is the log-reading shell.
+fn inspect_block(blocks: &[Block], height: Option<u64>) -> Result<String, String> {
+    match height {
+        None => {
+            let mut out = format!("blocks {}", blocks.len());
+            for b in blocks {
+                out.push_str(&format!(
+                    "\nheight {} txs {} stake_ops {} evidence {} validator_updates {}",
+                    b.height,
+                    b.txs.len(),
+                    b.stake_ops.len(),
+                    b.slashing_evidence.len(),
+                    b.validator_updates.len(),
+                ));
+            }
+            Ok(out)
+        }
+        Some(h) => {
+            let b = blocks
+                .iter()
+                .find(|b| b.height == h)
+                .ok_or_else(|| format!("no block at height {h} (log has {} block(s))", blocks.len()))?;
+            let mut out = format!(
+                "height {}\nhash {}\nprev_hash {}\ntimestamp_days {}\nstate_root {}\naccounts_root {}\ngraph_root {}\nnext_validators_root {}\n\
+txs {}\nstake_ops {}\nslashing_evidence {}\nvalidator_updates {}\nbridge_locks {}\nbridge_headers {}\nbridge_redeems {}",
+                b.height,
+                hex(&b.hash()),
+                hex(&b.prev_hash),
+                b.timestamp_days,
+                hex(&b.state_root),
+                hex(&b.accounts_root),
+                hex(&b.graph_root),
+                hex(&b.next_validators_root),
+                b.txs.len(),
+                b.stake_ops.len(),
+                b.slashing_evidence.len(),
+                b.validator_updates.len(),
+                b.bridge_locks.len(),
+                b.bridge_headers.len(),
+                b.bridge_redeems.len(),
+            );
+            for (i, tx) in b.txs.iter().enumerate() {
+                out.push_str(&format!("\ntx {i} hash {} author {}", hex(&tx.hash()), tx.author));
+            }
+            Ok(out)
+        }
+    }
+}
+
+/// M100: `node inspect-block --dir DIR [--height N]` — read `{dir}/blocks.log` and print the
+/// [`inspect_block`] rendering. Read-only (opens the log, binds nothing).
+fn cmd_inspect_block(args: &[String]) {
+    let dir = dir_arg(args);
+    let path = format!("{dir}/blocks.log");
+    let log = BlockLog::open(&path).unwrap_or_else(|e| fail("open log", e));
+    let blocks = log.read_all().unwrap_or_else(|e| fail("read log", e));
+    let height = opt_arg(args, "--height")
+        .map(|h| h.parse::<u64>().unwrap_or_else(|_| fail_msg("--height", &format!("`{h}` is not a u64"))));
+    match inspect_block(&blocks, height) {
+        Ok(s) => println!("{s}"),
+        Err(e) => fail_msg("inspect-block", &e),
+    }
+}
+
 fn cmd_run(config_path: String) {
     // M44: load the config first, then install the subscriber from its optional
     // `[logging]` section (absent ⇒ the M37 default). Config-load errors print via
@@ -3922,5 +3993,70 @@ mod tests {
         let contents = std::fs::read_to_string(p).unwrap();
         assert_eq!(derive_pubkey(&contents, "--key-file").expect("derive"), pub_hex);
         let _ = std::fs::remove_file(p);
+    }
+
+    // M100: a block with zeroed roots + empty body vectors, carrying `txs`, for inspect-block.
+    fn test_block(height: u64, txs: Vec<SubmissionTx>) -> Block {
+        Block {
+            height,
+            prev_hash: [0u8; 32],
+            timestamp_days: 0.0,
+            next_validators_root: [0u8; 32],
+            state_root: [height as u8; 32],
+            accounts_root: [0u8; 32],
+            graph_root: [0u8; 32],
+            bridge_root: [0u8; 32],
+            txs,
+            validator_updates: vec![],
+            stake_ops: vec![],
+            slashing_evidence: vec![],
+            bridge_locks: vec![],
+            bridge_headers: vec![],
+            bridge_redeems: vec![],
+        }
+    }
+
+    fn test_tx(author: u64) -> SubmissionTx {
+        SubmissionTx {
+            author,
+            embedding: [0.0f32; DIM],
+            domain: 1,
+            stake: 100,
+            reviews: vec![],
+            repl_success: 0,
+            repl_total: 0,
+            timestamp_days: 0.0,
+            signature: [0u8; 64],
+        }
+        .signed(&Keypair::from_seed(seed_for(author)))
+    }
+
+    #[test]
+    fn inspect_block_lists_all_blocks() {
+        // M100: with no --height, a one-line summary per block (body counts) + a header count.
+        let blocks = vec![test_block(1, vec![test_tx(5)]), test_block(2, vec![])];
+        let out = inspect_block(&blocks, None).expect("list");
+        assert!(out.starts_with("blocks 2\n"), "{out}");
+        assert!(out.contains("height 1 txs 1 stake_ops 0 evidence 0 validator_updates 0"), "{out}");
+        assert!(out.contains("height 2 txs 0 stake_ops 0 evidence 0 validator_updates 0"), "{out}");
+    }
+
+    #[test]
+    fn inspect_block_detail_prints_header_and_txs() {
+        // M100: --height prints the block's header (hash/prev/roots) + contents + each tx.
+        let tx = test_tx(5);
+        let b = test_block(1, vec![tx.clone()]);
+        let out = inspect_block(std::slice::from_ref(&b), Some(1)).expect("detail");
+        assert!(out.starts_with("height 1\n"), "{out}");
+        assert!(out.contains(&format!("hash {}\n", hex(&b.hash()))), "{out}");
+        assert!(out.contains("txs 1\n"), "{out}");
+        assert!(out.contains(&format!("tx 0 hash {} author 5", hex(&tx.hash()))), "{out}");
+    }
+
+    #[test]
+    fn inspect_block_missing_height_errors() {
+        // M100: a height with no block is a returned error (not a panic).
+        let blocks = vec![test_block(1, vec![])];
+        assert!(inspect_block(&blocks, Some(99)).is_err(), "missing height must error");
     }
 }
