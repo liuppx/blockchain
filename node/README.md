@@ -1341,6 +1341,18 @@ M116 的 `node rpc` 只能 GET。M117 补上写侧，让它成为**全能** RPC 
 
 **已知边界（顺延至 M121+）**：身份读三类已齐（`/genesis` 链 / `/node` 节点 / `/info` 链尖）；读面两分（`/params`/`/config`）已齐；RPC 自带端点发现 + 全能客户端 + 完整链读/写面；内容协商三轴已齐（仅 `identity`，真压缩顺延）；离线工具篮子已补；运维篮子剩余：证书/密钥轮换与落盘、follower 认证、指标端 TLS、OTel/push exporter、每-sink 独立 rotation 覆盖、时延直方图；keygen 篮子剩余：助记词 / BIP-39、口令加密 keystore、密钥轮换；剩余：游标分页、未知方法 `405`；共识 / wire 篮子（破 head 不变量）：**货币费用** + 费用优先排序、nonce / 序列号反重放。
 
+## `node verify --dir` — 链上最终性审计 CLI（Milestone 128）
+
+`node status` 只做**纯状态重放**（`Chain::replay`），从不验证最终性证书——无法回答"这份数据目录是否被 >2/3 法定人数真正认证过"。M128 加 `node verify --dir DIR`：载入 `blocks.log` + `certs.log`，经 `Chain::replay_verified` 把**每个已提交块对其最终性证书**逐一核对（高度 + 块哈希绑定 + 该高度生效验证人集下真正的 > 2/3 法定人数），**任一完整性错误即非零退出**，供监控/CI 钩子用退出码判健康。
+
+- **纯核心 + 薄壳**：`verify_logs(dir) -> VerifyOutcome`（`Ok{blocks,certs,head,state_root}` / `ReplayError` / `IoError`）无 I/O-退出耦合、可纯单测；`cmd_verify` 据此打印一行判词、错误时 `exit(1)`。
+- **与 `status` 的区别**：`status` 是快速状态快照（纯重放），`verify` 是**最终性审计**（证书复验）——两者互补、后者才是"数据可信"的判据。
+- **复用**：直接走既有 `Chain::replay_verified`（M18 最终性复验内核）；空目录（store 自动建空日志）→ 真空 `Ok{0,0}`（"暂无可验"而非错误）；长度不匹配 → `CountMismatch`；证书不绑其块 / 不足 2/3 → 对应 `ReplayError`。
+- **不变量保持**：纯离线读、无 wire/共识/状态/依赖改动，不碰 head。
+- **测试（+3 → 546）**：`verify_logs_ok_on_a_persisted_demo_chain`（驱动产 1 块 1 cert、`Ok` 计数对、head/state_root 非空摘要）、`verify_logs_empty_dir_is_vacuously_ok`（空目录 `Ok{0,0}`）、`verify_logs_rejects_length_mismatch`（多追一块 → `CountMismatch{2,1}`）。
+
+**已知边界（顺延至 M129+）**：离线审计/工具与轻客户端 over-RPC 面已齐；剩余多需引依赖（`Accept-Encoding` 真压缩、keystore 口令加密、OTel/push exporter、指标端 TLS）或属运维篮子（证书/密钥轮换与落盘、follower 认证、每-sink rotation、RPC 时延直方图——需跨任务原子）；生产路线大件：状态裁剪/快照/快速同步。均在"不破 head"（wire v1 已冻结）前提下推进。
+
 ## `GET /headers?from=H&limit=N` — 认证头区间读（Milestone 127）
 
 承接 M126 的单头读：轻客户端自创世（或可信检查点）走到链尖、逐高度验 cert 时，单头端点要 N 次往返。M127 加 `GET /headers?from=H&limit=N`——**gossip 头同步的 RPC 对应**，一次回一段连续认证头，让轻客户端经**纯 HTTP** 引导其头链（无需 P2P gossip）。

@@ -313,6 +313,7 @@ fn main() {
         "keygen" => cmd_keygen(&args),
         "localnet" => cmd_localnet(),
         "status" => cmd_status(dir_arg(&args)),
+        "verify" => cmd_verify(dir_arg(&args)),
         "inspect-block" => cmd_inspect_block(&args),
         "inspect-cert" => cmd_inspect_cert(&args),
         "certs" => cmd_certs(dir_arg(&args)),
@@ -404,6 +405,7 @@ fn usage() {
     eprintln!("  node pubkey (--key-file F | --seed HEX) [--genesis-id N ...]  derive + print the pubkey for an existing seed WITHOUT writing a file (read-only; pairs with inspect-tx --pubkey)");
     eprintln!("  node localnet           spin up an in-process tokio testnet (4 validators, no sequencer) and show all nodes converge via distributed BFT voting over real sockets");
     eprintln!("  node status --dir DIR   replay the block log and print state");
+    eprintln!("  node verify --dir DIR   replay blocks+certs logs through finality verification; non-zero exit on any integrity error (missing log, length mismatch, cert mismatch, < 2/3 quorum)");
     eprintln!("  node inspect-block --dir DIR [--height N]  read the persisted block log and print a per-block summary, or (with --height) one block's header + contents + tx hashes");
     eprintln!("  node inspect-cert  --dir DIR [--height N]  read the persisted cert log and print a per-cert summary, or (with --height) one finality certificate's height/round/block_hash + precommit voters");
     eprintln!("  node certs  --dir DIR   persist a certified chain (blocks+certs) and re-verify finality on reload");
@@ -4296,6 +4298,91 @@ fn cmd_status(dir: String) {
     print_summary(&chain);
 }
 
+/// M128: outcome of a finality-replay of an on-disk chain — one of a clean run, a
+/// [`zhixing_node::ReplayError`] from `replay_verified`, or an I/O / corrupt-log failure.
+#[derive(Debug)]
+enum VerifyOutcome {
+    Ok {
+        blocks: usize,
+        certs: usize,
+        head: String,
+        state_root: String,
+    },
+    ReplayError(zhixing_node::ReplayError),
+    IoError {
+        what: &'static str,
+        path: String,
+        err: std::io::Error,
+    },
+}
+
+/// M128: load `{dir}/blocks.log` and `{dir}/certs.log`, then `replay_verified` the chain so
+/// every committed block is checked against its finality certificate (height + block hash
+/// bind + a real > 2/3 quorum under the height's active validator set). Pure helper (no I/O
+/// coupling to process exit) so it can be unit-tested.
+fn verify_logs(dir: &str) -> VerifyOutcome {
+    let bpath = format!("{dir}/blocks.log");
+    let cpath = format!("{dir}/certs.log");
+    let blocks = match BlockLog::open(&bpath).and_then(|l| l.read_all()) {
+        Ok(b) => b,
+        Err(e) => {
+            return VerifyOutcome::IoError {
+                what: "open/read blocks.log",
+                path: bpath,
+                err: e,
+            };
+        }
+    };
+    let certs = match CertLog::open(&cpath).and_then(|l| l.read_all()) {
+        Ok(c) => c,
+        Err(e) => {
+            return VerifyOutcome::IoError {
+                what: "open/read certs.log",
+                path: cpath,
+                err: e,
+            };
+        }
+    };
+    let n = blocks.len();
+    let m = certs.len();
+    match Chain::replay_verified(demo_genesis(), &blocks, &certs) {
+        Ok(chain) => VerifyOutcome::Ok {
+            blocks: n,
+            certs: m,
+            head: short(&chain.head),
+            state_root: short(&chain.state.state_root()),
+        },
+        Err(e) => VerifyOutcome::ReplayError(e),
+    }
+}
+
+/// M128: `node verify --dir DIR` — the operator's finality audit. Replays `blocks.log` against
+/// `certs.log` and prints a one-line verdict. Exits **non-zero** on any integrity error
+/// (missing log, length mismatch, cert doesn't bind its block, < 2/3 quorum, …) so a
+/// monitor / CI hook can use the exit code.
+fn cmd_verify(dir: String) {
+    match verify_logs(&dir) {
+        VerifyOutcome::Ok {
+            blocks,
+            certs,
+            head,
+            state_root,
+        } => {
+            println!(
+                "ok  {blocks} block(s) + {certs} cert(s) verified; head {head}; state_root {state_root}"
+            );
+        }
+        VerifyOutcome::ReplayError(e) => {
+            eprintln!("error: replay_verified: {e}");
+            exit(1);
+        }
+        VerifyOutcome::IoError { what, path, err } => {
+            eprintln!("error: {what} ({path}): {err}");
+            exit(1);
+        }
+    }
+}
+
 /// Demonstrate certificate persistence and *replay-as-finality-verification*.
 /// First run: produce a BFT-certified chain and persist both `blocks.log` and
 /// `certs.log`. Every run: reload both logs and replay them re-verifying each
@@ -4644,6 +4731,111 @@ mod tests {
         .map(|s| s.to_string())
         .collect();
         assert_eq!(multi_arg(&args, "--review"), vec!["10:0.9", "11:0.8"]);
+    }
+
+    fn tmpdir(s: &str) -> std::path::PathBuf {
+        let mut p = std::env::temp_dir();
+        p.push(format!("zhixing-verify-{}-{}", s, std::process::id()));
+        let _ = std::fs::remove_dir_all(&p);
+        std::fs::create_dir_all(&p).expect("create tmpdir");
+        p
+    }
+
+    fn demo_seeds() -> BTreeMap<u64, [u8; 32]> {
+        (21u64..=24).map(|id| (id, seed_for(id))).collect()
+    }
+
+    fn persist_demo_chain(dir: &std::path::Path) {
+        let blog = BlockLog::open(dir.join("blocks.log")).expect("open blocks.log");
+        let clog = CertLog::open(dir.join("certs.log")).expect("open certs.log");
+        let mut d = ChainDriver::new(demo_genesis(), demo_seeds(), 4);
+        // A single submission drives exactly one certified block.
+        d.submit(tx(
+            1,
+            unit(1),
+            1,
+            reviews(&[(10, 0.9), (11, 0.85), (12, 0.9)]),
+            (3, 3),
+            1.0,
+        ))
+        .unwrap();
+        d.produce_until_drained(1.0, 16).expect("produce");
+        for b in d.blocks() {
+            blog.append(b).expect("append block");
+        }
+        for c in d.certificates() {
+            clog.append(c).expect("append cert");
+        }
+    }
+
+    #[test]
+    fn verify_logs_ok_on_a_persisted_demo_chain() {
+        // M128: a clean, single-block demo chain (3-validator quorum) replay-verifies cleanly:
+        // `Ok` with matching block/cert counts and a non-empty head/state_root digest.
+        let dir = tmpdir("ok");
+        persist_demo_chain(&dir);
+        let path = dir.to_string_lossy().to_string();
+        match verify_logs(&path) {
+            VerifyOutcome::Ok {
+                blocks,
+                certs,
+                head,
+                state_root,
+            } => {
+                assert_eq!(blocks, 1);
+                assert_eq!(certs, 1);
+                // `short()` renders the first/last 8 hex of the 32-byte hash joined by `…`.
+                assert!(head.contains('…') && head.len() > 8, "head: {head}");
+                assert!(
+                    state_root.contains('…') && state_root.len() > 8,
+                    "state_root: {state_root}"
+                );
+            }
+            other => panic!("expected Ok, got {other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn verify_logs_empty_dir_is_vacuously_ok() {
+        // M128: a fresh dir (the store auto-creates empty logs) replays zero blocks — a vacuous
+        // `Ok{0,0}`, the honest "nothing to verify yet" answer (not an error).
+        let dir = tmpdir("empty");
+        let path = dir.to_string_lossy().to_string();
+        match verify_logs(&path) {
+            VerifyOutcome::Ok { blocks, certs, .. } => {
+                assert_eq!(blocks, 0);
+                assert_eq!(certs, 0);
+            }
+            other => panic!("expected vacuous Ok, got {other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn verify_logs_rejects_length_mismatch() {
+        // M128: when `blocks.log` and `certs.log` have different lengths, `replay_verified`
+        // returns `CountMismatch` and the helper surfaces it as `ReplayError`.
+        let dir = tmpdir("mismatch");
+        persist_demo_chain(&dir);
+        // Append a second block (a duplicate of the one already on disk) with no matching cert
+        // ⇒ the two logs' lengths differ by one.
+        let blog = BlockLog::open(dir.join("blocks.log")).expect("reopen blocks.log");
+        let existing = blog.read_all().expect("read blocks");
+        let extra = existing.first().expect("one demo block").clone();
+        blog.append(&extra).expect("append extra");
+        let path = dir.to_string_lossy().to_string();
+        match verify_logs(&path) {
+            VerifyOutcome::ReplayError(zhixing_node::ReplayError::CountMismatch {
+                blocks,
+                certs,
+            }) => {
+                assert_eq!(blocks, 2);
+                assert_eq!(certs, 1);
+            }
+            other => panic!("expected CountMismatch, got {other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
