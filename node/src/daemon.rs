@@ -424,6 +424,12 @@ enum Cmd {
         id: u64,
         reply: oneshot::Sender<Option<Vec<u8>>>,
     },
+    /// M126: read the standalone certified header (header + finality cert) at a committed
+    /// height. `None` ⇒ genesis or a height past the tip (404).
+    QueryHeader {
+        height: u64,
+        reply: oneshot::Sender<Option<CertifiedHeader>>,
+    },
     /// M59: read one account's inclusion proof + the certified head it verifies
     /// against, for the verifiable read-class RPC. `None` ⇒ unknown id or no
     /// certified head yet (height 0).
@@ -1281,6 +1287,10 @@ async fn run_actor(mut actor: Actor, mut rx: mpsc::UnboundedReceiver<Cmd>) {
                 // M124: the entity's canonical Merkle leaf bytes, byte-identical to the leaf
                 // inside the matching `/…/proof` entry (reuses the same `serve_inclusion` path).
                 let _ = reply.send(actor.node.leaf(kind, id));
+            }
+            Cmd::QueryHeader { height, reply } => {
+                // M126: the standalone certified header at `height`.
+                let _ = reply.send(actor.node.certified_header(height));
             }
             Cmd::QueryAccountProof { id, reply } => {
                 let _ = reply.send(actor.node.account_inclusion(id));
@@ -2534,6 +2544,10 @@ enum GetRoute {
     /// re-hashes when verifying an inclusion proof. The trust bridge between a plain read and a
     /// `/…/proof` read. A bad/unknown kind or non-numeric id ⇒ `NotFound`.
     Leaf(ProofKind, u64),
+    /// M126: `GET /header/{height}` — the standalone cert-signed `CertifiedHeader` (header +
+    /// finality `Commit`) at a committed height, decoupled from any proof. The unit a light
+    /// client verifies against. Genesis (no log block) and a past-the-tip height ⇒ 404.
+    Header(u64),
     NotFound,
 }
 
@@ -2896,6 +2910,13 @@ fn route_get(path: &str) -> GetRoute {
                 // M124: `/leaf/{kind}/{id}` — the entity's canonical Merkle leaf bytes. `{kind}`
                 // is one of account|reviewer|validator|graph; a bad kind or non-numeric id ⇒ 404.
                 leaf_route(rest)
+            } else if let Some(rest) = p.strip_prefix("/header/") {
+                // M126: `/header/{height}` — the certified header at a committed height. A
+                // non-numeric height ⇒ 404; a height with no committed block is a 404 from the
+                // handler. (`/head`, the tip hash, is an exact match handled above.)
+                rest.parse::<u64>()
+                    .map(GetRoute::Header)
+                    .unwrap_or(GetRoute::NotFound)
             } else if let Some(rest) = p.strip_prefix("/bridge/lock/") {
                 // M63: `{id}/proof` is the only form — a bridge lock has no plain
                 // read, so a bare id (no `/proof`) or a non-numeric id ⇒ 404.
@@ -3408,6 +3429,7 @@ const READ_ROUTES: &[&str] = &[
     "/leaf/reviewer/{id}",
     "/leaf/validator/{id}",
     "/leaf/graph/{id}",
+    "/header/{height}",
     "/bridge/lock/{id}/proof",
     "/mempool/{hash}",
     "/tx/{hash}",
@@ -4869,6 +4891,29 @@ async fn serve_rpc_conn(mut stream: TcpStream, cmd: mpsc::UnboundedSender<Cmd>) 
                             fmt,
                             &format!("{} {id} not found", proof_kind_label(kind)),
                         ),
+                        Err(_) => http_response("503 Service Unavailable", "node stopped"),
+                    }
+                }
+            }
+            GetRoute::Header(height) => {
+                // M126: the standalone certified header at a committed height — hex `certified_header=`
+                // (SPV clients `decode_certified_header`), or the structured JSON twin. 404 past the tip.
+                let (reply, rx) = oneshot::channel();
+                if cmd.send(Cmd::QueryHeader { height, reply }).is_err() {
+                    http_response("503 Service Unavailable", "node stopped")
+                } else {
+                    match rx.await {
+                        Ok(Some(ch)) => ok_body(
+                            fmt,
+                            &format!(
+                                "certified_header={}",
+                                crate::hash::hex(&crate::codec::encode_certified_header(&ch))
+                            ),
+                            &json_certified_header(&ch),
+                        ),
+                        Ok(None) => {
+                            not_found_body(fmt, &format!("no certified header at height {height}"))
+                        }
                         Err(_) => http_response("503 Service Unavailable", "node stopped"),
                     }
                 }
@@ -7854,6 +7899,81 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    #[tokio::test]
+    async fn rpc_header_over_tcp() {
+        // M126: `/header/{height}` over real TCP — a committed height returns a `certified_header=`
+        // hex line that `decode_certified_header` accepts and whose cert binds `header.hash()`;
+        // genesis (height 0) and a past-the-tip height are 404.
+        let dir = tmp_dir("rpc-header");
+        let mut cfg = node_config(21, 21271, &[21], dir.clone());
+        let rpc_addr = "127.0.0.1:21281";
+        cfg.rpc = Some(crate::config::RpcConfig {
+            enabled: true,
+            listen: rpc_addr.into(),
+        });
+        let mut genesis = test_genesis();
+        genesis.validators = vec![(21, kp(21).public(), 1)];
+        let node = Node::start(cfg, genesis, Some(kp(21)))
+            .await
+            .expect("start node");
+
+        // Wait for at least one committed height.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            if node.status().await.map(|(h, _)| h >= 1).unwrap_or(false) {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "node never produced a block"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+
+        async fn get(addr: &str, path: &str) -> String {
+            let req =
+                format!("GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
+            let mut s = TcpStream::connect(addr).await.expect("connect rpc");
+            s.write_all(req.as_bytes()).await.expect("send get");
+            let mut resp = Vec::new();
+            s.read_to_end(&mut resp).await.expect("read response");
+            String::from_utf8_lossy(&resp).into_owned()
+        }
+        fn body_of(resp: &str) -> &str {
+            resp.rsplit("\r\n\r\n").next().unwrap_or("")
+        }
+
+        // /header/1 → 200 with a decodable certified header whose cert binds header.hash().
+        let resp = get(rpc_addr, "/header/1").await;
+        assert!(resp.starts_with("HTTP/1.1 200 OK"), "header status: {resp}");
+        let hex = body_of(&resp)
+            .lines()
+            .find_map(|l| l.strip_prefix("certified_header="))
+            .expect("certified_header= line");
+        let bytes: Vec<u8> = (0..hex.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).unwrap())
+            .collect();
+        let ch = crate::codec::decode_certified_header(&bytes).expect("decode certified header");
+        assert_eq!(ch.header.height, 1, "height 1 header");
+        assert_eq!(
+            ch.cert.block_hash,
+            ch.header.hash(),
+            "cert binds header hash"
+        );
+
+        // Genesis (no log block) and a past-the-tip height → 404.
+        let g = get(rpc_addr, "/header/0").await;
+        assert!(g.starts_with("HTTP/1.1 404"), "genesis header: {g}");
+        let future = get(rpc_addr, "/header/999999").await;
+        assert!(
+            future.starts_with("HTTP/1.1 404"),
+            "future header: {future}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn lock_proof_formats_and_verifies() {
         // M63: the `/bridge/lock/{id}/proof` body is the single hex line
@@ -10341,6 +10461,18 @@ mod tests {
         assert!(matches!(route_get("/leaf/account/x"), GetRoute::NotFound));
         assert!(matches!(route_get("/leaf/account/"), GetRoute::NotFound));
         assert!(matches!(route_get("/leaf/account"), GetRoute::NotFound));
+    }
+
+    #[test]
+    fn route_get_parses_header() {
+        // M126: `/header/{height}` parses to `Header(height)`; a non-numeric or empty height ⇒
+        // NotFound. `/head` (the tip hash) stays its own exact-match variant, not `/header/`.
+        assert!(matches!(route_get("/header/1"), GetRoute::Header(1)));
+        assert!(matches!(route_get("/header/0"), GetRoute::Header(0)));
+        assert!(matches!(route_get("/header/99"), GetRoute::Header(99)));
+        assert!(matches!(route_get("/header/x"), GetRoute::NotFound));
+        assert!(matches!(route_get("/header/"), GetRoute::NotFound));
+        assert!(matches!(route_get("/head"), GetRoute::Head));
     }
 
     #[test]

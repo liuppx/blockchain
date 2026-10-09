@@ -552,6 +552,20 @@ impl GossipNode {
         self.serve_inclusion(kind, id).map(|e| e.leaf())
     }
 
+    /// M126: the cert-signed [`CertifiedHeader`] (header + its finality `Commit`) at a committed
+    /// `height` — the standalone unit a light client verifies against, decoupled from any account
+    /// proof. `blocks[i]`/`certs[i]` is height `i+1`; genesis (height 0, no log block/cert) and a
+    /// height past the tip ⇒ `None`.
+    pub fn certified_header(&self, height: u64) -> Option<CertifiedHeader> {
+        if height == 0 {
+            return None;
+        }
+        let i = (height - 1) as usize;
+        let block = self.blocks.get(i)?;
+        let cert = self.certs.get(i)?;
+        Some(CertifiedHeader::from_certified(block, cert))
+    }
+
     /// M29: serve a heterogeneous batched proof request. Walks
     /// `items`, dispatches each one to the matching existing
     /// `serve_*` helper, and assembles a typed
