@@ -2209,6 +2209,26 @@ fn options_response() -> String {
     )
 }
 
+/// M123: RFC 9110 §15.5.6 — a `405 Method Not Allowed` response for a request method the
+/// server does not support on this resource. The spec requires the `Allow` header listing
+/// the supported methods (same set and source as `OPTIONS`); a short plaintext body explains
+/// the status. Pure (no I/O) for direct unit testing.
+fn method_not_allowed_response() -> String {
+    let body = "method not allowed";
+    format!(
+        "HTTP/1.1 405 Method Not Allowed\r\n\
+         Allow: {}\r\n\
+         Content-Type: text/plain; charset=utf-8\r\n\
+         Content-Length: {}\r\n\
+         Connection: close\r\n\
+         \r\n\
+         {}",
+        ALLOWED_METHODS,
+        body.len(),
+        body,
+    )
+}
+
 /// M108: the value of request header `name` (case-insensitive), trimmed. `None` if absent.
 /// Scans the raw CRLF-split header block, like [`accept_format`] / [`charset_acceptable`].
 fn header_value<'a>(head: &'a str, name: &str) -> Option<&'a str> {
@@ -2313,7 +2333,8 @@ async fn run_rpc(listener: TcpListener, my_id: u64, cmd: mpsc::UnboundedSender<C
 ///   `Content-Length`, `Vary`), no body (RFC 9110 §9.3.2);
 /// - M93: an `OPTIONS` returns `204 No Content` with an `Allow` header advertising the
 ///   served methods (RFC 9110 §9.3.7), answered before content negotiation;
-/// - any other non-`POST` method returns the `200 OK`/`"ok"` health probe;
+/// - M123: any other non-`POST` method returns `405 Method Not Allowed` with an `Allow`
+///   header (RFC 9110 §15.5.6); health probes use `GET /` (a `200 OK` above);
 /// - a `POST` reads the body (bounded by `Content-Length`, capped at
 ///   [`MAX_RPC_BODY`]), decodes it as raw `codec::encode_tx` bytes, and submits
 ///   it through the actor: `200`/hash on admission, `400` on a decode error,
@@ -5269,10 +5290,13 @@ async fn serve_rpc_conn(mut stream: TcpStream, cmd: mpsc::UnboundedSender<Cmd>) 
         return;
     }
 
-    // Anything that isn't a POST is treated as a health probe.
+    // M123: RFC 9110 §15.5.6 — anything that isn't a POST here (GET/HEAD/OPTIONS already
+    // returned above) is an unsupported method, so answer `405 Method Not Allowed` with the
+    // `Allow` header. Legitimate health probes use `GET /` (handled above as a `200 OK`), so
+    // this does not affect them.
     if !method.eq_ignore_ascii_case("POST") {
         let _ = stream
-            .write_all(http_response("200 OK", "ok").as_bytes())
+            .write_all(method_not_allowed_response().as_bytes())
             .await;
         let _ = stream.flush().await;
         return;
@@ -9793,10 +9817,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rpc_unsupported_method_is_health_probe() {
-        // M93: OPTIONS is the only non-GET/HEAD/POST method given special handling. Other
-        // methods (e.g. PUT) deliberately keep the pre-existing `200 OK`/`"ok"` health-probe
-        // fallback — exercised here so that intentional behavior can't regress silently.
+    async fn rpc_unsupported_method_returns_405() {
+        // M123: RFC 9110 §15.5.6 — a method the server does not support (e.g. PUT), after
+        // GET/HEAD/OPTIONS/POST are handled, returns `405 Method Not Allowed` with an `Allow`
+        // header listing the served methods (replacing the pre-M123 `200 OK` health-probe
+        // fallback). Legitimate health probes use `GET /` (still a `200 OK`).
         let dir = tmp_dir("rpc-unsupported-method");
         // node_config p2p listen = 20491 + (35-21) = 20505; keep the RPC port clear.
         let mut cfg = node_config(35, 20491, &[35], dir.clone());
@@ -9830,13 +9855,17 @@ mod tests {
         s.read_to_end(&mut resp).await.expect("read response");
         let resp = String::from_utf8_lossy(&resp);
         assert!(
-            resp.starts_with("HTTP/1.1 200 OK"),
-            "PUT falls back to health probe: {resp}"
+            resp.starts_with("HTTP/1.1 405 Method Not Allowed"),
+            "PUT must 405: {resp}"
+        );
+        assert!(
+            resp.contains(&format!("Allow: {ALLOWED_METHODS}\r\n")),
+            "405 must carry Allow header: {resp}"
         );
         assert_eq!(
             resp.split_once("\r\n\r\n").map(|(_, b)| b),
-            Some("ok"),
-            "probe body: {resp}"
+            Some("method not allowed"),
+            "405 body: {resp}"
         );
 
         let _ = std::fs::remove_dir_all(&dir);
@@ -11673,6 +11702,38 @@ vote_b.validator=5 vote_b.height=9 vote_b.round=2 vote_b.block_hash={b_h} vote_b
             resp.split_once("\r\n\r\n").map(|(_, b)| b),
             Some(""),
             "no body: {resp}"
+        );
+    }
+
+    #[test]
+    fn method_not_allowed_advertises_allow() {
+        // M123: RFC 9110 §15.5.6 — a `405 Method Not Allowed` response carries the `Allow`
+        // header (same served-method set as OPTIONS) and a short plaintext body.
+        let resp = method_not_allowed_response();
+        assert!(
+            resp.starts_with("HTTP/1.1 405 Method Not Allowed\r\n"),
+            "{resp}"
+        );
+        assert!(
+            resp.contains(&format!("Allow: {ALLOWED_METHODS}\r\n")),
+            "405 must carry Allow: {resp}"
+        );
+        assert!(
+            resp.contains("Content-Type: text/plain; charset=utf-8\r\n"),
+            "{resp}"
+        );
+        assert_eq!(
+            resp.split_once("\r\n\r\n").map(|(_, b)| b),
+            Some("method not allowed"),
+            "405 body: {resp}"
+        );
+        // Content-Length matches the body byte length.
+        assert!(
+            resp.contains(&format!(
+                "Content-Length: {}\r\n",
+                "method not allowed".len()
+            )),
+            "{resp}"
         );
     }
 

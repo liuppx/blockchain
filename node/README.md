@@ -1341,6 +1341,17 @@ M116 的 `node rpc` 只能 GET。M117 补上写侧，让它成为**全能** RPC 
 
 **已知边界（顺延至 M121+）**：身份读三类已齐（`/genesis` 链 / `/node` 节点 / `/info` 链尖）；读面两分（`/params`/`/config`）已齐；RPC 自带端点发现 + 全能客户端 + 完整链读/写面；内容协商三轴已齐（仅 `identity`，真压缩顺延）；离线工具篮子已补；运维篮子剩余：证书/密钥轮换与落盘、follower 认证、指标端 TLS、OTel/push exporter、每-sink 独立 rotation 覆盖、时延直方图；keygen 篮子剩余：助记词 / BIP-39、口令加密 keystore、密钥轮换；剩余：游标分页、未知方法 `405`；共识 / wire 篮子（破 head 不变量）：**货币费用** + 费用优先排序、nonce / 序列号反重放。
 
+## RPC 未知方法回 `405 Method Not Allowed`（Milestone 123）
+
+补齐 RFC 9110 的方法处理三连（M92 `HEAD`、M93 `OPTIONS`、本轮 `405`）：此前 RPC 对非 `GET`/`HEAD`/`OPTIONS`/`POST` 的方法（`PUT`/`DELETE`/`PATCH`/`TRACE`/垃圾方法）一律回落到 `200 OK`/`"ok"` 健康探针——**不符合规范**（§15.5.6 要求不支持的方法回 `405` 并带 `Allow` 头）。M123 把那个兜底换成 `405 Method Not Allowed`。
+
+- **改动**：`serve_rpc_conn` 的 "anything that isn't a POST" 兜底（`GET`/`HEAD` 在 `route_get` 块、`OPTIONS` 在其专臂均已先行 return）改为写 `method_not_allowed_response()`——`405` + `Allow: GET, HEAD, OPTIONS, POST`（复用 M93 的单一真相源 `ALLOWED_METHODS`）+ 短 `text/plain` body `method not allowed` + `Content-Length`。新增纯函数 `method_not_allowed_response()`，与 `options_response()` 同形、可纯单测。
+- **健康探针不受影响**：负载均衡器/scraper 的健康检查走 `GET /`（在 `route_get` 块回 `200 OK`/`"ok"`，保持 M38 语义），只有真正不支持的方法改回 `405`。
+- **不变量保持**：纯 RPC 层字符串，无 wire/共识/状态/依赖改动、RPC 默认关，故 `localnet` 逐字节同块、head 仍 wire v1 `a045426e…3b87bc`。
+- **测试（+2 → 533）**：纯 `method_not_allowed_advertises_allow`（断言 `405` 状态行 + `Allow` 头 + body + `Content-Length`），TCP `rpc_unsupported_method_returns_405`（把原 `rpc_unsupported_method_is_health_probe` 的 `PUT` 期望从 `200 ok` 改为 `405` + `Allow`）。
+
+**已知边界（顺延至 M124+）**：方法处理已 RFC 完备（`GET`/`HEAD`/`OPTIONS`/`POST` + `405`）；读写面边角剩余（游标分页、`Accept-Encoding` 真压缩须引依赖）；生产路线：keystore 口令加密、状态裁剪/快照/快速同步；运维/keygen 篮子剩余项不变。均在"不破 head"（wire v1 已冻结）前提下推进。
+
 ## Wire v1 冻结：交易费（付出块验证人）+ nonce 反重放（Milestone 122）
 
 生产路线的第二步，也是**唯一一次有意破链身份**的改动：把两个真经济缺口——**无交易费**（垃圾/DoS 经济学不完整、验证人无出块激励）与**无 nonce 序列反重放**（此前仅靠内容哈希去重）——一次性打包进 block/tx/account 编码，**只破一次 head**、重算并重新锁定 canonical 哈希，此后冻结，命名为「wire v1」。M121 先把哈希换成审计过的 `sha2`，为本次把"哈希来源"洗白。
