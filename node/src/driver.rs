@@ -23,7 +23,10 @@ use crate::consensus::Commit;
 use crate::mempool::Mempool;
 use crate::round::Sim;
 use crate::validator::ValidatorUpdate;
-use crate::{Block, BridgeHeader, BridgeLock, BridgeRedeem, Chain, ChainError, Genesis, Hash, Keypair, SlashEvidence, StakeOp, SubmissionTx};
+use crate::{
+    Block, BridgeHeader, BridgeLock, BridgeRedeem, Chain, ChainError, Genesis, Hash, Keypair,
+    SlashEvidence, StakeOp, SubmissionTx,
+};
 
 #[derive(Debug)]
 pub enum DriverError {
@@ -41,10 +44,16 @@ impl std::fmt::Display for DriverError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             DriverError::ConsensusStalled { height } => {
-                write!(f, "consensus stalled at height {height} (quorum not reached)")
+                write!(
+                    f,
+                    "consensus stalled at height {height} (quorum not reached)"
+                )
             }
             DriverError::BadCertificate { height } => {
-                write!(f, "finality certificate at height {height} failed verification")
+                write!(
+                    f,
+                    "finality certificate at height {height} failed verification"
+                )
             }
             DriverError::Apply(e) => write!(f, "finalized block failed to apply: {e}"),
         }
@@ -241,7 +250,7 @@ impl ChainDriver {
                     height: self.chain.state.height + 1,
                     prev_hash: self.chain.head,
                     timestamp_days,
-            proposer: 0,
+                    proposer: 0,
                     next_validators_root: [0u8; 32],
                     // M23: state_root/accounts_root are stamped by
                     // `Chain::commit` after the trial apply succeeds.
@@ -278,7 +287,9 @@ impl ChainDriver {
         // seal the validator-set commitment now that the block's contents are
         // final, so consensus votes on (and the post-consensus commit checks)
         // the header a light client will follow.
-        self.chain.seal(&mut candidate).map_err(DriverError::Apply)?;
+        self.chain
+            .seal(&mut candidate)
+            .map_err(DriverError::Apply)?;
         let height = candidate.height;
 
         // consensus over this height uses the set ACTIVE for it — the on-chain
@@ -287,7 +298,13 @@ impl ChainDriver {
         let active = self.chain.state.validators.clone();
 
         // drive BFT consensus over the candidate on the in-process bus
-        let mut sim = Sim::new(active.clone(), self.keys(), height, candidate.clone(), silent);
+        let mut sim = Sim::new(
+            active.clone(),
+            self.keys(),
+            height,
+            candidate.clone(),
+            silent,
+        );
         let decisions = sim.run();
 
         // every honest validator decides the same block; take any certificate
@@ -391,7 +408,11 @@ mod tests {
         let ids = [21u64, 22, 23, 24];
         let vset = ValidatorSet::new(
             ids.iter()
-                .map(|&id| Validator { id, pubkey: kp(id).public(), power: 1 })
+                .map(|&id| Validator {
+                    id,
+                    pubkey: kp(id).public(),
+                    power: 1,
+                })
                 .collect(),
         );
         let seeds = ids.iter().map(|&id| (id, seed(id))).collect();
@@ -405,16 +426,26 @@ mod tests {
             domain,
             stake: 2 * MICRO,
             reviews: vec![
-                Review { reviewer: 10, score: 0.9 },
-                Review { reviewer: 11, score: 0.85 },
-                Review { reviewer: 12, score: 0.9 },
+                Review {
+                    reviewer: 10,
+                    score: 0.9,
+                },
+                Review {
+                    reviewer: 11,
+                    score: 0.85,
+                },
+                Review {
+                    reviewer: 12,
+                    score: 0.9,
+                },
             ],
             repl_success: 3,
             repl_total: 3,
             timestamp_days: 1.0,
             signature: [0u8; 64],
-            fee: 0, nonce: 0,
-}
+            fee: 0,
+            nonce: 0,
+        }
         .signed(&kp(author))
     }
 
@@ -437,19 +468,31 @@ mod tests {
         let bal0 = d.chain.state.accounts[&1].balance;
 
         // stage a bond by account 1 and finalize a (certified) block carrying it
-        let op = StakeOp { account: 1, kind: BondKind::Bond, amount: 5 * MICRO, signature: [0u8; 64] }
-            .signed(&kp(1));
+        let op = StakeOp {
+            account: 1,
+            kind: BondKind::Bond,
+            amount: 5 * MICRO,
+            signature: [0u8; 64],
+        }
+        .signed(&kp(1));
         d.stage_stake_op(op);
-        d.produce(1.0, &BTreeSet::new()).unwrap().expect("a stake-only block is produced");
+        d.produce(1.0, &BTreeSet::new())
+            .unwrap()
+            .expect("a stake-only block is produced");
         assert_eq!(d.height(), 1);
         assert_eq!(d.chain.state.bonded, 5 * MICRO);
         assert_eq!(d.chain.state.accounts[&1].balance, bal0 - 5 * MICRO);
         // account 1 is now an active validator with power == its bond (certified by the old set)
-        assert_eq!(d.chain.state.validators.get(1).map(|v| v.power), Some(5 * MICRO));
+        assert_eq!(
+            d.chain.state.validators.get(1).map(|v| v.power),
+            Some(5 * MICRO)
+        );
 
         // the grown set (now including #1) certifies the next height
         d.submit(tx(2, 2, 2)).unwrap();
-        d.produce(2.0, &BTreeSet::new()).unwrap().expect("next height commits under the grown set");
+        d.produce(2.0, &BTreeSet::new())
+            .unwrap()
+            .expect("next height commits under the grown set");
         assert_eq!(d.height(), 2);
         assert_eq!(d.certificates().len(), 2);
         assert!(d.chain.state.supply_conserved());
@@ -463,11 +506,21 @@ mod tests {
         let mut d = ChainDriver::new(genesis(), seeds, 4);
 
         // account 1 self-bonds -> becomes an active validator effective height 2
-        let op = StakeOp { account: 1, kind: BondKind::Bond, amount: 5 * MICRO, signature: [0u8; 64] }
-            .signed(&kp(1));
+        let op = StakeOp {
+            account: 1,
+            kind: BondKind::Bond,
+            amount: 5 * MICRO,
+            signature: [0u8; 64],
+        }
+        .signed(&kp(1));
         d.stage_stake_op(op);
-        d.produce(1.0, &BTreeSet::new()).unwrap().expect("a stake-only block is produced");
-        assert_eq!(d.chain.state.validators.get(1).map(|v| v.power), Some(5 * MICRO));
+        d.produce(1.0, &BTreeSet::new())
+            .unwrap()
+            .expect("a stake-only block is produced");
+        assert_eq!(
+            d.chain.state.validators.get(1).map(|v| v.power),
+            Some(5 * MICRO)
+        );
 
         // it double-signs at height 2 — stage the cryptographic proof and finalize
         // a (certified) block carrying it; the offender is slashed and removed.
@@ -476,12 +529,21 @@ mod tests {
             vote_b: Vote::signed(1, 2, 0, [2u8; 32], VoteType::Precommit, &kp(1)),
         };
         d.stage_slashing_evidence(ev);
-        d.produce(2.0, &BTreeSet::new()).unwrap().expect("a slashing block is produced");
+        d.produce(2.0, &BTreeSet::new())
+            .unwrap()
+            .expect("a slashing block is produced");
         assert_eq!(d.height(), 2);
         assert_eq!(d.certificates().len(), 2);
-        assert_eq!(d.chain.state.treasury, 5 * MICRO, "bonded stake seized to treasury");
+        assert_eq!(
+            d.chain.state.treasury,
+            5 * MICRO,
+            "bonded stake seized to treasury"
+        );
         assert_eq!(d.chain.state.bonded, 0);
-        assert!(d.chain.state.validators.get(1).is_none(), "offender removed from the set");
+        assert!(
+            d.chain.state.validators.get(1).is_none(),
+            "offender removed from the set"
+        );
         assert!(d.chain.state.supply_conserved());
 
         // the certified chain replays and re-verifies finality to the same state
@@ -545,7 +607,10 @@ mod tests {
         silent.insert(24);
         let before = d.height();
         let r = d.produce(1.0, &silent);
-        assert!(matches!(r, Err(DriverError::ConsensusStalled { height: 1 })));
+        assert!(matches!(
+            r,
+            Err(DriverError::ConsensusStalled { height: 1 })
+        ));
         assert_eq!(d.height(), before, "no block committed on a stall");
     }
 
@@ -581,8 +646,7 @@ mod tests {
         d.produce_until_drained(1.0, 10).unwrap();
 
         // replay the retained (blocks, certs) re-verifying every height's quorum
-        let replayed =
-            Chain::replay_verified(genesis(), d.blocks(), d.certificates()).unwrap();
+        let replayed = Chain::replay_verified(genesis(), d.blocks(), d.certificates()).unwrap();
         assert_eq!(replayed.head, d.head());
         assert_eq!(replayed.state.state_root(), d.chain.state.state_root());
     }
@@ -641,11 +705,19 @@ mod tests {
         // admit validator #25; the change rides in the height-2 block but is
         // certified by the PRE-change set (the newcomer never votes on its arrival)
         let before2 = d.chain.state.validators.clone();
-        d.stage_validator_update(ValidatorUpdate { id: 25, pubkey: kp(25).public(), power: 1 });
+        d.stage_validator_update(ValidatorUpdate {
+            id: 25,
+            pubkey: kp(25).public(),
+            power: 1,
+        });
         let c2 = d.produce(2.0, &BTreeSet::new()).unwrap().unwrap();
         assert!(c2.verify(&before2).is_ok(), "certified by the old set");
         assert_eq!(before2.len(), 4);
-        assert_eq!(d.chain.state.validators.len(), 5, "set grew for the next height");
+        assert_eq!(
+            d.chain.state.validators.len(),
+            5,
+            "set grew for the next height"
+        );
 
         // height 3 is now certified by the NEW set of five
         let before3 = d.chain.state.validators.clone();
@@ -717,7 +789,9 @@ mod tests {
         }
         .signed(&kp(1));
         a.stage_bridge_lock(lock.clone());
-        a.produce(1.0, &BTreeSet::new()).unwrap().expect("A lock block commits");
+        a.produce(1.0, &BTreeSet::new())
+            .unwrap()
+            .expect("A lock block commits");
 
         // Relayer reads A's certified header, its finality cert, and the
         // inclusion proof of lock 0 against A's bridge_root.
@@ -735,7 +809,9 @@ mod tests {
             cert: a_cert.clone(),
             next_set: a_genesis_set.clone(),
         });
-        b.produce(1.0, &BTreeSet::new()).unwrap().expect("B follow block commits");
+        b.produce(1.0, &BTreeSet::new())
+            .unwrap()
+            .expect("B follow block commits");
 
         b.stage_bridge_redeem(BridgeRedeem {
             source_chain: a_genesis_hash,
@@ -745,7 +821,9 @@ mod tests {
             lock: lock.clone(),
             proof,
         });
-        b.produce(2.0, &BTreeSet::new()).unwrap().expect("B redeem block commits");
+        b.produce(2.0, &BTreeSet::new())
+            .unwrap()
+            .expect("B redeem block commits");
 
         // Destination credited on-chain, supply grew 1:1 with A's locked pool,
         // and the audit counter + dedup set both record the redemption.
@@ -756,9 +834,12 @@ mod tests {
         assert!(src.consumed.contains(&0));
 
         // The certified B chain replays and re-verifies to the same state.
-        let replayed =
-            Chain::replay_verified(gb_for_replay(a_genesis_hash, &a_genesis_set), b.blocks(), b.certificates())
-                .unwrap();
+        let replayed = Chain::replay_verified(
+            gb_for_replay(a_genesis_hash, &a_genesis_set),
+            b.blocks(),
+            b.certificates(),
+        )
+        .unwrap();
         assert_eq!(replayed.state.state_root(), b.chain.state.state_root());
     }
 

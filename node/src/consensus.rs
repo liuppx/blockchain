@@ -122,7 +122,7 @@ pub struct Commit {
 pub enum ConsensusError {
     NoVotes,
     WrongVoteType(u64),
-    Mismatch(u64),        // vote's height/round/hash disagrees with the commit
+    Mismatch(u64), // vote's height/round/hash disagrees with the commit
     UnknownValidator(u64),
     BadSignature(u64),
     DuplicateValidator(u64),
@@ -134,7 +134,9 @@ impl std::fmt::Display for ConsensusError {
         match self {
             ConsensusError::NoVotes => write!(f, "commit has no precommits"),
             ConsensusError::WrongVoteType(v) => write!(f, "validator {v} vote is not a precommit"),
-            ConsensusError::Mismatch(v) => write!(f, "validator {v} vote does not match the commit"),
+            ConsensusError::Mismatch(v) => {
+                write!(f, "validator {v} vote does not match the commit")
+            }
             ConsensusError::UnknownValidator(v) => write!(f, "unknown validator {v}"),
             ConsensusError::BadSignature(v) => write!(f, "invalid signature from validator {v}"),
             ConsensusError::DuplicateValidator(v) => write!(f, "validator {v} voted twice"),
@@ -227,7 +229,11 @@ pub fn detect_equivocation(a: &Commit, b: &Commit) -> Vec<u64> {
     if a.height != b.height || a.round != b.round || a.block_hash == b.block_hash {
         return Vec::new();
     }
-    let a_by: BTreeMap<u64, Hash> = a.precommits.iter().map(|v| (v.validator, v.block_hash)).collect();
+    let a_by: BTreeMap<u64, Hash> = a
+        .precommits
+        .iter()
+        .map(|v| (v.validator, v.block_hash))
+        .collect();
     let mut guilty = Vec::new();
     for v in &b.precommits {
         if let Some(&h) = a_by.get(&v.validator) {
@@ -287,7 +293,7 @@ mod tests {
             bridge_headers: Vec::new(),
             bridge_redeems: Vec::new(),
             proposer: 0,
-}
+        }
     }
 
     #[test]
@@ -323,7 +329,12 @@ mod tests {
             Vote::signed(2, 1, 0, bh, VoteType::Precommit, &kp(2)),
             Vote::signed(3, 1, 0, bh, VoteType::Precommit, &kp(4)), // forged
         ];
-        let commit = Commit { height: 1, round: 0, block_hash: bh, precommits: std::mem::take(&mut votes) };
+        let commit = Commit {
+            height: 1,
+            round: 0,
+            block_hash: bh,
+            precommits: std::mem::take(&mut votes),
+        };
         assert_eq!(commit.verify(&vs), Err(ConsensusError::BadSignature(3)));
     }
 
@@ -343,7 +354,10 @@ mod tests {
                 Vote::signed(2, 1, 0, bh, VoteType::Precommit, &kp(2)),
             ],
         };
-        assert_eq!(commit.verify(&vs), Err(ConsensusError::DuplicateValidator(1)));
+        assert_eq!(
+            commit.verify(&vs),
+            Err(ConsensusError::DuplicateValidator(1))
+        );
     }
 
     #[test]

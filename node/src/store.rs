@@ -57,7 +57,9 @@ fn read_records(path: &Path) -> io::Result<Vec<Vec<u8>>> {
         }
         let len = u32::from_be_bytes(buf[pos..pos + 4].try_into().unwrap()) as usize;
         pos += 4;
-        let end = pos.checked_add(len).ok_or_else(|| torn("length overflow"))?;
+        let end = pos
+            .checked_add(len)
+            .ok_or_else(|| torn("length overflow"))?;
         if end > buf.len() {
             return Err(torn("truncated record"));
         }
@@ -173,13 +175,17 @@ mod tests {
                 embedding: emb,
                 domain: height as u32,
                 stake: 2 * MICRO,
-                reviews: vec![Review { reviewer: 10, score: 0.9 }],
+                reviews: vec![Review {
+                    reviewer: 10,
+                    score: 0.9,
+                }],
                 repl_success: 3,
                 repl_total: 3,
                 timestamp_days: height as f32,
                 signature: [7u8; 64],
-                fee: 0, nonce: 0,
-}],
+                fee: 0,
+                nonce: 0,
+            }],
             validator_updates: Vec::new(),
             stake_ops: Vec::new(),
             slashing_evidence: Vec::new(),
@@ -187,7 +193,7 @@ mod tests {
             bridge_headers: Vec::new(),
             bridge_redeems: Vec::new(),
             proposer: 0,
-}
+        }
     }
 
     #[test]

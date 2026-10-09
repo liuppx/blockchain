@@ -664,9 +664,9 @@ pub struct ChainState {
 /// Genesis configuration.
 #[derive(Clone)]
 pub struct Genesis {
-    pub accounts: Vec<(u64, u64, PubKey)>,  // (id, endowment micro-$COG, pubkey)
-    pub reviewers: Vec<(u64, f32)>,         // (id, initial reputation)
-    pub seed_nodes: Vec<(Embedding, u32)>,  // pre-existing graph nodes
+    pub accounts: Vec<(u64, u64, PubKey)>, // (id, endowment micro-$COG, pubkey)
+    pub reviewers: Vec<(u64, f32)>,        // (id, initial reputation)
+    pub seed_nodes: Vec<(Embedding, u32)>, // pre-existing graph nodes
     pub params: DeltaKParams,
     pub base_emission_micro: u64,
     pub slash_bps: u32,
@@ -688,15 +688,29 @@ pub struct Genesis {
 
 #[derive(Clone, Debug)]
 pub enum ChainError {
-    BadHeight { expected: u64, got: u64 },
+    BadHeight {
+        expected: u64,
+        got: u64,
+    },
     BadPrevHash,
     UnknownAccount(u64),
     UnknownReviewer(u64),
-    InsufficientBalance { account: u64, need: u64, have: u64 },
+    InsufficientBalance {
+        account: u64,
+        need: u64,
+        have: u64,
+    },
     /// M122: the tx's `nonce` did not equal the account's current sequence number
     /// (replay, gap, or out-of-order submission).
-    BadNonce { account: u64, expected: u64, got: u64 },
-    BadScore { reviewer: u64, score: f32 },
+    BadNonce {
+        account: u64,
+        expected: u64,
+        got: u64,
+    },
+    BadScore {
+        reviewer: u64,
+        score: f32,
+    },
     EmptyReviews(u64),
     BadSignature(u64),
     /// A block's validator updates would leave the set empty — consensus would
@@ -705,7 +719,11 @@ pub enum ChainError {
     /// A bond/unbond op with a zero amount (never meaningful).
     ZeroStake(u64),
     /// An unbond of more than the account currently has bonded.
-    InsufficientBond { account: u64, need: u64, have: u64 },
+    InsufficientBond {
+        account: u64,
+        need: u64,
+        have: u64,
+    },
     /// Slashing evidence is malformed, against a non-validator, or carries an
     /// invalid signature. The block is rejected; the offending validator id is
     /// returned for diagnostics.
@@ -713,30 +731,40 @@ pub enum ChainError {
     /// The block's `next_validators_root` does not commit to the validator set
     /// this block hands off to (the set that certifies the next height). Either a
     /// producer sealed the wrong root or the block was tampered with.
-    ValidatorRootMismatch { height: u64 },
+    ValidatorRootMismatch {
+        height: u64,
+    },
     /// M23: the block's `state_root` does not equal the post-apply flat digest
     /// of the full consensus state. The cert-signed header commits to this
     /// root, so a mismatch means the producer sealed the wrong value (or a
     /// peer tampered with the field).
-    StateRootMismatch { height: u64 },
+    StateRootMismatch {
+        height: u64,
+    },
     /// M23: the block's `accounts_root` does not equal the post-apply Merkle
     /// root of (accounts ∪ reviewers). The cert-signed header commits to this
     /// root, so a mismatch means the producer sealed the wrong value (or a
     /// peer tampered with the field) — a wallet's account-inclusion proofs
     /// would not verify against the wrong root.
-    AccountsRootMismatch { height: u64 },
+    AccountsRootMismatch {
+        height: u64,
+    },
     /// M27: the block's `graph_root` does not equal the post-apply Merkle
     /// root of the cognitive-graph nodes sorted by cosine against the
     /// canonical pivot. Cert-signed via `header.graph_root`, this is the
     /// commitment a wallet opens the sorted graph view against for M27
     /// range claims — same root mismatch reasoning as `AccountsRootMismatch`.
-    GraphRootMismatch { height: u64 },
+    GraphRootMismatch {
+        height: u64,
+    },
     /// M30: the block's `bridge_root` does not equal the post-apply Merkle
     /// root of the cumulative `bridge_locks` map sorted by `lock_id`.
     /// Cert-signed via `header.bridge_root`, this is the commitment a
     /// destination chain's bridge endpoint opens a single lock against — same
     /// root-mismatch reasoning as `AccountsRootMismatch` / `GraphRootMismatch`.
-    BridgeRootMismatch { height: u64 },
+    BridgeRootMismatch {
+        height: u64,
+    },
     /// M31: a `BridgeHeader` / `BridgeRedeem` op named a source chain
     /// (`source_chain`) that this chain did not declare in
     /// [`Genesis::bridge_sources`]. The trust root is missing — the chain
@@ -747,48 +775,74 @@ pub enum ChainError {
     /// follower's tracked head (either wrong height or wrong prev_hash).
     /// The follower's height+1 / prev-chains-to-head check failed; either
     /// the relayer skipped a height or replayed an old one.
-    BridgeBadFollow { source: Hash, height: u64 },
+    BridgeBadFollow {
+        source: Hash,
+        height: u64,
+    },
     /// M31: cert-binding failed for a `BridgeHeader` or `BridgeRedeem`
     /// op. The cert is not a valid > 2/3 quorum of the tracked source
     /// set, or it does not bind the supplied header's hash. The relayer
     /// cannot forge past this — it's the same cert-binding check the
     /// off-chain `bridge::BridgeEndpoint` uses (M22/M30), just now run
     /// inside `apply_block`.
-    BridgeCertInvalid { source: Hash, height: u64 },
+    BridgeCertInvalid {
+        source: Hash,
+        height: u64,
+    },
     /// M31: a `BridgeHeader`'s `next_set` does not commit to the
     /// source header's `next_validators_root` (or is empty). The producer
     /// shipped a next set the header doesn't actually certify — a
     /// tampering or seal error. Mirrors the validator-root mismatch
     /// check on the destination side.
-    BridgeNextSetMismatch { source: Hash, height: u64 },
+    BridgeNextSetMismatch {
+        source: Hash,
+        height: u64,
+    },
     /// M31: a `BridgeRedeem` referenced a source header at a height
     /// the on-chain follower has not reached yet. The follower must
     /// advance via a `BridgeHeader` first; minting against an un-followed
     /// header is rejected.
-    BridgeSourceNotFollowed { source: Hash, height: u64 },
+    BridgeSourceNotFollowed {
+        source: Hash,
+        height: u64,
+    },
     /// M31: a `BridgeRedeem`'s Merkle proof did not open
     /// `lock.merkle_leaf(lock_id)` against `source_header.bridge_root`.
     /// Either the lock bytes were tampered with, the lock_id was
     /// changed, or the proof itself is forged.
-    BridgeInclusionInvalid { source: Hash, lock_id: u64 },
+    BridgeInclusionInvalid {
+        source: Hash,
+        lock_id: u64,
+    },
     /// M31: a `BridgeRedeem`'s `lock.dest_chain` is not this chain's
     /// `genesis_hash`. A lock destined for a *different* chain must not
     /// mint supply here.
-    BridgeWrongDestination { expected: Hash, got: Hash },
+    BridgeWrongDestination {
+        expected: Hash,
+        got: Hash,
+    },
     /// M31: a `BridgeRedeem` named a `(source_chain, lock_id)` already
     /// in `BridgeSource::consumed` — replay rejected. Same discipline as
     /// M30's `BridgeError::AlreadyConsumed`, just on the consensus path.
-    BridgeAlreadyRedeemed { source: Hash, lock_id: u64 },
+    BridgeAlreadyRedeemed {
+        source: Hash,
+        lock_id: u64,
+    },
     /// M54: the pending mempool is at its configured capacity bound, so a new
     /// transaction cannot be admitted. A node-local resource condition (not a
     /// consensus-validity error) — the submitter should retry later.
-    MempoolFull { capacity: usize },
+    MempoolFull {
+        capacity: usize,
+    },
     /// M57: `author` already holds the configured per-account pending-tx limit, so
     /// a new transaction from them cannot be admitted. Like `MempoolFull`, a
     /// node-local admission backpressure condition (not a consensus-validity
     /// error) — the submitter should wait for their pending txs to be included,
     /// then retry.
-    AccountQuotaFull { author: u64, limit: usize },
+    AccountQuotaFull {
+        author: u64,
+        limit: usize,
+    },
 }
 
 impl std::fmt::Display for ChainError {
@@ -1362,7 +1416,11 @@ impl ChainState {
             .accounts
             .get(&op.account)
             .ok_or(ChainError::UnknownAccount(op.account))?;
-        if !crypto::verify(&acct.pubkey, &codec::stakeop_signing_bytes(op), &op.signature) {
+        if !crypto::verify(
+            &acct.pubkey,
+            &codec::stakeop_signing_bytes(op),
+            &op.signature,
+        ) {
             return Err(ChainError::BadSignature(op.account));
         }
         if op.amount == 0 {
@@ -1544,20 +1602,15 @@ impl ChainState {
         }
         // 3. cert-binding against the *currently tracked* source set (NOT
         //    the op's own set — a relayer cannot substitute one).
-        ValidatorTracker::verify_state_root_against_header(
-            &op.header,
-            &op.cert,
-            &s.set,
-        )
-        .map_err(|_| ChainError::BridgeCertInvalid {
-            source: op.source_chain,
-            height: op.header.height,
-        })?;
+        ValidatorTracker::verify_state_root_against_header(&op.header, &op.cert, &s.set).map_err(
+            |_| ChainError::BridgeCertInvalid {
+                source: op.source_chain,
+                height: op.header.height,
+            },
+        )?;
         // 4. next_set root check (mirrors the destination-side check in
         //    `ValidatorTracker::follow_header`).
-        if op.next_set.is_empty()
-            || op.next_set.merkle_root() != op.header.next_validators_root
-        {
+        if op.next_set.is_empty() || op.next_set.merkle_root() != op.header.next_validators_root {
             return Err(ChainError::BridgeNextSetMismatch {
                 source: op.source_chain,
                 height: op.header.height,
@@ -1644,7 +1697,10 @@ impl ChainState {
         //    BOTH `accounts[dest].balance` and `supply` by the same amount,
         //    preserving `supply_conserved()`; `bridge_minted` is the
         //    audit counter mirroring `bridge_locked`.
-        self.accounts.get_mut(&op.lock.dest_account).unwrap().balance += op.lock.amount;
+        self.accounts
+            .get_mut(&op.lock.dest_account)
+            .unwrap()
+            .balance += op.lock.amount;
         self.supply += op.lock.amount;
         self.bridge_minted += op.lock.amount;
         self.bridge_sources
@@ -1790,7 +1846,11 @@ impl ChainState {
         for r in reviews {
             if let Some(rep) = self.reviewers.get_mut(&r.reviewer) {
                 let delta = if accepted {
-                    if r.score > 0.6 { 0.02 } else { -0.005 }
+                    if r.score > 0.6 {
+                        0.02
+                    } else {
+                        -0.005
+                    }
                 } else if r.score > 0.6 {
                     -0.03
                 } else {
@@ -1927,14 +1987,18 @@ impl ChainState {
     /// M24 accounts∪reviewers coverage).
     fn merkle_leaves(&self) -> Vec<Hash> {
         let n_graph = self.graph.nodes.len();
-        let mut leaves = Vec::with_capacity(
-            self.accounts.len() + self.reviewers.len() + n_graph,
-        );
+        let mut leaves = Vec::with_capacity(self.accounts.len() + self.reviewers.len() + n_graph);
         for (id, a) in &self.accounts {
             leaves.push(merkle::leaf_hash(&a.merkle_leaf(*id)));
         }
         for (id, rep) in &self.reviewers {
-            leaves.push(merkle::leaf_hash(&Reviewer { id: *id, reputation: *rep }.merkle_leaf()));
+            leaves.push(merkle::leaf_hash(
+                &Reviewer {
+                    id: *id,
+                    reputation: *rep,
+                }
+                .merkle_leaf(),
+            ));
         }
         for n in &self.graph.nodes {
             leaves.push(merkle::leaf_hash(&n.merkle_leaf()));
@@ -1959,7 +2023,9 @@ impl ChainState {
     /// order — so the proof path is `n_accounts + n_reviewers + idx`.
     /// `None` if `idx >= self.graph.nodes.len()`.
     pub fn graph_node_proof(&self, idx: usize) -> Option<merkle::Proof> {
-        if idx >= self.graph.nodes.len() { return None; }
+        if idx >= self.graph.nodes.len() {
+            return None;
+        }
         let offset = self.accounts.len() + self.reviewers.len();
         merkle::MerkleTree::from_leaf_hashes(self.merkle_leaves()).proof(offset + idx)
     }
@@ -1989,15 +2055,14 @@ impl ChainState {
     /// (node_id, GraphNode, merkle::Proof))` for the leaves in that range
     /// (in the same sorted order used by `graph_merkle_root`). `None` if
     /// `b > n` or `a > b` or `a == b` (empty slice).
-    pub fn graph_range_proof(
-        &self,
-        a: usize,
-        b: usize,
-    ) -> Option<RangeProof> {
+    pub fn graph_range_proof(&self, a: usize, b: usize) -> Option<RangeProof> {
         let n = self.graph.nodes.len();
-        if a > b || b > n || a == b { return None; }
+        if a > b || b > n || a == b {
+            return None;
+        }
         let sorted = self.graph_sorted_nodes();
-        let leaves: Vec<Hash> = sorted.iter()
+        let leaves: Vec<Hash> = sorted
+            .iter()
             .map(|n| merkle::leaf_hash(&n.merkle_leaf()))
             .collect();
         let tree = merkle::MerkleTree::from_leaf_hashes(leaves);
@@ -2007,7 +2072,10 @@ impl ChainState {
             let proof = tree.proof(i)?;
             entries.push((node.node_id, node.clone(), proof));
         }
-        Some(RangeProof { sub_root: tree.root(), entries })
+        Some(RangeProof {
+            sub_root: tree.root(),
+            entries,
+        })
     }
 
     /// Internal: graph nodes sorted by `(cos_sim(CANONICAL_PIVOT, *) desc,
@@ -2021,7 +2089,8 @@ impl ChainState {
             let sa = crate::engine::cos_sim(&CANONICAL_PIVOT, &a.embedding);
             let sb = crate::engine::cos_sim(&CANONICAL_PIVOT, &b.embedding);
             // Descending cosine; ties broken by `node_id` ascending.
-            sb.partial_cmp(&sa).unwrap_or(std::cmp::Ordering::Equal)
+            sb.partial_cmp(&sa)
+                .unwrap_or(std::cmp::Ordering::Equal)
                 .then(a.node_id.cmp(&b.node_id))
         });
         sorted
@@ -2030,7 +2099,8 @@ impl ChainState {
     /// Internal: preimage leaves for `graph_sorted_nodes`. Mirrors
     /// `merkle_leaves`'s third slice but in sorted order.
     fn graph_sorted_leaves(&self) -> Vec<Hash> {
-        self.graph_sorted_nodes().iter()
+        self.graph_sorted_nodes()
+            .iter()
             .map(|n| merkle::leaf_hash(&n.merkle_leaf()))
             .collect()
     }
@@ -2042,7 +2112,9 @@ impl ChainState {
     /// (cumulative state, separate from `accounts_root`), but ordered by
     /// `lock_id` instead of cosine — locks have no embeddings.
     pub fn bridge_merkle_root(&self) -> Hash {
-        let leaves: Vec<Hash> = self.bridge_locks.iter()
+        let leaves: Vec<Hash> = self
+            .bridge_locks
+            .iter()
             .map(|(id, lock)| merkle::leaf_hash(&lock.merkle_leaf(*id)))
             .collect();
         merkle::MerkleTree::from_leaf_hashes(leaves).root()
@@ -2054,7 +2126,9 @@ impl ChainState {
     pub fn bridge_lock_proof(&self, lock_id: u64) -> Option<merkle::Proof> {
         let ids: Vec<u64> = self.bridge_locks.keys().copied().collect();
         let index = ids.iter().position(|&k| k == lock_id)?;
-        let leaves: Vec<Hash> = self.bridge_locks.iter()
+        let leaves: Vec<Hash> = self
+            .bridge_locks
+            .iter()
             .map(|(id, lock)| merkle::leaf_hash(&lock.merkle_leaf(*id)))
             .collect();
         merkle::MerkleTree::from_leaf_hashes(leaves).proof(index)
@@ -2093,8 +2167,7 @@ impl ChainState {
 
         // `added` ⊆ [prev_n, new_n). With the append-only invariant every
         // node at insertion index >= prev_n is new.
-        let mut added: Vec<GraphLeafAtHeight> =
-            Vec::with_capacity(new_n.saturating_sub(prev_n));
+        let mut added: Vec<GraphLeafAtHeight> = Vec::with_capacity(new_n.saturating_sub(prev_n));
         for idx in prev_n..new_n {
             let node = self.graph.nodes[idx].clone();
             let proof = self
@@ -2135,7 +2208,11 @@ impl ChainState {
         let unbonding: u128 = self.unbonding.iter().map(|u| u.amount as u128).sum();
         // M30: locked-in-bridge pool is part of `supply` (a redistribution
         // within supply — the source balance dropped by the same amount).
-        let held: u128 = self.accounts.values().map(|a| a.balance as u128).sum::<u128>()
+        let held: u128 = self
+            .accounts
+            .values()
+            .map(|a| a.balance as u128)
+            .sum::<u128>()
             + self.treasury as u128
             + self.bonded as u128
             + self.bridge_locked as u128
@@ -2377,9 +2454,18 @@ mod tests {
 
     fn good_reviews() -> Vec<Review> {
         vec![
-            Review { reviewer: 10, score: 0.9 },
-            Review { reviewer: 11, score: 0.85 },
-            Review { reviewer: 12, score: 0.9 },
+            Review {
+                reviewer: 10,
+                score: 0.9,
+            },
+            Review {
+                reviewer: 11,
+                score: 0.85,
+            },
+            Review {
+                reviewer: 12,
+                score: 0.9,
+            },
         ]
     }
 
@@ -2388,7 +2474,14 @@ mod tests {
     }
 
     /// M122: fee/nonce-explicit variant for the wire-v1 tests.
-    fn novel_tx_full(author: u64, domain: u32, dim: usize, day: f32, fee: u64, nonce: u64) -> SubmissionTx {
+    fn novel_tx_full(
+        author: u64,
+        domain: u32,
+        dim: usize,
+        day: f32,
+        fee: u64,
+        nonce: u64,
+    ) -> SubmissionTx {
         SubmissionTx {
             author,
             embedding: unit(1.0, dim),
@@ -2457,8 +2550,9 @@ mod tests {
             repl_total: 3,
             timestamp_days: 1.0,
             signature: [0u8; 64],
-            fee: 0, nonce: 0,
-}
+            fee: 0,
+            nonce: 0,
+        }
         .signed(&kp(1));
         let mut b = block(&chain, 1, vec![dup]);
         let r = chain.commit(&mut b).unwrap();
@@ -2543,7 +2637,10 @@ mod tests {
         }
         .signed(&kp(2));
         let mut b = block(&chain, 1, vec![forged]);
-        assert!(matches!(chain.commit(&mut b), Err(ChainError::BadSignature(1))));
+        assert!(matches!(
+            chain.commit(&mut b),
+            Err(ChainError::BadSignature(1))
+        ));
     }
 
     #[test]
@@ -2552,7 +2649,10 @@ mod tests {
         let mut tx = novel_tx(1, 1, 1, 1.0); // validly signed
         tx.stake += 1; // mutate after signing -> signature no longer matches
         let mut b = block(&chain, 1, vec![tx]);
-        assert!(matches!(chain.commit(&mut b), Err(ChainError::BadSignature(1))));
+        assert!(matches!(
+            chain.commit(&mut b),
+            Err(ChainError::BadSignature(1))
+        ));
     }
 
     #[test]
@@ -2613,7 +2713,11 @@ mod tests {
     }
 
     fn vupd(id: u64, power: u64) -> ValidatorUpdate {
-        ValidatorUpdate { id, pubkey: kp(id).public(), power }
+        ValidatorUpdate {
+            id,
+            pubkey: kp(id).public(),
+            power,
+        }
     }
 
     #[test]
@@ -2645,7 +2749,11 @@ mod tests {
             .iter()
             .map(|v| v.id)
             .collect();
-        assert_eq!(ids, vec![21, 22, 23, 24], "set grew after the block committed");
+        assert_eq!(
+            ids,
+            vec![21, 22, 23, 24],
+            "set grew after the block committed"
+        );
         assert_eq!(chain.state.validators.total_power(), 4);
     }
 
@@ -2686,7 +2794,13 @@ mod tests {
 
     /// Build a block carrying a single signed bond/unbond op (no txs).
     fn stake_block(chain: &Chain, height: u64, account: u64, kind: BondKind, amount: u64) -> Block {
-        let op = StakeOp { account, kind, amount, signature: [0u8; 64] }.signed(&kp(account));
+        let op = StakeOp {
+            account,
+            kind,
+            amount,
+            signature: [0u8; 64],
+        }
+        .signed(&kp(account));
         let mut b = block(chain, height, vec![]);
         b.stake_ops = vec![op];
         // re-seal: block() sealed for an empty block; the appended op changes the
@@ -2707,14 +2821,18 @@ mod tests {
         assert_eq!(chain.state.bonded, 5 * MICRO);
         assert_eq!(chain.state.bonds.get(&1), Some(&(5 * MICRO)));
         // account 1 is now a validator whose power == its bonded stake
-        assert_eq!(chain.state.validators.get(1).map(|v| v.power), Some(5 * MICRO));
+        assert_eq!(
+            chain.state.validators.get(1).map(|v| v.power),
+            Some(5 * MICRO)
+        );
         assert!(chain.state.supply_conserved());
     }
 
     #[test]
     fn unbond_schedules_a_delayed_withdrawal_that_matures() {
         let mut chain = Chain::new(base_genesis());
-        let mut b = stake_block(&chain, 1, 1, BondKind::Bond, 5 * MICRO); chain.commit(&mut b).unwrap();
+        let mut b = stake_block(&chain, 1, 1, BondKind::Bond, 5 * MICRO);
+        chain.commit(&mut b).unwrap();
         let bal_after_bond = chain.state.accounts[&1].balance;
 
         // unbond at height 2: power drops immediately (next height), funds locked
@@ -2722,8 +2840,14 @@ mod tests {
         let r = chain.commit(&mut b).unwrap();
         assert_eq!(r.unbonded, 5 * MICRO);
         assert_eq!(chain.state.bonded, 0);
-        assert!(chain.state.validators.get(1).is_none(), "validator removed at power 0");
-        assert_eq!(chain.state.accounts[&1].balance, bal_after_bond, "funds still locked");
+        assert!(
+            chain.state.validators.get(1).is_none(),
+            "validator removed at power 0"
+        );
+        assert_eq!(
+            chain.state.accounts[&1].balance, bal_after_bond,
+            "funds still locked"
+        );
         assert_eq!(chain.state.unbonding.len(), 1);
         assert_eq!(chain.state.unbonding[0].mature_height, 2 + UNBONDING_PERIOD);
         assert!(chain.state.supply_conserved());
@@ -2735,7 +2859,11 @@ mod tests {
             chain.commit(&mut b).unwrap();
         }
         assert!(chain.state.unbonding.is_empty(), "matured out of the queue");
-        assert_eq!(chain.state.accounts[&1].balance, bal_after_bond + 5 * MICRO, "funds returned");
+        assert_eq!(
+            chain.state.accounts[&1].balance,
+            bal_after_bond + 5 * MICRO,
+            "funds returned"
+        );
         assert!(chain.state.supply_conserved());
     }
 
@@ -2743,7 +2871,10 @@ mod tests {
     fn bond_beyond_balance_is_rejected() {
         let mut chain = Chain::new(base_genesis());
         let mut b = stake_block(&chain, 1, 1, BondKind::Bond, 1000 * MICRO);
-        assert!(matches!(chain.commit(&mut b), Err(ChainError::InsufficientBalance { .. })));
+        assert!(matches!(
+            chain.commit(&mut b),
+            Err(ChainError::InsufficientBalance { .. })
+        ));
         assert_eq!(chain.state.height, 0, "rejected block rolls fully back");
         assert!(chain.state.bonds.is_empty());
         assert_eq!(chain.state.bonded, 0);
@@ -2753,7 +2884,10 @@ mod tests {
     fn unbond_beyond_bond_is_rejected() {
         let mut chain = Chain::new(base_genesis());
         let mut b = stake_block(&chain, 1, 1, BondKind::Unbond, MICRO);
-        assert!(matches!(chain.commit(&mut b), Err(ChainError::InsufficientBond { .. })));
+        assert!(matches!(
+            chain.commit(&mut b),
+            Err(ChainError::InsufficientBond { .. })
+        ));
         assert_eq!(chain.state.height, 0);
     }
 
@@ -2761,11 +2895,19 @@ mod tests {
     fn forged_stakeop_is_rejected() {
         let mut chain = Chain::new(base_genesis());
         // account 1's bond signed by account 2's key
-        let op = StakeOp { account: 1, kind: BondKind::Bond, amount: MICRO, signature: [0u8; 64] }
-            .signed(&kp(2));
+        let op = StakeOp {
+            account: 1,
+            kind: BondKind::Bond,
+            amount: MICRO,
+            signature: [0u8; 64],
+        }
+        .signed(&kp(2));
         let mut b = block(&chain, 1, vec![]);
         b.stake_ops = vec![op];
-        assert!(matches!(chain.commit(&mut b), Err(ChainError::BadSignature(1))));
+        assert!(matches!(
+            chain.commit(&mut b),
+            Err(ChainError::BadSignature(1))
+        ));
         assert_eq!(chain.state.height, 0);
     }
 
@@ -2773,7 +2915,10 @@ mod tests {
     fn zero_amount_stakeop_is_rejected() {
         let mut chain = Chain::new(base_genesis());
         let mut b = stake_block(&chain, 1, 1, BondKind::Bond, 0);
-        assert!(matches!(chain.commit(&mut b), Err(ChainError::ZeroStake(1))));
+        assert!(matches!(
+            chain.commit(&mut b),
+            Err(ChainError::ZeroStake(1))
+        ));
     }
 
     #[test]
@@ -2783,7 +2928,13 @@ mod tests {
         let mut plain_b = block(&plain, 1, vec![novel_tx(1, 1, 1, 1.0)]);
         plain.commit(&mut plain_b).unwrap();
         let mut b = block(&bonded, 1, vec![novel_tx(1, 1, 1, 1.0)]);
-        b.stake_ops = vec![StakeOp { account: 2, kind: BondKind::Bond, amount: 3 * MICRO, signature: [0u8; 64] }.signed(&kp(2))];
+        b.stake_ops = vec![StakeOp {
+            account: 2,
+            kind: BondKind::Bond,
+            amount: 3 * MICRO,
+            signature: [0u8; 64],
+        }
+        .signed(&kp(2))];
         bonded.seal(&mut b).unwrap();
         bonded.commit(&mut b).unwrap();
         assert_ne!(plain.state.state_root(), bonded.state.state_root());
@@ -2793,9 +2944,11 @@ mod tests {
     fn a_full_bond_unbond_cycle_conserves_supply() {
         let mut chain = Chain::new(base_genesis());
         let start = chain.state.supply;
-        let mut b = stake_block(&chain, 1, 1, BondKind::Bond, 7 * MICRO); chain.commit(&mut b).unwrap();
+        let mut b = stake_block(&chain, 1, 1, BondKind::Bond, 7 * MICRO);
+        chain.commit(&mut b).unwrap();
         assert!(chain.state.supply_conserved());
-        let mut b = stake_block(&chain, 2, 1, BondKind::Unbond, 4 * MICRO); chain.commit(&mut b).unwrap();
+        let mut b = stake_block(&chain, 2, 1, BondKind::Unbond, 4 * MICRO);
+        chain.commit(&mut b).unwrap();
         assert!(chain.state.supply_conserved());
         // still bonded 3, unbonding 4, balance rest — supply unchanged throughout
         assert_eq!(chain.state.bonded, 3 * MICRO);
@@ -2809,8 +2962,22 @@ mod tests {
     /// correctly signed by that validator's own key — valid double-sign evidence.
     fn evidence(offender: u64, height: u64, round: u32) -> SlashEvidence {
         SlashEvidence {
-            vote_a: Vote::signed(offender, height, round, [1u8; 32], VoteType::Precommit, &kp(offender)),
-            vote_b: Vote::signed(offender, height, round, [2u8; 32], VoteType::Precommit, &kp(offender)),
+            vote_a: Vote::signed(
+                offender,
+                height,
+                round,
+                [1u8; 32],
+                VoteType::Precommit,
+                &kp(offender),
+            ),
+            vote_b: Vote::signed(
+                offender,
+                height,
+                round,
+                [2u8; 32],
+                VoteType::Precommit,
+                &kp(offender),
+            ),
         }
     }
 
@@ -2829,16 +2996,28 @@ mod tests {
         let mut chain = Chain::new(base_genesis());
         let start = chain.state.supply;
         // account 1 self-bonds and becomes a validator effective height 2
-        let mut b = stake_block(&chain, 1, 1, BondKind::Bond, 5 * MICRO); chain.commit(&mut b).unwrap();
-        assert_eq!(chain.state.validators.get(1).map(|v| v.power), Some(5 * MICRO));
+        let mut b = stake_block(&chain, 1, 1, BondKind::Bond, 5 * MICRO);
+        chain.commit(&mut b).unwrap();
+        assert_eq!(
+            chain.state.validators.get(1).map(|v| v.power),
+            Some(5 * MICRO)
+        );
 
         // at height 2 the validator is active — submit proof it double-signed
-        let mut eb = evidence_block(&chain, 2, vec![evidence(1, 2, 0)]); let r = chain.commit(&mut eb).unwrap();
+        let mut eb = evidence_block(&chain, 2, vec![evidence(1, 2, 0)]);
+        let r = chain.commit(&mut eb).unwrap();
         assert_eq!(r.slashed_to_treasury, 5 * MICRO);
-        assert_eq!(chain.state.treasury, 5 * MICRO, "bonded stake seized to treasury");
+        assert_eq!(
+            chain.state.treasury,
+            5 * MICRO,
+            "bonded stake seized to treasury"
+        );
         assert_eq!(chain.state.bonded, 0);
         assert!(!chain.state.bonds.contains_key(&1));
-        assert!(chain.state.validators.get(1).is_none(), "offender removed from the set");
+        assert!(
+            chain.state.validators.get(1).is_none(),
+            "offender removed from the set"
+        );
         assert_eq!(chain.state.supply, start, "slash is supply-neutral");
         assert!(chain.state.supply_conserved());
     }
@@ -2848,17 +3027,30 @@ mod tests {
         let mut chain = Chain::new(base_genesis());
         // bond 6, partially unbond 2 (leaving power 4 so the validator stays active),
         // then slash: both the remaining bond and the still-maturing entry are seized.
-        let mut b = stake_block(&chain, 1, 1, BondKind::Bond, 6 * MICRO); chain.commit(&mut b).unwrap();
-        let mut b = stake_block(&chain, 2, 1, BondKind::Unbond, 2 * MICRO); chain.commit(&mut b).unwrap();
+        let mut b = stake_block(&chain, 1, 1, BondKind::Bond, 6 * MICRO);
+        chain.commit(&mut b).unwrap();
+        let mut b = stake_block(&chain, 2, 1, BondKind::Unbond, 2 * MICRO);
+        chain.commit(&mut b).unwrap();
         assert_eq!(chain.state.bonded, 4 * MICRO);
         assert_eq!(chain.state.unbonding.len(), 1);
-        assert_eq!(chain.state.validators.get(1).map(|v| v.power), Some(4 * MICRO));
+        assert_eq!(
+            chain.state.validators.get(1).map(|v| v.power),
+            Some(4 * MICRO)
+        );
 
-        let mut eb = evidence_block(&chain, 3, vec![evidence(1, 3, 0)]); let r = chain.commit(&mut eb).unwrap();
-        assert_eq!(r.slashed_to_treasury, 6 * MICRO, "bond + unbonding both seized");
+        let mut eb = evidence_block(&chain, 3, vec![evidence(1, 3, 0)]);
+        let r = chain.commit(&mut eb).unwrap();
+        assert_eq!(
+            r.slashed_to_treasury,
+            6 * MICRO,
+            "bond + unbonding both seized"
+        );
         assert_eq!(chain.state.treasury, 6 * MICRO);
         assert_eq!(chain.state.bonded, 0);
-        assert!(chain.state.unbonding.is_empty(), "maturing entry seized too");
+        assert!(
+            chain.state.unbonding.is_empty(),
+            "maturing entry seized too"
+        );
         assert!(chain.state.validators.get(1).is_none());
         assert!(chain.state.supply_conserved());
     }
@@ -2868,7 +3060,8 @@ mod tests {
         let mut chain = Chain::new(base_genesis());
         // genesis validator 21 has power but no bonded stake — slashing removes it
         // and moves nothing (still supply-neutral).
-        let mut eb = evidence_block(&chain, 1, vec![evidence(21, 1, 0)]); let r = chain.commit(&mut eb).unwrap();
+        let mut eb = evidence_block(&chain, 1, vec![evidence(21, 1, 0)]);
+        let r = chain.commit(&mut eb).unwrap();
         assert_eq!(r.slashed_to_treasury, 0);
         assert_eq!(chain.state.treasury, 0);
         assert!(chain.state.validators.get(21).is_none());
@@ -2885,7 +3078,10 @@ mod tests {
             vote_b: Vote::signed(21, 1, 0, [1u8; 32], VoteType::Precommit, &kp(21)),
         };
         let mut b = evidence_block(&chain, 1, vec![ev]);
-        assert!(matches!(chain.commit(&mut b), Err(ChainError::BadEquivocationEvidence(21))));
+        assert!(matches!(
+            chain.commit(&mut b),
+            Err(ChainError::BadEquivocationEvidence(21))
+        ));
         assert_eq!(chain.state.height, 0, "rejected block rolls fully back");
         assert_eq!(chain.state.validators.len(), 3);
     }
@@ -2895,7 +3091,10 @@ mod tests {
         let mut chain = Chain::new(base_genesis());
         // account 1 never bonded -> not in the validator set -> cannot be slashed
         let mut b = evidence_block(&chain, 1, vec![evidence(1, 1, 0)]);
-        assert!(matches!(chain.commit(&mut b), Err(ChainError::BadEquivocationEvidence(1))));
+        assert!(matches!(
+            chain.commit(&mut b),
+            Err(ChainError::BadEquivocationEvidence(1))
+        ));
         assert_eq!(chain.state.height, 0);
     }
 
@@ -2908,7 +3107,10 @@ mod tests {
             vote_b: Vote::signed(21, 1, 0, [2u8; 32], VoteType::Precommit, &kp(1)),
         };
         let mut b = evidence_block(&chain, 1, vec![ev]);
-        assert!(matches!(chain.commit(&mut b), Err(ChainError::BadEquivocationEvidence(21))));
+        assert!(matches!(
+            chain.commit(&mut b),
+            Err(ChainError::BadEquivocationEvidence(21))
+        ));
         assert_eq!(chain.state.height, 0);
     }
 
@@ -2922,7 +3124,10 @@ mod tests {
             1,
             vec![evidence(21, 1, 0), evidence(22, 1, 0), evidence(23, 1, 0)],
         );
-        assert!(matches!(chain.commit(&mut b), Err(ChainError::EmptyValidatorSet)));
+        assert!(matches!(
+            chain.commit(&mut b),
+            Err(ChainError::EmptyValidatorSet)
+        ));
         assert_eq!(chain.state.height, 0);
         assert_eq!(chain.state.validators.len(), 3);
     }
@@ -2964,7 +3169,7 @@ mod tests {
             bridge_headers: Vec::new(),
             bridge_redeems: Vec::new(),
             proposer: 0,
-};
+        };
         live.seal(&mut b2).unwrap();
         live.commit(&mut b2).unwrap();
         log.append(&b2).unwrap();
@@ -3007,7 +3212,10 @@ mod tests {
         // account 1 bonds -> becomes a validator next height. The sealed root must
         // equal the set the block actually hands off to.
         let mut b = stake_block(&chain, 1, 1, BondKind::Bond, 5 * MICRO);
-        assert_eq!(b.next_validators_root, chain.next_validators_root(&b).unwrap());
+        assert_eq!(
+            b.next_validators_root,
+            chain.next_validators_root(&b).unwrap()
+        );
         chain.commit(&mut b).unwrap();
         assert_eq!(chain.state.validators.merkle_root(), b.next_validators_root);
         // and validator 1 is provable against that committed root.
@@ -3024,14 +3232,20 @@ mod tests {
         let mut chain = Chain::new(base_genesis());
         let mut b = block(&chain, 1, vec![]); // sealed for no-change
         let root_for_empty = b.next_validators_root;
-        b.stake_ops = vec![
-            StakeOp { account: 1, kind: BondKind::Bond, amount: 5 * MICRO, signature: [0u8; 64] }
-                .signed(&kp(1)),
-        ];
+        b.stake_ops = vec![StakeOp {
+            account: 1,
+            kind: BondKind::Bond,
+            amount: 5 * MICRO,
+            signature: [0u8; 64],
+        }
+        .signed(&kp(1))];
         // the op admits validator 1, so the real handed-off root differs.
         assert_ne!(chain.next_validators_root(&b).unwrap(), root_for_empty);
         let err = chain.commit(&mut b).unwrap_err();
-        assert!(matches!(err, ChainError::ValidatorRootMismatch { .. }), "got {err:?}");
+        assert!(
+            matches!(err, ChainError::ValidatorRootMismatch { .. }),
+            "got {err:?}"
+        );
     }
 
     // ---- M23: state_root + accounts_root commitments in the header ----
@@ -3066,10 +3280,18 @@ mod tests {
             // (same genesis, same txs, same order — deterministic).
             let mut cloned = b.clone();
             replay.commit(&mut cloned).expect("replay");
-            assert_eq!(b.state_root, replay.state.state_root(),
-                "block {} state_root must equal post-apply state_root", b.height);
-            assert_eq!(b.accounts_root, replay.state.merkle_root(),
-                "block {} accounts_root must equal post-apply merkle_root", b.height);
+            assert_eq!(
+                b.state_root,
+                replay.state.state_root(),
+                "block {} state_root must equal post-apply state_root",
+                b.height
+            );
+            assert_eq!(
+                b.accounts_root,
+                replay.state.merkle_root(),
+                "block {} accounts_root must equal post-apply merkle_root",
+                b.height
+            );
         }
         // also assert that the roots differ across heights (the chain really moved)
         assert_ne!(blocks[0].state_root, blocks[1].state_root);
@@ -3087,7 +3309,10 @@ mod tests {
         let mut b = block(&chain, 1, vec![novel_tx(1, 1, 1, 1.0)]);
         b.state_root = [0xCCu8; 32];
         let err = chain.commit(&mut b).unwrap_err();
-        assert!(matches!(err, ChainError::StateRootMismatch { height: 1 }), "got {err:?}");
+        assert!(
+            matches!(err, ChainError::StateRootMismatch { height: 1 }),
+            "got {err:?}"
+        );
         assert_eq!(chain.state.height, 0, "rejected block rolls fully back");
     }
 
@@ -3099,7 +3324,10 @@ mod tests {
         let mut b = block(&chain, 1, vec![novel_tx(1, 1, 1, 1.0)]);
         b.accounts_root = [0xDDu8; 32];
         let err = chain.commit(&mut b).unwrap_err();
-        assert!(matches!(err, ChainError::AccountsRootMismatch { height: 1 }), "got {err:?}");
+        assert!(
+            matches!(err, ChainError::AccountsRootMismatch { height: 1 }),
+            "got {err:?}"
+        );
         assert_eq!(chain.state.height, 0, "rejected block rolls fully back");
     }
 
@@ -3114,7 +3342,10 @@ mod tests {
         let mut b = block(&chain, 1, vec![novel_tx(1, 1, 1, 1.0)]);
         b.graph_root = [0xEEu8; 32];
         let err = chain.commit(&mut b).unwrap_err();
-        assert!(matches!(err, ChainError::GraphRootMismatch { height: 1 }), "got {err:?}");
+        assert!(
+            matches!(err, ChainError::GraphRootMismatch { height: 1 }),
+            "got {err:?}"
+        );
         assert_eq!(chain.state.height, 0, "rejected block rolls fully back");
     }
 
@@ -3125,7 +3356,9 @@ mod tests {
         // determinism contract ever breaks the wallet's verifier cannot
         // re-derive the same root.
         let mut chain = Chain::new(base_genesis());
-        chain.commit(&mut block(&chain, 1, vec![novel_tx(1, 1, 1, 1.0)]).clone()).unwrap();
+        chain
+            .commit(&mut block(&chain, 1, vec![novel_tx(1, 1, 1, 1.0)]).clone())
+            .unwrap();
         let r1 = chain.state.graph_merkle_root();
         let r2 = chain.state.graph_merkle_root();
         assert_eq!(r1, r2);
@@ -3139,10 +3372,15 @@ mod tests {
         // not match the cosine order the two roots MUST differ — otherwise
         // the two commitments collapse and one of them is dead weight.
         let mut chain = Chain::new(base_genesis());
-        chain.commit(&mut block(&chain, 1, vec![novel_tx(1, 1, 1, 1.0)]).clone()).unwrap();
+        chain
+            .commit(&mut block(&chain, 1, vec![novel_tx(1, 1, 1, 1.0)]).clone())
+            .unwrap();
         let a = chain.state.merkle_root();
         let g = chain.state.graph_merkle_root();
-        assert_ne!(a, g, "different leaf orderings must produce different roots");
+        assert_ne!(
+            a, g,
+            "different leaf orderings must produce different roots"
+        );
     }
 
     #[test]
@@ -3151,7 +3389,9 @@ mod tests {
         // verify against `graph_merkle_root`; out-of-range slices return
         // `None`; an empty slice (`a == b`) returns `None`.
         let mut chain = Chain::new(base_genesis());
-        chain.commit(&mut block(&chain, 1, vec![novel_tx(1, 1, 1, 1.0)]).clone()).unwrap();
+        chain
+            .commit(&mut block(&chain, 1, vec![novel_tx(1, 1, 1, 1.0)]).clone())
+            .unwrap();
         let n = chain.state.graph.nodes.len();
         assert!(n >= 2, "genesis + 1 novel tx should give >= 2 graph nodes");
 
@@ -3160,8 +3400,10 @@ mod tests {
         assert_eq!(proof.sub_root, chain.state.graph_merkle_root());
         for (id, node, merkle_proof) in &proof.entries {
             let leaf_hash = crate::merkle::leaf_hash(&node.merkle_leaf());
-            assert!(crate::merkle::verify(&proof.sub_root, &leaf_hash, merkle_proof),
-                "per-leaf proof failed for node_id {id}");
+            assert!(
+                crate::merkle::verify(&proof.sub_root, &leaf_hash, merkle_proof),
+                "per-leaf proof failed for node_id {id}"
+            );
         }
 
         // Empty slice
@@ -3193,14 +3435,30 @@ mod tests {
         let chain = one_block_chain();
         for (&rid, &rep) in chain.state.reviewers.iter() {
             let proof = chain.state.reviewer_proof(rid).expect("proof exists");
-            let leaf = merkle::leaf_hash(&Reviewer { id: rid, reputation: rep }.merkle_leaf());
+            let leaf = merkle::leaf_hash(
+                &Reviewer {
+                    id: rid,
+                    reputation: rep,
+                }
+                .merkle_leaf(),
+            );
             assert!(
                 merkle::verify(&chain.state.merkle_root(), &leaf, &proof),
                 "reviewer {rid} proof does not verify"
             );
             // tamper with reputation: the leaf changes, verification must fail.
-            let bad_leaf = merkle::leaf_hash(&Reviewer { id: rid, reputation: rep + 0.1 }.merkle_leaf());
-            assert!(!merkle::verify(&chain.state.merkle_root(), &bad_leaf, &proof));
+            let bad_leaf = merkle::leaf_hash(
+                &Reviewer {
+                    id: rid,
+                    reputation: rep + 0.1,
+                }
+                .merkle_leaf(),
+            );
+            assert!(!merkle::verify(
+                &chain.state.merkle_root(),
+                &bad_leaf,
+                &proof
+            ));
         }
         assert!(chain.state.reviewer_proof(9_999).is_none());
     }
@@ -3225,9 +3483,8 @@ mod tests {
         );
         // First leaf is the smallest account id (account 1); the last leaf is
         // the largest reviewer id.
-        let first_account_leaf = merkle::leaf_hash(
-            &chain.state.accounts.get(&1).unwrap().merkle_leaf(1),
-        );
+        let first_account_leaf =
+            merkle::leaf_hash(&chain.state.accounts.get(&1).unwrap().merkle_leaf(1));
         let last_reviewer_leaf = merkle::leaf_hash(
             &Reviewer {
                 id: 12,
@@ -3235,14 +3492,31 @@ mod tests {
             }
             .merkle_leaf(),
         );
-        let pos_first = leaves.iter().position(|h| *h == first_account_leaf).expect("account 1 leaf");
-        let pos_last = leaves.iter().position(|h| *h == last_reviewer_leaf).expect("reviewer 12 leaf");
-        assert!(pos_first < pos_last, "account index {pos_first} should be < reviewer index {pos_last}");
+        let pos_first = leaves
+            .iter()
+            .position(|h| *h == first_account_leaf)
+            .expect("account 1 leaf");
+        let pos_last = leaves
+            .iter()
+            .position(|h| *h == last_reviewer_leaf)
+            .expect("reviewer 12 leaf");
+        assert!(
+            pos_first < pos_last,
+            "account index {pos_first} should be < reviewer index {pos_last}"
+        );
         // And both proofs verify against the shared root.
         let acct_proof = chain.state.account_proof(1).expect("account 1 proof");
         let rev_proof = chain.state.reviewer_proof(12).expect("reviewer 12 proof");
-        assert!(merkle::verify(&chain.state.merkle_root(), &first_account_leaf, &acct_proof));
-        assert!(merkle::verify(&chain.state.merkle_root(), &last_reviewer_leaf, &rev_proof));
+        assert!(merkle::verify(
+            &chain.state.merkle_root(),
+            &first_account_leaf,
+            &acct_proof
+        ));
+        assert!(merkle::verify(
+            &chain.state.merkle_root(),
+            &last_reviewer_leaf,
+            &rev_proof
+        ));
     }
 
     /// M25: every graph node in a multi-block chain has an inclusion proof
@@ -3308,7 +3582,10 @@ mod tests {
         );
 
         // And the producer's proof is a Merkle verify against the same root.
-        let proof = chain.state.graph_node_proof(0).expect("graph_node_proof(0)");
+        let proof = chain
+            .state
+            .graph_node_proof(0)
+            .expect("graph_node_proof(0)");
         assert!(merkle::verify(&chain.state.merkle_root(), &g_leaf, &proof));
     }
 
@@ -3343,11 +3620,13 @@ mod tests {
             "source balance should drop by lock amount"
         );
         assert_eq!(
-            chain.state.bridge_locked, 5 * MICRO,
+            chain.state.bridge_locked,
+            5 * MICRO,
             "bridge_locked pool should hold the locked amount"
         );
         assert_eq!(
-            chain.state.bridge_locks.len(), 1,
+            chain.state.bridge_locks.len(),
+            1,
             "exactly one lock in the cumulative map"
         );
         assert_eq!(
@@ -3487,11 +3766,8 @@ mod tests {
     fn seal_certify_commit(chain: &mut Chain, b: &mut Block) -> Commit {
         chain.seal(b).expect("seal");
         let set = chain.state.validators.clone();
-        let kps: BTreeMap<u64, Keypair> = set
-            .validators()
-            .iter()
-            .map(|v| (v.id, kp(v.id)))
-            .collect();
+        let kps: BTreeMap<u64, Keypair> =
+            set.validators().iter().map(|v| (v.id, kp(v.id))).collect();
         let voters: Vec<u64> = set.validators().iter().map(|v| v.id).collect();
         let cert = consensus::commit_block(&set, &kps, b, 0, &voters).expect("certify");
         chain.commit(b).expect("commit");
@@ -3502,10 +3778,7 @@ mod tests {
     /// `source_genesis_hash` as an allowed bridge source, anchored on
     /// `source_genesis_set`. Returns the live chain and B's own
     /// `genesis_hash` (which the source lock's `dest_chain` must equal).
-    fn dest_chain_b(
-        source_genesis_hash: Hash,
-        source_genesis_set: ValidatorSet,
-    ) -> (Chain, Hash) {
+    fn dest_chain_b(source_genesis_hash: Hash, source_genesis_set: ValidatorSet) -> (Chain, Hash) {
         let mut g = base_genesis();
         g.bridge_sources = vec![(
             source_genesis_hash,
@@ -3557,11 +3830,9 @@ mod tests {
         let ga = base_genesis();
         let (a_genesis_hash, a_genesis_set) = source_identity(&ga);
 
-        let (mut chain_b, b_genesis_hash) =
-            dest_chain_b(a_genesis_hash, a_genesis_set.clone());
+        let (mut chain_b, b_genesis_hash) = dest_chain_b(a_genesis_hash, a_genesis_set.clone());
 
-        let (a_block_1, a_cert_1, proof, lock) =
-            build_source_lock_envelope(b_genesis_hash);
+        let (a_block_1, a_cert_1, proof, lock) = build_source_lock_envelope(b_genesis_hash);
         let header_a1 = a_block_1.header();
 
         // Block on B at height 1: follow A's height 1 (next_set = a_genesis_set
@@ -3575,7 +3846,9 @@ mod tests {
         let mut b_b1 = block(&chain_b, 1, Vec::new());
         b_b1.bridge_headers.push(follow);
         chain_b.seal(&mut b_b1).unwrap();
-        chain_b.commit(&mut b_b1).expect("B height 1 follow commits");
+        chain_b
+            .commit(&mut b_b1)
+            .expect("B height 1 follow commits");
 
         // Block on B at height 2: redeem lock 0.
         let dest_before = chain_b.state.accounts.get(&5).unwrap().balance;
@@ -3591,7 +3864,9 @@ mod tests {
         let mut b_b2 = block(&chain_b, 2, Vec::new());
         b_b2.bridge_redeems.push(redeem);
         chain_b.seal(&mut b_b2).unwrap();
-        chain_b.commit(&mut b_b2).expect("B height 2 redeem commits");
+        chain_b
+            .commit(&mut b_b2)
+            .expect("B height 2 redeem commits");
 
         let amount = lock.amount;
         assert_eq!(
@@ -3709,12 +3984,10 @@ mod tests {
         let (a_genesis_hash, a_genesis_set) = source_identity(&ga);
 
         // B with A registered, follower still at height 0 (no follow yet).
-        let (mut chain_b, b_genesis_hash) =
-            dest_chain_b(a_genesis_hash, a_genesis_set.clone());
+        let (mut chain_b, b_genesis_hash) = dest_chain_b(a_genesis_hash, a_genesis_set.clone());
 
         // Build A's lock at height 1 (cert + proof).
-        let (a_block, cert, proof, lock) =
-            build_source_lock_envelope(b_genesis_hash);
+        let (a_block, cert, proof, lock) = build_source_lock_envelope(b_genesis_hash);
         // Try to redeem WITHOUT staging a BridgeHeader first.
         let redeem = BridgeRedeem {
             source_chain: a_genesis_hash,
@@ -3737,11 +4010,9 @@ mod tests {
         let ga = base_genesis();
         let (a_genesis_hash, a_genesis_set) = source_identity(&ga);
 
-        let (mut chain_b, b_genesis_hash) =
-            dest_chain_b(a_genesis_hash, a_genesis_set.clone());
+        let (mut chain_b, b_genesis_hash) = dest_chain_b(a_genesis_hash, a_genesis_set.clone());
 
-        let (a_block, cert, proof, lock) =
-            build_source_lock_envelope(b_genesis_hash);
+        let (a_block, cert, proof, lock) = build_source_lock_envelope(b_genesis_hash);
 
         // Follow A's height 1 first.
         let follow = BridgeHeader {
@@ -3780,11 +4051,9 @@ mod tests {
         let ga = base_genesis();
         let (a_genesis_hash, a_genesis_set) = source_identity(&ga);
 
-        let (mut chain_b, b_genesis_hash) =
-            dest_chain_b(a_genesis_hash, a_genesis_set.clone());
+        let (mut chain_b, b_genesis_hash) = dest_chain_b(a_genesis_hash, a_genesis_set.clone());
 
-        let (a_block, cert, proof, lock) =
-            build_source_lock_envelope(b_genesis_hash);
+        let (a_block, cert, proof, lock) = build_source_lock_envelope(b_genesis_hash);
 
         let follow = BridgeHeader {
             source_chain: a_genesis_hash,
@@ -3821,8 +4090,7 @@ mod tests {
         let (a_genesis_hash, a_genesis_set) = source_identity(&ga);
         let c_genesis_hash = [0xCC; 32];
 
-        let (mut chain_b, _) =
-            dest_chain_b(a_genesis_hash, a_genesis_set.clone());
+        let (mut chain_b, _) = dest_chain_b(a_genesis_hash, a_genesis_set.clone());
 
         // Build a lock on A destined for chain C, NOT B.
         let mut chain_a = Chain::new(ga);
@@ -3878,11 +4146,9 @@ mod tests {
         let ga = base_genesis();
         let (a_genesis_hash, a_genesis_set) = source_identity(&ga);
 
-        let (mut chain_b, b_genesis_hash) =
-            dest_chain_b(a_genesis_hash, a_genesis_set.clone());
+        let (mut chain_b, b_genesis_hash) = dest_chain_b(a_genesis_hash, a_genesis_set.clone());
 
-        let (a_block, cert, proof, lock) =
-            build_source_lock_envelope(b_genesis_hash);
+        let (a_block, cert, proof, lock) = build_source_lock_envelope(b_genesis_hash);
 
         let follow = BridgeHeader {
             source_chain: a_genesis_hash,
@@ -3932,11 +4198,9 @@ mod tests {
         let ga = base_genesis();
         let (a_genesis_hash, a_genesis_set) = source_identity(&ga);
 
-        let (mut chain_b, b_genesis_hash) =
-            dest_chain_b(a_genesis_hash, a_genesis_set.clone());
+        let (mut chain_b, b_genesis_hash) = dest_chain_b(a_genesis_hash, a_genesis_set.clone());
 
-        let (a_block, cert, proof, lock) =
-            build_source_lock_envelope(b_genesis_hash);
+        let (a_block, cert, proof, lock) = build_source_lock_envelope(b_genesis_hash);
 
         let root_initial = chain_b.state.state_root();
 
@@ -3992,10 +4256,7 @@ mod tests {
             "bridge_root must be stable across a no-op block",
         );
         // And the minted balance from the redeem survives the no-op block.
-        assert_eq!(
-            chain_b.state.accounts.get(&5).unwrap().balance,
-            10 * MICRO
-        );
+        assert_eq!(chain_b.state.accounts.get(&5).unwrap().balance, 10 * MICRO);
     }
 
     // ---- M122 (wire v1) targeted tests ----
@@ -4062,7 +4323,11 @@ mod tests {
             bridge_redeems: Vec::new(),
         };
         match chain.commit(&mut b2) {
-            Err(ChainError::BadNonce { account, expected, got }) => {
+            Err(ChainError::BadNonce {
+                account,
+                expected,
+                got,
+            }) => {
                 assert_eq!(account, 1);
                 assert_eq!(expected, 1);
                 assert_eq!(got, 2);
@@ -4088,9 +4353,12 @@ mod tests {
         use crate::mempool::Mempool;
         let mut chain = Chain::new(base_genesis());
         let mut mp = Mempool::new(16);
-        mp.insert(&chain, novel_tx_full(1, 1, 1, 1.0, MICRO, 0)).unwrap();
-        mp.insert(&chain, novel_tx_full(2, 2, 2, 1.0, 3 * MICRO, 0)).unwrap();
-        mp.insert(&chain, novel_tx_full(3, 3, 3, 1.0, 2 * MICRO, 0)).unwrap();
+        mp.insert(&chain, novel_tx_full(1, 1, 1, 1.0, MICRO, 0))
+            .unwrap();
+        mp.insert(&chain, novel_tx_full(2, 2, 2, 1.0, 3 * MICRO, 0))
+            .unwrap();
+        mp.insert(&chain, novel_tx_full(3, 3, 3, 1.0, 2 * MICRO, 0))
+            .unwrap();
         let mut blk = mp.build_block(&chain, 1.0).unwrap();
         blk.proposer = 21;
         chain.seal(&mut blk).unwrap();

@@ -257,9 +257,18 @@ mod tests {
 
     fn reviews() -> Vec<Review> {
         vec![
-            Review { reviewer: 10, score: 0.9 },
-            Review { reviewer: 11, score: 0.85 },
-            Review { reviewer: 12, score: 0.9 },
+            Review {
+                reviewer: 10,
+                score: 0.9,
+            },
+            Review {
+                reviewer: 11,
+                score: 0.85,
+            },
+            Review {
+                reviewer: 12,
+                score: 0.9,
+            },
         ]
     }
 
@@ -415,7 +424,10 @@ mod tests {
         assert!(mp.insert(&chain, tx(1, 2, 2, 2 * MICRO)).is_ok());
         assert!(matches!(
             mp.insert(&chain, tx(1, 3, 3, 2 * MICRO)),
-            Err(ChainError::AccountQuotaFull { author: 1, limit: 2 })
+            Err(ChainError::AccountQuotaFull {
+                author: 1,
+                limit: 2
+            })
         ));
         assert_eq!(mp.len(), 2);
         assert_eq!(mp.rejected_quota(), 1);
@@ -446,7 +458,10 @@ mod tests {
         assert_eq!(mp.len(), 1);
         assert!(matches!(
             mp.insert(&chain, tx(1, 2, 2, 2 * MICRO)),
-            Err(ChainError::AccountQuotaFull { author: 1, limit: 1 })
+            Err(ChainError::AccountQuotaFull {
+                author: 1,
+                limit: 1
+            })
         ));
     }
 

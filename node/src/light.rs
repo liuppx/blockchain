@@ -132,9 +132,11 @@ impl ProofEntry {
     pub fn leaf(&self) -> Vec<u8> {
         match self {
             ProofEntry::Account { id, account, .. } => account.merkle_leaf(*id),
-            ProofEntry::Reviewer { id, reputation, .. } => {
-                crate::Reviewer { id: *id, reputation: *reputation }.merkle_leaf()
+            ProofEntry::Reviewer { id, reputation, .. } => crate::Reviewer {
+                id: *id,
+                reputation: *reputation,
             }
+            .merkle_leaf(),
             ProofEntry::Validator { validator, .. } => validator.merkle_leaf(),
             ProofEntry::GraphNode { graph_node, .. } => graph_node.merkle_leaf(),
         }
@@ -229,10 +231,16 @@ pub enum BatchItem {
     Inclusion { kind: ProofKind, id: u64 },
     /// M26 kNN: top-`k` nearest neighbours of `query` at the
     /// cert-signed header's graph state.
-    Knn { query: crate::engine::Embedding, k: usize },
+    Knn {
+        query: crate::engine::Embedding,
+        k: usize,
+    },
     /// M27 range: nodes whose cosine similarity to `query` is at least
     /// `min_sim` at the cert-signed header's graph state.
-    Range { query: crate::engine::Embedding, min_sim: f32 },
+    Range {
+        query: crate::engine::Embedding,
+        min_sim: f32,
+    },
     /// M28 diff: graph nodes added/dropped between `h1` and `h2`.
     Diff { h1: u64, h2: u64 },
 }
@@ -421,10 +429,16 @@ impl std::fmt::Display for LightError {
                 write!(f, "light: bad height (expected {expected}, got {got})")
             }
             LightError::ForkDetected { height } => {
-                write!(f, "light: block at height {height} does not chain to tracked head")
+                write!(
+                    f,
+                    "light: block at height {height} does not chain to tracked head"
+                )
             }
             LightError::CertificateMismatch { height } => {
-                write!(f, "light: certificate does not match block at height {height}")
+                write!(
+                    f,
+                    "light: certificate does not match block at height {height}"
+                )
             }
             LightError::CountMismatch { blocks, certs } => {
                 write!(f, "light: {blocks} blocks but {certs} certificates")
@@ -434,39 +448,72 @@ impl std::fmt::Display for LightError {
                 write!(f, "light: validator-set update would empty the set")
             }
             LightError::InconsistentStakeOp { account, height } => {
-                write!(f, "light: unbond exceeds tracked bond for account {account} at height {height}")
+                write!(
+                    f,
+                    "light: unbond exceeds tracked bond for account {account} at height {height}"
+                )
             }
             LightError::ValidatorRootMismatch { height } => {
                 write!(f, "light: validator set at height {height} does not match next_validators_root commitment")
             }
             LightError::MembershipProofInvalid { height } => {
-                write!(f, "light: validator membership proof invalid against block {height}")
+                write!(
+                    f,
+                    "light: validator membership proof invalid against block {height}"
+                )
             }
             LightError::EmptyKnnQuery { height } => {
-                write!(f, "light: kNN query produced no neighbours against block {height}")
+                write!(
+                    f,
+                    "light: kNN query produced no neighbours against block {height}"
+                )
             }
             LightError::KnnRankingMismatch { height } => {
-                write!(f, "light: kNN claim ranking disagrees with re-derived ranking at block {height}")
+                write!(
+                    f,
+                    "light: kNN claim ranking disagrees with re-derived ranking at block {height}"
+                )
             }
             LightError::RangeCutoffInvalid { height } => {
-                write!(f, "light: range claim min_sim is outside [-1, 1] at block {height}")
+                write!(
+                    f,
+                    "light: range claim min_sim is outside [-1, 1] at block {height}"
+                )
             }
             LightError::RangeMismatch { height } => {
-                write!(f, "light: range claim disagrees with re-derived cut set at block {height}")
+                write!(
+                    f,
+                    "light: range claim disagrees with re-derived cut set at block {height}"
+                )
             }
             LightError::InvalidDiffRange { h1, h2 } => {
-                write!(f, "light: invalid diff range ({h1}, {h2}) — need 0 < h1 < h2")
+                write!(
+                    f,
+                    "light: invalid diff range ({h1}, {h2}) — need 0 < h1 < h2"
+                )
             }
             LightError::DiffMismatch { height } => {
-                write!(f, "light: diff claim disagrees with replay-derived partition at block {height}")
+                write!(
+                    f,
+                    "light: diff claim disagrees with replay-derived partition at block {height}"
+                )
             }
             LightError::BatchTooManyItems { count } => {
-                write!(f, "light: batched request has {count} items, exceeds MAX_BATCH_ITEMS = 32")
+                write!(
+                    f,
+                    "light: batched request has {count} items, exceeds MAX_BATCH_ITEMS = 32"
+                )
             }
             LightError::BatchItemCountMismatch { request, response } => {
-                write!(f, "light: batched request has {request} items but response has {response}")
+                write!(
+                    f,
+                    "light: batched request has {request} items but response has {response}"
+                )
             }
-            LightError::BatchItemKindMismatch { request_kind, response_kind } => {
+            LightError::BatchItemKindMismatch {
+                request_kind,
+                response_kind,
+            } => {
                 write!(f, "light: batched slot kind mismatch (request kind={request_kind}, response kind={response_kind})")
             }
         }
@@ -647,7 +694,9 @@ impl ValidatorTracker {
         // 6. cross-check the derived set against the header commitment (part of
         //    block_hash, so certificate-signed). Only then commit to self.
         if next.merkle_root() != block.next_validators_root {
-            return Err(LightError::ValidatorRootMismatch { height: block.height });
+            return Err(LightError::ValidatorRootMismatch {
+                height: block.height,
+            });
         }
 
         self.bonds = bonds;
@@ -671,7 +720,9 @@ impl ValidatorTracker {
     ) -> Result<u64, LightError> {
         let (block_hash, power) = self.verify_cert(block, cert)?;
         if next_set.merkle_root() != block.next_validators_root {
-            return Err(LightError::ValidatorRootMismatch { height: block.height });
+            return Err(LightError::ValidatorRootMismatch {
+                height: block.height,
+            });
         }
         if next_set.is_empty() {
             return Err(LightError::EmptyValidatorSet);
@@ -695,9 +746,12 @@ impl ValidatorTracker {
         next_set: &ValidatorSet,
     ) -> Result<u64, LightError> {
         let header_hash = header.hash();
-        let power = self.verify_cert_header(header.height, &header.prev_hash, &header_hash, cert)?;
+        let power =
+            self.verify_cert_header(header.height, &header.prev_hash, &header_hash, cert)?;
         if next_set.merkle_root() != header.next_validators_root {
-            return Err(LightError::ValidatorRootMismatch { height: header.height });
+            return Err(LightError::ValidatorRootMismatch {
+                height: header.height,
+            });
         }
         if next_set.is_empty() {
             return Err(LightError::EmptyValidatorSet);
@@ -735,7 +789,9 @@ impl ValidatorTracker {
     ) -> Result<(), LightError> {
         let hh = header.hash();
         if cert.height != header.height || cert.block_hash != hh {
-            return Err(LightError::CertificateMismatch { height: header.height });
+            return Err(LightError::CertificateMismatch {
+                height: header.height,
+            });
         }
         cert.verify(tracked_set).map_err(LightError::Consensus)?;
         let leaf = merkle::leaf_hash(&entry.leaf());
@@ -746,7 +802,9 @@ impl ValidatorTracker {
             ProofEntry::Validator { .. } => &header.next_validators_root,
         };
         if !merkle::verify(root, &leaf, entry.proof()) {
-            return Err(LightError::MembershipProofInvalid { height: header.height });
+            return Err(LightError::MembershipProofInvalid {
+                height: header.height,
+            });
         }
         Ok(())
     }
@@ -768,7 +826,9 @@ impl ValidatorTracker {
     ) -> Result<(), LightError> {
         let hh = header.hash();
         if cert.height != header.height || cert.block_hash != hh {
-            return Err(LightError::CertificateMismatch { height: header.height });
+            return Err(LightError::CertificateMismatch {
+                height: header.height,
+            });
         }
         cert.verify(tracked_set).map_err(LightError::Consensus)?;
         Ok(())
@@ -817,7 +877,9 @@ impl ValidatorTracker {
         // 1. cert-signing contract (same as verify_proof_against_header).
         let hh = header.hash();
         if cert.height != header.height || cert.block_hash != hh {
-            return Err(LightError::CertificateMismatch { height: header.height });
+            return Err(LightError::CertificateMismatch {
+                height: header.height,
+            });
         }
         cert.verify(tracked_set).map_err(LightError::Consensus)?;
 
@@ -825,7 +887,9 @@ impl ValidatorTracker {
         // request, not a real proof. Surface it explicitly so callers
         // can distinguish "no answer" from "verified answer".
         if claim.k == 0 || claim.neighbours.is_empty() {
-            return Err(LightError::EmptyKnnQuery { height: header.height });
+            return Err(LightError::EmptyKnnQuery {
+                height: header.height,
+            });
         }
 
         // 2. Merkle-verify every neighbour leaf against header.accounts_root.
@@ -836,7 +900,9 @@ impl ValidatorTracker {
         for (_node_id, graph_node, proof) in &claim.neighbours {
             let leaf = merkle::leaf_hash(&graph_node.merkle_leaf());
             if !merkle::verify(root, &leaf, proof) {
-                return Err(LightError::MembershipProofInvalid { height: header.height });
+                return Err(LightError::MembershipProofInvalid {
+                    height: header.height,
+                });
             }
         }
 
@@ -848,7 +914,10 @@ impl ValidatorTracker {
             .neighbours
             .iter()
             .map(|(node_id, graph_node, _)| {
-                (*node_id, crate::engine::cos_sim(&claim.query, &graph_node.embedding))
+                (
+                    *node_id,
+                    crate::engine::cos_sim(&claim.query, &graph_node.embedding),
+                )
             })
             .collect();
         // Same sort as `engine::CognitiveGraph::rank_by_cosine`:
@@ -879,7 +948,9 @@ impl ValidatorTracker {
         //    the prover's fault: tampered proof, omitted tied neighbour,
         //    reordered list, etc.
         if expected != claimed {
-            return Err(LightError::KnnRankingMismatch { height: header.height });
+            return Err(LightError::KnnRankingMismatch {
+                height: header.height,
+            });
         }
         Ok(())
     }
@@ -919,7 +990,9 @@ impl ValidatorTracker {
         // 1. cert-signing contract.
         let hh = header.hash();
         if cert.height != header.height || cert.block_hash != hh {
-            return Err(LightError::CertificateMismatch { height: header.height });
+            return Err(LightError::CertificateMismatch {
+                height: header.height,
+            });
         }
         cert.verify(tracked_set).map_err(LightError::Consensus)?;
 
@@ -928,7 +1001,9 @@ impl ValidatorTracker {
         //    and the prover is either lying about its work or shipping a
         //    constant answer. Surface it explicitly.
         if !claim.min_sim.is_finite() || claim.min_sim < -1.0 || claim.min_sim > 1.0 {
-            return Err(LightError::RangeCutoffInvalid { height: header.height });
+            return Err(LightError::RangeCutoffInvalid {
+                height: header.height,
+            });
         }
 
         // 3. Per-leaf Merkle verify every entry against `header.graph_root`.
@@ -941,7 +1016,9 @@ impl ValidatorTracker {
         for (_node_id, graph_node, proof) in &claim.nodes {
             let leaf = merkle::leaf_hash(&graph_node.merkle_leaf());
             if !merkle::verify(root, &leaf, proof) {
-                return Err(LightError::MembershipProofInvalid { height: header.height });
+                return Err(LightError::MembershipProofInvalid {
+                    height: header.height,
+                });
             }
         }
 
@@ -952,7 +1029,10 @@ impl ValidatorTracker {
             .nodes
             .iter()
             .map(|(node_id, graph_node, _)| {
-                (*node_id, crate::engine::cos_sim(&claim.query, &graph_node.embedding))
+                (
+                    *node_id,
+                    crate::engine::cos_sim(&claim.query, &graph_node.embedding),
+                )
             })
             .collect();
         local.sort_by(|a, b| {
@@ -969,7 +1049,9 @@ impl ValidatorTracker {
         // 5. Order + set equality.
         let claimed: Vec<u64> = claim.nodes.iter().map(|(id, _, _)| *id).collect();
         if expected != claimed {
-            return Err(LightError::RangeMismatch { height: header.height });
+            return Err(LightError::RangeMismatch {
+                height: header.height,
+            });
         }
         Ok(())
     }
@@ -1063,8 +1145,12 @@ impl ValidatorTracker {
         if cert_h2.height != h2 || cert_h2.block_hash != hh2 {
             return Err(LightError::CertificateMismatch { height: h2 });
         }
-        cert_h1.verify(&claim.tracked_set_h1).map_err(LightError::Consensus)?;
-        cert_h2.verify(&claim.tracked_set_h2).map_err(LightError::Consensus)?;
+        cert_h1
+            .verify(&claim.tracked_set_h1)
+            .map_err(LightError::Consensus)?;
+        cert_h2
+            .verify(&claim.tracked_set_h2)
+            .map_err(LightError::Consensus)?;
 
         // 2. Replay `[1..=h2]` from genesis to derive `state_at_h2` —
         //    and confirm the cached blocks are well-formed and chain to
@@ -1081,7 +1167,10 @@ impl ValidatorTracker {
         // for diff correctness, so we drop them here.
         let chain_h2 = crate::Chain::replay(
             genesis.clone(),
-            &blocks_in_range.iter().map(|(b, _)| b.clone()).collect::<Vec<_>>(),
+            &blocks_in_range
+                .iter()
+                .map(|(b, _)| b.clone())
+                .collect::<Vec<_>>(),
         )
         .map_err(|_e| {
             // Replay failure on a cached block: surface as a cert-binding
@@ -1215,28 +1304,27 @@ impl ValidatorTracker {
             match (req, resp) {
                 // Inclusion: route to M24 verifier. A None slot is the
                 // M24 "unknown key" semantics — skip silently.
-                (
-                    BatchItem::Inclusion { .. },
-                    BatchResponseItem::Inclusion(Some(entry)),
-                ) => {
+                (BatchItem::Inclusion { .. }, BatchResponseItem::Inclusion(Some(entry))) => {
                     ValidatorTracker::verify_proof_against_header(
-                        header, cert, tracked_set, entry,
+                        header,
+                        cert,
+                        tracked_set,
+                        entry,
                     )?;
                 }
                 (BatchItem::Knn { .. }, BatchResponseItem::Knn(Some(claim))) => {
-                    ValidatorTracker::verify_knn_against_header(
-                        header, cert, tracked_set, claim,
-                    )?;
+                    ValidatorTracker::verify_knn_against_header(header, cert, tracked_set, claim)?;
                 }
                 (BatchItem::Range { .. }, BatchResponseItem::Range(Some(claim))) => {
                     ValidatorTracker::verify_range_against_header(
-                        header, cert, tracked_set, claim,
+                        header,
+                        cert,
+                        tracked_set,
+                        claim,
                     )?;
                 }
                 (BatchItem::Diff { .. }, BatchResponseItem::Diff(env)) => {
-                    ValidatorTracker::verify_diff_against_headers(
-                        genesis, blocks_in_range, env,
-                    )?;
+                    ValidatorTracker::verify_diff_against_headers(genesis, blocks_in_range, env)?;
                 }
                 // Empty answer on the producer side: same skip semantics
                 // as M26/M27 — the wallet treats it as a verified
@@ -1346,9 +1434,18 @@ mod tests {
             fee: 0,
             nonce,
             reviews: vec![
-                Review { reviewer: 10, score: 0.9 },
-                Review { reviewer: 11, score: 0.85 },
-                Review { reviewer: 12, score: 0.9 },
+                Review {
+                    reviewer: 10,
+                    score: 0.9,
+                },
+                Review {
+                    reviewer: 11,
+                    score: 0.85,
+                },
+                Review {
+                    reviewer: 12,
+                    score: 0.9,
+                },
             ],
             repl_success: 3,
             repl_total: 3,
@@ -1359,11 +1456,23 @@ mod tests {
     }
 
     fn bond(account: u64, amount: u64) -> StakeOp {
-        StakeOp { account, kind: BondKind::Bond, amount, signature: [0u8; 64] }.signed(&kp(account))
+        StakeOp {
+            account,
+            kind: BondKind::Bond,
+            amount,
+            signature: [0u8; 64],
+        }
+        .signed(&kp(account))
     }
 
     fn unbond(account: u64, amount: u64) -> StakeOp {
-        StakeOp { account, kind: BondKind::Unbond, amount, signature: [0u8; 64] }.signed(&kp(account))
+        StakeOp {
+            account,
+            kind: BondKind::Unbond,
+            amount,
+            signature: [0u8; 64],
+        }
+        .signed(&kp(account))
     }
 
     fn no_silence() -> BTreeSet<u64> {
@@ -1379,14 +1488,24 @@ mod tests {
     fn follows_a_plain_chain() {
         let mut d = driver(base_genesis());
         for h in 1..=3u64 {
-            d.submit(novel_tx_nonce(1, 100 + h as u32, (h as usize) + 1, h as f32, h - 1)).unwrap();
+            d.submit(novel_tx_nonce(
+                1,
+                100 + h as u32,
+                (h as usize) + 1,
+                h as f32,
+                h - 1,
+            ))
+            .unwrap();
             d.produce(h as f32, &no_silence()).unwrap().expect("block");
         }
         let mut lt = ValidatorTracker::from_genesis(&base_genesis());
         lt.follow_all(d.blocks(), d.certificates()).expect("follow");
         assert_eq!(lt.height(), 3);
         assert_eq!(lt.head(), d.head());
-        assert_eq!(ids_powers(lt.validators()), ids_powers(&d.chain.state.validators));
+        assert_eq!(
+            ids_powers(lt.validators()),
+            ids_powers(&d.chain.state.validators)
+        );
         assert_eq!(ids_powers(lt.validators()), vec![(21, 1), (22, 1), (23, 1)]);
     }
 
@@ -1394,18 +1513,32 @@ mod tests {
     fn follows_explicit_validator_updates() {
         let mut d = driver(base_genesis());
         // h1: add validator 24. h2: remove validator 22.
-        d.stage_validator_update(ValidatorUpdate { id: 24, pubkey: kp(24).public(), power: 5 });
+        d.stage_validator_update(ValidatorUpdate {
+            id: 24,
+            pubkey: kp(24).public(),
+            power: 5,
+        });
         d.produce(1.0, &no_silence()).unwrap().expect("block");
-        d.stage_validator_update(ValidatorUpdate { id: 22, pubkey: kp(22).public(), power: 0 });
+        d.stage_validator_update(ValidatorUpdate {
+            id: 22,
+            pubkey: kp(22).public(),
+            power: 0,
+        });
         d.produce(2.0, &no_silence()).unwrap().expect("block");
 
         let mut lt = ValidatorTracker::from_genesis(&base_genesis());
         // follow height by height, checking the set tracks after each.
         lt.follow(&d.blocks()[0], &d.certificates()[0]).unwrap();
-        assert_eq!(ids_powers(lt.validators()), vec![(21, 1), (22, 1), (23, 1), (24, 5)]);
+        assert_eq!(
+            ids_powers(lt.validators()),
+            vec![(21, 1), (22, 1), (23, 1), (24, 5)]
+        );
         lt.follow(&d.blocks()[1], &d.certificates()[1]).unwrap();
         assert_eq!(ids_powers(lt.validators()), vec![(21, 1), (23, 1), (24, 5)]);
-        assert_eq!(ids_powers(lt.validators()), ids_powers(&d.chain.state.validators));
+        assert_eq!(
+            ids_powers(lt.validators()),
+            ids_powers(&d.chain.state.validators)
+        );
     }
 
     #[test]
@@ -1423,7 +1556,10 @@ mod tests {
         assert_eq!(lt.validators().get(1).map(|v| v.power), Some(6 * MICRO));
         lt.follow(&d.blocks()[1], &d.certificates()[1]).unwrap();
         assert_eq!(lt.validators().get(1).map(|v| v.power), Some(4 * MICRO));
-        assert_eq!(ids_powers(lt.validators()), ids_powers(&d.chain.state.validators));
+        assert_eq!(
+            ids_powers(lt.validators()),
+            ids_powers(&d.chain.state.validators)
+        );
     }
 
     #[test]
@@ -1444,8 +1580,14 @@ mod tests {
         lt.follow(&d.blocks()[0], &d.certificates()[0]).unwrap();
         assert!(lt.validators().get(1).is_some());
         lt.follow(&d.blocks()[1], &d.certificates()[1]).unwrap();
-        assert!(lt.validators().get(1).is_none(), "offender removed by the light client");
-        assert_eq!(ids_powers(lt.validators()), ids_powers(&d.chain.state.validators));
+        assert!(
+            lt.validators().get(1).is_none(),
+            "offender removed by the light client"
+        );
+        assert_eq!(
+            ids_powers(lt.validators()),
+            ids_powers(&d.chain.state.validators)
+        );
     }
 
     #[test]
@@ -1455,20 +1597,34 @@ mod tests {
         let mut d = driver(base_genesis());
         d.submit(novel_tx(1, 1, 1, 1.0)).unwrap();
         d.submit(novel_tx(2, 2, 2, 1.0)).unwrap();
-        d.stage_validator_update(ValidatorUpdate { id: 24, pubkey: kp(24).public(), power: 3 });
+        d.stage_validator_update(ValidatorUpdate {
+            id: 24,
+            pubkey: kp(24).public(),
+            power: 3,
+        });
         d.produce(1.0, &no_silence()).unwrap().expect("block");
         assert!(!d.blocks()[0].txs.is_empty(), "block really carries txs");
 
         let mut lt = ValidatorTracker::from_genesis(&base_genesis());
         lt.follow_all(d.blocks(), d.certificates()).unwrap();
-        assert_eq!(ids_powers(lt.validators()), vec![(21, 1), (22, 1), (23, 1), (24, 3)]);
-        assert_eq!(ids_powers(lt.validators()), ids_powers(&d.chain.state.validators));
+        assert_eq!(
+            ids_powers(lt.validators()),
+            vec![(21, 1), (22, 1), (23, 1), (24, 3)]
+        );
+        assert_eq!(
+            ids_powers(lt.validators()),
+            ids_powers(&d.chain.state.validators)
+        );
     }
 
     #[test]
     fn rejects_a_forged_certificate() {
         let mut d = driver(base_genesis());
-        d.stage_validator_update(ValidatorUpdate { id: 24, pubkey: kp(24).public(), power: 1 });
+        d.stage_validator_update(ValidatorUpdate {
+            id: 24,
+            pubkey: kp(24).public(),
+            power: 1,
+        });
         d.produce(1.0, &no_silence()).unwrap().expect("block");
 
         // tamper: drop precommits below quorum.
@@ -1514,7 +1670,10 @@ mod tests {
         let mut lt = ValidatorTracker::from_genesis(&base_genesis());
         // feed block 1 with block 2's certificate.
         let err = lt.follow(&d.blocks()[0], &d.certificates()[1]).unwrap_err();
-        assert!(matches!(err, LightError::CertificateMismatch { .. }), "got {err}");
+        assert!(
+            matches!(err, LightError::CertificateMismatch { .. }),
+            "got {err}"
+        );
     }
 
     #[test]
@@ -1523,7 +1682,11 @@ mod tests {
         let mut d = driver(base_genesis());
         // h1: add validator 24 (explicit update) + a real tx.
         d.submit(novel_tx(1, 1, 1, 1.0)).unwrap();
-        d.stage_validator_update(ValidatorUpdate { id: 24, pubkey: kp(24).public(), power: 2 });
+        d.stage_validator_update(ValidatorUpdate {
+            id: 24,
+            pubkey: kp(24).public(),
+            power: 2,
+        });
         d.produce(1.0, &no_silence()).unwrap().expect("block");
         // h2: account 2 bonds 7 -> validator 2 (staking).
         d.stage_stake_op(bond(2, 7 * MICRO));
@@ -1537,8 +1700,8 @@ mod tests {
         d.produce(3.0, &no_silence()).unwrap().expect("block");
 
         // authoritative full replay ...
-        let full = Chain::replay_verified(base_genesis(), d.blocks(), d.certificates())
-            .expect("replay");
+        let full =
+            Chain::replay_verified(base_genesis(), d.blocks(), d.certificates()).expect("replay");
         // ... vs the light follow.
         let mut lt = ValidatorTracker::from_genesis(&base_genesis());
         lt.follow_all(d.blocks(), d.certificates()).expect("follow");
@@ -1572,7 +1735,11 @@ mod tests {
         // path must reach the same set as the full replay.
         let mut d = driver(base_genesis());
         d.submit(novel_tx(1, 1, 1, 1.0)).unwrap();
-        d.stage_validator_update(ValidatorUpdate { id: 24, pubkey: kp(24).public(), power: 2 });
+        d.stage_validator_update(ValidatorUpdate {
+            id: 24,
+            pubkey: kp(24).public(),
+            power: 2,
+        });
         d.produce(1.0, &no_silence()).unwrap().expect("block");
         d.stage_stake_op(bond(2, 7 * MICRO));
         d.produce(2.0, &no_silence()).unwrap().expect("block");
@@ -1580,9 +1747,13 @@ mod tests {
         let sets = committed_sets(base_genesis(), d.blocks());
         let mut lt = ValidatorTracker::from_genesis(&base_genesis());
         for (i, (b, c)) in d.blocks().iter().zip(d.certificates()).enumerate() {
-            lt.follow_committed(b, c, &sets[i]).expect("follow_committed");
+            lt.follow_committed(b, c, &sets[i])
+                .expect("follow_committed");
         }
-        assert_eq!(ids_powers(lt.validators()), ids_powers(&d.chain.state.validators));
+        assert_eq!(
+            ids_powers(lt.validators()),
+            ids_powers(&d.chain.state.validators)
+        );
         assert_eq!(lt.head(), d.head());
         assert_eq!(lt.height(), 2);
     }
@@ -1590,17 +1761,26 @@ mod tests {
     #[test]
     fn follow_committed_rejects_a_wrong_next_set() {
         let mut d = driver(base_genesis());
-        d.stage_validator_update(ValidatorUpdate { id: 24, pubkey: kp(24).public(), power: 5 });
+        d.stage_validator_update(ValidatorUpdate {
+            id: 24,
+            pubkey: kp(24).public(),
+            power: 5,
+        });
         d.produce(1.0, &no_silence()).unwrap().expect("block");
 
         let mut lt = ValidatorTracker::from_genesis(&base_genesis());
         // hand it the genesis set as the "next" set, but block 1 added validator
         // 24 — its committed root does not match the genesis set's root.
-        let wrong = ValidatorTracker::from_genesis(&base_genesis()).validators().clone();
+        let wrong = ValidatorTracker::from_genesis(&base_genesis())
+            .validators()
+            .clone();
         let err = lt
             .follow_committed(&d.blocks()[0], &d.certificates()[0], &wrong)
             .unwrap_err();
-        assert!(matches!(err, LightError::ValidatorRootMismatch { .. }), "got {err}");
+        assert!(
+            matches!(err, LightError::ValidatorRootMismatch { .. }),
+            "got {err}"
+        );
         assert_eq!(lt.height(), 0, "tracker unchanged on rejection");
     }
 
@@ -1609,7 +1789,11 @@ mod tests {
         // the M21 strengthening: an honest chain's follow still succeeds, and the
         // tracked set's own root matches every block's commitment along the way.
         let mut d = driver(base_genesis());
-        d.stage_validator_update(ValidatorUpdate { id: 24, pubkey: kp(24).public(), power: 3 });
+        d.stage_validator_update(ValidatorUpdate {
+            id: 24,
+            pubkey: kp(24).public(),
+            power: 3,
+        });
         d.produce(1.0, &no_silence()).unwrap().expect("block");
         d.stage_stake_op(bond(1, 6 * MICRO));
         d.produce(2.0, &no_silence()).unwrap().expect("block");
@@ -1624,18 +1808,28 @@ mod tests {
     #[test]
     fn verify_proof_against_header_accepts_validator_membership() {
         let mut d = driver(base_genesis());
-        d.stage_validator_update(ValidatorUpdate { id: 24, pubkey: kp(24).public(), power: 5 });
+        d.stage_validator_update(ValidatorUpdate {
+            id: 24,
+            pubkey: kp(24).public(),
+            power: 5,
+        });
         d.produce(1.0, &no_silence()).unwrap().expect("block");
 
         let block = &d.blocks()[0];
         let cert = &d.certificates()[0];
         let next_set = d.chain.state.validators.clone();
-        let tracked = ValidatorTracker::from_genesis(&base_genesis()).validators().clone();
+        let tracked = ValidatorTracker::from_genesis(&base_genesis())
+            .validators()
+            .clone();
 
         let v = next_set.get(24).unwrap().clone();
         let proof = next_set.proof(24).unwrap();
         let header = crate::codec::BlockHeader::from_block(block);
-        let entry = ProofEntry::Validator { id: 24, validator: v.clone(), proof };
+        let entry = ProofEntry::Validator {
+            id: 24,
+            validator: v.clone(),
+            proof,
+        };
         ValidatorTracker::verify_proof_against_header(&header, cert, &tracked, &entry)
             .expect("genuine validator membership verifies");
     }
@@ -1643,23 +1837,36 @@ mod tests {
     #[test]
     fn verify_proof_against_header_rejects_a_tampered_validator_leaf() {
         let mut d = driver(base_genesis());
-        d.stage_validator_update(ValidatorUpdate { id: 24, pubkey: kp(24).public(), power: 5 });
+        d.stage_validator_update(ValidatorUpdate {
+            id: 24,
+            pubkey: kp(24).public(),
+            power: 5,
+        });
         d.produce(1.0, &no_silence()).unwrap().expect("block");
 
         let block = &d.blocks()[0];
         let cert = &d.certificates()[0];
         let next_set = d.chain.state.validators.clone();
-        let tracked = ValidatorTracker::from_genesis(&base_genesis()).validators().clone();
+        let tracked = ValidatorTracker::from_genesis(&base_genesis())
+            .validators()
+            .clone();
 
         let v = next_set.get(24).unwrap().clone();
         let proof = next_set.proof(24).unwrap();
         let mut forged = v.clone();
         forged.power += 1;
         let header = crate::codec::BlockHeader::from_block(block);
-        let entry = ProofEntry::Validator { id: 24, validator: forged, proof };
+        let entry = ProofEntry::Validator {
+            id: 24,
+            validator: forged,
+            proof,
+        };
         let err = ValidatorTracker::verify_proof_against_header(&header, cert, &tracked, &entry)
             .unwrap_err();
-        assert!(matches!(err, LightError::MembershipProofInvalid { .. }), "got {err}");
+        assert!(
+            matches!(err, LightError::MembershipProofInvalid { .. }),
+            "got {err}"
+        );
     }
 
     // --- M23/M24: account + reviewer SPV via the unified verifier ------------
@@ -1676,7 +1883,13 @@ mod tests {
 
         let block = d.blocks()[0].clone();
         let cert = d.certificates()[0].clone();
-        let account = d.chain.state.accounts.get(&1).cloned().expect("account 1 exists");
+        let account = d
+            .chain
+            .state
+            .accounts
+            .get(&1)
+            .cloned()
+            .expect("account 1 exists");
         let proof = d.chain.state.account_proof(1).expect("proof exists");
         (block, cert, account, proof)
     }
@@ -1684,9 +1897,15 @@ mod tests {
     #[test]
     fn verify_proof_against_header_accepts_account_membership() {
         let (block, cert, account, proof) = one_block_with_proof();
-        let tracked = ValidatorTracker::from_genesis(&base_genesis()).validators().clone();
+        let tracked = ValidatorTracker::from_genesis(&base_genesis())
+            .validators()
+            .clone();
         let header = crate::codec::BlockHeader::from_block(&block);
-        let entry = ProofEntry::Account { id: 1, account, proof };
+        let entry = ProofEntry::Account {
+            id: 1,
+            account,
+            proof,
+        };
         ValidatorTracker::verify_proof_against_header(&header, &cert, &tracked, &entry)
             .expect("header-only account membership verifies");
         // And `state_root_against_header` accepts the same cert-signed header.
@@ -1700,29 +1919,48 @@ mod tests {
         // The verifier computes the leaf from the supplied `account`, so a
         // tampered balance makes the recomputed leaf mismatch the proof's path.
         account.balance += 1;
-        let tracked = ValidatorTracker::from_genesis(&base_genesis()).validators().clone();
+        let tracked = ValidatorTracker::from_genesis(&base_genesis())
+            .validators()
+            .clone();
         let header = crate::codec::BlockHeader::from_block(&block);
-        let entry = ProofEntry::Account { id: 1, account, proof };
+        let entry = ProofEntry::Account {
+            id: 1,
+            account,
+            proof,
+        };
         let err = ValidatorTracker::verify_proof_against_header(&header, &cert, &tracked, &entry)
             .unwrap_err();
-        assert!(matches!(err, LightError::MembershipProofInvalid { .. }), "got {err}");
+        assert!(
+            matches!(err, LightError::MembershipProofInvalid { .. }),
+            "got {err}"
+        );
     }
 
     #[test]
     fn verify_proof_against_header_rejects_tampered_accounts_root() {
         let (block, cert, account, proof) = one_block_with_proof();
-        let tracked = ValidatorTracker::from_genesis(&base_genesis()).validators().clone();
+        let tracked = ValidatorTracker::from_genesis(&base_genesis())
+            .validators()
+            .clone();
         // Mutate accounts_root in the header (cert-signed field!) — the proof
         // now opens against a different root and must be rejected. The cert's
         // block_hash also no longer matches the mutated header's hash, so the
         // FIRST rejection is CertificateMismatch. Either failure is sound.
         let mut bad_header = crate::codec::BlockHeader::from_block(&block);
         bad_header.accounts_root = [0xAB; 32];
-        let entry = ProofEntry::Account { id: 1, account, proof };
-        let err = ValidatorTracker::verify_proof_against_header(&bad_header, &cert, &tracked, &entry)
-            .unwrap_err();
+        let entry = ProofEntry::Account {
+            id: 1,
+            account,
+            proof,
+        };
+        let err =
+            ValidatorTracker::verify_proof_against_header(&bad_header, &cert, &tracked, &entry)
+                .unwrap_err();
         assert!(
-            matches!(err, LightError::CertificateMismatch { .. } | LightError::MembershipProofInvalid { .. }),
+            matches!(
+                err,
+                LightError::CertificateMismatch { .. } | LightError::MembershipProofInvalid { .. }
+            ),
             "got {err}"
         );
     }
@@ -1730,21 +1968,35 @@ mod tests {
     #[test]
     fn verify_proof_against_header_rejects_a_wrong_certificate() {
         let (block, cert, account, proof) = one_block_with_proof();
-        let tracked = ValidatorTracker::from_genesis(&base_genesis()).validators().clone();
+        let tracked = ValidatorTracker::from_genesis(&base_genesis())
+            .validators()
+            .clone();
         let header = crate::codec::BlockHeader::from_block(&block);
-        let entry = ProofEntry::Account { id: 1, account, proof };
+        let entry = ProofEntry::Account {
+            id: 1,
+            account,
+            proof,
+        };
         // A cert for a different height doesn't bind this header.
         let mut wrong_height = cert.clone();
         wrong_height.height = block.height + 1;
-        let err = ValidatorTracker::verify_proof_against_header(&header, &wrong_height, &tracked, &entry)
-            .unwrap_err();
-        assert!(matches!(err, LightError::CertificateMismatch { .. }), "got {err}");
+        let err =
+            ValidatorTracker::verify_proof_against_header(&header, &wrong_height, &tracked, &entry)
+                .unwrap_err();
+        assert!(
+            matches!(err, LightError::CertificateMismatch { .. }),
+            "got {err}"
+        );
         // And a cert from a totally different chain (wrong block_hash) is rejected.
         let mut wrong_hash = cert.clone();
         wrong_hash.block_hash = [0xCC; 32];
-        let err = ValidatorTracker::verify_proof_against_header(&header, &wrong_hash, &tracked, &entry)
-            .unwrap_err();
-        assert!(matches!(err, LightError::CertificateMismatch { .. }), "got {err}");
+        let err =
+            ValidatorTracker::verify_proof_against_header(&header, &wrong_hash, &tracked, &entry)
+                .unwrap_err();
+        assert!(
+            matches!(err, LightError::CertificateMismatch { .. }),
+            "got {err}"
+        );
     }
 
     #[test]
@@ -1754,14 +2006,23 @@ mod tests {
         // doesn't contain it — so the locally-computed leaf won't verify against
         // the supplied proof.
         let (block, cert, _real_account, _proof) = one_block_with_proof();
-        let tracked = ValidatorTracker::from_genesis(&base_genesis()).validators().clone();
+        let tracked = ValidatorTracker::from_genesis(&base_genesis())
+            .validators()
+            .clone();
         let header = crate::codec::BlockHeader::from_block(&block);
         let fake_account = crate::Account::default();
         let empty_proof = merkle::Proof { steps: Vec::new() };
-        let entry = ProofEntry::Account { id: 999, account: fake_account, proof: empty_proof };
+        let entry = ProofEntry::Account {
+            id: 999,
+            account: fake_account,
+            proof: empty_proof,
+        };
         let err = ValidatorTracker::verify_proof_against_header(&header, &cert, &tracked, &entry)
             .unwrap_err();
-        assert!(matches!(err, LightError::MembershipProofInvalid { .. }), "got {err}");
+        assert!(
+            matches!(err, LightError::MembershipProofInvalid { .. }),
+            "got {err}"
+        );
     }
 
     #[test]
@@ -1772,11 +2033,23 @@ mod tests {
         d.produce(1.0, &no_silence()).unwrap().expect("block");
         let block = d.blocks()[0].clone();
         let cert = d.certificates()[0].clone();
-        let reputation = d.chain.state.reviewers.get(&10).copied().expect("reviewer 10");
+        let reputation = d
+            .chain
+            .state
+            .reviewers
+            .get(&10)
+            .copied()
+            .expect("reviewer 10");
         let proof = d.chain.state.reviewer_proof(10).expect("reviewer proof");
         let header = crate::codec::BlockHeader::from_block(&block);
-        let entry = ProofEntry::Reviewer { id: 10, reputation, proof };
-        let tracked = ValidatorTracker::from_genesis(&base_genesis()).validators().clone();
+        let entry = ProofEntry::Reviewer {
+            id: 10,
+            reputation,
+            proof,
+        };
+        let tracked = ValidatorTracker::from_genesis(&base_genesis())
+            .validators()
+            .clone();
         ValidatorTracker::verify_proof_against_header(&header, &cert, &tracked, &entry)
             .expect("reviewer proof verifies against accounts_root");
     }
@@ -1790,11 +2063,20 @@ mod tests {
         let cert = d.certificates()[0].clone();
         let proof = d.chain.state.reviewer_proof(10).expect("reviewer proof");
         let header = crate::codec::BlockHeader::from_block(&block);
-        let entry = ProofEntry::Reviewer { id: 10, reputation: 999.0, proof };
-        let tracked = ValidatorTracker::from_genesis(&base_genesis()).validators().clone();
+        let entry = ProofEntry::Reviewer {
+            id: 10,
+            reputation: 999.0,
+            proof,
+        };
+        let tracked = ValidatorTracker::from_genesis(&base_genesis())
+            .validators()
+            .clone();
         let err = ValidatorTracker::verify_proof_against_header(&header, &cert, &tracked, &entry)
             .unwrap_err();
-        assert!(matches!(err, LightError::MembershipProofInvalid { .. }), "got {err}");
+        assert!(
+            matches!(err, LightError::MembershipProofInvalid { .. }),
+            "got {err}"
+        );
     }
 
     /// M25: produce a 1-block certified chain that includes at least one
@@ -1812,13 +2094,26 @@ mod tests {
         // The chain state has at least the demo-genesis seed node(s) plus any
         // nodes added by the accepted submission. After `produce` block 1 the
         // graph is non-empty, so node id 0 is safe to request.
-        assert!(!d.chain.state.graph.nodes.is_empty(), "graph must be non-empty");
+        assert!(
+            !d.chain.state.graph.nodes.is_empty(),
+            "graph must be non-empty"
+        );
         let idx = 0;
         let node = d.chain.state.graph.nodes[idx].clone();
-        let proof = d.chain.state.graph_node_proof(idx).expect("graph_node_proof(0)");
+        let proof = d
+            .chain
+            .state
+            .graph_node_proof(idx)
+            .expect("graph_node_proof(0)");
         let header = crate::codec::BlockHeader::from_block(&block);
-        let entry = ProofEntry::GraphNode { node_id: node.node_id, graph_node: node.clone(), proof };
-        let tracked = ValidatorTracker::from_genesis(&base_genesis()).validators().clone();
+        let entry = ProofEntry::GraphNode {
+            node_id: node.node_id,
+            graph_node: node.clone(),
+            proof,
+        };
+        let tracked = ValidatorTracker::from_genesis(&base_genesis())
+            .validators()
+            .clone();
         ValidatorTracker::verify_proof_against_header(&header, &cert, &tracked, &entry)
             .expect("graph-node proof must verify");
     }
@@ -1835,15 +2130,28 @@ mod tests {
         let cert = d.certificates()[0].clone();
         let idx = 0;
         let mut node = d.chain.state.graph.nodes[idx].clone();
-        let proof = d.chain.state.graph_node_proof(idx).expect("graph_node_proof(0)");
+        let proof = d
+            .chain
+            .state
+            .graph_node_proof(idx)
+            .expect("graph_node_proof(0)");
         // Tamper: bump the first embedding float.
         node.embedding[0] += 1.0;
         let header = crate::codec::BlockHeader::from_block(&block);
-        let entry = ProofEntry::GraphNode { node_id: node.node_id, graph_node: node, proof };
-        let tracked = ValidatorTracker::from_genesis(&base_genesis()).validators().clone();
+        let entry = ProofEntry::GraphNode {
+            node_id: node.node_id,
+            graph_node: node,
+            proof,
+        };
+        let tracked = ValidatorTracker::from_genesis(&base_genesis())
+            .validators()
+            .clone();
         let err = ValidatorTracker::verify_proof_against_header(&header, &cert, &tracked, &entry)
             .unwrap_err();
-        assert!(matches!(err, LightError::MembershipProofInvalid { .. }), "got {err}");
+        assert!(
+            matches!(err, LightError::MembershipProofInvalid { .. }),
+            "got {err}"
+        );
     }
 
     // ----- M26: verify_knn_against_header -----
@@ -1851,19 +2159,18 @@ mod tests {
     /// Build a 1-block chain, then assemble a `KnnClaim` from the
     /// engine's `k_nearest_with_ties` over `chain.state.graph`. Returns the
     /// header, cert, and the claim so individual tests can mutate them.
-    fn one_block_with_knn_claim(k: usize) -> (
-        crate::codec::BlockHeader,
-        Commit,
-        ValidatorSet,
-        KnnClaim,
-    ) {
+    fn one_block_with_knn_claim(
+        k: usize,
+    ) -> (crate::codec::BlockHeader, Commit, ValidatorSet, KnnClaim) {
         let mut d = driver(base_genesis());
         d.submit(novel_tx(1, 1, 1, 1.0)).unwrap();
         d.produce(1.0, &no_silence()).unwrap().expect("block");
         let block = d.blocks()[0].clone();
         let cert = d.certificates()[0].clone();
         let header = crate::codec::BlockHeader::from_block(&block);
-        let tracked = ValidatorTracker::from_genesis(&base_genesis()).validators().clone();
+        let tracked = ValidatorTracker::from_genesis(&base_genesis())
+            .validators()
+            .clone();
 
         // Pick a query embedding equal to the first graph node's embedding
         // — its cosine sim with that node is 1.0, so it's always the top
@@ -1880,7 +2187,11 @@ mod tests {
             let node = d.chain.state.graph.nodes[idx].clone();
             neighbours.push((*id, node, proof));
         }
-        let claim = KnnClaim { query, k, neighbours };
+        let claim = KnnClaim {
+            query,
+            k,
+            neighbours,
+        };
         (header, cert, tracked, claim)
     }
 
@@ -1888,19 +2199,19 @@ mod tests {
     /// builds a `RangeClaim` — a query + cutoff, the cut set in cosine-desc
     /// order, and per-leaf proofs against `header.graph_root` (not
     /// `accounts_root`, the M27 routing).
-    fn one_block_with_range_claim(query: crate::engine::Embedding, min_sim: f32) -> (
-        crate::codec::BlockHeader,
-        Commit,
-        ValidatorSet,
-        RangeClaim,
-    ) {
+    fn one_block_with_range_claim(
+        query: crate::engine::Embedding,
+        min_sim: f32,
+    ) -> (crate::codec::BlockHeader, Commit, ValidatorSet, RangeClaim) {
         let mut d = driver(base_genesis());
         d.submit(novel_tx(1, 1, 1, 1.0)).unwrap();
         d.produce(1.0, &no_silence()).unwrap().expect("block");
         let block = d.blocks()[0].clone();
         let cert = d.certificates()[0].clone();
         let header = crate::codec::BlockHeader::from_block(&block);
-        let tracked = ValidatorTracker::from_genesis(&base_genesis()).validators().clone();
+        let tracked = ValidatorTracker::from_genesis(&base_genesis())
+            .validators()
+            .clone();
 
         // Compute the user-query-sorted ranking locally so the test
         // expectation matches the prover exactly. We need this list to
@@ -1924,35 +2235,39 @@ mod tests {
         // the per-leaf proof is the right one. Build the same sorted view
         // the prover does.
         let sorted_ids: Vec<u64> = {
-            let mut sorted: Vec<crate::engine::GraphNode> =
-                d.chain.state.graph.nodes.clone();
+            let mut sorted: Vec<crate::engine::GraphNode> = d.chain.state.graph.nodes.clone();
             sorted.sort_by(|a, b| {
-                let sa = crate::engine::cos_sim(
-                    &[1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
-                    &a.embedding,
-                );
-                let sb = crate::engine::cos_sim(
-                    &[1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
-                    &b.embedding,
-                );
-                sb.partial_cmp(&sa).unwrap_or(std::cmp::Ordering::Equal)
+                let sa =
+                    crate::engine::cos_sim(&[1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0], &a.embedding);
+                let sb =
+                    crate::engine::cos_sim(&[1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0], &b.embedding);
+                sb.partial_cmp(&sa)
+                    .unwrap_or(std::cmp::Ordering::Equal)
                     .then(a.node_id.cmp(&b.node_id))
             });
             sorted.iter().map(|n| n.node_id).collect()
         };
         for id in &cut_ids {
-            let sorted_idx = sorted_ids.iter().position(|x| x == id)
+            let sorted_idx = sorted_ids
+                .iter()
+                .position(|x| x == id)
                 .expect("id must be present in sorted view");
-            let proof = d.chain.state.graph_range_proof(
-                sorted_idx, sorted_idx + 1,
-            ).expect("range proof for a single sorted index");
+            let proof = d
+                .chain
+                .state
+                .graph_range_proof(sorted_idx, sorted_idx + 1)
+                .expect("range proof for a single sorted index");
             let (_id, node, merkle_proof) = proof.entries.into_iter().next().unwrap();
             // Sanity: the proof must verify against the graph_merkle_root
             // (= graph_root committed in the header).
             assert_eq!(proof.sub_root, d.chain.state.graph_merkle_root());
             nodes.push((*id, node, merkle_proof));
         }
-        let claim = RangeClaim { query, min_sim, nodes };
+        let claim = RangeClaim {
+            query,
+            min_sim,
+            nodes,
+        };
         (header, cert, tracked, claim)
     }
 
@@ -1963,7 +2278,10 @@ mod tests {
         // must accept a valid claim built end-to-end against graph_root.
         let query = [1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
         let (header, cert, tracked, claim) = one_block_with_range_claim(query, 0.5);
-        assert!(!claim.nodes.is_empty(), "test setup: query must hit >= 1 node");
+        assert!(
+            !claim.nodes.is_empty(),
+            "test setup: query must hit >= 1 node"
+        );
         ValidatorTracker::verify_range_against_header(&header, &cert, &tracked, &claim)
             .expect("wallet-side range claim verifies");
     }
@@ -1974,11 +2292,12 @@ mod tests {
         // verifier re-derives the cut and notices the missing entry.
         let query = [1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
         let (header, cert, tracked, mut claim) = one_block_with_range_claim(query, 0.5);
-        if claim.nodes.len() < 2 { return; }
+        if claim.nodes.len() < 2 {
+            return;
+        }
         claim.nodes.pop();
-        let err = ValidatorTracker::verify_range_against_header(
-            &header, &cert, &tracked, &claim,
-        ).unwrap_err();
+        let err = ValidatorTracker::verify_range_against_header(&header, &cert, &tracked, &claim)
+            .unwrap_err();
         assert!(matches!(err, LightError::RangeMismatch { .. }), "got {err}");
     }
 
@@ -1988,10 +2307,12 @@ mod tests {
         let query = [1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
         let (header, cert, tracked, mut claim) = one_block_with_range_claim(query, 0.5);
         claim.min_sim = 2.0;
-        let err = ValidatorTracker::verify_range_against_header(
-            &header, &cert, &tracked, &claim,
-        ).unwrap_err();
-        assert!(matches!(err, LightError::RangeCutoffInvalid { .. }), "got {err}");
+        let err = ValidatorTracker::verify_range_against_header(&header, &cert, &tracked, &claim)
+            .unwrap_err();
+        assert!(
+            matches!(err, LightError::RangeCutoffInvalid { .. }),
+            "got {err}"
+        );
     }
 
     #[test]
@@ -2003,10 +2324,13 @@ mod tests {
         let (header, cert, tracked, claim) = one_block_with_range_claim(query, 0.5);
         let mut bad_header = header.clone();
         bad_header.graph_root = [0xCD; 32];
-        let err = ValidatorTracker::verify_range_against_header(
-            &bad_header, &cert, &tracked, &claim,
-        ).unwrap_err();
-        assert!(matches!(err, LightError::CertificateMismatch { .. }), "got {err}");
+        let err =
+            ValidatorTracker::verify_range_against_header(&bad_header, &cert, &tracked, &claim)
+                .unwrap_err();
+        assert!(
+            matches!(err, LightError::CertificateMismatch { .. }),
+            "got {err}"
+        );
     }
 
     #[test]
@@ -2029,7 +2353,10 @@ mod tests {
         claim.neighbours.swap(0, 1);
         let err = ValidatorTracker::verify_knn_against_header(&header, &cert, &tracked, &claim)
             .unwrap_err();
-        assert!(matches!(err, LightError::KnnRankingMismatch { .. }), "got {err}");
+        assert!(
+            matches!(err, LightError::KnnRankingMismatch { .. }),
+            "got {err}"
+        );
     }
 
     #[test]
@@ -2046,7 +2373,10 @@ mod tests {
         claim.neighbours[0].1 = g;
         let err = ValidatorTracker::verify_knn_against_header(&header, &cert, &tracked, &claim)
             .unwrap_err();
-        assert!(matches!(err, LightError::MembershipProofInvalid { .. }), "got {err}");
+        assert!(
+            matches!(err, LightError::MembershipProofInvalid { .. }),
+            "got {err}"
+        );
     }
 
     #[test]
@@ -2059,7 +2389,10 @@ mod tests {
         // check runs.
         let err = ValidatorTracker::verify_knn_against_header(&bad_header, &cert, &tracked, &claim)
             .unwrap_err();
-        assert!(matches!(err, LightError::CertificateMismatch { .. }), "got {err}");
+        assert!(
+            matches!(err, LightError::CertificateMismatch { .. }),
+            "got {err}"
+        );
     }
 
     #[test]
@@ -2068,7 +2401,11 @@ mod tests {
         // (or the prover lied). The wallet surfaces this as EmptyKnnQuery
         // so callers can distinguish "no answer" from "verified answer".
         let (header, cert, tracked, _) = one_block_with_knn_claim(2);
-        let claim = KnnClaim { query: [0.0; 8], k: 1, neighbours: Vec::new() };
+        let claim = KnnClaim {
+            query: [0.0; 8],
+            k: 1,
+            neighbours: Vec::new(),
+        };
         let err = ValidatorTracker::verify_knn_against_header(&header, &cert, &tracked, &claim)
             .unwrap_err();
         assert!(matches!(err, LightError::EmptyKnnQuery { .. }), "got {err}");
@@ -2103,11 +2440,21 @@ mod tests {
         // block 1, before applying block 2). Both are derivable from
         // replay.
         let genesis = base_genesis();
-        let tracked_h1 = crate::Chain::replay(genesis.clone(), &[]).unwrap().state.validators.clone();
-        let tracked_h2 = crate::Chain::replay(genesis.clone(), &blocks[..1]).unwrap().state.validators.clone();
+        let tracked_h1 = crate::Chain::replay(genesis.clone(), &[])
+            .unwrap()
+            .state
+            .validators
+            .clone();
+        let tracked_h2 = crate::Chain::replay(genesis.clone(), &blocks[..1])
+            .unwrap()
+            .state
+            .validators
+            .clone();
         let header_h1 = crate::codec::BlockHeader::from_block(&blocks[0]);
         let header_h2 = crate::codec::BlockHeader::from_block(&blocks[1]);
-        (genesis, blocks, certs, tracked_h1, tracked_h2, header_h1, header_h2)
+        (
+            genesis, blocks, certs, tracked_h1, tracked_h2, header_h1, header_h2,
+        )
     }
 
     /// M28: a valid diff between h₁=1 and h₂=2 verifies end-to-end. Both
@@ -2121,12 +2468,19 @@ mod tests {
 
         // The producer side: replay from genesis to h₁, then compute the
         // diff against the live h₂ state.
-        let state_h1 = crate::Chain::replay(genesis.clone(), &blocks[..1]).unwrap().state;
-        let state_h2 = crate::Chain::replay(genesis.clone(), &blocks).unwrap().state;
+        let state_h1 = crate::Chain::replay(genesis.clone(), &blocks[..1])
+            .unwrap()
+            .state;
+        let state_h2 = crate::Chain::replay(genesis.clone(), &blocks)
+            .unwrap()
+            .state;
         let diff = state_h2.graph_diff(&state_h1);
 
         // Sanity: at least one node was added at h₂ (block 2's tx).
-        assert!(!diff.added.is_empty(), "block 2 added at least one graph node");
+        assert!(
+            !diff.added.is_empty(),
+            "block 2 added at least one graph node"
+        );
 
         let envelope = DiffEnvelope {
             header_prev: header_h1.clone(),
@@ -2139,11 +2493,8 @@ mod tests {
         };
         // The wallet has the full `[1..=h₂]` range in its header cache —
         // feed it the same blocks the producer replayed.
-        let blocks_in_range: Vec<(Block, Commit)> = blocks
-            .iter()
-            .cloned()
-            .zip(certs.iter().cloned())
-            .collect();
+        let blocks_in_range: Vec<(Block, Commit)> =
+            blocks.iter().cloned().zip(certs.iter().cloned()).collect();
         ValidatorTracker::verify_diff_against_headers(&genesis, &blocks_in_range, &envelope)
             .expect("M28: valid two-header diff verifies end-to-end");
     }
@@ -2154,10 +2505,17 @@ mod tests {
     fn verify_diff_rejects_a_tampered_added_proof() {
         let (genesis, blocks, certs, tracked_h1, tracked_h2, header_h1, header_h2) =
             two_block_certified_chain_for_diff();
-        let state_h1 = crate::Chain::replay(genesis.clone(), &blocks[..1]).unwrap().state;
-        let state_h2 = crate::Chain::replay(genesis.clone(), &blocks).unwrap().state;
+        let state_h1 = crate::Chain::replay(genesis.clone(), &blocks[..1])
+            .unwrap()
+            .state;
+        let state_h2 = crate::Chain::replay(genesis.clone(), &blocks)
+            .unwrap()
+            .state;
         let mut diff = state_h2.graph_diff(&state_h1);
-        assert!(!diff.added.is_empty(), "test setup: block 2 added >= 1 node");
+        assert!(
+            !diff.added.is_empty(),
+            "test setup: block 2 added >= 1 node"
+        );
 
         // Tamper: flip a byte in the first `added` proof.
         diff.added[0].proof.steps[0] = match diff.added[0].proof.steps[0] {
@@ -2174,13 +2532,11 @@ mod tests {
             tracked_set_h1: tracked_h1,
             tracked_set_h2: tracked_h2,
         };
-        let blocks_in_range: Vec<(Block, Commit)> = blocks
-            .iter()
-            .cloned()
-            .zip(certs.iter().cloned())
-            .collect();
-        let err = ValidatorTracker::verify_diff_against_headers(&genesis, &blocks_in_range, &envelope)
-            .unwrap_err();
+        let blocks_in_range: Vec<(Block, Commit)> =
+            blocks.iter().cloned().zip(certs.iter().cloned()).collect();
+        let err =
+            ValidatorTracker::verify_diff_against_headers(&genesis, &blocks_in_range, &envelope)
+                .unwrap_err();
         assert!(
             matches!(err, LightError::MembershipProofInvalid { .. }),
             "got {err}"
@@ -2194,8 +2550,12 @@ mod tests {
     fn verify_diff_rejects_a_tampered_h2_accounts_root() {
         let (genesis, blocks, certs, tracked_h1, tracked_h2, header_h1, header_h2) =
             two_block_certified_chain_for_diff();
-        let state_h1 = crate::Chain::replay(genesis.clone(), &blocks[..1]).unwrap().state;
-        let state_h2 = crate::Chain::replay(genesis.clone(), &blocks).unwrap().state;
+        let state_h1 = crate::Chain::replay(genesis.clone(), &blocks[..1])
+            .unwrap()
+            .state;
+        let state_h2 = crate::Chain::replay(genesis.clone(), &blocks)
+            .unwrap()
+            .state;
         let diff = state_h2.graph_diff(&state_h1);
 
         let mut bad_header_h2 = header_h2.clone();
@@ -2210,13 +2570,11 @@ mod tests {
             tracked_set_h1: tracked_h1,
             tracked_set_h2: tracked_h2,
         };
-        let blocks_in_range: Vec<(Block, Commit)> = blocks
-            .iter()
-            .cloned()
-            .zip(certs.iter().cloned())
-            .collect();
-        let err = ValidatorTracker::verify_diff_against_headers(&genesis, &blocks_in_range, &envelope)
-            .unwrap_err();
+        let blocks_in_range: Vec<(Block, Commit)> =
+            blocks.iter().cloned().zip(certs.iter().cloned()).collect();
+        let err =
+            ValidatorTracker::verify_diff_against_headers(&genesis, &blocks_in_range, &envelope)
+                .unwrap_err();
         assert!(
             matches!(err, LightError::CertificateMismatch { .. }),
             "got {err}"
@@ -2230,10 +2588,17 @@ mod tests {
     fn verify_diff_rejects_an_omitted_added_node() {
         let (genesis, blocks, certs, tracked_h1, tracked_h2, header_h1, header_h2) =
             two_block_certified_chain_for_diff();
-        let state_h1 = crate::Chain::replay(genesis.clone(), &blocks[..1]).unwrap().state;
-        let state_h2 = crate::Chain::replay(genesis.clone(), &blocks).unwrap().state;
+        let state_h1 = crate::Chain::replay(genesis.clone(), &blocks[..1])
+            .unwrap()
+            .state;
+        let state_h2 = crate::Chain::replay(genesis.clone(), &blocks)
+            .unwrap()
+            .state;
         let mut diff = state_h2.graph_diff(&state_h1);
-        assert!(!diff.added.is_empty(), "test setup: block 2 added >= 1 node");
+        assert!(
+            !diff.added.is_empty(),
+            "test setup: block 2 added >= 1 node"
+        );
         diff.added.pop();
 
         let envelope = DiffEnvelope {
@@ -2245,17 +2610,12 @@ mod tests {
             tracked_set_h1: tracked_h1,
             tracked_set_h2: tracked_h2,
         };
-        let blocks_in_range: Vec<(Block, Commit)> = blocks
-            .iter()
-            .cloned()
-            .zip(certs.iter().cloned())
-            .collect();
-        let err = ValidatorTracker::verify_diff_against_headers(&genesis, &blocks_in_range, &envelope)
-            .unwrap_err();
-        assert!(
-            matches!(err, LightError::DiffMismatch { .. }),
-            "got {err}"
-        );
+        let blocks_in_range: Vec<(Block, Commit)> =
+            blocks.iter().cloned().zip(certs.iter().cloned()).collect();
+        let err =
+            ValidatorTracker::verify_diff_against_headers(&genesis, &blocks_in_range, &envelope)
+                .unwrap_err();
+        assert!(matches!(err, LightError::DiffMismatch { .. }), "got {err}");
     }
 
     /// M28: degenerate ranges (`h₁ == 0`, `h₁ >= h₂`) are rejected
@@ -2264,11 +2624,8 @@ mod tests {
     fn verify_diff_rejects_degenerate_ranges() {
         let (genesis, blocks, certs, tracked_h1, tracked_h2, header_h1, header_h2) =
             two_block_certified_chain_for_diff();
-        let blocks_in_range: Vec<(Block, Commit)> = blocks
-            .iter()
-            .cloned()
-            .zip(certs.iter().cloned())
-            .collect();
+        let blocks_in_range: Vec<(Block, Commit)> =
+            blocks.iter().cloned().zip(certs.iter().cloned()).collect();
 
         // h1 == 0 is rejected even though the rest of the envelope is
         // well-formed.
@@ -2347,13 +2704,22 @@ mod tests {
         let certs = d.certificates().to_vec();
         let header = crate::codec::BlockHeader::from_block(&blocks[0]);
         let cert = certs[0].clone();
-        let tracked = crate::Chain::replay(genesis.clone(), &[]).unwrap().state.validators.clone();
-        let blocks_in_range: Vec<(Block, Commit)> = blocks
-            .iter()
-            .cloned()
-            .zip(certs.iter().cloned())
-            .collect();
-        (genesis, blocks, certs, header, cert, tracked, blocks_in_range)
+        let tracked = crate::Chain::replay(genesis.clone(), &[])
+            .unwrap()
+            .state
+            .validators
+            .clone();
+        let blocks_in_range: Vec<(Block, Commit)> =
+            blocks.iter().cloned().zip(certs.iter().cloned()).collect();
+        (
+            genesis,
+            blocks,
+            certs,
+            header,
+            cert,
+            tracked,
+            blocks_in_range,
+        )
     }
 
     #[test]
@@ -2369,8 +2735,11 @@ mod tests {
         // Inclusion: Account(1) at h₂.
         let acct_proof = d.chain.state.account_proof(1).expect("acct 1 proof");
         let acct = d.chain.state.accounts.get(&1).cloned().expect("acct 1");
-        let inclusion_entry =
-            ProofEntry::Account { id: 1, account: acct, proof: acct_proof };
+        let inclusion_entry = ProofEntry::Account {
+            id: 1,
+            account: acct,
+            proof: acct_proof,
+        };
 
         // kNN: 3 nearest to the first graph node's embedding at h₂.
         let query = d.chain.state.graph.nodes[0].embedding;
@@ -2383,11 +2752,19 @@ mod tests {
             let node = d.chain.state.graph.nodes[idx].clone();
             neighbours.push((*id, node, proof));
         }
-        let claim = KnnClaim { query, k: 3, neighbours };
+        let claim = KnnClaim {
+            query,
+            k: 3,
+            neighbours,
+        };
 
         // Diff: h₁=1 → h₂=2.
-        let state_h1 = crate::Chain::replay(genesis.clone(), &blocks[..1]).unwrap().state;
-        let state_h2 = crate::Chain::replay(genesis.clone(), &blocks).unwrap().state;
+        let state_h1 = crate::Chain::replay(genesis.clone(), &blocks[..1])
+            .unwrap()
+            .state;
+        let state_h2 = crate::Chain::replay(genesis.clone(), &blocks)
+            .unwrap()
+            .state;
         let diff = state_h2.graph_diff(&state_h1);
         let diff_env = DiffEnvelope {
             header_prev: header_h1.clone(),
@@ -2400,7 +2777,10 @@ mod tests {
         };
 
         let items = vec![
-            BatchItem::Inclusion { kind: ProofKind::Account, id: 1 },
+            BatchItem::Inclusion {
+                kind: ProofKind::Account,
+                id: 1,
+            },
             BatchItem::Knn { query, k: 3 },
             BatchItem::Diff { h1: 1, h2: 2 },
         ];
@@ -2411,17 +2791,22 @@ mod tests {
                 BatchResponseItem::Diff(Box::new(diff_env)),
             ],
         };
-        let blocks_in_range: Vec<(Block, Commit)> = blocks
-            .iter()
-            .cloned()
-            .zip(certs.iter().cloned())
-            .collect();
+        let blocks_in_range: Vec<(Block, Commit)> =
+            blocks.iter().cloned().zip(certs.iter().cloned()).collect();
         let tracker = fresh_tracker(&genesis);
         // The h₂ tracked set certifies header_h2.
-        let tracked_h2_cert = ValidatorTracker::from_genesis(&genesis).validators().clone();
+        let tracked_h2_cert = ValidatorTracker::from_genesis(&genesis)
+            .validators()
+            .clone();
         ValidatorTracker::verify_batch(
-            &tracker, &genesis, &header_h2, &certs[1], &tracked_h2_cert,
-            &blocks_in_range, &items, &response,
+            &tracker,
+            &genesis,
+            &header_h2,
+            &certs[1],
+            &tracked_h2_cert,
+            &blocks_in_range,
+            &items,
+            &response,
         )
         .expect("M29: heterogeneous (Inclusion, Knn, Diff) batch verifies end-to-end");
     }
@@ -2458,14 +2843,17 @@ mod tests {
             })
             .collect();
         sorted.sort_by(|a, b| {
-            b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal)
+            b.1.partial_cmp(&a.1)
+                .unwrap_or(std::cmp::Ordering::Equal)
                 .then(a.0.node_id.cmp(&b.0.node_id))
         });
         let sorted_ids: Vec<u64> = sorted.iter().map(|(n, _)| n.node_id).collect();
         let mut range_nodes: Vec<(u64, crate::engine::GraphNode, merkle::Proof)> =
             Vec::with_capacity(cut_ids.len());
         for id in &cut_ids {
-            let sorted_idx = sorted_ids.iter().position(|x| x == id)
+            let sorted_idx = sorted_ids
+                .iter()
+                .position(|x| x == id)
                 .expect("id must be in sorted view");
             let proof = d
                 .chain
@@ -2475,15 +2863,26 @@ mod tests {
             let (_id, node, merkle_proof) = proof.entries.into_iter().next().unwrap();
             range_nodes.push((*id, node, merkle_proof));
         }
-        let range_claim = RangeClaim { query, min_sim, nodes: range_nodes };
+        let range_claim = RangeClaim {
+            query,
+            min_sim,
+            nodes: range_nodes,
+        };
 
         let acct_proof = d.chain.state.account_proof(1).expect("acct 1 proof");
         let acct = d.chain.state.accounts.get(&1).cloned().expect("acct 1");
-        let inclusion_entry =
-            ProofEntry::Account { id: 1, account: acct, proof: acct_proof };
+        let inclusion_entry = ProofEntry::Account {
+            id: 1,
+            account: acct,
+            proof: acct_proof,
+        };
 
-        let state_h1 = crate::Chain::replay(genesis.clone(), &blocks[..1]).unwrap().state;
-        let state_h2 = crate::Chain::replay(genesis.clone(), &blocks).unwrap().state;
+        let state_h1 = crate::Chain::replay(genesis.clone(), &blocks[..1])
+            .unwrap()
+            .state;
+        let state_h2 = crate::Chain::replay(genesis.clone(), &blocks)
+            .unwrap()
+            .state;
         let diff = state_h2.graph_diff(&state_h1);
         let diff_env = DiffEnvelope {
             header_prev: header_h1.clone(),
@@ -2496,7 +2895,10 @@ mod tests {
         };
 
         let items = vec![
-            BatchItem::Inclusion { kind: ProofKind::Account, id: 1 },
+            BatchItem::Inclusion {
+                kind: ProofKind::Account,
+                id: 1,
+            },
             BatchItem::Range { query, min_sim },
             BatchItem::Diff { h1: 1, h2: 2 },
         ];
@@ -2507,16 +2909,21 @@ mod tests {
                 BatchResponseItem::Diff(Box::new(diff_env)),
             ],
         };
-        let blocks_in_range: Vec<(Block, Commit)> = blocks
-            .iter()
-            .cloned()
-            .zip(certs.iter().cloned())
-            .collect();
+        let blocks_in_range: Vec<(Block, Commit)> =
+            blocks.iter().cloned().zip(certs.iter().cloned()).collect();
         let tracker = fresh_tracker(&genesis);
-        let tracked_h2_cert = ValidatorTracker::from_genesis(&genesis).validators().clone();
+        let tracked_h2_cert = ValidatorTracker::from_genesis(&genesis)
+            .validators()
+            .clone();
         ValidatorTracker::verify_batch(
-            &tracker, &genesis, &header_h2, &certs[1], &tracked_h2_cert,
-            &blocks_in_range, &items, &response,
+            &tracker,
+            &genesis,
+            &header_h2,
+            &certs[1],
+            &tracked_h2_cert,
+            &blocks_in_range,
+            &items,
+            &response,
         )
         .expect("M29: heterogeneous (Inclusion, Range, Diff) batch verifies end-to-end");
     }
@@ -2534,11 +2941,18 @@ mod tests {
         let acct_proof = d.chain.state.account_proof(1).expect("acct 1 proof");
         let mut acct = d.chain.state.accounts.get(&1).cloned().expect("acct 1");
         acct.balance += 1; // tamper
-        let tampered_entry =
-            ProofEntry::Account { id: 1, account: acct, proof: acct_proof };
+        let tampered_entry = ProofEntry::Account {
+            id: 1,
+            account: acct,
+            proof: acct_proof,
+        };
 
-        let state_h1 = crate::Chain::replay(genesis.clone(), &blocks[..1]).unwrap().state;
-        let state_h2 = crate::Chain::replay(genesis.clone(), &blocks).unwrap().state;
+        let state_h1 = crate::Chain::replay(genesis.clone(), &blocks[..1])
+            .unwrap()
+            .state;
+        let state_h2 = crate::Chain::replay(genesis.clone(), &blocks)
+            .unwrap()
+            .state;
         let diff = state_h2.graph_diff(&state_h1);
         let diff_env = DiffEnvelope {
             header_prev: header_h1.clone(),
@@ -2551,7 +2965,10 @@ mod tests {
         };
 
         let items = vec![
-            BatchItem::Inclusion { kind: ProofKind::Account, id: 1 },
+            BatchItem::Inclusion {
+                kind: ProofKind::Account,
+                id: 1,
+            },
             BatchItem::Diff { h1: 1, h2: 2 },
         ];
         let response = BatchResponseEnvelope {
@@ -2560,16 +2977,21 @@ mod tests {
                 BatchResponseItem::Diff(Box::new(diff_env)),
             ],
         };
-        let blocks_in_range: Vec<(Block, Commit)> = blocks
-            .iter()
-            .cloned()
-            .zip(certs.iter().cloned())
-            .collect();
+        let blocks_in_range: Vec<(Block, Commit)> =
+            blocks.iter().cloned().zip(certs.iter().cloned()).collect();
         let tracker = fresh_tracker(&genesis);
-        let tracked_h2_cert = ValidatorTracker::from_genesis(&genesis).validators().clone();
+        let tracked_h2_cert = ValidatorTracker::from_genesis(&genesis)
+            .validators()
+            .clone();
         let err = ValidatorTracker::verify_batch(
-            &tracker, &genesis, &header_h2, &certs[1], &tracked_h2_cert,
-            &blocks_in_range, &items, &response,
+            &tracker,
+            &genesis,
+            &header_h2,
+            &certs[1],
+            &tracked_h2_cert,
+            &blocks_in_range,
+            &items,
+            &response,
         )
         .unwrap_err();
         assert!(
@@ -2598,13 +3020,21 @@ mod tests {
             let node = d.chain.state.graph.nodes[idx].clone();
             neighbours.push((*id, node, proof));
         }
-        let mut claim = KnnClaim { query, k: 3, neighbours };
+        let mut claim = KnnClaim {
+            query,
+            k: 3,
+            neighbours,
+        };
         if claim.neighbours.len() >= 2 {
             claim.neighbours.swap(0, 1); // tamper ranking order
         }
 
-        let state_h1 = crate::Chain::replay(genesis.clone(), &blocks[..1]).unwrap().state;
-        let state_h2 = crate::Chain::replay(genesis.clone(), &blocks).unwrap().state;
+        let state_h1 = crate::Chain::replay(genesis.clone(), &blocks[..1])
+            .unwrap()
+            .state;
+        let state_h2 = crate::Chain::replay(genesis.clone(), &blocks)
+            .unwrap()
+            .state;
         let diff = state_h2.graph_diff(&state_h1);
         let diff_env = DiffEnvelope {
             header_prev: header_h1.clone(),
@@ -2626,16 +3056,21 @@ mod tests {
                 BatchResponseItem::Diff(Box::new(diff_env)),
             ],
         };
-        let blocks_in_range: Vec<(Block, Commit)> = blocks
-            .iter()
-            .cloned()
-            .zip(certs.iter().cloned())
-            .collect();
+        let blocks_in_range: Vec<(Block, Commit)> =
+            blocks.iter().cloned().zip(certs.iter().cloned()).collect();
         let tracker = fresh_tracker(&genesis);
-        let tracked_h2_cert = ValidatorTracker::from_genesis(&genesis).validators().clone();
+        let tracked_h2_cert = ValidatorTracker::from_genesis(&genesis)
+            .validators()
+            .clone();
         let err = ValidatorTracker::verify_batch(
-            &tracker, &genesis, &header_h2, &certs[1], &tracked_h2_cert,
-            &blocks_in_range, &items, &response,
+            &tracker,
+            &genesis,
+            &header_h2,
+            &certs[1],
+            &tracked_h2_cert,
+            &blocks_in_range,
+            &items,
+            &response,
         )
         .unwrap_err();
         assert!(
@@ -2654,10 +3089,17 @@ mod tests {
         d.submit(novel_tx(2, 2, 2, 2.0)).unwrap();
         d.produce(2.0, &no_silence()).unwrap().expect("block 2");
 
-        let state_h1 = crate::Chain::replay(genesis.clone(), &blocks[..1]).unwrap().state;
-        let state_h2 = crate::Chain::replay(genesis.clone(), &blocks).unwrap().state;
+        let state_h1 = crate::Chain::replay(genesis.clone(), &blocks[..1])
+            .unwrap()
+            .state;
+        let state_h2 = crate::Chain::replay(genesis.clone(), &blocks)
+            .unwrap()
+            .state;
         let mut diff = state_h2.graph_diff(&state_h1);
-        assert!(!diff.added.is_empty(), "block 2 added at least one graph node");
+        assert!(
+            !diff.added.is_empty(),
+            "block 2 added at least one graph node"
+        );
         diff.added.pop(); // tamper: drop one added entry
 
         let diff_env = DiffEnvelope {
@@ -2674,16 +3116,21 @@ mod tests {
         let response = BatchResponseEnvelope {
             items: vec![BatchResponseItem::Diff(Box::new(diff_env))],
         };
-        let blocks_in_range: Vec<(Block, Commit)> = blocks
-            .iter()
-            .cloned()
-            .zip(certs.iter().cloned())
-            .collect();
+        let blocks_in_range: Vec<(Block, Commit)> =
+            blocks.iter().cloned().zip(certs.iter().cloned()).collect();
         let tracker = fresh_tracker(&genesis);
-        let tracked_h2_cert = ValidatorTracker::from_genesis(&genesis).validators().clone();
+        let tracked_h2_cert = ValidatorTracker::from_genesis(&genesis)
+            .validators()
+            .clone();
         let err = ValidatorTracker::verify_batch(
-            &tracker, &genesis, &header_h2, &certs[1], &tracked_h2_cert,
-            &blocks_in_range, &items, &response,
+            &tracker,
+            &genesis,
+            &header_h2,
+            &certs[1],
+            &tracked_h2_cert,
+            &blocks_in_range,
+            &items,
+            &response,
         )
         .unwrap_err();
         assert!(
@@ -2712,15 +3159,25 @@ mod tests {
             let node = d.chain.state.graph.nodes[idx].clone();
             neighbours.push((*id, node, proof));
         }
-        let knn_claim = KnnClaim { query, k: 1, neighbours };
+        let knn_claim = KnnClaim {
+            query,
+            k: 1,
+            neighbours,
+        };
 
         let acct_proof = d.chain.state.account_proof(1).expect("acct 1 proof");
         let acct = d.chain.state.accounts.get(&1).cloned().expect("acct 1");
-        let inclusion_entry =
-            ProofEntry::Account { id: 1, account: acct, proof: acct_proof };
+        let inclusion_entry = ProofEntry::Account {
+            id: 1,
+            account: acct,
+            proof: acct_proof,
+        };
 
         let items = vec![
-            BatchItem::Inclusion { kind: ProofKind::Account, id: 1 },
+            BatchItem::Inclusion {
+                kind: ProofKind::Account,
+                id: 1,
+            },
             BatchItem::Knn { query, k: 1 },
         ];
         // Slot 0 gets Knn, slot 1 gets Inclusion — the kinds at the
@@ -2733,8 +3190,14 @@ mod tests {
         };
         let tracker = fresh_tracker(&genesis);
         let err = ValidatorTracker::verify_batch(
-            &tracker, &genesis, &header, &cert, &tracked, &blocks_in_range,
-            &items, &response,
+            &tracker,
+            &genesis,
+            &header,
+            &cert,
+            &tracked,
+            &blocks_in_range,
+            &items,
+            &response,
         )
         .unwrap_err();
         assert!(
@@ -2748,9 +3211,18 @@ mod tests {
         let (genesis, _blocks, _certs, header, cert, tracked, blocks_in_range) =
             one_block_artifacts();
         let items = vec![
-            BatchItem::Inclusion { kind: ProofKind::Account, id: 1 },
-            BatchItem::Inclusion { kind: ProofKind::Reviewer, id: 1 },
-            BatchItem::Range { query: [0.0; 8], min_sim: 0.0 },
+            BatchItem::Inclusion {
+                kind: ProofKind::Account,
+                id: 1,
+            },
+            BatchItem::Inclusion {
+                kind: ProofKind::Reviewer,
+                id: 1,
+            },
+            BatchItem::Range {
+                query: [0.0; 8],
+                min_sim: 0.0,
+            },
         ];
         let response = BatchResponseEnvelope {
             items: vec![
@@ -2760,12 +3232,24 @@ mod tests {
         };
         let tracker = fresh_tracker(&genesis);
         let err = ValidatorTracker::verify_batch(
-            &tracker, &genesis, &header, &cert, &tracked, &blocks_in_range,
-            &items, &response,
+            &tracker,
+            &genesis,
+            &header,
+            &cert,
+            &tracked,
+            &blocks_in_range,
+            &items,
+            &response,
         )
         .unwrap_err();
         assert!(
-            matches!(err, LightError::BatchItemCountMismatch { request: 3, response: 2 }),
+            matches!(
+                err,
+                LightError::BatchItemCountMismatch {
+                    request: 3,
+                    response: 2
+                }
+            ),
             "expected BatchItemCountMismatch {{ 3, 2 }}, got {err}"
         );
     }
@@ -2792,10 +3276,17 @@ mod tests {
             let node = d.chain.state.graph.nodes[idx].clone();
             neighbours.push((*id, node, proof));
         }
-        let claim = KnnClaim { query, k: 1, neighbours };
+        let claim = KnnClaim {
+            query,
+            k: 1,
+            neighbours,
+        };
 
         let items = vec![
-            BatchItem::Inclusion { kind: ProofKind::Account, id: 999 },
+            BatchItem::Inclusion {
+                kind: ProofKind::Account,
+                id: 999,
+            },
             BatchItem::Knn { query, k: 1 },
         ];
         let response = BatchResponseEnvelope {
@@ -2804,16 +3295,21 @@ mod tests {
                 BatchResponseItem::Knn(Some(claim)),
             ],
         };
-        let blocks_in_range: Vec<(Block, Commit)> = blocks
-            .iter()
-            .cloned()
-            .zip(certs.iter().cloned())
-            .collect();
+        let blocks_in_range: Vec<(Block, Commit)> =
+            blocks.iter().cloned().zip(certs.iter().cloned()).collect();
         let tracker = fresh_tracker(&genesis);
-        let tracked_h2_cert = ValidatorTracker::from_genesis(&genesis).validators().clone();
+        let tracked_h2_cert = ValidatorTracker::from_genesis(&genesis)
+            .validators()
+            .clone();
         ValidatorTracker::verify_batch(
-            &tracker, &genesis, &header_h2, &certs[1], &tracked_h2_cert,
-            &blocks_in_range, &items, &response,
+            &tracker,
+            &genesis,
+            &header_h2,
+            &certs[1],
+            &tracked_h2_cert,
+            &blocks_in_range,
+            &items,
+            &response,
         )
         .expect("M29: skipping a None inclusion slot leaves the rest verifiable");
     }

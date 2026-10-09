@@ -17,15 +17,15 @@ pub type Embedding = [f32; DIM];
 /// Unified governance parameter table (mirrors B.2.3 defaults).
 #[derive(Clone, Copy, Debug)]
 pub struct DeltaKParams {
-    pub tau_dup: f32,      // near-duplicate threshold
+    pub tau_dup: f32, // near-duplicate threshold
     pub n_review_min: usize,
-    pub c_cap: f32,        // correctness cap when reviews insufficient
-    pub n_min: usize,      // minimum replication attempts
-    pub lam: f32,          // cross-domain bridging coefficient
+    pub c_cap: f32,   // correctness cap when reviews insufficient
+    pub n_min: usize, // minimum replication attempts
+    pub lam: f32,     // cross-domain bridging coefficient
     pub bonus_max: f32,
-    pub decay: f32,        // time decay per day
+    pub decay: f32, // time decay per day
     pub fresh_min: f32,
-    pub delta_k_min: f32,  // ΔK gate: below this -> 0
+    pub delta_k_min: f32, // ΔK gate: below this -> 0
 }
 
 impl Default for DeltaKParams {
@@ -92,7 +92,9 @@ impl Enc {
         self.0.extend_from_slice(&v.to_be_bytes());
     }
     fn emb(&mut self, e: &Embedding) {
-        for &x in e { self.f32(x); }
+        for &x in e {
+            self.f32(x);
+        }
     }
 }
 
@@ -109,7 +111,9 @@ impl CognitiveGraph {
     }
 
     pub fn with_capacity(cap: usize) -> Self {
-        CognitiveGraph { nodes: Vec::with_capacity(cap) }
+        CognitiveGraph {
+            nodes: Vec::with_capacity(cap),
+        }
     }
 
     /// Append a node to the graph and return its monotonic `node_id`.
@@ -118,7 +122,11 @@ impl CognitiveGraph {
     #[inline]
     pub fn add(&mut self, embedding: Embedding, domain: u32) -> u64 {
         let id = self.nodes.len() as u64;
-        self.nodes.push(GraphNode { node_id: id, embedding, domain });
+        self.nodes.push(GraphNode {
+            node_id: id,
+            embedding,
+            domain,
+        });
         id
     }
 
@@ -289,7 +297,11 @@ pub fn agreement(reviews: &[(f32, f32)]) -> f32 {
     }
     let n = reviews.len() as f32;
     let mean: f32 = reviews.iter().map(|(_, s)| *s).sum::<f32>() / n;
-    let var: f32 = reviews.iter().map(|(_, s)| (s - mean) * (s - mean)).sum::<f32>() / n;
+    let var: f32 = reviews
+        .iter()
+        .map(|(_, s)| (s - mean) * (s - mean))
+        .sum::<f32>()
+        / n;
     clamp(1.0 - 2.0 * var.sqrt(), 0.0, 1.0)
 }
 
@@ -371,7 +383,11 @@ mod tests {
     #[test]
     fn first_node_in_domain_is_fully_novel() {
         let g = CognitiveGraph::new();
-        let sub = Submission { embedding: unit(1.0), domain: 0, timestamp_days: 0.0 };
+        let sub = Submission {
+            embedding: unit(1.0),
+            domain: 0,
+            timestamp_days: 0.0,
+        };
         let reviews = vec![(1.0, 0.9); 5];
         let dk = compute_delta_k(&sub, &g, &reviews, (3, 3), &DeltaKParams::default(), 0.0);
         assert!(dk > 0.0);
@@ -381,7 +397,11 @@ mod tests {
     fn near_duplicate_gets_zero() {
         let mut g = CognitiveGraph::new();
         g.add(unit(1.0), 0);
-        let sub = Submission { embedding: unit(1.0), domain: 0, timestamp_days: 0.0 };
+        let sub = Submission {
+            embedding: unit(1.0),
+            domain: 0,
+            timestamp_days: 0.0,
+        };
         let reviews = vec![(1.0, 0.9); 5];
         let dk = compute_delta_k(&sub, &g, &reviews, (3, 3), &DeltaKParams::default(), 0.0);
         assert_eq!(dk, 0.0); // cos_sim == 1 > tau_dup -> novelty 0 -> gated to 0
@@ -400,10 +420,14 @@ mod tests {
 
     #[test]
     fn merkle_leaf_is_stable_and_id_prefixed() {
-        let n = GraphNode { node_id: 7, embedding: unit(1.0), domain: 3 };
+        let n = GraphNode {
+            node_id: 7,
+            embedding: unit(1.0),
+            domain: 3,
+        };
         let leaf = n.merkle_leaf();
         assert_eq!(leaf.len(), 8 + 32 + 4); // 44 bytes
-        // id is at the front in BE
+                                            // id is at the front in BE
         assert_eq!(&leaf[0..8], &7u64.to_be_bytes());
         // embedding follows: 8 × f32, first one is 1.0
         let e0 = f32::from_be_bytes(leaf[8..12].try_into().unwrap());
@@ -415,7 +439,11 @@ mod tests {
     #[test]
     fn low_scores_gated_out() {
         let g = CognitiveGraph::new();
-        let sub = Submission { embedding: unit(1.0), domain: 0, timestamp_days: 0.0 };
+        let sub = Submission {
+            embedding: unit(1.0),
+            domain: 0,
+            timestamp_days: 0.0,
+        };
         let reviews = vec![(1.0, 0.05); 5];
         let dk = compute_delta_k(&sub, &g, &reviews, (0, 3), &DeltaKParams::default(), 0.0);
         assert_eq!(dk, 0.0);
@@ -578,15 +606,33 @@ mod python {
             fresh_min: Option<f32>,
             delta_k_min: Option<f32>,
         ) {
-            if let Some(v) = tau_dup { self.params.tau_dup = v; }
-            if let Some(v) = n_review_min { self.params.n_review_min = v; }
-            if let Some(v) = c_cap { self.params.c_cap = v; }
-            if let Some(v) = n_min { self.params.n_min = v; }
-            if let Some(v) = lam { self.params.lam = v; }
-            if let Some(v) = bonus_max { self.params.bonus_max = v; }
-            if let Some(v) = decay { self.params.decay = v; }
-            if let Some(v) = fresh_min { self.params.fresh_min = v; }
-            if let Some(v) = delta_k_min { self.params.delta_k_min = v; }
+            if let Some(v) = tau_dup {
+                self.params.tau_dup = v;
+            }
+            if let Some(v) = n_review_min {
+                self.params.n_review_min = v;
+            }
+            if let Some(v) = c_cap {
+                self.params.c_cap = v;
+            }
+            if let Some(v) = n_min {
+                self.params.n_min = v;
+            }
+            if let Some(v) = lam {
+                self.params.lam = v;
+            }
+            if let Some(v) = bonus_max {
+                self.params.bonus_max = v;
+            }
+            if let Some(v) = decay {
+                self.params.decay = v;
+            }
+            if let Some(v) = fresh_min {
+                self.params.fresh_min = v;
+            }
+            if let Some(v) = delta_k_min {
+                self.params.delta_k_min = v;
+            }
         }
 
         /// Compute ΔK for one submission against the current graph and params.
@@ -626,4 +672,3 @@ mod python {
         Ok(())
     }
 }
-

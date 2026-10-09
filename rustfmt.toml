@@ -1,0 +1,6 @@
+# Repo-wide formatting standard (applies to both `node/` and `engine/`).
+# These are rustfmt's stable defaults, pinned explicitly so `cargo fmt` is
+# idempotent across toolchains and future milestones can run it freely without
+# producing incidental diff churn.
+edition = "2021"
+max_width = 100

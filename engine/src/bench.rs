@@ -7,9 +7,7 @@
 //! Run: cargo run --release --bin bench -- [N] [M] [D]
 
 use std::time::Instant;
-use zhixing_engine::{
-    compute_delta_k, CognitiveGraph, DeltaKParams, Embedding, Submission, DIM,
-};
+use zhixing_engine::{compute_delta_k, CognitiveGraph, DeltaKParams, Embedding, Submission, DIM};
 
 /// Tiny deterministic xorshift64* RNG (std-only, no crates).
 struct Rng(u64);
@@ -66,10 +64,7 @@ fn main() {
     // build graph
     let mut graph = CognitiveGraph::with_capacity(n);
     for _ in 0..n {
-        graph.add(
-            rand_unit(&mut rng),
-            (rng.next_u64() % d as u64) as u32,
-        );
+        graph.add(rand_unit(&mut rng), (rng.next_u64() % d as u64) as u32);
     }
 
     // pre-generate submissions + reviews so timing isolates the ΔK hot path

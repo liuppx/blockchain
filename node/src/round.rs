@@ -96,7 +96,14 @@ impl Proposal {
     ) -> Self {
         let msg = proposal_signing_bytes(height, round, &block.hash(), valid_round, proposer);
         let signature = kp.sign(&msg);
-        Proposal { height, round, block, valid_round, proposer, signature }
+        Proposal {
+            height,
+            round,
+            block,
+            valid_round,
+            proposer,
+            signature,
+        }
     }
 
     fn verify_sig(&self, pk: &PubKey) -> bool {
@@ -333,14 +340,19 @@ impl RoundState {
                 }
                 let val = self.vset.get(v.validator)?;
                 let pk = val.pubkey;
-                let bytes = vote_signing_bytes(v.validator, v.height, v.round, &v.block_hash, v.vote_type);
+                let bytes =
+                    vote_signing_bytes(v.validator, v.height, v.round, &v.block_hash, v.vote_type);
                 if !crypto::verify(&pk, &bytes, &v.signature) {
                     return None;
                 }
                 match v.vote_type {
                     VoteType::Prevote => {
                         // Prevote equivocation is not slashable here; first-wins.
-                        self.prevotes.entry(v.round).or_default().entry(v.validator).or_insert(v);
+                        self.prevotes
+                            .entry(v.round)
+                            .or_default()
+                            .entry(v.validator)
+                            .or_insert(v);
                         None
                     }
                     VoteType::Precommit => {
@@ -356,7 +368,10 @@ impl RoundState {
                                 } else {
                                     (v.clone(), prev.clone())
                                 };
-                                Some(SlashEvidence { vote_a: a, vote_b: b })
+                                Some(SlashEvidence {
+                                    vote_a: a,
+                                    vote_b: b,
+                                })
                             }
                             _ => None,
                         };
@@ -427,7 +442,12 @@ impl RoundState {
                         .filter(|v| v.block_hash == bh)
                         .cloned()
                         .collect();
-                    let commit = Commit { height: self.height, round: pr, block_hash: bh, precommits };
+                    let commit = Commit {
+                        height: self.height,
+                        round: pr,
+                        block_hash: bh,
+                        precommits,
+                    };
                     self.decided = Some(commit.clone());
                     out.push(Action::Decided(commit));
                     return true;
@@ -457,11 +477,12 @@ impl RoundState {
                 {
                     // L28: proposal re-proposing a value locked at valid_round,
                     // backed by a prevote-quorum from that round
-                    let target = if self.valid_block(&p.block) && self.locked_ok_pol(&bh, p.valid_round) {
-                        bh
-                    } else {
-                        NIL
-                    };
+                    let target =
+                        if self.valid_block(&p.block) && self.locked_ok_pol(&bh, p.valid_round) {
+                            bh
+                        } else {
+                            NIL
+                        };
                     self.cast_prevote(r, target, kp, out);
                     self.step = Step::Prevote;
                     return true;
@@ -470,7 +491,10 @@ impl RoundState {
         }
 
         // L34: first prevote-quorum (any value) at this round -> arm prevote timeout.
-        if self.step == Step::Prevote && !self.fired.contains(&(34, r)) && self.prevote_power(r, None) >= q {
+        if self.step == Step::Prevote
+            && !self.fired.contains(&(34, r))
+            && self.prevote_power(r, None) >= q
+        {
             self.fired.insert((34, r));
             out.push(Action::Schedule(Step::Prevote, r));
             return true;
@@ -572,10 +596,19 @@ impl Sim {
         let mut nodes = BTreeMap::new();
         for v in vset.validators() {
             if !silent.contains(&v.id) {
-                nodes.insert(v.id, RoundState::new(vset.clone(), v.id, height, candidate.clone()));
+                nodes.insert(
+                    v.id,
+                    RoundState::new(vset.clone(), v.id, height, candidate.clone()),
+                );
             }
         }
-        Sim { vset, keys, nodes, queue: VecDeque::new(), timeouts: BTreeSet::new() }
+        Sim {
+            vset,
+            keys,
+            nodes,
+            queue: VecDeque::new(),
+            timeouts: BTreeSet::new(),
+        }
     }
 
     fn apply(&mut self, id: u64, actions: Vec<Action>) {
@@ -631,7 +664,10 @@ impl Sim {
                 if self.nodes.contains_key(&id) {
                     let acts = {
                         let kp = &self.keys[&id];
-                        self.nodes.get_mut(&id).unwrap().on_timeout(kp, tag_step(tag), round)
+                        self.nodes
+                            .get_mut(&id)
+                            .unwrap()
+                            .on_timeout(kp, tag_step(tag), round)
                     };
                     self.apply(id, acts);
                 }
@@ -675,7 +711,11 @@ mod tests {
     fn vset(ids: &[u64]) -> ValidatorSet {
         ValidatorSet::new(
             ids.iter()
-                .map(|&id| Validator { id, pubkey: kp(id).public(), power: 1 })
+                .map(|&id| Validator {
+                    id,
+                    pubkey: kp(id).public(),
+                    power: 1,
+                })
                 .collect(),
         )
     }
@@ -699,7 +739,7 @@ mod tests {
             bridge_headers: Vec::new(),
             bridge_redeems: Vec::new(),
             proposer: 0,
-}
+        }
     }
 
     #[test]
@@ -792,12 +832,14 @@ mod tests {
         let impostor = ids.iter().copied().find(|&x| x != proposer).unwrap();
         let mut node = RoundState::new(vs, impostor, 1, b.clone());
         let _ = node.start(&kp(impostor)); // a non-proposer just arms a timeout
-        // impostor forges a proposal for round 0 signed with its own key
+                                           // impostor forges a proposal for round 0 signed with its own key
         let forged = Proposal::signed(1, 0, b.clone(), -1, impostor, &kp(impostor));
         let acts = node.on_message(&kp(impostor), Msg::Proposal(forged));
         // it must NOT have prevoted the forged proposal (no broadcast produced)
         assert!(
-            !acts.iter().any(|a| matches!(a, Action::Broadcast(Msg::Vote(_)))),
+            !acts
+                .iter()
+                .any(|a| matches!(a, Action::Broadcast(Msg::Vote(_)))),
             "a proposal from the wrong proposer must be dropped"
         );
     }
@@ -865,7 +907,10 @@ mod tests {
             &kp(1),
             Msg::Vote(Vote::signed(2, 1, 0, ha, VoteType::Precommit, &kp(2))),
         );
-        assert!(find_equiv(&first).is_none(), "first precommit is not evidence");
+        assert!(
+            find_equiv(&first).is_none(),
+            "first precommit is not evidence"
+        );
         let second = node.on_message(
             &kp(1),
             Msg::Vote(Vote::signed(2, 1, 0, hb, VoteType::Precommit, &kp(2))),
@@ -883,12 +928,18 @@ mod tests {
         let mut node = RoundState::new(vset(&ids), 1, 1, block(1));
         let _ = node.start(&kp(1));
         let h = [7u8; 32];
-        node.on_message(&kp(1), Msg::Vote(Vote::signed(2, 1, 0, h, VoteType::Precommit, &kp(2))));
+        node.on_message(
+            &kp(1),
+            Msg::Vote(Vote::signed(2, 1, 0, h, VoteType::Precommit, &kp(2))),
+        );
         let again = node.on_message(
             &kp(1),
             Msg::Vote(Vote::signed(2, 1, 0, h, VoteType::Precommit, &kp(2))),
         );
-        assert!(find_equiv(&again).is_none(), "identical precommit is not evidence");
+        assert!(
+            find_equiv(&again).is_none(),
+            "identical precommit is not evidence"
+        );
     }
 
     #[test]
@@ -900,13 +951,30 @@ mod tests {
         let _ = node.start(&kp(1));
         node.on_message(
             &kp(1),
-            Msg::Vote(Vote::signed(2, 1, 0, [1u8; 32], VoteType::Precommit, &kp(2))),
+            Msg::Vote(Vote::signed(
+                2,
+                1,
+                0,
+                [1u8; 32],
+                VoteType::Precommit,
+                &kp(2),
+            )),
         );
         let r1 = node.on_message(
             &kp(1),
-            Msg::Vote(Vote::signed(2, 1, 1, [2u8; 32], VoteType::Precommit, &kp(2))),
+            Msg::Vote(Vote::signed(
+                2,
+                1,
+                1,
+                [2u8; 32],
+                VoteType::Precommit,
+                &kp(2),
+            )),
         );
-        assert!(find_equiv(&r1).is_none(), "cross-round precommits are not a double-sign");
+        assert!(
+            find_equiv(&r1).is_none(),
+            "cross-round precommits are not a double-sign"
+        );
     }
 
     #[test]
@@ -924,7 +992,10 @@ mod tests {
             &kp(1),
             Msg::Vote(Vote::signed(2, 1, 0, [2u8; 32], VoteType::Prevote, &kp(2))),
         );
-        assert!(find_equiv(&second).is_none(), "prevote conflicts are not slashable here");
+        assert!(
+            find_equiv(&second).is_none(),
+            "prevote conflicts are not slashable here"
+        );
     }
 
     #[test]
@@ -950,6 +1021,10 @@ mod tests {
             .expect("n2 detects")
             .clone();
 
-        assert_eq!(e1.hash(), e2.hash(), "canonical ordering makes evidence dedup-stable");
+        assert_eq!(
+            e1.hash(),
+            e2.hash(),
+            "canonical ordering makes evidence dedup-stable"
+        );
     }
 }

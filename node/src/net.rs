@@ -46,8 +46,8 @@ use crate::codec::{
 };
 use crate::consensus::Commit;
 use crate::light::ValidatorTracker;
-use crate::merkle;
 use crate::mempool::Mempool;
+use crate::merkle;
 use crate::validator::ValidatorSet;
 use crate::{Block, Chain, Genesis, Hash, SlashEvidence, StakeOp, SubmissionTx};
 
@@ -97,14 +97,18 @@ pub enum GossipMsg {
     /// header it received over M22, so the full peer never gets to lie about
     /// which leaf corresponds to which id. Full nodes serve; light nodes drop.
     /// Capped at [`MAX_PROOF_BATCH`] items per message.
-    GetProof { items: Vec<(crate::light::ProofKind, u64)> },
+    GetProof {
+        items: Vec<(crate::light::ProofKind, u64)>,
+    },
     /// M24: the batched response. `items.len() == request.items.len()`; a
     /// `None` at index `i` means "unknown key" — the wallet's local
     /// `verify_proof_against_header` will reject it cleanly with
     /// `MembershipProofInvalid` against the cert-signed header's root. Light
     /// nodes cache entries by `(kind, id)` via
     /// [`LightGossipNode::take_proof`].
-    Proof { items: Vec<Option<crate::light::ProofEntry>> },
+    Proof {
+        items: Vec<Option<crate::light::ProofEntry>>,
+    },
     /// M28: a light wallet asks a full peer for a cert-signed temporal diff
     /// between two cert-signed heights it already holds. The full peer
     /// replays `(h₁+1..h₂]` on its own chain state and packages the
@@ -333,7 +337,12 @@ pub struct GossipNode {
 
 impl GossipNode {
     /// A fresh node holding only `genesis`, aware of `peers`.
-    pub fn new(id: u64, genesis: Genesis, max_txs: usize, peers: impl IntoIterator<Item = u64>) -> Self {
+    pub fn new(
+        id: u64,
+        genesis: Genesis,
+        max_txs: usize,
+        peers: impl IntoIterator<Item = u64>,
+    ) -> Self {
         GossipNode {
             id,
             chain: Chain::new(genesis.clone()),
@@ -428,32 +437,23 @@ impl GossipNode {
         id: u64,
     ) -> Option<crate::light::ProofEntry> {
         match kind {
-            crate::light::ProofKind::Account => {
-                self.chain.state.account_proof(id).and_then(|p| {
-                    self.chain
-                        .state
-                        .accounts
-                        .get(&id)
-                        .cloned()
-                        .map(|a| crate::light::ProofEntry::Account {
-                            id,
-                            account: a,
-                            proof: p,
-                        })
+            crate::light::ProofKind::Account => self.chain.state.account_proof(id).and_then(|p| {
+                self.chain.state.accounts.get(&id).cloned().map(|a| {
+                    crate::light::ProofEntry::Account {
+                        id,
+                        account: a,
+                        proof: p,
+                    }
                 })
-            }
-            crate::light::ProofKind::Reviewer => {
-                self.chain.state.reviewer_proof(id).map(|p| {
-                    let reputation = self
-                        .chain
-                        .state
-                        .reviewers
-                        .get(&id)
-                        .copied()
-                        .unwrap_or(0.0);
-                    crate::light::ProofEntry::Reviewer { id, reputation, proof: p }
-                })
-            }
+            }),
+            crate::light::ProofKind::Reviewer => self.chain.state.reviewer_proof(id).map(|p| {
+                let reputation = self.chain.state.reviewers.get(&id).copied().unwrap_or(0.0);
+                crate::light::ProofEntry::Reviewer {
+                    id,
+                    reputation,
+                    proof: p,
+                }
+            }),
             crate::light::ProofKind::Validator => {
                 self.chain.state.validators.proof(id).and_then(|p| {
                     self.chain
@@ -478,17 +478,13 @@ impl GossipNode {
                 // node_id along with the proof.
                 let idx = id as usize;
                 self.chain.state.graph_node_proof(idx).and_then(|p| {
-                    self.chain
-                        .state
-                        .graph
-                        .nodes
-                        .get(idx)
-                        .cloned()
-                        .map(|n| crate::light::ProofEntry::GraphNode {
+                    self.chain.state.graph.nodes.get(idx).cloned().map(|n| {
+                        crate::light::ProofEntry::GraphNode {
                             node_id: n.node_id,
                             graph_node: n,
                             proof: p,
-                        })
+                        }
+                    })
                 })
             }
         }
@@ -520,10 +516,7 @@ impl GossipNode {
     /// empty when the batch has no Diff item) — so a Diff slot verifies without
     /// the client having pre-synced the chain. Computed before `items` is moved
     /// into `serve_batch`.
-    pub fn batch(
-        &self,
-        items: Vec<crate::light::BatchItem>,
-    ) -> Option<crate::light::BatchReply> {
+    pub fn batch(&self, items: Vec<crate::light::BatchItem>) -> Option<crate::light::BatchReply> {
         let max_h2 = items
             .iter()
             .filter_map(|it| match it {
@@ -666,7 +659,11 @@ impl GossipNode {
             let graph_node = self.chain.state.graph.nodes.get(idx).cloned()?;
             neighbours.push((*node_id, graph_node, proof));
         }
-        Some(crate::light::KnnClaim { query, k, neighbours })
+        Some(crate::light::KnnClaim {
+            query,
+            k,
+            neighbours,
+        })
     }
 
     /// M27: serve a cert-signed range claim for `cos_sim(query, n) >= min_sim`
@@ -716,30 +713,36 @@ impl GossipNode {
         let sorted_index: std::collections::HashMap<u64, usize> = {
             let mut sorted = self.chain.state.graph.nodes.clone();
             sorted.sort_by(|a, b| {
-                let sa = crate::engine::cos_sim(
-                    &[1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
-                    &a.embedding,
-                );
-                let sb = crate::engine::cos_sim(
-                    &[1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
-                    &b.embedding,
-                );
-                sb.partial_cmp(&sa).unwrap_or(std::cmp::Ordering::Equal)
+                let sa =
+                    crate::engine::cos_sim(&[1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0], &a.embedding);
+                let sb =
+                    crate::engine::cos_sim(&[1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0], &b.embedding);
+                sb.partial_cmp(&sa)
+                    .unwrap_or(std::cmp::Ordering::Equal)
                     .then(a.node_id.cmp(&b.node_id))
             });
-            sorted.iter().enumerate().map(|(i, n)| (n.node_id, i)).collect()
+            sorted
+                .iter()
+                .enumerate()
+                .map(|(i, n)| (n.node_id, i))
+                .collect()
         };
         let mut nodes: Vec<(u64, crate::engine::GraphNode, merkle::Proof)> =
             Vec::with_capacity(ranked.len());
         for (node_id, _sim) in &ranked {
             let sorted_idx = *sorted_index.get(node_id)?;
-            let proof = self.chain.state.graph_range_proof(
-                sorted_idx, sorted_idx + 1,
-            )?;
+            let proof = self
+                .chain
+                .state
+                .graph_range_proof(sorted_idx, sorted_idx + 1)?;
             let (_id, graph_node, merkle_proof) = proof.entries.into_iter().next()?;
             nodes.push((*node_id, graph_node, merkle_proof));
         }
-        Some(crate::light::RangeClaim { query, min_sim, nodes })
+        Some(crate::light::RangeClaim {
+            query,
+            min_sim,
+            nodes,
+        })
     }
 
     /// M28: serve a cert-signed temporal graph diff between two cert-signed
@@ -778,8 +781,7 @@ impl GossipNode {
         // prefix length is exactly `h1` (not `h1 - 1`) so we capture the
         // post-block-h₁ state, not the pre-block-h₁ state.
         let state_h1 = {
-            let prefix: Vec<crate::Block> =
-                self.blocks[..h1 as usize].to_vec();
+            let prefix: Vec<crate::Block> = self.blocks[..h1 as usize].to_vec();
             crate::Chain::replay(self.genesis.clone(), &prefix)
                 .ok()?
                 .state
@@ -794,19 +796,13 @@ impl GossipNode {
         // surface the sets as-is — the wallet re-derives them anyway
         // from its header cache.
         let tracked_h1 = {
-            let replay = crate::Chain::replay(
-                self.genesis.clone(),
-                &self.blocks[..h1 as usize],
-            )
-            .ok()?;
+            let replay =
+                crate::Chain::replay(self.genesis.clone(), &self.blocks[..h1 as usize]).ok()?;
             replay.state.validators.clone()
         };
         let tracked_h2 = {
-            let replay = crate::Chain::replay(
-                self.genesis.clone(),
-                &self.blocks[..h2 as usize],
-            )
-            .ok()?;
+            let replay =
+                crate::Chain::replay(self.genesis.clone(), &self.blocks[..h2 as usize]).ok()?;
             replay.state.validators.clone()
         };
         Some(crate::light::DiffEnvelope {
@@ -842,14 +838,12 @@ impl GossipNode {
         // tracker must follow to know the cert). Replay from genesis so we
         // get the post-apply state for this height, the same way
         // `serve_diff` builds per-side tracked sets.
-        let tracked_set = crate::Chain::replay(
-            self.genesis.clone(),
-            &self.blocks[..height as usize],
-        )
-        .ok()?
-        .state
-        .validators
-        .clone();
+        let tracked_set =
+            crate::Chain::replay(self.genesis.clone(), &self.blocks[..height as usize])
+                .ok()?
+                .state
+                .validators
+                .clone();
         Some(crate::bridge::LockEnvelope {
             source_header: header,
             source_cert: cert.clone(),
@@ -870,7 +864,13 @@ impl GossipNode {
             .bridge_locks
             .iter()
             .map(|(&id, lock)| {
-                let h = self.chain.state.bridge_lock_heights.get(&id).copied().unwrap_or(0);
+                let h = self
+                    .chain
+                    .state
+                    .bridge_lock_heights
+                    .get(&id)
+                    .copied()
+                    .unwrap_or(0);
                 (id, h, lock.clone())
             })
             .collect()
@@ -958,12 +958,14 @@ impl GossipNode {
         if !block.slashing_evidence.is_empty() {
             let committed: std::collections::HashSet<[u8; 32]> =
                 block.slashing_evidence.iter().map(|ev| ev.hash()).collect();
-            self.pending_evidence.retain(|ev| !committed.contains(&ev.hash()));
+            self.pending_evidence
+                .retain(|ev| !committed.contains(&ev.hash()));
         }
         if !block.stake_ops.is_empty() {
             let committed: std::collections::HashSet<[u8; 32]> =
                 block.stake_ops.iter().map(|op| op.hash()).collect();
-            self.pending_stake_ops.retain(|op| !committed.contains(&op.hash()));
+            self.pending_stake_ops
+                .retain(|op| !committed.contains(&op.hash()));
         }
         self.blocks.push(block);
         self.certs.push(cert);
@@ -982,24 +984,27 @@ impl GossipNode {
     /// client will follow. `None` only when the sealed candidate fails its trial
     /// apply (unproposable); honest nodes then time out rather than propose it.
     pub fn build_candidate(&self, timestamp_days: f32) -> Option<Block> {
-        let mut candidate = self.mempool.build_block(&self.chain, timestamp_days).unwrap_or(Block {
-            height: self.chain.state.height + 1,
-            prev_hash: self.chain.head,
-            timestamp_days,
-            proposer: 0,
-            next_validators_root: [0u8; 32],
-            state_root: [0u8; 32],
-            accounts_root: [0u8; 32],
-            graph_root: [0u8; 32],
-            bridge_root: [0u8; 32],
-            txs: Vec::new(),
-            validator_updates: Vec::new(),
-            stake_ops: Vec::new(),
-            slashing_evidence: Vec::new(),
-            bridge_locks: Vec::new(),
-            bridge_headers: Vec::new(),
-            bridge_redeems: Vec::new(),
-        });
+        let mut candidate = self
+            .mempool
+            .build_block(&self.chain, timestamp_days)
+            .unwrap_or(Block {
+                height: self.chain.state.height + 1,
+                prev_hash: self.chain.head,
+                timestamp_days,
+                proposer: 0,
+                next_validators_root: [0u8; 32],
+                state_root: [0u8; 32],
+                accounts_root: [0u8; 32],
+                graph_root: [0u8; 32],
+                bridge_root: [0u8; 32],
+                txs: Vec::new(),
+                validator_updates: Vec::new(),
+                stake_ops: Vec::new(),
+                slashing_evidence: Vec::new(),
+                bridge_locks: Vec::new(),
+                bridge_headers: Vec::new(),
+                bridge_redeems: Vec::new(),
+            });
         candidate.stake_ops = self.pending_stake_ops.clone();
         candidate.slashing_evidence = self.pending_evidence.clone();
         // M122: this node is the proposer of the block it builds — credit its own
@@ -1017,7 +1022,9 @@ impl GossipNode {
     /// the gossip to flood it to peers. A tx that fails static validation is
     /// dropped (empty result).
     pub fn submit_local(&mut self, tx: SubmissionTx) -> Vec<(u64, GossipMsg)> {
-        self.submit_local_checked(tx).map(|(_, out)| out).unwrap_or_default()
+        self.submit_local_checked(tx)
+            .map(|(_, out)| out)
+            .unwrap_or_default()
     }
 
     /// M54: bound the pending mempool (DoS hardening). `usize::MAX` ⇒ unbounded.
@@ -1097,7 +1104,12 @@ impl GossipNode {
 
     /// The gossip a node emits to announce its current height (anti-entropy tick).
     pub fn announce(&self) -> Vec<(u64, GossipMsg)> {
-        self.broadcast(GossipMsg::Status { height: self.height() }, None)
+        self.broadcast(
+            GossipMsg::Status {
+                height: self.height(),
+            },
+            None,
+        )
     }
 
     /// React to one message from peer `from`; return outbound `(peer, msg)`.
@@ -1107,7 +1119,12 @@ impl GossipNode {
             GossipMsg::Status { height } => {
                 if height > self.height() {
                     // peer is ahead: pull what we are missing
-                    vec![(from, GossipMsg::GetBlocks { from: self.height() + 1 })]
+                    vec![(
+                        from,
+                        GossipMsg::GetBlocks {
+                            from: self.height() + 1,
+                        },
+                    )]
                 } else if height < self.height() {
                     // peer is behind: offer it what it lacks
                     vec![(from, GossipMsg::Blocks(self.batch_from(height + 1)))]
@@ -1183,12 +1200,20 @@ impl GossipNode {
             // `state_at_h1`, then packages the diff body plus per-side
             // certs/headers into a typed envelope. The wallet re-verifies
             // every piece against its own cached range and tracked sets.
-            GossipMsg::GetDiff { h1, h2, header_h1, header_h2 } => {
-                match self.serve_diff(h1, h2, &header_h1, &header_h2) {
-                    Some(envelope) => vec![(from, GossipMsg::Diff { envelope: Box::new(envelope) })],
-                    None => Vec::new(),
-                }
-            }
+            GossipMsg::GetDiff {
+                h1,
+                h2,
+                header_h1,
+                header_h2,
+            } => match self.serve_diff(h1, h2, &header_h1, &header_h2) {
+                Some(envelope) => vec![(
+                    from,
+                    GossipMsg::Diff {
+                        envelope: Box::new(envelope),
+                    },
+                )],
+                None => Vec::new(),
+            },
             GossipMsg::Diff { .. } => Vec::new(), // full nodes don't consume diffs
             // M30: bridge lock fetch. Full peer answers with a cert-signed
             // lock envelope if the lock exists on its chain; the wallet's
@@ -1196,7 +1221,12 @@ impl GossipNode {
             // header against its own tracked set (same soundness pattern as
             // M28).
             GossipMsg::GetLock { lock_id } => match self.serve_lock(lock_id) {
-                Some(envelope) => vec![(from, GossipMsg::Lock { envelope: Box::new(envelope) })],
+                Some(envelope) => vec![(
+                    from,
+                    GossipMsg::Lock {
+                        envelope: Box::new(envelope),
+                    },
+                )],
                 None => Vec::new(),
             },
             GossipMsg::Lock { .. } => Vec::new(), // full nodes don't consume locks
@@ -1225,9 +1255,19 @@ impl GossipNode {
         }
         // we advanced: tell peers our new height (they will pull from us), and if
         // the batch was full there may be more — ask the sender to continue.
-        let mut out = self.broadcast(GossipMsg::Status { height: self.height() }, Some(from));
+        let mut out = self.broadcast(
+            GossipMsg::Status {
+                height: self.height(),
+            },
+            Some(from),
+        );
         if applied == n && n == MAX_BATCH {
-            out.push((from, GossipMsg::GetBlocks { from: self.height() + 1 }));
+            out.push((
+                from,
+                GossipMsg::GetBlocks {
+                    from: self.height() + 1,
+                },
+            ));
         }
         out
     }
@@ -1596,11 +1636,7 @@ impl LightGossipNode {
         }
     }
 
-    fn on_headers(
-        &mut self,
-        from: u64,
-        batch: Vec<CertifiedHeader>,
-    ) -> Vec<(u64, GossipMsg)> {
+    fn on_headers(&mut self, from: u64, batch: Vec<CertifiedHeader>) -> Vec<(u64, GossipMsg)> {
         let mut advanced = 0usize;
         for ch in batch {
             // Light peers don't have next_sets over the wire; the demo supplies
@@ -1615,7 +1651,12 @@ impl LightGossipNode {
         // tell peer our new height so they keep pushing if there is more
         let mut out = Vec::new();
         if advanced > 0 {
-            out.push((from, GossipMsg::Status { height: self.tracker.height() }));
+            out.push((
+                from,
+                GossipMsg::Status {
+                    height: self.tracker.height(),
+                },
+            ));
         }
         out
     }
@@ -1625,7 +1666,14 @@ impl LightGossipNode {
         self.peers
             .iter()
             .copied()
-            .map(|p| (p, GossipMsg::Status { height: self.tracker.height() }))
+            .map(|p| {
+                (
+                    p,
+                    GossipMsg::Status {
+                        height: self.tracker.height(),
+                    },
+                )
+            })
             .collect()
     }
 }
@@ -1679,10 +1727,20 @@ impl LightNetwork {
     pub fn announce_all(&mut self) {
         let mut out = Vec::new();
         for id in self.full.keys() {
-            out.extend(self.full[id].announce().into_iter().map(|(d, m)| (d, *id, m)));
+            out.extend(
+                self.full[id]
+                    .announce()
+                    .into_iter()
+                    .map(|(d, m)| (d, *id, m)),
+            );
         }
         for id in self.light.keys() {
-            out.extend(self.light[id].announce().into_iter().map(|(d, m)| (d, *id, m)));
+            out.extend(
+                self.light[id]
+                    .announce()
+                    .into_iter()
+                    .map(|(d, m)| (d, *id, m)),
+            );
         }
         for (dst, src, msg) in out {
             self.queue.push_back((dst, src, msg));
@@ -1694,7 +1752,12 @@ impl LightNetwork {
     /// [`LightGossipNode::apply_header`] with `next_set_for(height)` as the
     /// authoritative next set. `full_id` and `light_id` select which peers
     /// participate in the bridge.
-    pub fn run(&mut self, full_id: u64, light_id: u64, mut next_set_for: impl FnMut(u64) -> Option<ValidatorSet>) -> usize {
+    pub fn run(
+        &mut self,
+        full_id: u64,
+        light_id: u64,
+        mut next_set_for: impl FnMut(u64) -> Option<ValidatorSet>,
+    ) -> usize {
         let mut delivered = 0;
         while let Some((dst, src, msg)) = self.queue.pop_front() {
             // Side-channel: full→light Headers bypass the normal
@@ -1830,7 +1893,12 @@ pub fn encode_gossip(m: &GossipMsg) -> Vec<u8> {
         // existing proof pair (length-prefixed, tagged sub-payloads):
         //   - GetDiff: u64_be(h1), u64_be(h2), header_h1, header_h2
         //   - Diff:    the typed DiffEnvelope as a single length-prefixed blob
-        GossipMsg::GetDiff { h1, h2, header_h1, header_h2 } => {
+        GossipMsg::GetDiff {
+            h1,
+            h2,
+            header_h1,
+            header_h2,
+        } => {
             out.push(TAG_GETDIFF);
             out.extend_from_slice(&h1.to_be_bytes());
             out.extend_from_slice(&h2.to_be_bytes());
@@ -1885,8 +1953,12 @@ pub fn encode_gossip(m: &GossipMsg) -> Vec<u8> {
 pub fn decode_gossip(buf: &[u8]) -> Result<GossipMsg, CodecError> {
     let (&tag, mut rest) = buf.split_first().ok_or(CodecError::UnexpectedEof)?;
     let msg = match tag {
-        TAG_STATUS => GossipMsg::Status { height: take_u64(&mut rest)? },
-        TAG_GETBLOCKS => GossipMsg::GetBlocks { from: take_u64(&mut rest)? },
+        TAG_STATUS => GossipMsg::Status {
+            height: take_u64(&mut rest)?,
+        },
+        TAG_GETBLOCKS => GossipMsg::GetBlocks {
+            from: take_u64(&mut rest)?,
+        },
         TAG_BLOCKS => {
             let n = take_u64(&mut rest)?;
             if n > MAX_BATCH as u64 {
@@ -1903,7 +1975,9 @@ pub fn decode_gossip(buf: &[u8]) -> Result<GossipMsg, CodecError> {
         TAG_TX => GossipMsg::Tx(decode_tx(take_bytes(&mut rest)?)?),
         TAG_EVIDENCE => GossipMsg::Evidence(decode_evidence(take_bytes(&mut rest)?)?),
         TAG_STAKEOP => GossipMsg::StakeOp(decode_stakeop(take_bytes(&mut rest)?)?),
-        TAG_GETHEADERS => GossipMsg::GetHeaders { from: take_u64(&mut rest)? },
+        TAG_GETHEADERS => GossipMsg::GetHeaders {
+            from: take_u64(&mut rest)?,
+        },
         TAG_HEADERS => {
             let n = take_u64(&mut rest)?;
             if n > MAX_BATCH as u64 {
@@ -1959,7 +2033,12 @@ pub fn decode_gossip(buf: &[u8]) -> Result<GossipMsg, CodecError> {
             let h2 = take_u64(&mut rest)?;
             let header_h1 = Box::new(crate::codec::decode_header(take_bytes(&mut rest)?)?);
             let header_h2 = Box::new(crate::codec::decode_header(take_bytes(&mut rest)?)?);
-            GossipMsg::GetDiff { h1, h2, header_h1, header_h2 }
+            GossipMsg::GetDiff {
+                h1,
+                h2,
+                header_h1,
+                header_h2,
+            }
         }
         TAG_DIFF => GossipMsg::Diff {
             envelope: Box::new(decode_diff_envelope(take_bytes(&mut rest)?)?),
@@ -1980,16 +2059,14 @@ pub fn decode_gossip(buf: &[u8]) -> Result<GossipMsg, CodecError> {
                 rest = &rest[1..];
                 match kind {
                     0 => {
-                        let kind_byte =
-                            rest.first().copied().ok_or(CodecError::UnexpectedEof)?;
+                        let kind_byte = rest.first().copied().ok_or(CodecError::UnexpectedEof)?;
                         rest = &rest[1..];
                         let k = crate::codec::decode_proof_kind(kind_byte)?;
                         let id = take_u64(&mut rest)?;
                         items.push(crate::light::BatchItem::Inclusion { kind: k, id });
                     }
                     1 => {
-                        let (query, k) =
-                            crate::codec::decode_knn_request(take_bytes(&mut rest)?)?;
+                        let (query, k) = crate::codec::decode_knn_request(take_bytes(&mut rest)?)?;
                         items.push(crate::light::BatchItem::Knn { query, k });
                     }
                     2 => {
@@ -2017,9 +2094,9 @@ pub fn decode_gossip(buf: &[u8]) -> Result<GossipMsg, CodecError> {
         TAG_LOCK => GossipMsg::Lock {
             envelope: Box::new(decode_lock_envelope(take_bytes(&mut rest)?)?),
         },
-        TAG_CONSENSUS => GossipMsg::Consensus(Box::new(
-            crate::codec::decode_consensus_msg(take_bytes(&mut rest)?)?,
-        )),
+        TAG_CONSENSUS => GossipMsg::Consensus(Box::new(crate::codec::decode_consensus_msg(
+            take_bytes(&mut rest)?,
+        )?)),
         // M39: peer address book — u32 count then per-entry (u64 id + length-
         // prefixed utf8 addr). Addrs are best-effort hints (parse-checked before
         // dialing), so a non-utf8 addr decodes lossily rather than failing.
@@ -2059,12 +2136,18 @@ pub fn encode_diff_envelope(env: &crate::light::DiffEnvelope) -> Vec<u8> {
     let mut out = Vec::new();
     out.extend_from_slice(&(env.diff.added.len() as u32).to_be_bytes());
     for entry in &env.diff.added {
-        put_bytes(&mut out, &crate::codec::encode_graph_node(&entry.graph_node));
+        put_bytes(
+            &mut out,
+            &crate::codec::encode_graph_node(&entry.graph_node),
+        );
         put_bytes(&mut out, &crate::codec::encode_proof(&entry.proof));
     }
     out.extend_from_slice(&(env.diff.dropped.len() as u32).to_be_bytes());
     for entry in &env.diff.dropped {
-        put_bytes(&mut out, &crate::codec::encode_graph_node(&entry.graph_node));
+        put_bytes(
+            &mut out,
+            &crate::codec::encode_graph_node(&entry.graph_node),
+        );
         put_bytes(&mut out, &crate::codec::encode_proof(&entry.proof));
     }
     put_bytes(&mut out, &crate::codec::encode_header(&env.header_prev));
@@ -2085,7 +2168,11 @@ pub fn decode_diff_envelope(buf: &[u8]) -> Result<crate::light::DiffEnvelope, Co
         let gn = crate::codec::decode_graph_node(take_bytes(&mut p)?)?;
         let proof = crate::codec::decode_proof(take_bytes(&mut p)?)?;
         let node_id = gn.node_id;
-        added.push(crate::GraphLeafAtHeight { node_id, graph_node: gn, proof });
+        added.push(crate::GraphLeafAtHeight {
+            node_id,
+            graph_node: gn,
+            proof,
+        });
     }
     let n_dropped = take_u32(&mut p)? as usize;
     let mut dropped = Vec::with_capacity(n_dropped);
@@ -2093,7 +2180,11 @@ pub fn decode_diff_envelope(buf: &[u8]) -> Result<crate::light::DiffEnvelope, Co
         let gn = crate::codec::decode_graph_node(take_bytes(&mut p)?)?;
         let proof = crate::codec::decode_proof(take_bytes(&mut p)?)?;
         let node_id = gn.node_id;
-        dropped.push(crate::GraphLeafAtHeight { node_id, graph_node: gn, proof });
+        dropped.push(crate::GraphLeafAtHeight {
+            node_id,
+            graph_node: gn,
+            proof,
+        });
     }
     let header_prev = crate::codec::decode_header(take_bytes(&mut p)?)?;
     let cert_prev = crate::codec::decode_commit(take_bytes(&mut p)?)?;
@@ -2221,7 +2312,10 @@ pub fn encode_batch_request(items: &[crate::light::BatchItem]) -> Vec<u8> {
                 put_bytes(&mut out, &crate::codec::encode_knn_request(query, *k));
             }
             crate::light::BatchItem::Range { query, min_sim } => {
-                put_bytes(&mut out, &crate::codec::encode_range_request(query, *min_sim));
+                put_bytes(
+                    &mut out,
+                    &crate::codec::encode_range_request(query, *min_sim),
+                );
             }
             crate::light::BatchItem::Diff { h1, h2 } => {
                 out.extend_from_slice(&h1.to_be_bytes());
@@ -2235,9 +2329,7 @@ pub fn encode_batch_request(items: &[crate::light::BatchItem]) -> Vec<u8> {
 /// M61: inverse of [`encode_batch_request`]. Caps the item count at
 /// `MAX_BATCH_ITEMS` (→ [`CodecError::TooManyItems`]), matching the inline gossip
 /// `GetBatch` decoder and [`decode_batch_envelope`].
-pub fn decode_batch_request(
-    buf: &[u8],
-) -> Result<Vec<crate::light::BatchItem>, CodecError> {
+pub fn decode_batch_request(buf: &[u8]) -> Result<Vec<crate::light::BatchItem>, CodecError> {
     let mut rest = buf;
     let n = take_u32(&mut rest)? as usize;
     if n > MAX_BATCH_ITEMS {
@@ -2262,8 +2354,7 @@ pub fn decode_batch_request(
                 items.push(crate::light::BatchItem::Knn { query, k });
             }
             2 => {
-                let (query, min_sim) =
-                    crate::codec::decode_range_request(take_bytes(&mut rest)?)?;
+                let (query, min_sim) = crate::codec::decode_range_request(take_bytes(&mut rest)?)?;
                 items.push(crate::light::BatchItem::Range { query, min_sim });
             }
             3 => {
@@ -2442,7 +2533,11 @@ pub fn decode_knn_claim(buf: &[u8]) -> Result<crate::light::KnnClaim, CodecError
     if !p.is_empty() {
         return Err(CodecError::TrailingBytes);
     }
-    Ok(crate::light::KnnClaim { query, k, neighbours })
+    Ok(crate::light::KnnClaim {
+        query,
+        k,
+        neighbours,
+    })
 }
 
 /// M29: encode a `RangeClaim` as a length-prefixed blob for the
@@ -2455,7 +2550,10 @@ pub fn encode_range_claim(c: &crate::light::RangeClaim) -> Vec<u8> {
         put_bytes(&mut out, &crate::codec::encode_graph_node(gn));
         put_bytes(&mut out, &crate::codec::encode_proof(proof));
     }
-    put_bytes(&mut out, &crate::codec::encode_range_request(&c.query, c.min_sim));
+    put_bytes(
+        &mut out,
+        &crate::codec::encode_range_request(&c.query, c.min_sim),
+    );
     out
 }
 
@@ -2474,7 +2572,11 @@ pub fn decode_range_claim(buf: &[u8]) -> Result<crate::light::RangeClaim, CodecE
     if !p.is_empty() {
         return Err(CodecError::TrailingBytes);
     }
-    Ok(crate::light::RangeClaim { query, min_sim, nodes })
+    Ok(crate::light::RangeClaim {
+        query,
+        min_sim,
+        nodes,
+    })
 }
 
 fn put_bytes(out: &mut Vec<u8>, b: &[u8]) {
@@ -2538,7 +2640,9 @@ pub fn read_msg<R: Read>(r: &mut R) -> io::Result<GossipMsg> {
 mod tests {
     use super::*;
     use crate::driver::ChainDriver;
-    use crate::{BondKind, Keypair, Review, SlashEvidence, SubmissionTx, Vote, VoteType, DIM, MICRO};
+    use crate::{
+        BondKind, Keypair, Review, SlashEvidence, SubmissionTx, Vote, VoteType, DIM, MICRO,
+    };
     use std::collections::BTreeMap;
     use zhixing_engine::DeltaKParams;
 
@@ -2571,7 +2675,10 @@ mod tests {
             base_emission_micro: 8 * MICRO,
             slash_bps: 10_000,
             timestamp_days: 0.0,
-            validators: [21u64, 22, 23, 24].iter().map(|&id| (id, kp(id).public(), 1)).collect(),
+            validators: [21u64, 22, 23, 24]
+                .iter()
+                .map(|&id| (id, kp(id).public(), 1))
+                .collect(),
             bridge_sources: vec![],
         }
     }
@@ -2583,22 +2690,35 @@ mod tests {
             domain,
             stake: 2 * MICRO,
             reviews: vec![
-                Review { reviewer: 10, score: 0.9 },
-                Review { reviewer: 11, score: 0.85 },
-                Review { reviewer: 12, score: 0.9 },
+                Review {
+                    reviewer: 10,
+                    score: 0.9,
+                },
+                Review {
+                    reviewer: 11,
+                    score: 0.85,
+                },
+                Review {
+                    reviewer: 12,
+                    score: 0.9,
+                },
             ],
             repl_success: 3,
             repl_total: 3,
             timestamp_days: 1.0,
             signature: [0u8; 64],
-            fee: 0, nonce: 0,
-}
+            fee: 0,
+            nonce: 0,
+        }
         .signed(&kp(author))
     }
 
     /// Produce a real certified chain (blocks + certs) to seed sync tests with.
     fn certified_chain(n_tx: usize) -> (Vec<Block>, Vec<Commit>) {
-        let seeds: BTreeMap<u64, [u8; 32]> = [21u64, 22, 23, 24].iter().map(|&id| (id, seed(id))).collect();
+        let seeds: BTreeMap<u64, [u8; 32]> = [21u64, 22, 23, 24]
+            .iter()
+            .map(|&id| (id, seed(id)))
+            .collect();
         let mut d = ChainDriver::new(genesis(), seeds, 1);
         let txs = [tx(1, 1, 1), tx(2, 2, 2), tx(3, 3, 3), tx(1, 4, 4)];
         for t in txs.iter().take(n_tx) {
@@ -2611,7 +2731,8 @@ mod tests {
     #[test]
     fn wire_round_trips_every_message() {
         let (blocks, certs) = certified_chain(2);
-        let batch: Vec<(Block, Commit)> = blocks.iter().cloned().zip(certs.iter().cloned()).collect();
+        let batch: Vec<(Block, Commit)> =
+            blocks.iter().cloned().zip(certs.iter().cloned()).collect();
         let headers: Vec<CertifiedHeader> = blocks
             .iter()
             .zip(certs.iter())
@@ -2620,7 +2741,9 @@ mod tests {
         // A trivial account + Merkle proof (the proof is shape, not semantics;
         // round-trip is the property under test).
         let fake_account = crate::Account::default();
-        let fake_proof = crate::merkle::Proof { steps: vec![crate::merkle::Step::Right([0xAA; 32])] };
+        let fake_proof = crate::merkle::Proof {
+            steps: vec![crate::merkle::Step::Right([0xAA; 32])],
+        };
         // M24: a single mixed-kind batched proof request with all three kinds
         // present (Account + Reviewer + Validator) and one None-slot in the
         // response — covers the full new wire shape in one round-trip.
@@ -2641,7 +2764,11 @@ mod tests {
                 None,
                 Some(crate::light::ProofEntry::Validator {
                     id: 25,
-                    validator: Validator { id: 25, pubkey: [3u8; 32], power: 7 },
+                    validator: Validator {
+                        id: 25,
+                        pubkey: [3u8; 32],
+                        power: 7,
+                    },
                     proof: fake_proof.clone(),
                 }),
             ],
@@ -2843,7 +2970,11 @@ mod tests {
         // decoded.
         let mut endpoint = BridgeEndpoint::new(&gb, &ga);
         endpoint
-            .follow_source(&env2.source_header, &env2.source_cert, &env2.source_tracked_set)
+            .follow_source(
+                &env2.source_header,
+                &env2.source_cert,
+                &env2.source_tracked_set,
+            )
             .expect("follow");
         let verified = endpoint.verify_lock(&env2).expect("verify");
         assert_eq!(verified.dest_account, 7);
@@ -2866,7 +2997,10 @@ mod tests {
     fn decode_rejects_trailing_bytes() {
         let mut bytes = encode_gossip(&GossipMsg::Status { height: 1 });
         bytes.push(0);
-        assert!(matches!(decode_gossip(&bytes), Err(CodecError::TrailingBytes)));
+        assert!(matches!(
+            decode_gossip(&bytes),
+            Err(CodecError::TrailingBytes)
+        ));
     }
 
     #[test]
@@ -2905,7 +3039,10 @@ mod tests {
         assert!(fresh.apply_certified(blocks[0].clone(), certs[0].clone()));
         let mut forged = certs[1].clone();
         forged.block_hash = [0xabu8; 32];
-        assert!(!fresh.apply_certified(blocks[1].clone(), forged), "forged cert refused");
+        assert!(
+            !fresh.apply_certified(blocks[1].clone(), forged),
+            "forged cert refused"
+        );
         assert_eq!(fresh.height(), 1, "chain stops at the gap, uncorrupted");
 
         // a batch that starts with the bad cert makes no progress at all
@@ -2923,8 +3060,10 @@ mod tests {
     fn tx_gossip_reaches_every_node() {
         // three fully-connected fresh nodes; a tx injected at one floods to all
         let ids = [1u64, 2, 3];
-        let nodes: Vec<GossipNode> =
-            ids.iter().map(|&id| GossipNode::new(id, genesis(), 16, ids.iter().copied())).collect();
+        let nodes: Vec<GossipNode> = ids
+            .iter()
+            .map(|&id| GossipNode::new(id, genesis(), 16, ids.iter().copied()))
+            .collect();
         let mut net = Network::new(nodes);
 
         let t = tx(1, 1, 1);
@@ -2934,7 +3073,10 @@ mod tests {
         net.run();
 
         for id in ids {
-            assert!(net.node(id).mempool.contains(&h), "node {id} received the tx");
+            assert!(
+                net.node(id).mempool.contains(&h),
+                "node {id} received the tx"
+            );
         }
     }
 
@@ -2947,8 +3089,9 @@ mod tests {
 
         let good = tx(1, 1, 1);
         let h = good.hash();
-        let (returned, gossip) =
-            node.submit_local_checked(good).expect("valid tx is admitted");
+        let (returned, gossip) = node
+            .submit_local_checked(good)
+            .expect("valid tx is admitted");
         assert_eq!(returned, h);
         assert!(node.mempool.contains(&h), "valid tx landed in the mempool");
         assert!(!gossip.is_empty(), "admission produces gossip to flood");
@@ -2956,25 +3099,40 @@ mod tests {
         // An unknown-author tx fails validation → the checked variant surfaces it.
         let bad = tx(99, 2, 2);
         let bh = bad.hash();
-        assert!(node.submit_local_checked(bad.clone()).is_err(), "reject is surfaced");
-        assert!(!node.mempool.contains(&bh), "rejected tx never entered the mempool");
+        assert!(
+            node.submit_local_checked(bad.clone()).is_err(),
+            "reject is surfaced"
+        );
+        assert!(
+            !node.mempool.contains(&bh),
+            "rejected tx never entered the mempool"
+        );
 
         // Plain submit_local swallows the same reject (empty vec), byte-identical.
-        assert!(node.submit_local(bad).is_empty(), "submit_local drops the reject");
+        assert!(
+            node.submit_local(bad).is_empty(),
+            "submit_local drops the reject"
+        );
     }
 
     #[test]
     fn a_duplicate_tx_does_not_re_flood() {
         let ids = [1u64, 2];
-        let nodes: Vec<GossipNode> =
-            ids.iter().map(|&id| GossipNode::new(id, genesis(), 16, ids.iter().copied())).collect();
+        let nodes: Vec<GossipNode> = ids
+            .iter()
+            .map(|&id| GossipNode::new(id, genesis(), 16, ids.iter().copied()))
+            .collect();
         let mut net = Network::new(nodes);
         let t = tx(1, 1, 1);
         let out = net.nodes.get_mut(&1).unwrap().submit_local(t.clone());
         net.inject(1, out);
         net.run();
         // re-injecting the same tx to node 2 yields no new forwarding
-        let again = net.nodes.get_mut(&2).unwrap().on_message(1, GossipMsg::Tx(t));
+        let again = net
+            .nodes
+            .get_mut(&2)
+            .unwrap()
+            .on_message(1, GossipMsg::Tx(t));
         assert!(again.is_empty(), "an already-seen tx is not re-gossiped");
     }
 
@@ -3065,7 +3223,9 @@ mod tests {
             assert_eq!(net.node(id).height(), 3, "node {id} caught up");
         }
         let root = net.node(1).chain.state.state_root();
-        assert!(ids.iter().all(|&id| net.node(id).chain.state.state_root() == root));
+        assert!(ids
+            .iter()
+            .all(|&id| net.node(id).chain.state.state_root() == root));
     }
 
     #[test]
@@ -3091,8 +3251,22 @@ mod tests {
     /// (height=2, round=0). Both votes carry valid ed25519 signatures by kp(1).
     fn sample_evidence(offender: u64) -> SlashEvidence {
         SlashEvidence {
-            vote_a: Vote::signed(offender, 2, 0, [0xAAu8; 32], VoteType::Precommit, &kp(offender)),
-            vote_b: Vote::signed(offender, 2, 0, [0xBBu8; 32], VoteType::Precommit, &kp(offender)),
+            vote_a: Vote::signed(
+                offender,
+                2,
+                0,
+                [0xAAu8; 32],
+                VoteType::Precommit,
+                &kp(offender),
+            ),
+            vote_b: Vote::signed(
+                offender,
+                2,
+                0,
+                [0xBBu8; 32],
+                VoteType::Precommit,
+                &kp(offender),
+            ),
         }
     }
 
@@ -3111,8 +3285,10 @@ mod tests {
     fn evidence_gossip_reaches_every_node() {
         // three fully-connected fresh nodes; an evidence injected at one floods to all
         let ids = [1u64, 2, 3];
-        let nodes: Vec<GossipNode> =
-            ids.iter().map(|&id| GossipNode::new(id, genesis(), 16, ids.iter().copied())).collect();
+        let nodes: Vec<GossipNode> = ids
+            .iter()
+            .map(|&id| GossipNode::new(id, genesis(), 16, ids.iter().copied()))
+            .collect();
         let mut net = Network::new(nodes);
 
         let ev = sample_evidence(1);
@@ -3130,8 +3306,10 @@ mod tests {
     #[test]
     fn a_duplicate_evidence_does_not_re_flood() {
         let ids = [1u64, 2];
-        let nodes: Vec<GossipNode> =
-            ids.iter().map(|&id| GossipNode::new(id, genesis(), 16, ids.iter().copied())).collect();
+        let nodes: Vec<GossipNode> = ids
+            .iter()
+            .map(|&id| GossipNode::new(id, genesis(), 16, ids.iter().copied()))
+            .collect();
         let mut net = Network::new(nodes);
         let ev = sample_evidence(1);
         net.submit_evidence(1, ev.clone());
@@ -3142,7 +3320,10 @@ mod tests {
             .get_mut(&2)
             .unwrap()
             .on_message(1, GossipMsg::Evidence(ev));
-        assert!(again.is_empty(), "an already-seen evidence is not re-gossiped");
+        assert!(
+            again.is_empty(),
+            "an already-seen evidence is not re-gossiped"
+        );
     }
 
     #[test]
@@ -3157,7 +3338,10 @@ mod tests {
         let mut node = GossipNode::new(1, genesis(), 16, [1, 2]);
         let out = node.submit_local_evidence(bad.clone());
         assert!(out.is_empty(), "malformed evidence is not broadcast");
-        assert!(node.pending_evidence().is_empty(), "malformed evidence is not staged");
+        assert!(
+            node.pending_evidence().is_empty(),
+            "malformed evidence is not staged"
+        );
 
         // receiving one from a peer is also dropped
         let out2 = node.on_message(2, GossipMsg::Evidence(bad));
@@ -3167,8 +3351,10 @@ mod tests {
     #[test]
     fn stake_op_gossip_reaches_every_node() {
         let ids = [1u64, 2, 3];
-        let nodes: Vec<GossipNode> =
-            ids.iter().map(|&id| GossipNode::new(id, genesis(), 16, ids.iter().copied())).collect();
+        let nodes: Vec<GossipNode> = ids
+            .iter()
+            .map(|&id| GossipNode::new(id, genesis(), 16, ids.iter().copied()))
+            .collect();
         let mut net = Network::new(nodes);
 
         let op = sample_bond(1, 5 * MICRO);
@@ -3199,7 +3385,10 @@ mod tests {
         // h=1: account 1 self-bonds 6 $COG → becomes an active validator at h=2
         let bond = sample_bond(1, 6 * MICRO);
         driver.stage_stake_op(bond);
-        driver.produce(1.0, &BTreeSet::new()).unwrap().expect("stake-only block at h=1");
+        driver
+            .produce(1.0, &BTreeSet::new())
+            .unwrap()
+            .expect("stake-only block at h=1");
         assert_eq!(
             driver.chain.state.validators.get(1).map(|v| v.power),
             Some(6 * MICRO),
@@ -3227,7 +3416,10 @@ mod tests {
         assert_eq!(block.slashing_evidence[0].hash(), ev.hash());
         // ... and the offender was slashed
         let state = &driver.chain.state;
-        assert!(state.validators.get(1).is_none(), "offender removed from validator set");
+        assert!(
+            state.validators.get(1).is_none(),
+            "offender removed from validator set"
+        );
         assert_eq!(state.bonded, 0, "bonded pool drained");
         assert_eq!(state.treasury, 6 * MICRO, "treasury seized the stake");
         // ... and replay re-verifies finality
@@ -3274,7 +3466,9 @@ mod tests {
         // a fresh peer asks for headers from height 1.
         let out = full.on_message(2, GossipMsg::GetHeaders { from: 1 });
         assert_eq!(out.len(), 1, "full node replies with one Headers batch");
-        let (_, GossipMsg::Headers(batch)) = &out[0] else { panic!("expected Headers, got {:?}", out[0]) };
+        let (_, GossipMsg::Headers(batch)) = &out[0] else {
+            panic!("expected Headers, got {:?}", out[0])
+        };
         assert_eq!(batch.len(), 3, "full node serves every retained header");
         for (i, ch) in batch.iter().enumerate() {
             assert_eq!(ch.height(), (i + 1) as u64);
@@ -3310,7 +3504,11 @@ mod tests {
         }
 
         let l = net.light_node(light_id);
-        assert_eq!(l.tracker().height(), 3, "light node reached the full node's height");
+        assert_eq!(
+            l.tracker().height(),
+            3,
+            "light node reached the full node's height"
+        );
         let authoritative = authoritative_final_set(&genesis(), &blocks);
         assert_eq!(
             l.tracker().validators().merkle_root(),
@@ -3336,8 +3534,15 @@ mod tests {
             power: 1,
         }]);
         let err = light.apply_header(ch, &bad_set).unwrap_err();
-        assert!(matches!(err, crate::light::LightError::ValidatorRootMismatch { .. }), "got {err}");
-        assert_eq!(light.tracker().height(), 0, "tracker unchanged on rejection");
+        assert!(
+            matches!(err, crate::light::LightError::ValidatorRootMismatch { .. }),
+            "got {err}"
+        );
+        assert_eq!(
+            light.tracker().height(),
+            0,
+            "tracker unchanged on rejection"
+        );
     }
 
     #[test]
@@ -3345,15 +3550,22 @@ mod tests {
         // The whole point of M22: a header-only gossip batch is smaller than a
         // block batch because bodies (txs, stake ops, evidence) are not carried.
         let (blocks, certs) = certified_chain(3);
-        let full_batch: Vec<(Block, Commit)> = blocks.iter().cloned().zip(certs.iter().cloned()).collect();
+        let full_batch: Vec<(Block, Commit)> =
+            blocks.iter().cloned().zip(certs.iter().cloned()).collect();
         let header_batch: Vec<CertifiedHeader> = blocks
             .iter()
             .zip(certs.iter())
             .map(|(b, c)| CertifiedHeader::from_certified(b, c))
             .collect();
 
-        let full_bytes: usize = full_batch.iter().map(|(b, c)| encode_block(b).len() + encode_commit(c).len()).sum();
-        let header_bytes: usize = header_batch.iter().map(|ch| encode_certified_header(ch).len()).sum();
+        let full_bytes: usize = full_batch
+            .iter()
+            .map(|(b, c)| encode_block(b).len() + encode_commit(c).len())
+            .sum();
+        let header_bytes: usize = header_batch
+            .iter()
+            .map(|ch| encode_certified_header(ch).len())
+            .sum();
 
         assert!(
             header_bytes < full_bytes,
@@ -3373,7 +3585,8 @@ mod tests {
         let mut lt = ValidatorTracker::from_genesis(&genesis());
         for (i, (b, c)) in blocks.iter().zip(certs.iter()).enumerate() {
             let ch = CertifiedHeader::from_certified(b, c);
-            lt.follow_header(&ch.header, &ch.cert, &sets[i]).expect("follow_header");
+            lt.follow_header(&ch.header, &ch.cert, &sets[i])
+                .expect("follow_header");
         }
         assert_eq!(lt.height(), 3);
         let authoritative = authoritative_final_set(&genesis(), &blocks);
@@ -3388,9 +3601,18 @@ mod tests {
         // body) round-trips a heterogeneous `Vec<BatchItem>`, caps the item count,
         // and emits bytes byte-identical to the inline gossip `GetBatch` framing.
         let items = vec![
-            crate::light::BatchItem::Inclusion { kind: crate::light::ProofKind::Reviewer, id: 10 },
-            crate::light::BatchItem::Knn { query: unit(0), k: 1 },
-            crate::light::BatchItem::Range { query: unit(0), min_sim: 0.0 },
+            crate::light::BatchItem::Inclusion {
+                kind: crate::light::ProofKind::Reviewer,
+                id: 10,
+            },
+            crate::light::BatchItem::Knn {
+                query: unit(0),
+                k: 1,
+            },
+            crate::light::BatchItem::Range {
+                query: unit(0),
+                min_sim: 0.0,
+            },
             crate::light::BatchItem::Diff { h1: 1, h2: 2 },
         ];
 
@@ -3398,13 +3620,26 @@ mod tests {
         // (compared as bytes to sidestep float Eq on the embedding queries).
         let bytes = encode_batch_request(&items);
         let decoded = decode_batch_request(&bytes).expect("decode batch request");
-        assert_eq!(encode_batch_request(&decoded), bytes, "round-trip must be stable");
+        assert_eq!(
+            encode_batch_request(&decoded),
+            bytes,
+            "round-trip must be stable"
+        );
 
         // The standalone encoding equals the tail of the inline gossip `GetBatch`
         // framing (tag byte + request bytes) — the RPC body shares that wire format.
-        let gossip = encode_gossip(&GossipMsg::GetBatch { items: items.clone() });
-        assert_eq!(gossip[0], TAG_GETBATCH, "gossip GetBatch leads with its tag");
-        assert_eq!(&gossip[1..], &bytes[..], "RPC body matches the gossip GetBatch tail");
+        let gossip = encode_gossip(&GossipMsg::GetBatch {
+            items: items.clone(),
+        });
+        assert_eq!(
+            gossip[0], TAG_GETBATCH,
+            "gossip GetBatch leads with its tag"
+        );
+        assert_eq!(
+            &gossip[1..],
+            &bytes[..],
+            "RPC body matches the gossip GetBatch tail"
+        );
 
         // Over-cap request is rejected at decode time (mirrors the gossip decoder).
         let big: Vec<_> = (0..=MAX_BATCH_ITEMS)
@@ -3415,7 +3650,10 @@ mod tests {
             .collect();
         let over = encode_batch_request(&big);
         assert!(
-            matches!(decode_batch_request(&over), Err(CodecError::TooManyItems(_))),
+            matches!(
+                decode_batch_request(&over),
+                Err(CodecError::TooManyItems(_))
+            ),
             "over-cap batch must decode to TooManyItems",
         );
     }
@@ -3437,11 +3675,17 @@ mod tests {
         // framing (tag byte + body) — the RPC line shares that wire format.
         let gossip = encode_gossip(&GossipMsg::Blocks(batch.clone()));
         assert_eq!(gossip[0], TAG_BLOCKS, "gossip Blocks leads with its tag");
-        assert_eq!(&gossip[1..], &bytes[..], "range_blocks line matches the gossip Blocks tail");
+        assert_eq!(
+            &gossip[1..],
+            &bytes[..],
+            "range_blocks line matches the gossip Blocks tail"
+        );
 
         // An empty range encodes to just the u64 count (0) and round-trips.
         assert_eq!(encode_blocks(&[]), 0u64.to_be_bytes().to_vec());
-        assert!(decode_blocks(&encode_blocks(&[])).expect("decode empty").is_empty());
+        assert!(decode_blocks(&encode_blocks(&[]))
+            .expect("decode empty")
+            .is_empty());
 
         // A buffer that lies about its count (huge n, no bodies) fails fast at the
         // first missing pair — no OOM from a pre-sized allocation.
@@ -3471,12 +3715,24 @@ mod tests {
         ];
         let (ch, env, range) = full.batch(items.clone()).expect("batch served");
         assert_eq!(env.items.len(), items.len(), "one slot per request item");
-        assert_eq!(range.len(), 2, "Diff{{1,2}} ships the full [1..=2] block range");
+        assert_eq!(
+            range.len(),
+            2,
+            "Diff{{1,2}} ships the full [1..=2] block range"
+        );
 
         let tracker = crate::light::ValidatorTracker::from_genesis(&genesis());
         let tracked = tracker.validators().clone();
         tracker
-            .verify_batch(&genesis(), &ch.header, &ch.cert, &tracked, &range, &items, &env)
+            .verify_batch(
+                &genesis(),
+                &ch.header,
+                &ch.cert,
+                &tracked,
+                &range,
+                &items,
+                &env,
+            )
             .expect("the shipped range satisfies the Diff slot; head anchors the rest");
 
         // A Diff-free batch ships no range.
@@ -3529,7 +3785,9 @@ mod tests {
         let validator_root = &full.chain.state.validators.merkle_root();
 
         for (i, e) in entries.iter().enumerate() {
-            let entry = e.as_ref().unwrap_or_else(|| panic!("entry {i} should be Some"));
+            let entry = e
+                .as_ref()
+                .unwrap_or_else(|| panic!("entry {i} should be Some"));
             let leaf = crate::merkle::leaf_hash(&entry.leaf());
             let root = match entry {
                 crate::light::ProofEntry::Account { .. }
@@ -3615,12 +3873,18 @@ mod tests {
             .take_proof(crate::light::ProofKind::Validator, 21)
             .expect("validator proof cached");
 
-        crate::light::ValidatorTracker::verify_proof_against_header(&header, last_cert, &tracked, &acct)
-            .expect("light wallet proves account 1");
-        crate::light::ValidatorTracker::verify_proof_against_header(&header, last_cert, &tracked, &rev)
-            .expect("light wallet proves reviewer 10");
-        crate::light::ValidatorTracker::verify_proof_against_header(&header, last_cert, &tracked, &val)
-            .expect("light wallet proves validator 25");
+        crate::light::ValidatorTracker::verify_proof_against_header(
+            &header, last_cert, &tracked, &acct,
+        )
+        .expect("light wallet proves account 1");
+        crate::light::ValidatorTracker::verify_proof_against_header(
+            &header, last_cert, &tracked, &rev,
+        )
+        .expect("light wallet proves reviewer 10");
+        crate::light::ValidatorTracker::verify_proof_against_header(
+            &header, last_cert, &tracked, &val,
+        )
+        .expect("light wallet proves validator 25");
 
         net.put_full(full_node);
         net.put_light(light_node);
@@ -3654,7 +3918,9 @@ mod tests {
         let mut light_node = net.take_light(light_id);
         let reply = full_node.on_message(
             light_id,
-            GossipMsg::GetProof { items: vec![(crate::light::ProofKind::Validator, 21)] },
+            GossipMsg::GetProof {
+                items: vec![(crate::light::ProofKind::Validator, 21)],
+            },
         );
         let (_dst, proof_msg) = reply.into_iter().next().unwrap();
         light_node.on_message(1, proof_msg);
@@ -3664,7 +3930,12 @@ mod tests {
             .expect("validator proof cached");
         // Tamper: bump the validator's power by 1.
         let mut forged = entry;
-        if let crate::light::ProofEntry::Validator { id, ref mut validator, .. } = forged {
+        if let crate::light::ProofEntry::Validator {
+            id,
+            ref mut validator,
+            ..
+        } = forged
+        {
             validator.power += 1;
             let _ = id; // id unchanged
         } else {
@@ -3711,16 +3982,23 @@ mod tests {
             other => panic!("expected Proof, got {other:?}"),
         };
         let entry = entry.expect("reviewer 11 exists in the chain");
-        let ProofEntry::Reviewer { id, reputation, proof } = entry else {
+        let ProofEntry::Reviewer {
+            id,
+            reputation,
+            proof,
+        } = entry
+        else {
             panic!("expected Reviewer entry");
         };
         assert_eq!(id, 11);
         assert!(reputation >= 0.0);
         // Local verification against the full peer's accounts_root.
-        let leaf = crate::merkle::leaf_hash(
-            &crate::Reviewer { id, reputation }.merkle_leaf(),
-        );
-        assert!(crate::merkle::verify(&full.chain.state.merkle_root(), &leaf, &proof));
+        let leaf = crate::merkle::leaf_hash(&crate::Reviewer { id, reputation }.merkle_leaf());
+        assert!(crate::merkle::verify(
+            &full.chain.state.merkle_root(),
+            &leaf,
+            &proof
+        ));
     }
 
     #[test]
@@ -3755,7 +4033,11 @@ mod tests {
             other => panic!("expected Proof, got {other:?}"),
         };
         assert_eq!(entries.len(), 1);
-        assert!(entries[0].is_none(), "unknown id must produce None, got {:?}", entries[0]);
+        assert!(
+            entries[0].is_none(),
+            "unknown id must produce None, got {:?}",
+            entries[0]
+        );
 
         // And the wallet sees a cache miss.
         let mut light = LightGossipNode::new(99, &genesis(), [1]);
@@ -3767,7 +4049,9 @@ mod tests {
         );
         let (_dst, proof_msg) = reply.into_iter().next().unwrap();
         light.on_message(1, proof_msg);
-        assert!(light.take_proof(crate::light::ProofKind::Account, 999).is_none());
+        assert!(light
+            .take_proof(crate::light::ProofKind::Account, 999)
+            .is_none());
     }
 
     /// M25: full node serves a `ProofEntry::GraphNode` for a graph node
@@ -3801,7 +4085,11 @@ mod tests {
 
         // Wire shape: it's a GraphNode entry with the right node_id.
         match entry {
-            crate::light::ProofEntry::GraphNode { node_id, graph_node, .. } => {
+            crate::light::ProofEntry::GraphNode {
+                node_id,
+                graph_node,
+                ..
+            } => {
                 assert_eq!(*node_id, expected_node.node_id);
                 assert_eq!(*graph_node, expected_node);
             }
@@ -3866,7 +4154,8 @@ mod tests {
         };
         assert_eq!(entries.len(), 4);
         for (i, e) in entries.iter().enumerate() {
-            e.as_ref().unwrap_or_else(|| panic!("entry {i} must be Some"));
+            e.as_ref()
+                .unwrap_or_else(|| panic!("entry {i} must be Some"));
         }
 
         // Each entry must verify locally against the right root.
@@ -3916,10 +4205,11 @@ mod tests {
 
         let query = [0.5f32, 0.5, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
         let k = 2;
-        let claim = node
-            .serve_knn(query, k)
-            .expect("kNN claim");
-        assert!(!claim.neighbours.is_empty(), "graph must have at least one node");
+        let claim = node.serve_knn(query, k).expect("kNN claim");
+        assert!(
+            !claim.neighbours.is_empty(),
+            "graph must have at least one node"
+        );
         assert!(claim.k >= 1);
         // Each neighbour leaf must verify against the header's accounts_root.
         let header = crate::codec::BlockHeader::from_block(&last);
@@ -3931,7 +4221,9 @@ mod tests {
             );
         }
         // And the wallet-side verifier must accept the claim end-to-end.
-        let tracked = ValidatorTracker::from_genesis(&genesis()).validators().clone();
+        let tracked = ValidatorTracker::from_genesis(&genesis())
+            .validators()
+            .clone();
         ValidatorTracker::verify_knn_against_header(&header, &last_cert, &tracked, &claim)
             .expect("wallet-side kNN claim verifies");
     }
@@ -3967,9 +4259,7 @@ mod tests {
 
         let query = [0.5f32, 0.5, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
         let min_sim = 0.0;
-        let claim = node
-            .serve_range(query, min_sim)
-            .expect("range claim");
+        let claim = node.serve_range(query, min_sim).expect("range claim");
         assert!(!claim.nodes.is_empty(), "graph must have at least one node");
         // Each leaf must verify against graph_root (NOT accounts_root).
         let header = crate::codec::BlockHeader::from_block(&last);
@@ -3981,10 +4271,11 @@ mod tests {
             );
         }
         // And the wallet-side verifier must accept the claim end-to-end.
-        let tracked = ValidatorTracker::from_genesis(&genesis()).validators().clone();
-        ValidatorTracker::verify_range_against_header(
-            &header, &last_cert, &tracked, &claim,
-        ).expect("wallet-side range claim verifies");
+        let tracked = ValidatorTracker::from_genesis(&genesis())
+            .validators()
+            .clone();
+        ValidatorTracker::verify_range_against_header(&header, &last_cert, &tracked, &claim)
+            .expect("wallet-side range claim verifies");
     }
 
     #[test]
@@ -4040,14 +4331,14 @@ mod tests {
             );
         }
         // And the wallet-side verifier accepts the envelope end-to-end.
-        let blocks_in_range: Vec<(Block, Commit)> = blocks
-            .iter()
-            .cloned()
-            .zip(certs.iter().cloned())
-            .collect();
+        let blocks_in_range: Vec<(Block, Commit)> =
+            blocks.iter().cloned().zip(certs.iter().cloned()).collect();
         crate::light::ValidatorTracker::verify_diff_against_headers(
-            &genesis(), &blocks_in_range, &env,
-        ).expect("wallet-side diff verifier accepts the envelope");
+            &genesis(),
+            &blocks_in_range,
+            &env,
+        )
+        .expect("wallet-side diff verifier accepts the envelope");
 
         // Round-trip through the wire codec (GetDiff + Diff + back).
         let get = GossipMsg::GetDiff {
@@ -4067,8 +4358,11 @@ mod tests {
         };
         // The wire-roundtripped envelope must verify identically.
         crate::light::ValidatorTracker::verify_diff_against_headers(
-            &genesis(), &blocks_in_range, &back_envelope,
-        ).expect("wallet-side diff verifier accepts the wire-roundtripped envelope");
+            &genesis(),
+            &blocks_in_range,
+            &back_envelope,
+        )
+        .expect("wallet-side diff verifier accepts the wire-roundtripped envelope");
     }
 
     #[test]
@@ -4081,10 +4375,22 @@ mod tests {
         let header_h1 = crate::codec::BlockHeader::from_block(&blocks[0]);
         let header_h2 = crate::codec::BlockHeader::from_block(&blocks[1]);
 
-        assert!(full.serve_diff(0, 2, &header_h1, &header_h2).is_none(), "h1 == 0");
-        assert!(full.serve_diff(2, 2, &header_h1, &header_h2).is_none(), "h1 == h2");
-        assert!(full.serve_diff(2, 1, &header_h1, &header_h2).is_none(), "h1 > h2");
-        assert!(full.serve_diff(1, 99, &header_h1, &header_h2).is_none(), "h2 > height");
+        assert!(
+            full.serve_diff(0, 2, &header_h1, &header_h2).is_none(),
+            "h1 == 0"
+        );
+        assert!(
+            full.serve_diff(2, 2, &header_h1, &header_h2).is_none(),
+            "h1 == h2"
+        );
+        assert!(
+            full.serve_diff(2, 1, &header_h1, &header_h2).is_none(),
+            "h1 > h2"
+        );
+        assert!(
+            full.serve_diff(1, 99, &header_h1, &header_h2).is_none(),
+            "h2 > height"
+        );
         // Wrong-height headers:
         assert!(
             full.serve_diff(1, 2, &header_h2, &header_h2).is_none(),

@@ -109,7 +109,10 @@ fn timeout_for(t: &Timing, step: Step, round: u32) -> Duration {
 pub async fn write_frame<W: AsyncWriteExt + Unpin>(w: &mut W, msg: &GossipMsg) -> io::Result<()> {
     let body = encode_gossip(msg);
     if body.len() > MAX_FRAME {
-        return Err(io::Error::new(io::ErrorKind::InvalidData, "outbound frame exceeds MAX_FRAME"));
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "outbound frame exceeds MAX_FRAME",
+        ));
     }
     let len = body.len() as u32;
     w.write_all(&len.to_be_bytes()).await?;
@@ -124,7 +127,10 @@ pub async fn read_frame<R: AsyncReadExt + Unpin>(r: &mut R) -> io::Result<Gossip
     r.read_exact(&mut lenb).await?;
     let len = u32::from_be_bytes(lenb) as usize;
     if len > MAX_FRAME {
-        return Err(io::Error::new(io::ErrorKind::InvalidData, "inbound frame exceeds MAX_FRAME"));
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "inbound frame exceeds MAX_FRAME",
+        ));
     }
     let mut buf = vec![0u8; len];
     r.read_exact(&mut buf).await?;
@@ -284,7 +290,10 @@ where
     W: AsyncWriteExt + Unpin,
 {
     let kp = ctx.kp.as_ref().ok_or_else(|| {
-        io::Error::new(io::ErrorKind::InvalidInput, "peer auth required but this node has no signing key")
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "peer auth required but this node has no signing key",
+        )
     })?;
     if ctx.bind_channel && binding.is_none() {
         return Err(io::Error::new(
@@ -317,7 +326,13 @@ where
     peer_nonce.copy_from_slice(&pi[40..72]);
 
     // sign our transcript and send the signature
-    let sig = kp.sign(&auth_transcript(ctx.my_id, &my_nonce, peer_id, &peer_nonce, cb));
+    let sig = kp.sign(&auth_transcript(
+        ctx.my_id,
+        &my_nonce,
+        peer_id,
+        &peer_nonce,
+        cb,
+    ));
     wr.write_all(&sig).await?;
     wr.flush().await?;
 
@@ -328,7 +343,10 @@ where
     // verify: the peer must be a genesis validator, present the pubkey genesis
     // binds to its id, and sign its own transcript with that key.
     let expected = ctx.validators.get(&peer_id).ok_or_else(|| {
-        io::Error::new(io::ErrorKind::InvalidData, format!("peer {peer_id} is not a genesis validator"))
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("peer {peer_id} is not a genesis validator"),
+        )
     })?;
     if peer_pk != *expected {
         return Err(io::Error::new(
@@ -354,7 +372,10 @@ enum Cmd {
     /// A peer sent us a message.
     Inbound { from: u64, msg: Box<GossipMsg> },
     /// A connection finished its handshake; register its outbound queue.
-    Register { id: u64, tx: mpsc::UnboundedSender<GossipMsg> },
+    Register {
+        id: u64,
+        tx: mpsc::UnboundedSender<GossipMsg>,
+    },
     /// A connection dropped.
     Unregister { id: u64 },
     /// M33: begin (or attempt to begin) consensus for this height. Self-sent on
@@ -507,29 +528,17 @@ enum Cmd {
         reply: oneshot::Sender<Option<Vec<(crate::Hash, u64)>>>,
     },
     /// M104: snapshot the money-supply totals for the `/supply` read.
-    QuerySupply {
-        reply: oneshot::Sender<SupplyView>,
-    },
+    QuerySupply { reply: oneshot::Sender<SupplyView> },
     /// M105: snapshot the governance/economic knobs (ΔK params + base emission + slash bps).
-    QueryParams {
-        reply: oneshot::Sender<ParamsView>,
-    },
+    QueryParams { reply: oneshot::Sender<ParamsView> },
     /// M119: snapshot the operational config (consensus timing + mempool bounds + role).
-    QueryConfig {
-        reply: oneshot::Sender<ConfigView>,
-    },
+    QueryConfig { reply: oneshot::Sender<ConfigView> },
     /// M120: read this node's identity — (node id, is_validator) — for the `/node` read.
-    QueryNode {
-        reply: oneshot::Sender<(u64, bool)>,
-    },
+    QueryNode { reply: oneshot::Sender<(u64, bool)> },
     /// M106: read this node's chain identity (`genesis_hash`) for the `/genesis` read.
-    QueryGenesisHash {
-        reply: oneshot::Sender<crate::Hash>,
-    },
+    QueryGenesisHash { reply: oneshot::Sender<crate::Hash> },
     /// M107: read the handshake aggregate (identity + tip) for the `/info` read, atomically.
-    QueryInfo {
-        reply: oneshot::Sender<InfoView>,
-    },
+    QueryInfo { reply: oneshot::Sender<InfoView> },
     /// M61: serve a heterogeneous proof batch + the certified head it verifies
     /// against, for the verifiable batch read RPC. `None` ⇒ `serve_batch` rejected
     /// (over `MAX_BATCH_ITEMS` or a degenerate Diff range) or no certified head
@@ -629,7 +638,12 @@ impl Node {
     /// `None` if the actor has stopped.
     pub async fn submit_tx(&self, tx: SubmissionTx) -> Option<Result<Hash, crate::ChainError>> {
         let (reply, rx) = oneshot::channel();
-        self.cmd.send(Cmd::SubmitTx { tx: Box::new(tx), reply }).ok()?;
+        self.cmd
+            .send(Cmd::SubmitTx {
+                tx: Box::new(tx),
+                reply,
+            })
+            .ok()?;
         rx.await.ok()
     }
 
@@ -653,10 +667,7 @@ impl Node {
     /// M59: read one account's inclusion proof + the certified head it verifies
     /// against, via the verifiable read-class query path. Outer `None` ⇒ actor
     /// stopped; inner `None` ⇒ unknown account or no certified head yet.
-    pub async fn account_proof(
-        &self,
-        id: u64,
-    ) -> Option<Option<(CertifiedHeader, ProofEntry)>> {
+    pub async fn account_proof(&self, id: u64) -> Option<Option<(CertifiedHeader, ProofEntry)>> {
         let (reply, rx) = oneshot::channel();
         self.cmd.send(Cmd::QueryAccountProof { id, reply }).ok()?;
         rx.await.ok()
@@ -671,7 +682,9 @@ impl Node {
         id: u64,
     ) -> Option<Option<(CertifiedHeader, ProofEntry)>> {
         let (reply, rx) = oneshot::channel();
-        self.cmd.send(Cmd::QueryInclusion { kind, id, reply }).ok()?;
+        self.cmd
+            .send(Cmd::QueryInclusion { kind, id, reply })
+            .ok()?;
         rx.await.ok()
     }
 
@@ -814,7 +827,10 @@ impl Actor {
         let bucket = self
             .peer_tx_buckets
             .entry(from)
-            .or_insert_with(|| TokenBucket { tokens: burst, last: now });
+            .or_insert_with(|| TokenBucket {
+                tokens: burst,
+                last: now,
+            });
         bucket.allow(now, self.tx_rate, burst)
     }
 
@@ -899,7 +915,11 @@ impl Actor {
                 self.tx_index.insert(tx.hash(), h);
             }
             self.appended += 1;
-            debug!(node = self.node.id, height = self.appended as u64, "block committed");
+            debug!(
+                node = self.node.id,
+                height = self.appended as u64,
+                "block committed"
+            );
         }
     }
 
@@ -909,7 +929,11 @@ impl Actor {
         let d = timeout_for(&self.timing, step, round);
         tokio::spawn(async move {
             tokio::time::sleep(d).await;
-            let _ = tx.send(Cmd::Timeout { height, step, round });
+            let _ = tx.send(Cmd::Timeout {
+                height,
+                step,
+                round,
+            });
         });
     }
 
@@ -1048,7 +1072,11 @@ impl Actor {
     /// M33: consensus finalized a block — commit it, persist, tell peers, and
     /// queue the next height.
     fn on_decided(&mut self, commit: crate::consensus::Commit) {
-        let block = match self.cons.as_ref().and_then(|c| c.round.decided_block().cloned()) {
+        let block = match self
+            .cons
+            .as_ref()
+            .and_then(|c| c.round.decided_block().cloned())
+        {
             Some(b) => b,
             None => return,
         };
@@ -1070,7 +1098,10 @@ impl Actor {
         if self.kp.is_none() {
             return; // pure follower never runs consensus
         }
-        let stale = self.cons.as_ref().is_none_or(|c| self.node.height() >= c.height);
+        let stale = self
+            .cons
+            .as_ref()
+            .is_none_or(|c| self.node.height() >= c.height);
         if stale {
             self.cons = None;
             self.schedule_start(self.node.height() + 1, self.timing.block_interval_ms);
@@ -1083,7 +1114,9 @@ async fn run_actor(mut actor: Actor, mut rx: mpsc::UnboundedReceiver<Cmd>) {
         match cmd {
             Cmd::Register { id, tx } => {
                 // Kick anti-entropy: tell the new peer our height immediately.
-                let _ = tx.send(GossipMsg::Status { height: actor.node.height() });
+                let _ = tx.send(GossipMsg::Status {
+                    height: actor.node.height(),
+                });
                 // M39: kick discovery — hand the new peer our address book (incl.
                 // our own listen addr) so it can learn + dial the rest of the mesh.
                 if actor.peer_exchange {
@@ -1154,7 +1187,11 @@ async fn run_actor(mut actor: Actor, mut rx: mpsc::UnboundedReceiver<Cmd>) {
                 let _ = reply.send(actor.node.chain.state.validate_tx(&tx));
             }
             Cmd::StartHeight { height } => actor.on_start_tick(height),
-            Cmd::Timeout { height, step, round } => actor.on_timeout(height, step, round),
+            Cmd::Timeout {
+                height,
+                step,
+                round,
+            } => actor.on_timeout(height, step, round),
             Cmd::Announce => {
                 actor.broadcast_status();
                 // M39: re-propagate the address book so newly-learned peers reach
@@ -1175,17 +1212,21 @@ async fn run_actor(mut actor: Actor, mut rx: mpsc::UnboundedReceiver<Cmd>) {
                         .reviewers
                         .get(&id)
                         .map(|&r| EntityView::Reviewer { id, reputation: r }),
-                    ProofKind::Validator => st
-                        .validators
-                        .get(id)
-                        .map(|v| EntityView::Validator { id, power: v.power, pubkey: v.pubkey }),
-                    ProofKind::GraphNode => st.graph.nodes.get(id as usize).map(|n| {
-                        EntityView::GraphNode {
-                            node_id: n.node_id,
-                            domain: n.domain,
-                            embedding: n.embedding,
-                        }
+                    ProofKind::Validator => st.validators.get(id).map(|v| EntityView::Validator {
+                        id,
+                        power: v.power,
+                        pubkey: v.pubkey,
                     }),
+                    ProofKind::GraphNode => {
+                        st.graph
+                            .nodes
+                            .get(id as usize)
+                            .map(|n| EntityView::GraphNode {
+                                node_id: n.node_id,
+                                domain: n.domain,
+                                embedding: n.embedding,
+                            })
+                    }
                     // Account has its own plain read (QueryAccount); never routed here.
                     ProofKind::Account => None,
                 };
@@ -1221,8 +1262,14 @@ async fn run_actor(mut actor: Actor, mut rx: mpsc::UnboundedReceiver<Cmd>) {
             }
             Cmd::QueryReviewers { reply } => {
                 // M85: snapshot the id-sorted reviewer reputation map for the list directory.
-                let reviewers =
-                    actor.node.chain.state.reviewers.iter().map(|(&id, &r)| (id, r)).collect();
+                let reviewers = actor
+                    .node
+                    .chain
+                    .state
+                    .reviewers
+                    .iter()
+                    .map(|(&id, &r)| (id, r))
+                    .collect();
                 let _ = reply.send(reviewers);
             }
             Cmd::QueryGraphNodes { reply } => {
@@ -1231,8 +1278,14 @@ async fn run_actor(mut actor: Actor, mut rx: mpsc::UnboundedReceiver<Cmd>) {
             }
             Cmd::QueryBonds { reply } => {
                 // M87: snapshot the id-sorted per-validator bonded-stake map for the directory.
-                let bonds =
-                    actor.node.chain.state.bonds.iter().map(|(&id, &amt)| (id, amt)).collect();
+                let bonds = actor
+                    .node
+                    .chain
+                    .state
+                    .bonds
+                    .iter()
+                    .map(|(&id, &amt)| (id, amt))
+                    .collect();
                 let _ = reply.send(bonds);
             }
             Cmd::QueryUnbonding { reply } => {
@@ -1273,8 +1326,12 @@ async fn run_actor(mut actor: Actor, mut rx: mpsc::UnboundedReceiver<Cmd>) {
             }
             Cmd::QueryBlock { height, reply } => {
                 // M113: locate the committed block at `height` and summarize its header + body.
-                let summary = actor.node.blocks().iter().find(|b| b.height == height).map(|b| {
-                    BlockSummary {
+                let summary = actor
+                    .node
+                    .blocks()
+                    .iter()
+                    .find(|b| b.height == height)
+                    .map(|b| BlockSummary {
                         height: b.height,
                         hash: b.hash(),
                         prev_hash: b.prev_hash,
@@ -1285,8 +1342,7 @@ async fn run_actor(mut actor: Actor, mut rx: mpsc::UnboundedReceiver<Cmd>) {
                         n_stake_ops: b.stake_ops.len(),
                         n_evidence: b.slashing_evidence.len(),
                         n_validator_updates: b.validator_updates.len(),
-                    }
-                });
+                    });
                 let _ = reply.send(summary);
             }
             Cmd::QueryBlockTxs { height, reply } => {
@@ -1330,7 +1386,11 @@ async fn run_actor(mut actor: Actor, mut rx: mpsc::UnboundedReceiver<Cmd>) {
             Cmd::QueryConfig { reply } => {
                 // M119: operational config from the actor's resolved timing + mempool bounds.
                 let _ = reply.send(ConfigView {
-                    role: if actor.kp.is_some() { "validator" } else { "follower" },
+                    role: if actor.kp.is_some() {
+                        "validator"
+                    } else {
+                        "follower"
+                    },
                     propose_timeout_ms: actor.timing.propose_ms,
                     prevote_timeout_ms: actor.timing.prevote_ms,
                     precommit_timeout_ms: actor.timing.precommit_ms,
@@ -1430,7 +1490,13 @@ async fn handle_conn(
     info!(node = my_id, peer = peer_id, "peer connected");
 
     let (out_tx, mut out_rx) = mpsc::unbounded_channel::<GossipMsg>();
-    if cmd.send(Cmd::Register { id: peer_id, tx: out_tx }).is_err() {
+    if cmd
+        .send(Cmd::Register {
+            id: peer_id,
+            tx: out_tx,
+        })
+        .is_err()
+    {
         return;
     }
 
@@ -1443,7 +1509,13 @@ async fn handle_conn(
     });
 
     while let Ok(msg) = read_frame(&mut rd).await {
-        if cmd.send(Cmd::Inbound { from: peer_id, msg: Box::new(msg) }).is_err() {
+        if cmd
+            .send(Cmd::Inbound {
+                from: peer_id,
+                msg: Box::new(msg),
+            })
+            .is_err()
+        {
             break;
         }
     }
@@ -1453,7 +1525,11 @@ async fn handle_conn(
     writer.abort();
 }
 
-async fn run_listener(listener: TcpListener, ctx: Arc<AuthContext>, cmd: mpsc::UnboundedSender<Cmd>) {
+async fn run_listener(
+    listener: TcpListener,
+    ctx: Arc<AuthContext>,
+    cmd: mpsc::UnboundedSender<Cmd>,
+) {
     let my_id = ctx.my_id;
     loop {
         match listener.accept().await {
@@ -1590,7 +1666,9 @@ fn build_tls_setup(mtls: Option<MtlsMaterial>) -> io::Result<TlsSetup> {
         .public_key()
         .ok_or_else(|| io::Error::other("mTLS signer exposed no public key"))?;
     let certified = Arc::new(rustls::sign::CertifiedKey::new(
-        vec![rustls::pki_types::CertificateDer::from(spki.as_ref().to_vec())],
+        vec![rustls::pki_types::CertificateDer::from(
+            spki.as_ref().to_vec(),
+        )],
         signing_key,
     ));
 
@@ -1867,8 +1945,18 @@ fn render_prometheus(m: &Metrics) -> String {
         s.push_str(&format!("# TYPE {name} gauge\n"));
         s.push_str(&format!("{name} {value}\n"));
     };
-    gauge(&mut s, "zhixing_height", "Certified chain height.", m.height);
-    gauge(&mut s, "zhixing_peers_connected", "Connected peers.", m.peers as u64);
+    gauge(
+        &mut s,
+        "zhixing_height",
+        "Certified chain height.",
+        m.height,
+    );
+    gauge(
+        &mut s,
+        "zhixing_peers_connected",
+        "Connected peers.",
+        m.peers as u64,
+    );
     gauge(
         &mut s,
         "zhixing_is_validator",
@@ -1881,7 +1969,12 @@ fn render_prometheus(m: &Metrics) -> String {
         "1 if a consensus instance is in flight, else 0.",
         m.consensus_active as u64,
     );
-    gauge(&mut s, "zhixing_mempool_txs", "Pending transactions in the mempool.", m.mempool as u64);
+    gauge(
+        &mut s,
+        "zhixing_mempool_txs",
+        "Pending transactions in the mempool.",
+        m.mempool as u64,
+    );
     gauge(
         &mut s,
         "zhixing_mempool_capacity",
@@ -2041,7 +2134,9 @@ const MAX_RPC_BODY: usize = 65536;
 /// (case-insensitive header name). Returns `None` if absent or unparsable.
 fn parse_content_length(headers: &str) -> Option<usize> {
     for line in headers.split("\r\n") {
-        let Some((name, value)) = line.split_once(':') else { continue };
+        let Some((name, value)) = line.split_once(':') else {
+            continue;
+        };
         if name.trim().eq_ignore_ascii_case("content-length") {
             return value.trim().parse::<usize>().ok();
         }
@@ -2118,7 +2213,9 @@ fn options_response() -> String {
 /// Scans the raw CRLF-split header block, like [`accept_format`] / [`charset_acceptable`].
 fn header_value<'a>(head: &'a str, name: &str) -> Option<&'a str> {
     for line in head.split("\r\n") {
-        let Some((n, v)) = line.split_once(':') else { continue };
+        let Some((n, v)) = line.split_once(':') else {
+            continue;
+        };
         if n.trim().eq_ignore_ascii_case(name) {
             return Some(v.trim());
         }
@@ -2132,8 +2229,13 @@ fn header_value<'a>(head: &'a str, name: &str) -> Option<&'a str> {
 /// the body only when it actually changed. Applied to `200` read responses only (error bodies
 /// carry no validator). The `304` repeats the validator + `Vary` and sends no body. Pure.
 fn apply_etag(resp: String, if_none_match: Option<&str>) -> String {
-    let Some((head, body)) = resp.split_once("\r\n\r\n") else { return resp };
-    let etag = format!("\"{}\"", crate::hash::hex(&crate::hash::sha256(body.as_bytes())));
+    let Some((head, body)) = resp.split_once("\r\n\r\n") else {
+        return resp;
+    };
+    let etag = format!(
+        "\"{}\"",
+        crate::hash::hex(&crate::hash::sha256(body.as_bytes()))
+    );
     if if_none_match == Some(etag.as_str()) {
         return format!(
             "HTTP/1.1 304 Not Modified\r\nETag: {etag}\r\nVary: Accept, Accept-Charset, Accept-Encoding\r\nConnection: close\r\n\r\n"
@@ -2358,7 +2460,11 @@ enum RespFormat {
 fn response_format(query: &str) -> Option<RespFormat> {
     for pair in query.split('&') {
         if let Some(v) = pair.strip_prefix("format=") {
-            return Some(if v == "json" { RespFormat::Json } else { RespFormat::Text });
+            return Some(if v == "json" {
+                RespFormat::Json
+            } else {
+                RespFormat::Text
+            });
         }
     }
     None
@@ -2480,7 +2586,9 @@ fn media_match(accept_value: &str, ty: &str, sub: &str) -> (u16, u8) {
 fn accept_format(head: &str) -> Negotiation {
     let mut value = None;
     for line in head.split("\r\n") {
-        let Some((name, v)) = line.split_once(':') else { continue };
+        let Some((name, v)) = line.split_once(':') else {
+            continue;
+        };
         if name.trim().eq_ignore_ascii_case("accept") {
             value = Some(v);
             break;
@@ -2495,7 +2603,11 @@ fn accept_format(head: &str) -> Negotiation {
         return Negotiation::NotAcceptable;
     }
     let use_json = q_json > q_text || (q_json == q_text && spec_json >= 2);
-    Negotiation::Use(if use_json { RespFormat::Json } else { RespFormat::Text })
+    Negotiation::Use(if use_json {
+        RespFormat::Json
+    } else {
+        RespFormat::Text
+    })
 }
 
 /// M68/M69: resolve the response rendering. An explicit `?format=` query wins (the most
@@ -2554,7 +2666,9 @@ fn charset_q(accept_value: &str, name: &str) -> u16 {
 fn charset_acceptable(head: &str) -> bool {
     let mut value = None;
     for line in head.split("\r\n") {
-        let Some((name, v)) = line.split_once(':') else { continue };
+        let Some((name, v)) = line.split_once(':') else {
+            continue;
+        };
         if name.trim().eq_ignore_ascii_case("accept-charset") {
             value = Some(v);
             break;
@@ -2570,7 +2684,9 @@ fn charset_acceptable(head: &str) -> bool {
 /// refused, i.e. an explicit `identity;q=0`, or a `*;q=0` with no overriding `identity` entry.
 /// So, unlike charset, a list like `gzip` (identity unmentioned, no `*`) still accepts identity.
 fn encoding_acceptable(head: &str) -> bool {
-    let Some(value) = header_value(head, "accept-encoding") else { return true };
+    let Some(value) = header_value(head, "accept-encoding") else {
+        return true;
+    };
     let mut identity_q: Option<u16> = None;
     let mut star_q: Option<u16> = None;
     for range in value.split(',') {
@@ -2590,8 +2706,8 @@ fn encoding_acceptable(head: &str) -> bool {
         }
     }
     match identity_q {
-        Some(q) => q > 0,                                  // an explicit identity entry decides
-        None => star_q.map(|q| q > 0).unwrap_or(true),     // else `*` decides; else default-accept
+        Some(q) => q > 0,                              // an explicit identity entry decides
+        None => star_q.map(|q| q > 0).unwrap_or(true), // else `*` decides; else default-accept
     }
 }
 
@@ -2658,7 +2774,10 @@ fn route_get(path: &str) -> GetRoute {
                         .parse::<u64>()
                         .map(GetRoute::AccountProof)
                         .unwrap_or(GetRoute::NotFound),
-                    None => rest.parse::<u64>().map(GetRoute::Account).unwrap_or(GetRoute::NotFound),
+                    None => rest
+                        .parse::<u64>()
+                        .map(GetRoute::Account)
+                        .unwrap_or(GetRoute::NotFound),
                 }
             } else if let Some(rest) = p.strip_prefix("/reviewer/") {
                 entity_route(rest, ProofKind::Reviewer)
@@ -2679,18 +2798,28 @@ fn route_get(path: &str) -> GetRoute {
             } else if let Some(rest) = p.strip_prefix("/mempool/") {
                 // M103: `/mempool/{hash}` is a membership read — is this tx hash currently
                 // pending? A malformed (non-64-hex) hash ⇒ 404.
-                parse_hash(rest).map(GetRoute::MempoolContains).unwrap_or(GetRoute::NotFound)
+                parse_hash(rest)
+                    .map(GetRoute::MempoolContains)
+                    .unwrap_or(GetRoute::NotFound)
             } else if let Some(rest) = p.strip_prefix("/tx/") {
                 // M112: `/tx/{hash}` is a committed-inclusion read — at which height (if any)
                 // was this tx mined? A malformed hash ⇒ 404.
-                parse_hash(rest).map(GetRoute::TxHeight).unwrap_or(GetRoute::NotFound)
+                parse_hash(rest)
+                    .map(GetRoute::TxHeight)
+                    .unwrap_or(GetRoute::NotFound)
             } else if let Some(rest) = p.strip_prefix("/block/") {
                 // M113/M114: `/block/{height}` is the header+counts read; `/block/{height}/txs`
                 // (M114) is the tx-reference list. A non-numeric height ⇒ 404; a height with no
                 // committed block is a 404 produced by the handler.
                 match rest.strip_suffix("/txs") {
-                    Some(hp) => hp.parse::<u64>().map(GetRoute::BlockTxs).unwrap_or(GetRoute::NotFound),
-                    None => rest.parse::<u64>().map(GetRoute::Block).unwrap_or(GetRoute::NotFound),
+                    Some(hp) => hp
+                        .parse::<u64>()
+                        .map(GetRoute::BlockTxs)
+                        .unwrap_or(GetRoute::NotFound),
+                    None => rest
+                        .parse::<u64>()
+                        .map(GetRoute::Block)
+                        .unwrap_or(GetRoute::NotFound),
                 }
             } else {
                 GetRoute::Health
@@ -2762,9 +2891,20 @@ fn format_account(id: u64, a: &Account) -> String {
 /// read-class RPC — the non-proof siblings of `GET /account/{id}`. Account keeps its
 /// own richer `Account` snapshot; this carries the per-kind fields.
 pub enum EntityView {
-    Reviewer { id: u64, reputation: f32 },
-    Validator { id: u64, power: u64, pubkey: crate::crypto::PubKey },
-    GraphNode { node_id: u64, domain: u32, embedding: crate::Embedding },
+    Reviewer {
+        id: u64,
+        reputation: f32,
+    },
+    Validator {
+        id: u64,
+        power: u64,
+        pubkey: crate::crypto::PubKey,
+    },
+    GraphNode {
+        node_id: u64,
+        domain: u32,
+        embedding: crate::Embedding,
+    },
 }
 
 /// M65: render a plain entity view as a grep-friendly `key=value` line (same shape as
@@ -2776,11 +2916,25 @@ fn format_entity(v: &EntityView) -> String {
             format!("kind=reviewer id={id} reputation={reputation}")
         }
         EntityView::Validator { id, power, pubkey } => {
-            format!("kind=validator id={id} power={power} pubkey={}", crate::hash::hex(pubkey))
+            format!(
+                "kind=validator id={id} power={power} pubkey={}",
+                crate::hash::hex(pubkey)
+            )
         }
-        EntityView::GraphNode { node_id, domain, embedding } => {
-            let emb = embedding.iter().map(|f| f.to_string()).collect::<Vec<_>>().join(",");
-            format!("kind=graph node_id={node_id} domain={domain} dim={} embedding={emb}", embedding.len())
+        EntityView::GraphNode {
+            node_id,
+            domain,
+            embedding,
+        } => {
+            let emb = embedding
+                .iter()
+                .map(|f| f.to_string())
+                .collect::<Vec<_>>()
+                .join(",");
+            format!(
+                "kind=graph node_id={node_id} domain={domain} dim={} embedding={emb}",
+                embedding.len()
+            )
         }
     }
 }
@@ -2899,14 +3053,22 @@ fn json_u64(n: u64) -> String {
 
 /// M103: a `bool` as a JSON literal — `true` / `false`. Used by the mempool-membership read.
 fn json_bool(b: bool) -> String {
-    if b { "true".to_string() } else { "false".to_string() }
+    if b {
+        "true".to_string()
+    } else {
+        "false".to_string()
+    }
 }
 
 /// M103: a `bool` as a grep-friendly text body — `present` / `absent`. Avoids the
 /// `true`/`false` JSON literals that would render ambiguously to clients that don't
 /// negotiate `?format=json`.
 fn bool_str(b: bool) -> &'static str {
-    if b { "present" } else { "absent" }
+    if b {
+        "present"
+    } else {
+        "absent"
+    }
 }
 
 /// M112: render the `/tx/{hash}` inclusion answer — the committed height, or `absent` when
@@ -3103,7 +3265,11 @@ fn format_routes() -> String {
 
 /// M118: `GET /routes?format=json` — the JSON sibling, `{"routes":["…",…]}`.
 fn json_routes() -> String {
-    let items = READ_ROUTES.iter().map(|r| json_str(r)).collect::<Vec<_>>().join(",");
+    let items = READ_ROUTES
+        .iter()
+        .map(|r| json_str(r))
+        .collect::<Vec<_>>()
+        .join(",");
     format!("{{\"routes\":[{items}]}}")
 }
 
@@ -3139,8 +3305,16 @@ fn json_entity(v: &EntityView) -> String {
             json_u64(*power),
             json_str(&crate::hash::hex(pubkey)),
         ),
-        EntityView::GraphNode { node_id, domain, embedding } => {
-            let emb = embedding.iter().map(|f| json_f32(*f)).collect::<Vec<_>>().join(",");
+        EntityView::GraphNode {
+            node_id,
+            domain,
+            embedding,
+        } => {
+            let emb = embedding
+                .iter()
+                .map(|f| json_f32(*f))
+                .collect::<Vec<_>>()
+                .join(",");
             format!(
                 "{{\"kind\":\"graph\",\"node_id\":{},\"domain\":{},\"dim\":{},\"embedding\":[{}]}}",
                 json_u64(*node_id),
@@ -3182,7 +3356,12 @@ fn json_lock_listing(locks: &[(u64, u64, crate::BridgeLock)]) -> String {
 fn format_validator_listing(vs: &[crate::validator::Validator]) -> String {
     vs.iter()
         .map(|v| {
-            format!("validator_id={} power={} pubkey={}", v.id, v.power, crate::hash::hex(&v.pubkey))
+            format!(
+                "validator_id={} power={} pubkey={}",
+                v.id,
+                v.power,
+                crate::hash::hex(&v.pubkey)
+            )
         })
         .collect::<Vec<_>>()
         .join("\n")
@@ -3346,13 +3525,21 @@ fn json_unbonding(e: &crate::UnbondingEntry) -> String {
 /// M88: render the unbonding-delay queue as grep-friendly lines, one per entry (empty
 /// string when the queue is empty). Reuses `format_unbonding` per item; insertion order.
 fn format_unbonding_listing(queue: &[crate::UnbondingEntry]) -> String {
-    queue.iter().map(format_unbonding).collect::<Vec<_>>().join("\n")
+    queue
+        .iter()
+        .map(format_unbonding)
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 /// M88: `GET /unbonding?format=json` — the JSON sibling of [`format_unbonding_listing`].
 /// A JSON **array** of objects (`[]` when empty), reusing `json_unbonding` per item.
 fn json_unbonding_listing(queue: &[crate::UnbondingEntry]) -> String {
-    let items = queue.iter().map(json_unbonding).collect::<Vec<_>>().join(",");
+    let items = queue
+        .iter()
+        .map(json_unbonding)
+        .collect::<Vec<_>>()
+        .join(",");
     format!("[{items}]")
 }
 
@@ -3376,7 +3563,10 @@ fn format_stake_op(op: &crate::StakeOp) -> String {
 /// M89: render the pending stake-op pool as grep-friendly lines, one per op (empty string
 /// when the pool is empty). Reuses `format_stake_op` per item; staging order.
 fn format_stakeop_listing(ops: &[crate::StakeOp]) -> String {
-    ops.iter().map(format_stake_op).collect::<Vec<_>>().join("\n")
+    ops.iter()
+        .map(format_stake_op)
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 /// M89: `GET /stake-ops?format=json` — the JSON sibling of [`format_stakeop_listing`]. A
@@ -3420,13 +3610,21 @@ fn format_slash_evidence(e: &crate::SlashEvidence) -> String {
 /// M90: render the pending slashing-evidence pool as grep-friendly lines, one per entry
 /// (empty string when the pool is empty). Reuses `format_slash_evidence`; staging order.
 fn format_evidence_listing(evidence: &[crate::SlashEvidence]) -> String {
-    evidence.iter().map(format_slash_evidence).collect::<Vec<_>>().join("\n")
+    evidence
+        .iter()
+        .map(format_slash_evidence)
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 /// M90: `GET /evidence?format=json` — the JSON sibling of [`format_evidence_listing`]. A
 /// JSON **array** of objects (`[]` when empty), reusing the existing `json_slash_evidence`.
 fn json_evidence_listing(evidence: &[crate::SlashEvidence]) -> String {
-    let items = evidence.iter().map(json_slash_evidence).collect::<Vec<_>>().join(",");
+    let items = evidence
+        .iter()
+        .map(json_slash_evidence)
+        .collect::<Vec<_>>()
+        .join(",");
     format!("[{items}]")
 }
 
@@ -3446,26 +3644,41 @@ fn json_peer(id: u64, addr: &Option<String>) -> String {
         Some(a) => json_str(a),
         None => "null".to_string(),
     };
-    format!("{{\"kind\":\"peer\",\"id\":{},\"addr\":{}}}", json_u64(id), addr)
+    format!(
+        "{{\"kind\":\"peer\",\"id\":{},\"addr\":{}}}",
+        json_u64(id),
+        addr
+    )
 }
 
 /// M91: render the connected-peer directory as grep-friendly lines, one per peer (empty
 /// string when none are connected). Reuses `format_peer` per item; id order.
 fn format_peer_listing(peers: &[(u64, Option<String>)]) -> String {
-    peers.iter().map(|(id, addr)| format_peer(*id, addr)).collect::<Vec<_>>().join("\n")
+    peers
+        .iter()
+        .map(|(id, addr)| format_peer(*id, addr))
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 /// M91: `GET /peers?format=json` — the JSON sibling of [`format_peer_listing`]. A JSON
 /// **array** of objects (`[]` when empty), reusing `json_peer` per item.
 fn json_peer_listing(peers: &[(u64, Option<String>)]) -> String {
-    let items = peers.iter().map(|(id, addr)| json_peer(*id, addr)).collect::<Vec<_>>().join(",");
+    let items = peers
+        .iter()
+        .map(|(id, addr)| json_peer(*id, addr))
+        .collect::<Vec<_>>()
+        .join(",");
     format!("[{items}]")
 }
 
 /// M111: render one pending-tx summary (content hash + author) as a grep-friendly line.
 /// The full tx is fetched by hash; this directory is deliberately a lightweight index.
 fn format_pending_tx(hash: &crate::Hash, author: u64) -> String {
-    format!("kind=pending_tx hash={} author={author}", crate::hash::hex(hash))
+    format!(
+        "kind=pending_tx hash={} author={author}",
+        crate::hash::hex(hash)
+    )
 }
 
 /// M111: the JSON sibling of [`format_pending_tx`] — a `{"kind":"pending_tx",…}` object with
@@ -3481,13 +3694,20 @@ fn json_pending_tx(hash: &crate::Hash, author: u64) -> String {
 /// M111: render the pending-tx directory as grep-friendly lines, one per tx (empty string
 /// when the pool is empty). Reuses `format_pending_tx`; hash order.
 fn format_mempool_listing(txs: &[(crate::Hash, u64)]) -> String {
-    txs.iter().map(|(h, a)| format_pending_tx(h, *a)).collect::<Vec<_>>().join("\n")
+    txs.iter()
+        .map(|(h, a)| format_pending_tx(h, *a))
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 /// M111: `GET /mempool?format=json` — the JSON sibling of [`format_mempool_listing`]. A JSON
 /// **array** of objects (`[]` when empty), reusing `json_pending_tx` per item.
 fn json_mempool_listing(txs: &[(crate::Hash, u64)]) -> String {
-    let items = txs.iter().map(|(h, a)| json_pending_tx(h, *a)).collect::<Vec<_>>().join(",");
+    let items = txs
+        .iter()
+        .map(|(h, a)| json_pending_tx(h, *a))
+        .collect::<Vec<_>>()
+        .join(",");
     format!("[{items}]")
 }
 
@@ -3509,12 +3729,19 @@ fn json_block_tx(hash: &crate::Hash, author: u64) -> String {
 /// M114: render a committed block's tx references as grep-friendly lines (empty string for an
 /// empty block). Reuses `format_block_tx`; block order (`build_block`'s canonical tx-hash sort).
 fn format_block_tx_listing(txs: &[(crate::Hash, u64)]) -> String {
-    txs.iter().map(|(h, a)| format_block_tx(h, *a)).collect::<Vec<_>>().join("\n")
+    txs.iter()
+        .map(|(h, a)| format_block_tx(h, *a))
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 /// M114: `GET /block/{height}/txs?format=json` — the JSON array sibling (`[]` when empty).
 fn json_block_tx_listing(txs: &[(crate::Hash, u64)]) -> String {
-    let items = txs.iter().map(|(h, a)| json_block_tx(h, *a)).collect::<Vec<_>>().join(",");
+    let items = txs
+        .iter()
+        .map(|(h, a)| json_block_tx(h, *a))
+        .collect::<Vec<_>>()
+        .join(",");
     format!("[{items}]")
 }
 
@@ -3624,7 +3851,11 @@ struct ConfigView {
 /// M119: render a mempool bound — a number, or `unbounded` when it is `usize::MAX` (the
 /// unset default), so the body never shows the raw sentinel `18446744073709551615`.
 fn bound_str(n: usize) -> String {
-    if n == usize::MAX { "unbounded".to_string() } else { n.to_string() }
+    if n == usize::MAX {
+        "unbounded".to_string()
+    } else {
+        n.to_string()
+    }
 }
 
 /// M119: render the operational config as grep-friendly `key=value` lines. Pure for testing.
@@ -3667,7 +3898,11 @@ fn json_config(c: &ConfigView) -> String {
 fn format_node(id: u64, is_validator: bool) -> String {
     format!(
         "node_id={id}\nrole={}\nversion={NODE_VERSION}",
-        if is_validator { "validator" } else { "follower" },
+        if is_validator {
+            "validator"
+        } else {
+            "follower"
+        },
     )
 }
 
@@ -3677,7 +3912,11 @@ fn json_node(id: u64, is_validator: bool) -> String {
     format!(
         "{{\"node_id\":{},\"role\":{},\"version\":{}}}",
         json_u64(id),
-        json_str(if is_validator { "validator" } else { "follower" }),
+        json_str(if is_validator {
+            "validator"
+        } else {
+            "follower"
+        }),
         json_str(NODE_VERSION),
     )
 }
@@ -3690,7 +3929,12 @@ fn json_page(items: &str, total: usize, next: Option<usize>) -> String {
         Some(n) => json_u64(n as u64),
         None => "null".to_string(),
     };
-    format!("{{\"total\":{},\"next\":{},\"items\":{}}}", json_u64(total as u64), next, items)
+    format!(
+        "{{\"total\":{},\"next\":{},\"items\":{}}}",
+        json_u64(total as u64),
+        next,
+        items
+    )
 }
 
 // ---- M67/M74/M75/M76/M77/M78: JSON renderers for the proof / batch / lock reads. -----
@@ -3736,7 +3980,12 @@ fn json_vote(v: &crate::consensus::Vote) -> String {
 
 /// M74: a finality `Commit` — `{"height","round","block_hash","precommits":[…]}`.
 fn json_commit(c: &Commit) -> String {
-    let precommits = c.precommits.iter().map(json_vote).collect::<Vec<_>>().join(",");
+    let precommits = c
+        .precommits
+        .iter()
+        .map(json_vote)
+        .collect::<Vec<_>>()
+        .join(",");
     format!(
         "{{\"height\":{},\"round\":{},\"block_hash\":{},\"precommits\":[{}]}}",
         json_u64(c.height),
@@ -3798,10 +4047,16 @@ fn json_merkle_proof(p: &crate::merkle::Proof) -> String {
         .iter()
         .map(|s| match s {
             crate::merkle::Step::Left(h) => {
-                format!("{{\"side\":\"left\",\"hash\":{}}}", json_str(&crate::hash::hex(h)))
+                format!(
+                    "{{\"side\":\"left\",\"hash\":{}}}",
+                    json_str(&crate::hash::hex(h))
+                )
             }
             crate::merkle::Step::Right(h) => {
-                format!("{{\"side\":\"right\",\"hash\":{}}}", json_str(&crate::hash::hex(h)))
+                format!(
+                    "{{\"side\":\"right\",\"hash\":{}}}",
+                    json_str(&crate::hash::hex(h))
+                )
             }
         })
         .collect::<Vec<_>>()
@@ -3819,20 +4074,32 @@ fn json_proof_entry(e: &ProofEntry) -> String {
             json_account(*id, account),
             json_merkle_proof(proof),
         ),
-        ProofEntry::Reviewer { id, reputation, proof } => format!(
+        ProofEntry::Reviewer {
+            id,
+            reputation,
+            proof,
+        } => format!(
             "{{\"kind\":\"reviewer\",\"id\":{},\"reputation\":{},\"proof\":{}}}",
             json_u64(*id),
             json_f32(*reputation),
             json_merkle_proof(proof),
         ),
-        ProofEntry::Validator { id, validator, proof } => format!(
+        ProofEntry::Validator {
+            id,
+            validator,
+            proof,
+        } => format!(
             "{{\"kind\":\"validator\",\"id\":{},\"power\":{},\"pubkey\":{},\"proof\":{}}}",
             json_u64(*id),
             json_u64(validator.power),
             json_str(&crate::hash::hex(&validator.pubkey)),
             json_merkle_proof(proof),
         ),
-        ProofEntry::GraphNode { node_id, graph_node, proof } => {
+        ProofEntry::GraphNode {
+            node_id,
+            graph_node,
+            proof,
+        } => {
             let emb = graph_node
                 .embedding
                 .iter()
@@ -3868,7 +4135,10 @@ fn json_account_proof(ch: &CertifiedHeader, entry: &ProofEntry) -> String {
 fn json_embedding(emb: &[f32]) -> String {
     format!(
         "[{}]",
-        emb.iter().map(|f| json_f32(*f)).collect::<Vec<_>>().join(","),
+        emb.iter()
+            .map(|f| json_f32(*f))
+            .collect::<Vec<_>>()
+            .join(","),
     )
 }
 
@@ -3888,7 +4158,11 @@ fn json_graph_node(gn: &crate::engine::GraphNode) -> String {
 /// M76: one cert-signed graph leaf `{"node_id","graph_node":{…},"proof":{…}}` — shared by
 /// the kNN / range neighbour tuples (`(node_id, GraphNode, Proof)`) and `DiffClaim`'s
 /// `GraphLeafAtHeight`.
-fn json_graph_leaf(node_id: u64, gn: &crate::engine::GraphNode, proof: &crate::merkle::Proof) -> String {
+fn json_graph_leaf(
+    node_id: u64,
+    gn: &crate::engine::GraphNode,
+    proof: &crate::merkle::Proof,
+) -> String {
     format!(
         "{{\"node_id\":{},\"graph_node\":{},\"proof\":{}}}",
         json_u64(node_id),
@@ -3958,7 +4232,11 @@ fn json_validator(v: &crate::validator::Validator) -> String {
 fn json_validator_set(s: &crate::validator::ValidatorSet) -> String {
     format!(
         "[{}]",
-        s.validators().iter().map(json_validator).collect::<Vec<_>>().join(","),
+        s.validators()
+            .iter()
+            .map(json_validator)
+            .collect::<Vec<_>>()
+            .join(","),
     )
 }
 
@@ -3983,13 +4261,19 @@ fn json_diff_envelope(e: &crate::light::DiffEnvelope) -> String {
 fn json_batch_item(it: &crate::light::BatchResponseItem) -> String {
     use crate::light::BatchResponseItem as I;
     match it {
-        I::Inclusion(Some(e)) => format!("{{\"kind\":\"inclusion\",\"entry\":{}}}", json_proof_entry(e)),
+        I::Inclusion(Some(e)) => format!(
+            "{{\"kind\":\"inclusion\",\"entry\":{}}}",
+            json_proof_entry(e)
+        ),
         I::Inclusion(None) => "{\"kind\":\"inclusion\",\"entry\":null}".to_string(),
         I::Knn(Some(c)) => format!("{{\"kind\":\"knn\",\"claim\":{}}}", json_knn_claim(c)),
         I::Knn(None) => "{\"kind\":\"knn\",\"claim\":null}".to_string(),
         I::Range(Some(c)) => format!("{{\"kind\":\"range\",\"claim\":{}}}", json_range_claim(c)),
         I::Range(None) => "{\"kind\":\"range\",\"claim\":null}".to_string(),
-        I::Diff(e) => format!("{{\"kind\":\"diff\",\"envelope\":{}}}", json_diff_envelope(e)),
+        I::Diff(e) => format!(
+            "{{\"kind\":\"diff\",\"envelope\":{}}}",
+            json_diff_envelope(e)
+        ),
     }
 }
 
@@ -3998,7 +4282,11 @@ fn json_batch_item(it: &crate::light::BatchResponseItem) -> String {
 fn json_batch_envelope(env: &BatchResponseEnvelope) -> String {
     format!(
         "{{\"items\":[{}]}}",
-        env.items.iter().map(json_batch_item).collect::<Vec<_>>().join(","),
+        env.items
+            .iter()
+            .map(json_batch_item)
+            .collect::<Vec<_>>()
+            .join(","),
     )
 }
 
@@ -4042,12 +4330,21 @@ fn json_lock(env: &crate::bridge::LockEnvelope) -> String {
 
 /// M78: a `Review` as `{"reviewer","score"}`.
 fn json_review(r: &crate::Review) -> String {
-    format!("{{\"reviewer\":{},\"score\":{}}}", json_u64(r.reviewer), json_f32(r.score))
+    format!(
+        "{{\"reviewer\":{},\"score\":{}}}",
+        json_u64(r.reviewer),
+        json_f32(r.score)
+    )
 }
 
 /// M78: a `SubmissionTx` — the unit of work, with its embedding and reviews.
 fn json_submission_tx(tx: &crate::SubmissionTx) -> String {
-    let reviews = tx.reviews.iter().map(json_review).collect::<Vec<_>>().join(",");
+    let reviews = tx
+        .reviews
+        .iter()
+        .map(json_review)
+        .collect::<Vec<_>>()
+        .join(",");
     format!(
         "{{\"author\":{},\"embedding\":{},\"domain\":{},\"stake\":{},\"reviews\":[{}],\
          \"repl_success\":{},\"repl_total\":{},\"timestamp_days\":{},\"signature\":{}}}",
@@ -4080,7 +4377,11 @@ fn json_stake_op(op: &crate::StakeOp) -> String {
 
 /// M78: a `SlashEvidence` — a pair of conflicting precommit votes (reuses `json_vote`).
 fn json_slash_evidence(e: &crate::SlashEvidence) -> String {
-    format!("{{\"vote_a\":{},\"vote_b\":{}}}", json_vote(&e.vote_a), json_vote(&e.vote_b))
+    format!(
+        "{{\"vote_a\":{},\"vote_b\":{}}}",
+        json_vote(&e.vote_a),
+        json_vote(&e.vote_b)
+    )
 }
 
 /// M78: a `BridgeHeader` — a followed source header + cert + next set.
@@ -4114,9 +4415,19 @@ fn json_bridge_redeem(r: &crate::BridgeRedeem) -> String {
 fn json_block(b: &crate::Block) -> String {
     let join = |parts: Vec<String>| parts.join(",");
     let txs = join(b.txs.iter().map(json_submission_tx).collect());
-    let vus = join(b.validator_updates.iter().map(json_validator_update).collect());
+    let vus = join(
+        b.validator_updates
+            .iter()
+            .map(json_validator_update)
+            .collect(),
+    );
     let sops = join(b.stake_ops.iter().map(json_stake_op).collect());
-    let ev = join(b.slashing_evidence.iter().map(json_slash_evidence).collect());
+    let ev = join(
+        b.slashing_evidence
+            .iter()
+            .map(json_slash_evidence)
+            .collect(),
+    );
     let locks = join(b.bridge_locks.iter().map(json_bridge_lock).collect());
     let bhdrs = join(b.bridge_headers.iter().map(json_bridge_header).collect());
     let brdms = join(b.bridge_redeems.iter().map(json_bridge_redeem).collect());
@@ -4133,7 +4444,13 @@ fn json_block(b: &crate::Block) -> String {
         json_str(&crate::hash::hex(&b.accounts_root)),
         json_str(&crate::hash::hex(&b.graph_root)),
         json_str(&crate::hash::hex(&b.bridge_root)),
-        txs, vus, sops, ev, locks, bhdrs, brdms,
+        txs,
+        vus,
+        sops,
+        ev,
+        locks,
+        bhdrs,
+        brdms,
     )
 }
 
@@ -4141,7 +4458,13 @@ fn json_block(b: &crate::Block) -> String {
 fn json_range_blocks(range: &[(Block, Commit)]) -> String {
     let items = range
         .iter()
-        .map(|(b, c)| format!("{{\"block\":{},\"commit\":{}}}", json_block(b), json_commit(c)))
+        .map(|(b, c)| {
+            format!(
+                "{{\"block\":{},\"commit\":{}}}",
+                json_block(b),
+                json_commit(c)
+            )
+        })
         .collect::<Vec<_>>()
         .join(",");
     format!("[{items}]")
@@ -4150,7 +4473,11 @@ fn json_range_blocks(range: &[(Block, Commit)]) -> String {
 /// M67/M74/M76/M78: `{"certified_header":{…},"batch_envelope":{…},"range_blocks":[…]}`
 /// — the JSON twin of [`format_batch`]. The `certified_header` (M74), `batch_envelope`
 /// (M76) and `range_blocks` (M78) are all structured; no opaque-hex field remains.
-fn json_batch(ch: &CertifiedHeader, env: &BatchResponseEnvelope, range: &[(Block, Commit)]) -> String {
+fn json_batch(
+    ch: &CertifiedHeader,
+    env: &BatchResponseEnvelope,
+    range: &[(Block, Commit)],
+) -> String {
     format!(
         "{{\"certified_header\":{},\"batch_envelope\":{},\"range_blocks\":{}}}",
         json_certified_header(ch),
@@ -4176,9 +4503,11 @@ fn ok_body(fmt: RespFormat, text: &str, json: &str) -> String {
 fn error_body(fmt: RespFormat, status_line: &str, msg: &str) -> String {
     match fmt {
         RespFormat::Text => http_response(status_line, msg),
-        RespFormat::Json => {
-            http_response_ct(status_line, "application/json", &format!("{{\"error\":{}}}", json_str(msg)))
-        }
+        RespFormat::Json => http_response_ct(
+            status_line,
+            "application/json",
+            &format!("{{\"error\":{}}}", json_str(msg)),
+        ),
     }
 }
 
@@ -4202,7 +4531,15 @@ async fn serve_rpc_conn(mut stream: TcpStream, cmd: mpsc::UnboundedSender<Cmd>) 
                     break pos + 4;
                 }
                 if acc.len() >= MAX_RPC_HEADER {
-                    let _ = stream.write_all(http_response("431 Request Header Fields Too Large", "header too large").as_bytes()).await;
+                    let _ = stream
+                        .write_all(
+                            http_response(
+                                "431 Request Header Fields Too Large",
+                                "header too large",
+                            )
+                            .as_bytes(),
+                        )
+                        .await;
                     return;
                 }
             }
@@ -4212,7 +4549,9 @@ async fn serve_rpc_conn(mut stream: TcpStream, cmd: mpsc::UnboundedSender<Cmd>) 
 
     // The request line + headers are ASCII; a non-UTF-8 header block is malformed.
     let Ok(head) = std::str::from_utf8(&acc[..header_end]) else {
-        let _ = stream.write_all(http_response("400 Bad Request", "malformed headers").as_bytes()).await;
+        let _ = stream
+            .write_all(http_response("400 Bad Request", "malformed headers").as_bytes())
+            .await;
         return;
     };
     let method = head.split_whitespace().next().unwrap_or("");
@@ -4244,7 +4583,11 @@ async fn serve_rpc_conn(mut stream: TcpStream, cmd: mpsc::UnboundedSender<Cmd>) 
                 .write_all(
                     maybe_head(
                         is_head,
-                        http_response_ct("406 Not Acceptable", "application/json", &not_acceptable_json()),
+                        http_response_ct(
+                            "406 Not Acceptable",
+                            "application/json",
+                            &not_acceptable_json(),
+                        ),
                     )
                     .as_bytes(),
                 )
@@ -4348,9 +4691,10 @@ async fn serve_rpc_conn(mut stream: TcpStream, cmd: mpsc::UnboundedSender<Cmd>) 
                 } else {
                     match rx.await {
                         Ok(Some(v)) => ok_body(fmt, &format_entity(&v), &json_entity(&v)),
-                        Ok(None) => {
-                            not_found_body(fmt, &format!("{} {id} not found", proof_kind_label(kind)))
-                        }
+                        Ok(None) => not_found_body(
+                            fmt,
+                            &format!("{} {id} not found", proof_kind_label(kind)),
+                        ),
                         Err(_) => http_response("503 Service Unavailable", "node stopped"),
                     }
                 }
@@ -4401,9 +4745,7 @@ async fn serve_rpc_conn(mut stream: TcpStream, cmd: mpsc::UnboundedSender<Cmd>) 
                 } else {
                     match rx.await {
                         Ok(Some(env)) => ok_body(fmt, &format_lock(&env), &json_lock(&env)),
-                        Ok(None) => {
-                            not_found_body(fmt, &format!("bridge lock {id} not found"))
-                        }
+                        Ok(None) => not_found_body(fmt, &format!("bridge lock {id} not found")),
                         Err(_) => http_response("503 Service Unavailable", "node stopped"),
                     }
                 }
@@ -4745,7 +5087,9 @@ async fn serve_rpc_conn(mut stream: TcpStream, cmd: mpsc::UnboundedSender<Cmd>) 
                     http_response("503 Service Unavailable", "node stopped")
                 } else {
                     match rx.await {
-                        Ok(height) => ok_body(fmt, &format_tx_height(height), &json_tx_height(height)),
+                        Ok(height) => {
+                            ok_body(fmt, &format_tx_height(height), &json_tx_height(height))
+                        }
                         Err(_) => http_response("503 Service Unavailable", "node stopped"),
                     }
                 }
@@ -4758,7 +5102,9 @@ async fn serve_rpc_conn(mut stream: TcpStream, cmd: mpsc::UnboundedSender<Cmd>) 
                     http_response("503 Service Unavailable", "node stopped")
                 } else {
                     match rx.await {
-                        Ok(Some(b)) => ok_body(fmt, &format_block_summary(&b), &json_block_summary(&b)),
+                        Ok(Some(b)) => {
+                            ok_body(fmt, &format_block_summary(&b), &json_block_summary(&b))
+                        }
                         Ok(None) => http_response("404 Not Found", "block not found"),
                         Err(_) => http_response("503 Service Unavailable", "node stopped"),
                     }
@@ -4867,7 +5213,9 @@ async fn serve_rpc_conn(mut stream: TcpStream, cmd: mpsc::UnboundedSender<Cmd>) 
                     http_response("503 Service Unavailable", "node stopped")
                 } else {
                     match rx.await {
-                        Ok((id, is_val)) => ok_body(fmt, &format_node(id, is_val), &json_node(id, is_val)),
+                        Ok((id, is_val)) => {
+                            ok_body(fmt, &format_node(id, is_val), &json_node(id, is_val))
+                        }
                         Err(_) => http_response("503 Service Unavailable", "node stopped"),
                     }
                 }
@@ -4923,7 +5271,9 @@ async fn serve_rpc_conn(mut stream: TcpStream, cmd: mpsc::UnboundedSender<Cmd>) 
 
     // Anything that isn't a POST is treated as a health probe.
     if !method.eq_ignore_ascii_case("POST") {
-        let _ = stream.write_all(http_response("200 OK", "ok").as_bytes()).await;
+        let _ = stream
+            .write_all(http_response("200 OK", "ok").as_bytes())
+            .await;
         let _ = stream.flush().await;
         return;
     }
@@ -4933,11 +5283,17 @@ async fn serve_rpc_conn(mut stream: TcpStream, cmd: mpsc::UnboundedSender<Cmd>) 
     // path stays the M53 tx-submission path verbatim.
     if path == "/batch" {
         let Some(len) = parse_content_length(head) else {
-            let _ = stream.write_all(http_response("411 Length Required", "missing content-length").as_bytes()).await;
+            let _ = stream
+                .write_all(
+                    http_response("411 Length Required", "missing content-length").as_bytes(),
+                )
+                .await;
             return;
         };
         if len > MAX_RPC_BODY {
-            let _ = stream.write_all(http_response("413 Payload Too Large", "batch too large").as_bytes()).await;
+            let _ = stream
+                .write_all(http_response("413 Payload Too Large", "batch too large").as_bytes())
+                .await;
             return;
         }
         let mut body: Vec<u8> = acc[header_end..].to_vec();
@@ -4949,7 +5305,9 @@ async fn serve_rpc_conn(mut stream: TcpStream, cmd: mpsc::UnboundedSender<Cmd>) 
             }
         }
         if body.len() < len {
-            let _ = stream.write_all(http_response("400 Bad Request", "truncated body").as_bytes()).await;
+            let _ = stream
+                .write_all(http_response("400 Bad Request", "truncated body").as_bytes())
+                .await;
             return;
         }
         body.truncate(len);
@@ -4957,7 +5315,9 @@ async fn serve_rpc_conn(mut stream: TcpStream, cmd: mpsc::UnboundedSender<Cmd>) 
         let items = match crate::net::decode_batch_request(&body) {
             Ok(items) => items,
             Err(e) => {
-                let _ = stream.write_all(error_body(fmt, "400 Bad Request", &e.to_string()).as_bytes()).await;
+                let _ = stream
+                    .write_all(error_body(fmt, "400 Bad Request", &e.to_string()).as_bytes())
+                    .await;
                 let _ = stream.flush().await;
                 return;
             }
@@ -4965,7 +5325,9 @@ async fn serve_rpc_conn(mut stream: TcpStream, cmd: mpsc::UnboundedSender<Cmd>) 
 
         let (reply, rx) = oneshot::channel();
         if cmd.send(Cmd::QueryBatch { items, reply }).is_err() {
-            let _ = stream.write_all(http_response("503 Service Unavailable", "node stopped").as_bytes()).await;
+            let _ = stream
+                .write_all(http_response("503 Service Unavailable", "node stopped").as_bytes())
+                .await;
             return;
         }
         let resp = match rx.await {
@@ -4987,11 +5349,17 @@ async fn serve_rpc_conn(mut stream: TcpStream, cmd: mpsc::UnboundedSender<Cmd>) 
     // on a validation reject (same shapes as `/submit_tx`, minus the admission side effect).
     if path == "/validate" {
         let Some(len) = parse_content_length(head) else {
-            let _ = stream.write_all(http_response("411 Length Required", "missing content-length").as_bytes()).await;
+            let _ = stream
+                .write_all(
+                    http_response("411 Length Required", "missing content-length").as_bytes(),
+                )
+                .await;
             return;
         };
         if len > MAX_RPC_BODY {
-            let _ = stream.write_all(http_response("413 Payload Too Large", "tx too large").as_bytes()).await;
+            let _ = stream
+                .write_all(http_response("413 Payload Too Large", "tx too large").as_bytes())
+                .await;
             return;
         }
         let mut body: Vec<u8> = acc[header_end..].to_vec();
@@ -5003,7 +5371,9 @@ async fn serve_rpc_conn(mut stream: TcpStream, cmd: mpsc::UnboundedSender<Cmd>) 
             }
         }
         if body.len() < len {
-            let _ = stream.write_all(http_response("400 Bad Request", "truncated body").as_bytes()).await;
+            let _ = stream
+                .write_all(http_response("400 Bad Request", "truncated body").as_bytes())
+                .await;
             return;
         }
         body.truncate(len);
@@ -5011,15 +5381,25 @@ async fn serve_rpc_conn(mut stream: TcpStream, cmd: mpsc::UnboundedSender<Cmd>) 
         let tx = match crate::codec::decode_tx(&body) {
             Ok(tx) => tx,
             Err(e) => {
-                let _ = stream.write_all(error_body(fmt, "400 Bad Request", &e.to_string()).as_bytes()).await;
+                let _ = stream
+                    .write_all(error_body(fmt, "400 Bad Request", &e.to_string()).as_bytes())
+                    .await;
                 let _ = stream.flush().await;
                 return;
             }
         };
 
         let (reply, rx) = oneshot::channel();
-        if cmd.send(Cmd::ValidateTx { tx: Box::new(tx), reply }).is_err() {
-            let _ = stream.write_all(http_response("503 Service Unavailable", "node stopped").as_bytes()).await;
+        if cmd
+            .send(Cmd::ValidateTx {
+                tx: Box::new(tx),
+                reply,
+            })
+            .is_err()
+        {
+            let _ = stream
+                .write_all(http_response("503 Service Unavailable", "node stopped").as_bytes())
+                .await;
             return;
         }
         let resp = match rx.await {
@@ -5034,11 +5414,15 @@ async fn serve_rpc_conn(mut stream: TcpStream, cmd: mpsc::UnboundedSender<Cmd>) 
 
     // Determine how many body bytes to expect, capped.
     let Some(len) = parse_content_length(head) else {
-        let _ = stream.write_all(http_response("411 Length Required", "missing content-length").as_bytes()).await;
+        let _ = stream
+            .write_all(http_response("411 Length Required", "missing content-length").as_bytes())
+            .await;
         return;
     };
     if len > MAX_RPC_BODY {
-        let _ = stream.write_all(http_response("413 Payload Too Large", "tx too large").as_bytes()).await;
+        let _ = stream
+            .write_all(http_response("413 Payload Too Large", "tx too large").as_bytes())
+            .await;
         return;
     }
 
@@ -5052,7 +5436,9 @@ async fn serve_rpc_conn(mut stream: TcpStream, cmd: mpsc::UnboundedSender<Cmd>) 
         }
     }
     if body.len() < len {
-        let _ = stream.write_all(http_response("400 Bad Request", "truncated body").as_bytes()).await;
+        let _ = stream
+            .write_all(http_response("400 Bad Request", "truncated body").as_bytes())
+            .await;
         return;
     }
     body.truncate(len);
@@ -5061,7 +5447,9 @@ async fn serve_rpc_conn(mut stream: TcpStream, cmd: mpsc::UnboundedSender<Cmd>) 
     let tx = match crate::codec::decode_tx(&body) {
         Ok(tx) => tx,
         Err(e) => {
-            let _ = stream.write_all(error_body(fmt, "400 Bad Request", &e.to_string()).as_bytes()).await;
+            let _ = stream
+                .write_all(error_body(fmt, "400 Bad Request", &e.to_string()).as_bytes())
+                .await;
             let _ = stream.flush().await;
             return;
         }
@@ -5069,8 +5457,16 @@ async fn serve_rpc_conn(mut stream: TcpStream, cmd: mpsc::UnboundedSender<Cmd>) 
 
     // Submit through the actor and report the admission result.
     let (reply, rx) = oneshot::channel();
-    if cmd.send(Cmd::SubmitTx { tx: Box::new(tx), reply }).is_err() {
-        let _ = stream.write_all(http_response("503 Service Unavailable", "node stopped").as_bytes()).await;
+    if cmd
+        .send(Cmd::SubmitTx {
+            tx: Box::new(tx),
+            reply,
+        })
+        .is_err()
+    {
+        let _ = stream
+            .write_all(http_response("503 Service Unavailable", "node stopped").as_bytes())
+            .await;
         return;
     }
     let resp = match rx.await {
@@ -5135,7 +5531,9 @@ impl Node {
                 None => {
                     return Err(io::Error::new(
                         io::ErrorKind::InvalidInput,
-                        format!("node {my_id} has a validator key but is not in genesis.validators"),
+                        format!(
+                            "node {my_id} has a validator key but is not in genesis.validators"
+                        ),
                     ));
                 }
             }
@@ -5244,7 +5642,10 @@ impl Node {
         // connectors below cover them — don't let discovery re-dial). Discovery
         // grows both sets as address-book gossip arrives.
         let mut addrs: HashMap<u64, String> = HashMap::new();
-        addrs.insert(my_id, self_advertise_addr(&cfg.node.listen, &cfg.network.advertise_addr));
+        addrs.insert(
+            my_id,
+            self_advertise_addr(&cfg.node.listen, &cfg.network.advertise_addr),
+        );
         let mut dialing: HashSet<u64> = HashSet::new();
         for p in &cfg.peers {
             addrs.entry(p.id).or_insert_with(|| p.addr.clone());
@@ -5260,8 +5661,11 @@ impl Node {
         // connector. M43: when `require_peer_certs` is on too, build genesis-pinned
         // mTLS — the credential is this node's genesis seed and the verifier admits
         // only genesis validators (guarded by the fail-fasts above).
-        let validators: HashMap<u64, PubKey> =
-            genesis.validators.iter().map(|(id, pk, _)| (*id, *pk)).collect();
+        let validators: HashMap<u64, PubKey> = genesis
+            .validators
+            .iter()
+            .map(|(id, pk, _)| (*id, *pk))
+            .collect();
         let tls = if cfg.network.enable_tls {
             let mtls = if cfg.network.require_peer_certs {
                 Some(MtlsMaterial {
@@ -5269,9 +5673,7 @@ impl Node {
                         .as_ref()
                         .expect("guarded by require_peer_certs fail-fast")
                         .secret_seed(),
-                    validators: Arc::new(
-                        genesis.validators.iter().map(|(_, pk, _)| *pk).collect(),
-                    ),
+                    validators: Arc::new(genesis.validators.iter().map(|(_, pk, _)| *pk).collect()),
                 })
             } else {
                 None
@@ -5439,7 +5841,7 @@ pub fn init_tracing() {
 pub fn init_tracing_with(logging: Option<&crate::config::LoggingConfig>) {
     use tracing_subscriber::{fmt, EnvFilter};
     let lc = logging.cloned().unwrap_or_default(); // level "info", format "text", stderr
-    // M48: resolve each scalar↔array pair into one directive string (array wins).
+                                                   // M48: resolve each scalar↔array pair into one directive string (array wins).
     let base = resolve_directive(&lc.level, &lc.levels);
     let se = resolve_directive(&lc.stderr_level, &lc.stderr_levels);
     let fe = resolve_directive(&lc.file_level, &lc.file_levels);
@@ -5464,7 +5866,9 @@ pub fn init_tracing_with(logging: Option<&crate::config::LoggingConfig>) {
         }
     } else if !lc.stderr {
         // M45 path — file only, byte-identical to an M45 file target without a tee.
-        let builder = fmt().with_env_filter(filter).with_writer(build_file_appender(&lc.file, &lc.rotation, lc.max_files));
+        let builder = fmt()
+            .with_env_filter(filter)
+            .with_writer(build_file_appender(&lc.file, &lc.rotation, lc.max_files));
         if json {
             let _ = builder.json().try_init();
         } else {
@@ -5475,8 +5879,16 @@ pub fn init_tracing_with(logging: Option<&crate::config::LoggingConfig>) {
         let per_sink_level = rust_log.is_err() && (!se.is_empty() || !fe.is_empty());
         // M49: per-sink formatter override. Independent of RUST_LOG (which governs
         // filtering, not formatting); empty ⇒ inherit the base `format`.
-        let sjson = if lc.stderr_format.is_empty() { json } else { lc.stderr_format == "json" };
-        let fjson = if lc.file_format.is_empty() { json } else { lc.file_format == "json" };
+        let sjson = if lc.stderr_format.is_empty() {
+            json
+        } else {
+            lc.stderr_format == "json"
+        };
+        let fjson = if lc.file_format.is_empty() {
+            json
+        } else {
+            lc.file_format == "json"
+        };
         let per_sink_fmt = !lc.stderr_format.is_empty() || !lc.file_format.is_empty();
         if !per_sink_level && !per_sink_fmt {
             // M46 path — one shared filter + one shared format for both sinks
@@ -5491,8 +5903,20 @@ pub fn init_tracing_with(logging: Option<&crate::config::LoggingConfig>) {
                 Ok(f) => f,
                 Err(_) => EnvFilter::new(if dir.is_empty() { &base } else { dir }),
             };
-            let (sdir, fdir) = if per_sink_level { (se.as_str(), fe.as_str()) } else { ("", "") };
-            init_tee_leveled(mk(sdir), mk(fdir), sjson, fjson, &lc.file, &lc.rotation, lc.max_files);
+            let (sdir, fdir) = if per_sink_level {
+                (se.as_str(), fe.as_str())
+            } else {
+                ("", "")
+            };
+            init_tee_leveled(
+                mk(sdir),
+                mk(fdir),
+                sjson,
+                fjson,
+                &lc.file,
+                &lc.rotation,
+                lc.max_files,
+            );
         }
     }
 }
@@ -5568,26 +5992,54 @@ fn init_tee_leveled(
     match (stderr_json, file_json) {
         (false, false) => {
             let _ = tracing_subscriber::registry()
-                .with(fmt::layer().with_writer(std::io::stderr).with_filter(stderr_filter))
+                .with(
+                    fmt::layer()
+                        .with_writer(std::io::stderr)
+                        .with_filter(stderr_filter),
+                )
                 .with(fmt::layer().with_writer(appender).with_filter(file_filter))
                 .try_init();
         }
         (false, true) => {
             let _ = tracing_subscriber::registry()
-                .with(fmt::layer().with_writer(std::io::stderr).with_filter(stderr_filter))
-                .with(fmt::layer().json().with_writer(appender).with_filter(file_filter))
+                .with(
+                    fmt::layer()
+                        .with_writer(std::io::stderr)
+                        .with_filter(stderr_filter),
+                )
+                .with(
+                    fmt::layer()
+                        .json()
+                        .with_writer(appender)
+                        .with_filter(file_filter),
+                )
                 .try_init();
         }
         (true, false) => {
             let _ = tracing_subscriber::registry()
-                .with(fmt::layer().json().with_writer(std::io::stderr).with_filter(stderr_filter))
+                .with(
+                    fmt::layer()
+                        .json()
+                        .with_writer(std::io::stderr)
+                        .with_filter(stderr_filter),
+                )
                 .with(fmt::layer().with_writer(appender).with_filter(file_filter))
                 .try_init();
         }
         (true, true) => {
             let _ = tracing_subscriber::registry()
-                .with(fmt::layer().json().with_writer(std::io::stderr).with_filter(stderr_filter))
-                .with(fmt::layer().json().with_writer(appender).with_filter(file_filter))
+                .with(
+                    fmt::layer()
+                        .json()
+                        .with_writer(std::io::stderr)
+                        .with_filter(stderr_filter),
+                )
+                .with(
+                    fmt::layer()
+                        .json()
+                        .with_writer(appender)
+                        .with_filter(file_filter),
+                )
                 .try_init();
         }
     }
@@ -5730,8 +6182,7 @@ mod tests {
         // Registry where each sink carries its own EnvFilter (stderr=info, file=debug),
         // creates the parent dir, and installs without panicking. (Global-subscriber
         // `try_init` is swallowed, so this is safe alongside the other init tests.)
-        let dir =
-            std::env::temp_dir().join(format!("zhixing-m47-tee-lvl-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("zhixing-m47-tee-lvl-{}", std::process::id()));
         let file = dir.join("node.log");
         init_tracing_with(Some(&crate::config::LoggingConfig {
             file: file.to_str().unwrap().to_string(),
@@ -5750,8 +6201,7 @@ mod tests {
         // (bounded retention via `max_log_files`), creates the parent dir, and yields
         // a working appender; and the file arm of `init_tracing_with` installs without
         // panicking. `max_files == 0` stays on the M45 `::new` path (covered elsewhere).
-        let dir =
-            std::env::temp_dir().join(format!("zhixing-m50-retain-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("zhixing-m50-retain-{}", std::process::id()));
         let file = dir.join("node.log");
         let path = file.to_str().unwrap().to_string();
         // The builder path builds without panicking (a real bounded appender).
@@ -5774,8 +6224,7 @@ mod tests {
         // parent dir, and installs without panicking — exercises the 2×2 format path.
         // (Global-subscriber `try_init` is swallowed, so this is safe alongside the
         // other init tests.)
-        let dir =
-            std::env::temp_dir().join(format!("zhixing-m49-tee-fmt-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("zhixing-m49-tee-fmt-{}", std::process::id()));
         let file = dir.join("node.log");
         init_tracing_with(Some(&crate::config::LoggingConfig {
             file: file.to_str().unwrap().to_string(),
@@ -5795,10 +6244,7 @@ mod tests {
         assert_eq!(resolve_directive("", &[]), "");
         // a non-empty array wins over the scalar and is joined by ','.
         assert_eq!(
-            resolve_directive(
-                "info",
-                &["debug".to_string(), "tokio=warn".to_string()],
-            ),
+            resolve_directive("info", &["debug".to_string(), "tokio=warn".to_string()],),
             "debug,tokio=warn",
         );
         // even when the scalar is empty, a non-empty array composes.
@@ -5815,7 +6261,10 @@ mod tests {
             "warn",
         );
         // an array of only-blank entries falls back to the scalar.
-        assert_eq!(resolve_directive("info", &["".to_string(), "  ".to_string()]), "info");
+        assert_eq!(
+            resolve_directive("info", &["".to_string(), "  ".to_string()]),
+            "info"
+        );
     }
 
     #[test]
@@ -5851,7 +6300,11 @@ mod tests {
         for want in expect {
             let got = read_frame(&mut b).await.unwrap();
             // re-encoding equality is a kind-agnostic round-trip check.
-            assert_eq!(encode_gossip(&want), encode_gossip(&got), "frame round-trip");
+            assert_eq!(
+                encode_gossip(&want),
+                encode_gossip(&got),
+                "frame round-trip"
+            );
         }
         writer.await.unwrap();
     }
@@ -5888,7 +6341,11 @@ mod tests {
         let n1 = [1u8; 32];
         let n2 = [2u8; 32];
         let a = auth_transcript(21, &n1, 22, &n2, None);
-        assert_eq!(a, auth_transcript(21, &n1, 22, &n2, None), "same inputs ⇒ identical bytes");
+        assert_eq!(
+            a,
+            auth_transcript(21, &n1, 22, &n2, None),
+            "same inputs ⇒ identical bytes"
+        );
         // Swapping the signer/peer roles must change the bytes: each side signs a
         // *distinct* transcript, so one side's signature can't be replayed as the
         // other's.
@@ -5935,7 +6392,10 @@ mod tests {
         let signed = kp(21).sign(&auth_transcript(21, &n1, 22, &n2, Some(&leg_a)));
         // Verifier on the other honest end reconstructs with ITS leg's binding:
         let relayed = auth_transcript(21, &n1, 22, &n2, Some(&leg_b));
-        assert!(!verify(&kp(21).public(), &relayed, &signed), "relayed sig must fail");
+        assert!(
+            !verify(&kp(21).public(), &relayed, &signed),
+            "relayed sig must fail"
+        );
         // Same channel binding on both ends ⇒ verifies.
         let direct = auth_transcript(21, &n1, 22, &n2, Some(&leg_a));
         assert!(verify(&kp(21).public(), &direct, &signed));
@@ -5947,7 +6407,10 @@ mod tests {
         let n2 = [4u8; 32];
         let t = auth_transcript(21, &n1, 22, &n2, None);
         let sig = kp(21).sign(&t);
-        assert!(verify(&kp(21).public(), &t, &sig), "the correct genesis key verifies");
+        assert!(
+            verify(&kp(21).public(), &t, &sig),
+            "the correct genesis key verifies"
+        );
         // A different validator's signature over the same transcript must fail —
         // exactly what stops an impostor from authenticating as validator 21.
         let forged = kp(22).sign(&t);
@@ -5956,8 +6419,8 @@ mod tests {
 
     // --- integration: three in-process nodes over loopback TCP converge --------
 
-    use crate::validator::{Validator, ValidatorSet};
     use crate::consensus::Commit;
+    use crate::validator::{Validator, ValidatorSet};
     use crate::{Block, Keypair, Review, MICRO};
     use std::collections::BTreeMap;
     use zhixing_engine::{DeltaKParams, DIM};
@@ -5988,7 +6451,10 @@ mod tests {
             base_emission_micro: 8 * MICRO,
             slash_bps: 10_000,
             timestamp_days: 0.0,
-            validators: [21u64, 22, 23, 24].iter().map(|&id| (id, kp(id).public(), 1)).collect(),
+            validators: [21u64, 22, 23, 24]
+                .iter()
+                .map(|&id| (id, kp(id).public(), 1))
+                .collect(),
             bridge_sources: vec![],
         }
     }
@@ -5996,7 +6462,11 @@ mod tests {
         ValidatorSet::new(
             [21u64, 22, 23, 24]
                 .iter()
-                .map(|&id| Validator { id, pubkey: kp(id).public(), power: 1 })
+                .map(|&id| Validator {
+                    id,
+                    pubkey: kp(id).public(),
+                    power: 1,
+                })
                 .collect(),
         )
     }
@@ -6007,21 +6477,32 @@ mod tests {
             domain,
             stake: 2 * MICRO,
             reviews: vec![
-                Review { reviewer: 10, score: 0.9 },
-                Review { reviewer: 11, score: 0.85 },
-                Review { reviewer: 12, score: 0.9 },
+                Review {
+                    reviewer: 10,
+                    score: 0.9,
+                },
+                Review {
+                    reviewer: 11,
+                    score: 0.85,
+                },
+                Review {
+                    reviewer: 12,
+                    score: 0.9,
+                },
             ],
             repl_success: 3,
             repl_total: 3,
             timestamp_days: 1.0,
             signature: [0u8; 64],
-            fee: 0, nonce: 0,
-}
+            fee: 0,
+            nonce: 0,
+        }
         .signed(&kp(author))
     }
 
     fn tmp_dir(tag: &str) -> String {
-        let p = std::env::temp_dir().join(format!("zhixing-daemon-test-{}-{tag}", std::process::id()));
+        let p =
+            std::env::temp_dir().join(format!("zhixing-daemon-test-{}-{tag}", std::process::id()));
         let _ = std::fs::remove_dir_all(&p);
         p.to_string_lossy().into_owned()
     }
@@ -6029,11 +6510,18 @@ mod tests {
     fn node_config(id: u64, port_base: u16, ids: &[u64], data_dir: String) -> NodeConfig {
         let addr = |i: u64| format!("127.0.0.1:{}", port_base + (i - 21) as u16);
         NodeConfig {
-            node: crate::config::NodeSection { id, listen: addr(id), data_dir },
+            node: crate::config::NodeSection {
+                id,
+                listen: addr(id),
+                data_dir,
+            },
             peers: ids
                 .iter()
                 .filter(|&&p| p != id)
-                .map(|&p| crate::config::PeerConfig { id: p, addr: addr(p) })
+                .map(|&p| crate::config::PeerConfig {
+                    id: p,
+                    addr: addr(p),
+                })
                 .collect(),
             genesis: String::new(),
             // Tests hand the signing key to `Node::start` directly, so the config's
@@ -6065,8 +6553,8 @@ mod tests {
             for (_id, node) in nodes {
                 states.push(node.status().await.unwrap_or((0, [0u8; 32])));
             }
-            let converged = states.iter().all(|(h, _)| *h >= target)
-                && states.windows(2).all(|w| w[0] == w[1]);
+            let converged =
+                states.iter().all(|(h, _)| *h >= target) && states.windows(2).all(|w| w[0] == w[1]);
             if converged {
                 return states;
             }
@@ -6093,7 +6581,10 @@ mod tests {
                     return (b, c);
                 }
             }
-            assert!(tokio::time::Instant::now() < deadline, "log for {dir} never reached {n} records");
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "log for {dir} never reached {n} records"
+            );
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
     }
@@ -6121,7 +6612,9 @@ mod tests {
             let dir = tmp_dir(&format!("conv-n{id}"));
             data_dirs.insert(id, dir.clone());
             let cfg = node_config(id, port_base, &ids, dir);
-            let node = Node::start(cfg, genesis.clone(), Some(kp(id))).await.expect("start node");
+            let node = Node::start(cfg, genesis.clone(), Some(kp(id)))
+                .await
+                .expect("start node");
             nodes.push((id, node));
         }
 
@@ -6141,7 +6634,8 @@ mod tests {
         // heights each carry a > 2/3 BFT certificate — real finality over the
         // wire, produced by distributed voting, not a sequencer.
         let vset = test_vset();
-        let (blocks, certs) = read_prefix(&data_dirs[&22], target as usize, Duration::from_secs(5)).await;
+        let (blocks, certs) =
+            read_prefix(&data_dirs[&22], target as usize, Duration::from_secs(5)).await;
         crate::Chain::replay_verified(genesis.clone(), &blocks, &certs).expect("finality");
         for c in &certs {
             assert!(c.verify(&vset).unwrap() * 3 > vset.total_power() * 2);
@@ -6165,7 +6659,9 @@ mod tests {
             let dir = tmp_dir(&format!("crash1-n{id}"));
             data_dirs.insert(id, dir.clone());
             let cfg = node_config(id, port_base, &ids, dir); // peers still list 24
-            let node = Node::start(cfg, genesis.clone(), Some(kp(id))).await.expect("start node");
+            let node = Node::start(cfg, genesis.clone(), Some(kp(id)))
+                .await
+                .expect("start node");
             nodes.push((id, node));
         }
 
@@ -6175,8 +6671,10 @@ mod tests {
         assert!(states.iter().all(|&(h, _)| h >= target));
 
         let vset = test_vset();
-        let (blocks, certs) = read_prefix(&data_dirs[&21], target as usize, Duration::from_secs(5)).await;
-        crate::Chain::replay_verified(genesis.clone(), &blocks, &certs).expect("finality with 1 fault");
+        let (blocks, certs) =
+            read_prefix(&data_dirs[&21], target as usize, Duration::from_secs(5)).await;
+        crate::Chain::replay_verified(genesis.clone(), &blocks, &certs)
+            .expect("finality with 1 fault");
         for c in &certs {
             // each cert is still a > 2/3 quorum of the FULL set (3 of 4 suffices).
             assert!(c.verify(&vset).unwrap() * 3 > vset.total_power() * 2);
@@ -6200,7 +6698,9 @@ mod tests {
             let dir = tmp_dir(&format!("crash2-n{id}"));
             data_dirs.insert(id, dir.clone());
             let cfg = node_config(id, port_base, &ids, dir);
-            let node = Node::start(cfg, genesis.clone(), Some(kp(id))).await.expect("start node");
+            let node = Node::start(cfg, genesis.clone(), Some(kp(id)))
+                .await
+                .expect("start node");
             nodes.push((id, node));
         }
 
@@ -6228,7 +6728,9 @@ mod tests {
             let dir = tmp_dir(&format!("late-n{id}"));
             data_dirs.insert(id, dir.clone());
             let cfg = node_config(id, port_base, &ids, dir);
-            let node = Node::start(cfg, genesis.clone(), Some(kp(id))).await.expect("start node");
+            let node = Node::start(cfg, genesis.clone(), Some(kp(id)))
+                .await
+                .expect("start node");
             nodes.push((id, node));
         }
 
@@ -6240,7 +6742,9 @@ mod tests {
         let dir = tmp_dir("late-n24");
         data_dirs.insert(24, dir.clone());
         let cfg = node_config(24, port_base, &ids, dir);
-        let node24 = Node::start(cfg, genesis.clone(), Some(kp(24))).await.expect("start late node");
+        let node24 = Node::start(cfg, genesis.clone(), Some(kp(24)))
+            .await
+            .expect("start late node");
         nodes.push((24, node24));
 
         // all four should reach a common height beyond where the trio started
@@ -6250,8 +6754,10 @@ mod tests {
         assert!(states.iter().all(|&(h, head)| h == h0 && head == head0));
 
         // the late joiner recovered real finality, not just an equal head
-        let (blocks, certs) = read_prefix(&data_dirs[&24], target as usize, Duration::from_secs(5)).await;
-        crate::Chain::replay_verified(genesis.clone(), &blocks, &certs).expect("late joiner finality");
+        let (blocks, certs) =
+            read_prefix(&data_dirs[&24], target as usize, Duration::from_secs(5)).await;
+        crate::Chain::replay_verified(genesis.clone(), &blocks, &certs)
+            .expect("late joiner finality");
 
         cleanup(&data_dirs);
     }
@@ -6273,7 +6779,9 @@ mod tests {
             let cfg = node_config(id, port_base, &all, dir);
             // id 25 has no key ⇒ pure follower.
             let key = vids.contains(&id).then(|| kp(id));
-            let node = Node::start(cfg, genesis.clone(), key).await.expect("start node");
+            let node = Node::start(cfg, genesis.clone(), key)
+                .await
+                .expect("start node");
             nodes.push((id, node));
         }
 
@@ -6284,7 +6792,8 @@ mod tests {
 
         // the follower (25) persisted and can re-verify finality it never helped
         // produce.
-        let (blocks, certs) = read_prefix(&data_dirs[&25], target as usize, Duration::from_secs(5)).await;
+        let (blocks, certs) =
+            read_prefix(&data_dirs[&25], target as usize, Duration::from_secs(5)).await;
         crate::Chain::replay_verified(genesis.clone(), &blocks, &certs).expect("follower finality");
 
         cleanup(&data_dirs);
@@ -6312,7 +6821,9 @@ mod tests {
             let dir = tmp_dir(&format!("equiv-n{id}"));
             data_dirs.insert(id, dir.clone());
             let cfg = node_config(id, port_base, &live, dir);
-            let node = Node::start(cfg, genesis.clone(), Some(kp(id))).await.expect("start node");
+            let node = Node::start(cfg, genesis.clone(), Some(kp(id)))
+                .await
+                .expect("start node");
             nodes.push((id, node));
         }
 
@@ -6368,7 +6879,8 @@ mod tests {
         // offender is gone from the active set — the double-sign was punished.
         let (blocks, certs) =
             read_prefix(&data_dirs[&22], ev_height as usize, Duration::from_secs(5)).await;
-        let chain = crate::Chain::replay_verified(genesis.clone(), &blocks, &certs).expect("finality");
+        let chain =
+            crate::Chain::replay_verified(genesis.clone(), &blocks, &certs).expect("finality");
         assert!(
             chain.state.validators.get(21).is_none(),
             "validator 21 must be removed after being slashed for equivocation"
@@ -6392,13 +6904,31 @@ mod tests {
             create_empty_blocks: true,
         };
         // round 0 → base only
-        assert_eq!(timeout_for(&t, Step::Propose, 0), Duration::from_millis(200));
-        assert_eq!(timeout_for(&t, Step::Prevote, 0), Duration::from_millis(300));
-        assert_eq!(timeout_for(&t, Step::Precommit, 0), Duration::from_millis(400));
+        assert_eq!(
+            timeout_for(&t, Step::Propose, 0),
+            Duration::from_millis(200)
+        );
+        assert_eq!(
+            timeout_for(&t, Step::Prevote, 0),
+            Duration::from_millis(300)
+        );
+        assert_eq!(
+            timeout_for(&t, Step::Precommit, 0),
+            Duration::from_millis(400)
+        );
         // round 2 → base + 2*delta
-        assert_eq!(timeout_for(&t, Step::Propose, 2), Duration::from_millis(300));
-        assert_eq!(timeout_for(&t, Step::Prevote, 2), Duration::from_millis(400));
-        assert_eq!(timeout_for(&t, Step::Precommit, 2), Duration::from_millis(500));
+        assert_eq!(
+            timeout_for(&t, Step::Propose, 2),
+            Duration::from_millis(300)
+        );
+        assert_eq!(
+            timeout_for(&t, Step::Prevote, 2),
+            Duration::from_millis(400)
+        );
+        assert_eq!(
+            timeout_for(&t, Step::Precommit, 2),
+            Duration::from_millis(500)
+        );
     }
 
     #[tokio::test]
@@ -6417,7 +6947,9 @@ mod tests {
             data_dirs.insert(id, dir.clone());
             let mut cfg = node_config(id, port_base, &ids, dir);
             cfg.consensus.create_empty_blocks = false;
-            let node = Node::start(cfg, genesis.clone(), Some(kp(id))).await.expect("start node");
+            let node = Node::start(cfg, genesis.clone(), Some(kp(id)))
+                .await
+                .expect("start node");
             nodes.push((id, node));
         }
 
@@ -6492,15 +7024,25 @@ mod tests {
             ("zhixing_pending_stake_ops", 2),
             ("zhixing_pending_evidence", 1),
         ] {
-            assert!(out.contains(&format!("# TYPE {name} gauge")), "missing TYPE for {name}");
-            assert!(out.contains(&format!("\n{name} {value}\n")), "missing `{name} {value}`");
+            assert!(
+                out.contains(&format!("# TYPE {name} gauge")),
+                "missing TYPE for {name}"
+            );
+            assert!(
+                out.contains(&format!("\n{name} {value}\n")),
+                "missing `{name} {value}`"
+            );
         }
     }
 
     #[test]
     fn render_prometheus_encodes_role_and_head() {
         // Follower with a live consensus round: role 0, consensus 1.
-        let m = Metrics { is_validator: false, consensus_active: true, ..sample_metrics() };
+        let m = Metrics {
+            is_validator: false,
+            consensus_active: true,
+            ..sample_metrics()
+        };
         let out = render_prometheus(&m);
         assert!(out.contains("\nzhixing_is_validator 0\n"));
         assert!(out.contains("\nzhixing_consensus_active 1\n"));
@@ -6521,8 +7063,14 @@ mod tests {
             ("zhixing_txs_rate_limited_total", 23),
             ("zhixing_txs_quota_rejected_total", 29),
         ] {
-            assert!(out.contains(&format!("# TYPE {name} counter")), "missing TYPE for {name}");
-            assert!(out.contains(&format!("\n{name} {value}\n")), "missing `{name} {value}`");
+            assert!(
+                out.contains(&format!("# TYPE {name} counter")),
+                "missing TYPE for {name}"
+            );
+            assert!(
+                out.contains(&format!("\n{name} {value}\n")),
+                "missing `{name} {value}`"
+            );
         }
     }
 
@@ -6531,7 +7079,9 @@ mod tests {
         // A single fresh validator: genesis height 0, no peers dialed, has a key.
         let dir = tmp_dir("metrics-handle");
         let cfg = node_config(21, 19671, &[21], dir.clone());
-        let node = Node::start(cfg, test_genesis(), Some(kp(21))).await.expect("start node");
+        let node = Node::start(cfg, test_genesis(), Some(kp(21)))
+            .await
+            .expect("start node");
 
         let m = node.metrics().await.expect("metrics snapshot");
         assert_eq!(m.height, 0);
@@ -6552,15 +7102,25 @@ mod tests {
         let cfg = node_config(21, 19681, &[21], dir.clone());
         let mut genesis = test_genesis();
         genesis.validators = vec![(21, kp(21).public(), 1)];
-        let node = Node::start(cfg, genesis, Some(kp(21))).await.expect("start node");
+        let node = Node::start(cfg, genesis, Some(kp(21)))
+            .await
+            .expect("start node");
 
         node.submit(test_tx(21, 0, 1));
         // Let the heartbeat drive a couple of block intervals (1000ms each).
         tokio::time::sleep(Duration::from_millis(2500)).await;
 
         let m = node.metrics().await.expect("metrics snapshot");
-        assert!(m.blocks_committed >= 1, "expected >=1 committed block, got {}", m.blocks_committed);
-        assert!(m.local_txs >= 1, "expected >=1 local tx, got {}", m.local_txs);
+        assert!(
+            m.blocks_committed >= 1,
+            "expected >=1 committed block, got {}",
+            m.blocks_committed
+        );
+        assert!(
+            m.local_txs >= 1,
+            "expected >=1 local tx, got {}",
+            m.local_txs
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -6575,12 +7135,16 @@ mod tests {
             enabled: true,
             listen: metrics_addr.into(),
         });
-        let _node = Node::start(cfg, test_genesis(), Some(kp(21))).await.expect("start node");
+        let _node = Node::start(cfg, test_genesis(), Some(kp(21)))
+            .await
+            .expect("start node");
 
         // The listener binds during start(), but give the accept task a beat.
         tokio::time::sleep(Duration::from_millis(200)).await;
 
-        let mut stream = TcpStream::connect(metrics_addr).await.expect("connect metrics");
+        let mut stream = TcpStream::connect(metrics_addr)
+            .await
+            .expect("connect metrics");
         stream
             .write_all(b"GET /metrics HTTP/1.1\r\nHost: localhost\r\n\r\n")
             .await
@@ -6590,8 +7154,14 @@ mod tests {
         stream.read_to_end(&mut resp).await.expect("read response");
         let text = String::from_utf8_lossy(&resp);
 
-        assert!(text.starts_with("HTTP/1.1 200 OK"), "expected 200, got: {text}");
-        assert!(text.contains("zhixing_height 0"), "missing height gauge: {text}");
+        assert!(
+            text.starts_with("HTTP/1.1 200 OK"),
+            "expected 200, got: {text}"
+        );
+        assert!(
+            text.contains("zhixing_height 0"),
+            "missing height gauge: {text}"
+        );
         assert!(text.contains("# TYPE zhixing_height gauge"));
 
         let _ = std::fs::remove_dir_all(&dir);
@@ -6619,7 +7189,9 @@ mod tests {
         let cfg = node_config(21, 19701, &[21], dir.clone());
         let mut genesis = test_genesis();
         genesis.validators = vec![(21, kp(21).public(), 1)];
-        let node = Node::start(cfg, genesis, Some(kp(21))).await.expect("start node");
+        let node = Node::start(cfg, genesis, Some(kp(21)))
+            .await
+            .expect("start node");
 
         let good = test_tx(1, 0, 1);
         let h = good.hash();
@@ -6627,7 +7199,11 @@ mod tests {
         assert_eq!(accepted.expect("valid tx admitted"), h);
 
         let m = node.metrics().await.expect("metrics");
-        assert!(m.mempool >= 1, "valid tx landed in the mempool, got {}", m.mempool);
+        assert!(
+            m.mempool >= 1,
+            "valid tx landed in the mempool, got {}",
+            m.mempool
+        );
 
         // An unknown-author tx fails validation → Err surfaced to the caller.
         let bad = test_tx(99, 1, 2);
@@ -6645,10 +7221,15 @@ mod tests {
         let dir = tmp_dir("rpc-endpoint");
         let mut cfg = node_config(21, 19721, &[21], dir.clone());
         let rpc_addr = "127.0.0.1:19821";
-        cfg.rpc = Some(crate::config::RpcConfig { enabled: true, listen: rpc_addr.into() });
+        cfg.rpc = Some(crate::config::RpcConfig {
+            enabled: true,
+            listen: rpc_addr.into(),
+        });
         let mut genesis = test_genesis();
         genesis.validators = vec![(21, kp(21).public(), 1)];
-        let node = Node::start(cfg, genesis, Some(kp(21))).await.expect("start node");
+        let node = Node::start(cfg, genesis, Some(kp(21)))
+            .await
+            .expect("start node");
 
         tokio::time::sleep(Duration::from_millis(200)).await;
 
@@ -6670,8 +7251,14 @@ mod tests {
         let mut resp = Vec::new();
         stream.read_to_end(&mut resp).await.expect("read response");
         let text = String::from_utf8_lossy(&resp);
-        assert!(text.starts_with("HTTP/1.1 200 OK"), "expected 200, got: {text}");
-        assert!(text.contains(&crate::hash::hex(&h)), "expected hash in body: {text}");
+        assert!(
+            text.starts_with("HTTP/1.1 200 OK"),
+            "expected 200, got: {text}"
+        );
+        assert!(
+            text.contains(&crate::hash::hex(&h)),
+            "expected hash in body: {text}"
+        );
 
         let m = node.metrics().await.expect("metrics");
         assert!(m.mempool >= 1, "tx entered the mempool, got {}", m.mempool);
@@ -6692,7 +7279,10 @@ mod tests {
         let mut resp2 = Vec::new();
         s2.read_to_end(&mut resp2).await.expect("read response 2");
         let text2 = String::from_utf8_lossy(&resp2);
-        assert!(text2.starts_with("HTTP/1.1 400"), "expected 400, got: {text2}");
+        assert!(
+            text2.starts_with("HTTP/1.1 400"),
+            "expected 400, got: {text2}"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -6721,7 +7311,7 @@ mod tests {
             submissions: 6,
             accepted: 7,
             nonce: 0,
-};
+        };
         assert_eq!(
             format_account(1, &a),
             format!(
@@ -6740,15 +7330,21 @@ mod tests {
         let dir = tmp_dir("rpc-get");
         let mut cfg = node_config(21, 19761, &[21], dir.clone());
         let rpc_addr = "127.0.0.1:19841";
-        cfg.rpc = Some(crate::config::RpcConfig { enabled: true, listen: rpc_addr.into() });
+        cfg.rpc = Some(crate::config::RpcConfig {
+            enabled: true,
+            listen: rpc_addr.into(),
+        });
         let mut genesis = test_genesis();
         genesis.validators = vec![(21, kp(21).public(), 1)];
-        let _node = Node::start(cfg, genesis, Some(kp(21))).await.expect("start node");
+        let _node = Node::start(cfg, genesis, Some(kp(21)))
+            .await
+            .expect("start node");
 
         tokio::time::sleep(Duration::from_millis(200)).await;
 
         async fn get(addr: &str, path: &str) -> String {
-            let req = format!("GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
+            let req =
+                format!("GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
             let mut s = TcpStream::connect(addr).await.expect("connect rpc");
             s.write_all(req.as_bytes()).await.expect("send get");
             let mut resp = Vec::new();
@@ -6763,14 +7359,20 @@ mod tests {
         let h = get(rpc_addr, "/height").await;
         assert!(h.starts_with("HTTP/1.1 200 OK"), "height status: {h}");
         let body = body_of(&h);
-        assert!(!body.is_empty() && body.chars().all(|c| c.is_ascii_digit()), "height body: {body:?}");
+        assert!(
+            !body.is_empty() && body.chars().all(|c| c.is_ascii_digit()),
+            "height body: {body:?}"
+        );
 
         // /head → 200 + a 64-char hex head hash.
         let hd = get(rpc_addr, "/head").await;
         assert!(hd.starts_with("HTTP/1.1 200 OK"), "head status: {hd}");
         let body = body_of(&hd);
         assert_eq!(body.len(), 64, "head hex len: {body:?}");
-        assert!(body.chars().all(|c| c.is_ascii_hexdigit()), "head hex: {body:?}");
+        assert!(
+            body.chars().all(|c| c.is_ascii_hexdigit()),
+            "head hex: {body:?}"
+        );
 
         // /account/1 → 200 + account fields (genesis account 1 exists).
         let a = get(rpc_addr, "/account/1").await;
@@ -6794,9 +7396,15 @@ mod tests {
         // M59: `/account/{id}/proof` is the verifiable read; the bare `{id}` stays the
         // M58 plain read; a bad/empty id in either shape is NotFound (404). The M58
         // routes are unaffected.
-        assert!(matches!(route_get("/account/7/proof"), GetRoute::AccountProof(7)));
+        assert!(matches!(
+            route_get("/account/7/proof"),
+            GetRoute::AccountProof(7)
+        ));
         assert!(matches!(route_get("/account/7"), GetRoute::Account(7)));
-        assert!(matches!(route_get("/account/notanum/proof"), GetRoute::NotFound));
+        assert!(matches!(
+            route_get("/account/notanum/proof"),
+            GetRoute::NotFound
+        ));
         assert!(matches!(route_get("/account//proof"), GetRoute::NotFound));
         assert!(matches!(route_get("/height"), GetRoute::Height));
         assert!(matches!(route_get("/"), GetRoute::Health));
@@ -6812,7 +7420,9 @@ mod tests {
         let cfg = node_config(21, 19781, &[21], dir.clone());
         let mut genesis = test_genesis();
         genesis.validators = vec![(21, kp(21).public(), 1)]; // quorum 1 ⇒ node self-commits
-        let node = Node::start(cfg, genesis.clone(), Some(kp(21))).await.expect("start node");
+        let node = Node::start(cfg, genesis.clone(), Some(kp(21)))
+            .await
+            .expect("start node");
 
         // Wait for at least one certified block (empty-block heartbeat gives a head cert).
         let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
@@ -6820,7 +7430,10 @@ mod tests {
             if node.status().await.map(|(h, _)| h >= 1).unwrap_or(false) {
                 break;
             }
-            assert!(tokio::time::Instant::now() < deadline, "node never produced a block");
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "node never produced a block"
+            );
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
 
@@ -6844,7 +7457,11 @@ mod tests {
         .expect("account proof must verify against the tracked genesis set");
 
         // Unknown account → inner None (no such id in state).
-        assert!(node.account_proof(999999).await.expect("actor up").is_none());
+        assert!(node
+            .account_proof(999999)
+            .await
+            .expect("actor up")
+            .is_none());
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -6856,10 +7473,15 @@ mod tests {
         let dir = tmp_dir("rpc-acct-proof");
         let mut cfg = node_config(21, 19801, &[21], dir.clone());
         let rpc_addr = "127.0.0.1:19811";
-        cfg.rpc = Some(crate::config::RpcConfig { enabled: true, listen: rpc_addr.into() });
+        cfg.rpc = Some(crate::config::RpcConfig {
+            enabled: true,
+            listen: rpc_addr.into(),
+        });
         let mut genesis = test_genesis();
         genesis.validators = vec![(21, kp(21).public(), 1)];
-        let node = Node::start(cfg, genesis, Some(kp(21))).await.expect("start node");
+        let node = Node::start(cfg, genesis, Some(kp(21)))
+            .await
+            .expect("start node");
 
         // Wait for a certified head so the proof route has something to verify against.
         let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
@@ -6867,12 +7489,16 @@ mod tests {
             if node.status().await.map(|(h, _)| h >= 1).unwrap_or(false) {
                 break;
             }
-            assert!(tokio::time::Instant::now() < deadline, "node never produced a block");
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "node never produced a block"
+            );
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
 
         async fn get(addr: &str, path: &str) -> String {
-            let req = format!("GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
+            let req =
+                format!("GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
             let mut s = TcpStream::connect(addr).await.expect("connect rpc");
             s.write_all(req.as_bytes()).await.expect("send get");
             let mut resp = Vec::new();
@@ -6955,7 +7581,9 @@ mod tests {
 
         // Format exactly as the RPC handler would, then recover the envelope.
         let body = format_lock(&env);
-        let hex = body.strip_prefix("lock_envelope=").expect("lock_envelope= prefix");
+        let hex = body
+            .strip_prefix("lock_envelope=")
+            .expect("lock_envelope= prefix");
         fn unhex(s: &str) -> Vec<u8> {
             (0..s.len())
                 .step_by(2)
@@ -6967,7 +7595,11 @@ mod tests {
         // A destination endpoint verifies the self-contained envelope — no extra fetch.
         let mut endpoint = BridgeEndpoint::new(&gb, &ga);
         endpoint
-            .follow_source(&env2.source_header, &env2.source_cert, &env2.source_tracked_set)
+            .follow_source(
+                &env2.source_header,
+                &env2.source_cert,
+                &env2.source_tracked_set,
+            )
             .expect("follow");
         let verified = endpoint.verify_lock(&env2).expect("verify");
         assert_eq!(verified.dest_account, 7);
@@ -6983,10 +7615,15 @@ mod tests {
         let dir = tmp_dir("rpc-lock-proof");
         let mut cfg = node_config(21, 20071, &[21], dir.clone());
         let rpc_addr = "127.0.0.1:20081";
-        cfg.rpc = Some(crate::config::RpcConfig { enabled: true, listen: rpc_addr.into() });
+        cfg.rpc = Some(crate::config::RpcConfig {
+            enabled: true,
+            listen: rpc_addr.into(),
+        });
         let mut genesis = test_genesis();
         genesis.validators = vec![(21, kp(21).public(), 1)];
-        let node = Node::start(cfg, genesis, Some(kp(21))).await.expect("start node");
+        let node = Node::start(cfg, genesis, Some(kp(21)))
+            .await
+            .expect("start node");
 
         // Wait for a certified head (the route is reachable regardless of locks).
         let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
@@ -6994,12 +7631,16 @@ mod tests {
             if node.status().await.map(|(h, _)| h >= 1).unwrap_or(false) {
                 break;
             }
-            assert!(tokio::time::Instant::now() < deadline, "node never produced a block");
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "node never produced a block"
+            );
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
 
         async fn get(addr: &str, path: &str) -> String {
-            let req = format!("GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
+            let req =
+                format!("GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
             let mut s = TcpStream::connect(addr).await.expect("connect rpc");
             s.write_all(req.as_bytes()).await.expect("send get");
             let mut resp = Vec::new();
@@ -7027,10 +7668,15 @@ mod tests {
         let dir = tmp_dir("rpc-bridge-locks");
         let mut cfg = node_config(21, 20091, &[21], dir.clone());
         let rpc_addr = "127.0.0.1:20101";
-        cfg.rpc = Some(crate::config::RpcConfig { enabled: true, listen: rpc_addr.into() });
+        cfg.rpc = Some(crate::config::RpcConfig {
+            enabled: true,
+            listen: rpc_addr.into(),
+        });
         let mut genesis = test_genesis();
         genesis.validators = vec![(21, kp(21).public(), 1)];
-        let node = Node::start(cfg, genesis, Some(kp(21))).await.expect("start node");
+        let node = Node::start(cfg, genesis, Some(kp(21)))
+            .await
+            .expect("start node");
 
         // Wait for a certified head (the route is reachable regardless of locks).
         let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
@@ -7038,12 +7684,16 @@ mod tests {
             if node.status().await.map(|(h, _)| h >= 1).unwrap_or(false) {
                 break;
             }
-            assert!(tokio::time::Instant::now() < deadline, "node never produced a block");
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "node never produced a block"
+            );
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
 
         async fn get(addr: &str, path: &str) -> String {
-            let req = format!("GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
+            let req =
+                format!("GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
             let mut s = TcpStream::connect(addr).await.expect("connect rpc");
             s.write_all(req.as_bytes()).await.expect("send get");
             let mut resp = Vec::new();
@@ -7057,20 +7707,39 @@ mod tests {
         // Plain directory on an empty chain → 200. M79: the body is now the pagination
         // envelope, so an empty chain renders `total=0` (no `next=` line, no items).
         let resp = get(rpc_addr, "/bridge/locks").await;
-        assert!(resp.starts_with("HTTP/1.1 200 OK"), "bridge locks status: {resp}");
+        assert!(
+            resp.starts_with("HTTP/1.1 200 OK"),
+            "bridge locks status: {resp}"
+        );
         assert_eq!(body_of(&resp), "total=0", "empty chain → total=0 envelope");
 
         // M72: pagination params don't break framing on the (empty) live chain — an
         // empty window is still a 200 (window correctness over data: `paginate_windows`).
         // M79: the empty window renders the `total=0` envelope (text) / `items:[]` (JSON).
         let paged = get(rpc_addr, "/bridge/locks?limit=1&offset=0").await;
-        assert!(paged.starts_with("HTTP/1.1 200 OK"), "paged status: {paged}");
-        assert!(paged.contains("Content-Type: text/plain; charset=utf-8\r\n"), "paged ct: {paged}");
-        assert_eq!(body_of(&paged), "total=0", "empty window → total=0 envelope");
+        assert!(
+            paged.starts_with("HTTP/1.1 200 OK"),
+            "paged status: {paged}"
+        );
+        assert!(
+            paged.contains("Content-Type: text/plain; charset=utf-8\r\n"),
+            "paged ct: {paged}"
+        );
+        assert_eq!(
+            body_of(&paged),
+            "total=0",
+            "empty window → total=0 envelope"
+        );
 
         let paged_json = get(rpc_addr, "/bridge/locks?format=json&limit=0").await;
-        assert!(paged_json.starts_with("HTTP/1.1 200 OK"), "paged json status: {paged_json}");
-        assert!(paged_json.contains("Content-Type: application/json\r\n"), "paged json ct: {paged_json}");
+        assert!(
+            paged_json.starts_with("HTTP/1.1 200 OK"),
+            "paged json status: {paged_json}"
+        );
+        assert!(
+            paged_json.contains("Content-Type: application/json\r\n"),
+            "paged json ct: {paged_json}"
+        );
         assert_eq!(
             body_of(&paged_json),
             "{\"total\":\"0\",\"next\":null,\"items\":[]}",
@@ -7089,10 +7758,15 @@ mod tests {
         let dir = tmp_dir("rpc-validators-list");
         let mut cfg = node_config(24, 20111, &[24], dir.clone());
         let rpc_addr = "127.0.0.1:20121";
-        cfg.rpc = Some(crate::config::RpcConfig { enabled: true, listen: rpc_addr.into() });
+        cfg.rpc = Some(crate::config::RpcConfig {
+            enabled: true,
+            listen: rpc_addr.into(),
+        });
         let mut genesis = test_genesis();
         genesis.validators = vec![(24, kp(24).public(), 1)]; // quorum 1 ⇒ self-commit
-        let node = Node::start(cfg, genesis, Some(kp(24))).await.expect("start node");
+        let node = Node::start(cfg, genesis, Some(kp(24)))
+            .await
+            .expect("start node");
 
         // Wait for a certified head (the route is reachable regardless, but this keeps
         // the setup symmetric with the bridge-locks test).
@@ -7101,12 +7775,16 @@ mod tests {
             if node.status().await.map(|(h, _)| h >= 1).unwrap_or(false) {
                 break;
             }
-            assert!(tokio::time::Instant::now() < deadline, "node never produced a block");
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "node never produced a block"
+            );
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
 
         async fn get(addr: &str, path: &str) -> String {
-            let req = format!("GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
+            let req =
+                format!("GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
             let mut s = TcpStream::connect(addr).await.expect("connect rpc");
             s.write_all(req.as_bytes()).await.expect("send get");
             let mut resp = Vec::new();
@@ -7120,7 +7798,10 @@ mod tests {
 
         // Plain directory → 200 with the single genesis validator.
         let resp = get(rpc_addr, "/validators").await;
-        assert!(resp.starts_with("HTTP/1.1 200 OK"), "validators status: {resp}");
+        assert!(
+            resp.starts_with("HTTP/1.1 200 OK"),
+            "validators status: {resp}"
+        );
         assert_eq!(
             body_of(&resp),
             format!("total=1\nvalidator_id=24 power=1 pubkey={pubkey_hex}"),
@@ -7129,8 +7810,14 @@ mod tests {
 
         // JSON representation → the `total`/`next`/`items` envelope with the validator.
         let as_json = get(rpc_addr, "/validators?format=json").await;
-        assert!(as_json.starts_with("HTTP/1.1 200 OK"), "validators json status: {as_json}");
-        assert!(as_json.contains("Content-Type: application/json\r\n"), "json ct: {as_json}");
+        assert!(
+            as_json.starts_with("HTTP/1.1 200 OK"),
+            "validators json status: {as_json}"
+        );
+        assert!(
+            as_json.contains("Content-Type: application/json\r\n"),
+            "json ct: {as_json}"
+        );
         assert_eq!(
             body_of(&as_json),
             format!(
@@ -7143,12 +7830,23 @@ mod tests {
         // `?offset=1` windows past the only validator → empty page, no `next` (end reached).
         let past = get(rpc_addr, "/validators?offset=1").await;
         assert!(past.starts_with("HTTP/1.1 200 OK"), "offset status: {past}");
-        assert_eq!(body_of(&past), "total=1", "offset past end → total=1, empty page");
+        assert_eq!(
+            body_of(&past),
+            "total=1",
+            "offset past end → total=1, empty page"
+        );
 
         // `?limit=0` is an explicit empty page, but another page remains → `next=0`.
         let empty = get(rpc_addr, "/validators?limit=0").await;
-        assert!(empty.starts_with("HTTP/1.1 200 OK"), "limit=0 status: {empty}");
-        assert_eq!(body_of(&empty), "total=1\nnext=0", "limit=0 → empty page with next=0");
+        assert!(
+            empty.starts_with("HTTP/1.1 200 OK"),
+            "limit=0 status: {empty}"
+        );
+        assert_eq!(
+            body_of(&empty),
+            "total=1\nnext=0",
+            "limit=0 → empty page with next=0"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -7161,24 +7859,33 @@ mod tests {
         let dir = tmp_dir("rpc-accounts-list");
         let mut cfg = node_config(25, 20251, &[25], dir.clone());
         let rpc_addr = "127.0.0.1:20261";
-        cfg.rpc = Some(crate::config::RpcConfig { enabled: true, listen: rpc_addr.into() });
+        cfg.rpc = Some(crate::config::RpcConfig {
+            enabled: true,
+            listen: rpc_addr.into(),
+        });
         let mut genesis = test_genesis();
         genesis.validators = vec![(25, kp(25).public(), 1)]; // quorum 1 ⇒ self-commit
         genesis.accounts = vec![(1, 50 * crate::MICRO, kp(1).public())];
         genesis.reviewers = vec![];
-        let node = Node::start(cfg, genesis, Some(kp(25))).await.expect("start node");
+        let node = Node::start(cfg, genesis, Some(kp(25)))
+            .await
+            .expect("start node");
 
         let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
         loop {
             if node.status().await.map(|(h, _)| h >= 1).unwrap_or(false) {
                 break;
             }
-            assert!(tokio::time::Instant::now() < deadline, "node never produced a block");
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "node never produced a block"
+            );
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
 
         async fn get(addr: &str, path: &str) -> String {
-            let req = format!("GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
+            let req =
+                format!("GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
             let mut s = TcpStream::connect(addr).await.expect("connect rpc");
             s.write_all(req.as_bytes()).await.expect("send get");
             let mut resp = Vec::new();
@@ -7199,11 +7906,14 @@ mod tests {
             submissions: 0,
             accepted: 0,
             nonce: 0,
-};
+        };
 
         // Plain directory → 200 with the single account.
         let resp = get(rpc_addr, "/accounts").await;
-        assert!(resp.starts_with("HTTP/1.1 200 OK"), "accounts status: {resp}");
+        assert!(
+            resp.starts_with("HTTP/1.1 200 OK"),
+            "accounts status: {resp}"
+        );
         assert_eq!(
             body_of(&resp),
             format!("total=1\n{}", format_account(1, &want)),
@@ -7212,23 +7922,43 @@ mod tests {
 
         // JSON representation → the `total`/`next`/`items` envelope with the account.
         let as_json = get(rpc_addr, "/accounts?format=json").await;
-        assert!(as_json.starts_with("HTTP/1.1 200 OK"), "accounts json status: {as_json}");
-        assert!(as_json.contains("Content-Type: application/json\r\n"), "json ct: {as_json}");
+        assert!(
+            as_json.starts_with("HTTP/1.1 200 OK"),
+            "accounts json status: {as_json}"
+        );
+        assert!(
+            as_json.contains("Content-Type: application/json\r\n"),
+            "json ct: {as_json}"
+        );
         assert_eq!(
             body_of(&as_json),
-            format!("{{\"total\":\"1\",\"next\":null,\"items\":[{}]}}", json_account(1, &want)),
+            format!(
+                "{{\"total\":\"1\",\"next\":null,\"items\":[{}]}}",
+                json_account(1, &want)
+            ),
             "single-account JSON envelope"
         );
 
         // `?offset=1` windows past the only account → empty page, no `next`.
         let past = get(rpc_addr, "/accounts?offset=1").await;
         assert!(past.starts_with("HTTP/1.1 200 OK"), "offset status: {past}");
-        assert_eq!(body_of(&past), "total=1", "offset past end → total=1, empty page");
+        assert_eq!(
+            body_of(&past),
+            "total=1",
+            "offset past end → total=1, empty page"
+        );
 
         // `?limit=0` is an explicit empty page, but another page remains → `next=0`.
         let empty = get(rpc_addr, "/accounts?limit=0").await;
-        assert!(empty.starts_with("HTTP/1.1 200 OK"), "limit=0 status: {empty}");
-        assert_eq!(body_of(&empty), "total=1\nnext=0", "limit=0 → empty page with next=0");
+        assert!(
+            empty.starts_with("HTTP/1.1 200 OK"),
+            "limit=0 status: {empty}"
+        );
+        assert_eq!(
+            body_of(&empty),
+            "total=1\nnext=0",
+            "limit=0 → empty page with next=0"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -7241,22 +7971,31 @@ mod tests {
         let dir = tmp_dir("rpc-reviewers-list");
         let mut cfg = node_config(26, 20271, &[26], dir.clone());
         let rpc_addr = "127.0.0.1:20281";
-        cfg.rpc = Some(crate::config::RpcConfig { enabled: true, listen: rpc_addr.into() });
+        cfg.rpc = Some(crate::config::RpcConfig {
+            enabled: true,
+            listen: rpc_addr.into(),
+        });
         let mut genesis = test_genesis();
         genesis.validators = vec![(26, kp(26).public(), 1)]; // quorum 1 ⇒ self-commit
-        let node = Node::start(cfg, genesis, Some(kp(26))).await.expect("start node");
+        let node = Node::start(cfg, genesis, Some(kp(26)))
+            .await
+            .expect("start node");
 
         let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
         loop {
             if node.status().await.map(|(h, _)| h >= 1).unwrap_or(false) {
                 break;
             }
-            assert!(tokio::time::Instant::now() < deadline, "node never produced a block");
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "node never produced a block"
+            );
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
 
         async fn get(addr: &str, path: &str) -> String {
-            let req = format!("GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
+            let req =
+                format!("GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
             let mut s = TcpStream::connect(addr).await.expect("connect rpc");
             s.write_all(req.as_bytes()).await.expect("send get");
             let mut resp = Vec::new();
@@ -7282,13 +8021,26 @@ mod tests {
 
         // Plain directory → 200 with all three reviewers (id order).
         let resp = get(rpc_addr, "/reviewers").await;
-        assert!(resp.starts_with("HTTP/1.1 200 OK"), "reviewers status: {resp}");
-        assert_eq!(body_of(&resp), format!("total=3\n{text_lines}"), "reviewer text envelope");
+        assert!(
+            resp.starts_with("HTTP/1.1 200 OK"),
+            "reviewers status: {resp}"
+        );
+        assert_eq!(
+            body_of(&resp),
+            format!("total=3\n{text_lines}"),
+            "reviewer text envelope"
+        );
 
         // JSON representation → the `total`/`next`/`items` envelope with the reviewers.
         let as_json = get(rpc_addr, "/reviewers?format=json").await;
-        assert!(as_json.starts_with("HTTP/1.1 200 OK"), "reviewers json status: {as_json}");
-        assert!(as_json.contains("Content-Type: application/json\r\n"), "json ct: {as_json}");
+        assert!(
+            as_json.starts_with("HTTP/1.1 200 OK"),
+            "reviewers json status: {as_json}"
+        );
+        assert!(
+            as_json.contains("Content-Type: application/json\r\n"),
+            "json ct: {as_json}"
+        );
         assert_eq!(
             body_of(&as_json),
             format!("{{\"total\":\"3\",\"next\":null,\"items\":[{json_items}]}}"),
@@ -7300,14 +8052,27 @@ mod tests {
         assert!(mid.starts_with("HTTP/1.1 200 OK"), "offset status: {mid}");
         assert_eq!(
             body_of(&mid),
-            format!("total=3\nnext=2\n{}", format_entity(&EntityView::Reviewer { id: 11, reputation: 1.0 })),
+            format!(
+                "total=3\nnext=2\n{}",
+                format_entity(&EntityView::Reviewer {
+                    id: 11,
+                    reputation: 1.0
+                })
+            ),
             "middle window → total=3, next=2, one line"
         );
 
         // `?offset=3` windows past the last reviewer → empty page, no `next`.
         let past = get(rpc_addr, "/reviewers?offset=3").await;
-        assert!(past.starts_with("HTTP/1.1 200 OK"), "offset-past status: {past}");
-        assert_eq!(body_of(&past), "total=3", "offset past end → total=3, empty page");
+        assert!(
+            past.starts_with("HTTP/1.1 200 OK"),
+            "offset-past status: {past}"
+        );
+        assert_eq!(
+            body_of(&past),
+            "total=3",
+            "offset past end → total=3, empty page"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -7320,22 +8085,31 @@ mod tests {
         let dir = tmp_dir("rpc-graph-list");
         let mut cfg = node_config(27, 20291, &[27], dir.clone());
         let rpc_addr = "127.0.0.1:20301";
-        cfg.rpc = Some(crate::config::RpcConfig { enabled: true, listen: rpc_addr.into() });
+        cfg.rpc = Some(crate::config::RpcConfig {
+            enabled: true,
+            listen: rpc_addr.into(),
+        });
         let mut genesis = test_genesis();
         genesis.validators = vec![(27, kp(27).public(), 1)]; // quorum 1 ⇒ self-commit
-        let node = Node::start(cfg, genesis, Some(kp(27))).await.expect("start node");
+        let node = Node::start(cfg, genesis, Some(kp(27)))
+            .await
+            .expect("start node");
 
         let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
         loop {
             if node.status().await.map(|(h, _)| h >= 1).unwrap_or(false) {
                 break;
             }
-            assert!(tokio::time::Instant::now() < deadline, "node never produced a block");
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "node never produced a block"
+            );
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
 
         async fn get(addr: &str, path: &str) -> String {
-            let req = format!("GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
+            let req =
+                format!("GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
             let mut s = TcpStream::connect(addr).await.expect("connect rpc");
             s.write_all(req.as_bytes()).await.expect("send get");
             let mut resp = Vec::new();
@@ -7348,27 +8122,48 @@ mod tests {
 
         // The single seeded graph node (node_id 0, domain 0, unit embedding). Rendered by
         // the same `/graph/0` single-read path, so the listing line is byte-identical.
-        let want = EntityView::GraphNode { node_id: 0, domain: 0, embedding: unit(0) };
+        let want = EntityView::GraphNode {
+            node_id: 0,
+            domain: 0,
+            embedding: unit(0),
+        };
 
         // Plain directory → 200 with the single node.
         let resp = get(rpc_addr, "/graph").await;
         assert!(resp.starts_with("HTTP/1.1 200 OK"), "graph status: {resp}");
-        assert_eq!(body_of(&resp), format!("total=1\n{}", format_entity(&want)), "graph text envelope");
+        assert_eq!(
+            body_of(&resp),
+            format!("total=1\n{}", format_entity(&want)),
+            "graph text envelope"
+        );
 
         // JSON representation → the `total`/`next`/`items` envelope with the node.
         let as_json = get(rpc_addr, "/graph?format=json").await;
-        assert!(as_json.starts_with("HTTP/1.1 200 OK"), "graph json status: {as_json}");
-        assert!(as_json.contains("Content-Type: application/json\r\n"), "json ct: {as_json}");
+        assert!(
+            as_json.starts_with("HTTP/1.1 200 OK"),
+            "graph json status: {as_json}"
+        );
+        assert!(
+            as_json.contains("Content-Type: application/json\r\n"),
+            "json ct: {as_json}"
+        );
         assert_eq!(
             body_of(&as_json),
-            format!("{{\"total\":\"1\",\"next\":null,\"items\":[{}]}}", json_entity(&want)),
+            format!(
+                "{{\"total\":\"1\",\"next\":null,\"items\":[{}]}}",
+                json_entity(&want)
+            ),
             "graph JSON envelope"
         );
 
         // `?offset=1` windows past the only node → empty page, no `next`.
         let past = get(rpc_addr, "/graph?offset=1").await;
         assert!(past.starts_with("HTTP/1.1 200 OK"), "offset status: {past}");
-        assert_eq!(body_of(&past), "total=1", "offset past end → total=1, empty page");
+        assert_eq!(
+            body_of(&past),
+            "total=1",
+            "offset past end → total=1, empty page"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -7383,22 +8178,31 @@ mod tests {
         let dir = tmp_dir("rpc-bonds-list");
         let mut cfg = node_config(28, 20311, &[28], dir.clone());
         let rpc_addr = "127.0.0.1:20321";
-        cfg.rpc = Some(crate::config::RpcConfig { enabled: true, listen: rpc_addr.into() });
+        cfg.rpc = Some(crate::config::RpcConfig {
+            enabled: true,
+            listen: rpc_addr.into(),
+        });
         let mut genesis = test_genesis();
         genesis.validators = vec![(28, kp(28).public(), 1)]; // quorum 1 ⇒ self-commit
-        let node = Node::start(cfg, genesis, Some(kp(28))).await.expect("start node");
+        let node = Node::start(cfg, genesis, Some(kp(28)))
+            .await
+            .expect("start node");
 
         let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
         loop {
             if node.status().await.map(|(h, _)| h >= 1).unwrap_or(false) {
                 break;
             }
-            assert!(tokio::time::Instant::now() < deadline, "node never produced a block");
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "node never produced a block"
+            );
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
 
         async fn get(addr: &str, path: &str) -> String {
-            let req = format!("GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
+            let req =
+                format!("GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
             let mut s = TcpStream::connect(addr).await.expect("connect rpc");
             s.write_all(req.as_bytes()).await.expect("send get");
             let mut resp = Vec::new();
@@ -7412,12 +8216,22 @@ mod tests {
         // Plain directory → 200 with an empty page (no bonds at genesis, only the `total` head).
         let resp = get(rpc_addr, "/bonds").await;
         assert!(resp.starts_with("HTTP/1.1 200 OK"), "bonds status: {resp}");
-        assert_eq!(body_of(&resp), "total=0", "bonds text envelope (empty directory)");
+        assert_eq!(
+            body_of(&resp),
+            "total=0",
+            "bonds text envelope (empty directory)"
+        );
 
         // JSON representation → the `total`/`next`/`items` envelope with an empty array.
         let as_json = get(rpc_addr, "/bonds?format=json").await;
-        assert!(as_json.starts_with("HTTP/1.1 200 OK"), "bonds json status: {as_json}");
-        assert!(as_json.contains("Content-Type: application/json\r\n"), "json ct: {as_json}");
+        assert!(
+            as_json.starts_with("HTTP/1.1 200 OK"),
+            "bonds json status: {as_json}"
+        );
+        assert!(
+            as_json.contains("Content-Type: application/json\r\n"),
+            "json ct: {as_json}"
+        );
         assert_eq!(
             body_of(&as_json),
             "{\"total\":\"0\",\"next\":null,\"items\":[]}",
@@ -7437,22 +8251,31 @@ mod tests {
         let dir = tmp_dir("rpc-unbonding-list");
         let mut cfg = node_config(29, 20331, &[29], dir.clone());
         let rpc_addr = "127.0.0.1:20341";
-        cfg.rpc = Some(crate::config::RpcConfig { enabled: true, listen: rpc_addr.into() });
+        cfg.rpc = Some(crate::config::RpcConfig {
+            enabled: true,
+            listen: rpc_addr.into(),
+        });
         let mut genesis = test_genesis();
         genesis.validators = vec![(29, kp(29).public(), 1)]; // quorum 1 ⇒ self-commit
-        let node = Node::start(cfg, genesis, Some(kp(29))).await.expect("start node");
+        let node = Node::start(cfg, genesis, Some(kp(29)))
+            .await
+            .expect("start node");
 
         let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
         loop {
             if node.status().await.map(|(h, _)| h >= 1).unwrap_or(false) {
                 break;
             }
-            assert!(tokio::time::Instant::now() < deadline, "node never produced a block");
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "node never produced a block"
+            );
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
 
         async fn get(addr: &str, path: &str) -> String {
-            let req = format!("GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
+            let req =
+                format!("GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
             let mut s = TcpStream::connect(addr).await.expect("connect rpc");
             s.write_all(req.as_bytes()).await.expect("send get");
             let mut resp = Vec::new();
@@ -7465,13 +8288,26 @@ mod tests {
 
         // Plain directory → 200 with an empty page (no queued withdrawals at genesis).
         let resp = get(rpc_addr, "/unbonding").await;
-        assert!(resp.starts_with("HTTP/1.1 200 OK"), "unbonding status: {resp}");
-        assert_eq!(body_of(&resp), "total=0", "unbonding text envelope (empty queue)");
+        assert!(
+            resp.starts_with("HTTP/1.1 200 OK"),
+            "unbonding status: {resp}"
+        );
+        assert_eq!(
+            body_of(&resp),
+            "total=0",
+            "unbonding text envelope (empty queue)"
+        );
 
         // JSON representation → the `total`/`next`/`items` envelope with an empty array.
         let as_json = get(rpc_addr, "/unbonding?format=json").await;
-        assert!(as_json.starts_with("HTTP/1.1 200 OK"), "unbonding json status: {as_json}");
-        assert!(as_json.contains("Content-Type: application/json\r\n"), "json ct: {as_json}");
+        assert!(
+            as_json.starts_with("HTTP/1.1 200 OK"),
+            "unbonding json status: {as_json}"
+        );
+        assert!(
+            as_json.contains("Content-Type: application/json\r\n"),
+            "json ct: {as_json}"
+        );
         assert_eq!(
             body_of(&as_json),
             "{\"total\":\"0\",\"next\":null,\"items\":[]}",
@@ -7491,22 +8327,31 @@ mod tests {
         let dir = tmp_dir("rpc-stake-ops-list");
         let mut cfg = node_config(30, 20351, &[30], dir.clone());
         let rpc_addr = "127.0.0.1:20361";
-        cfg.rpc = Some(crate::config::RpcConfig { enabled: true, listen: rpc_addr.into() });
+        cfg.rpc = Some(crate::config::RpcConfig {
+            enabled: true,
+            listen: rpc_addr.into(),
+        });
         let mut genesis = test_genesis();
         genesis.validators = vec![(30, kp(30).public(), 1)]; // quorum 1 ⇒ self-commit
-        let node = Node::start(cfg, genesis, Some(kp(30))).await.expect("start node");
+        let node = Node::start(cfg, genesis, Some(kp(30)))
+            .await
+            .expect("start node");
 
         let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
         loop {
             if node.status().await.map(|(h, _)| h >= 1).unwrap_or(false) {
                 break;
             }
-            assert!(tokio::time::Instant::now() < deadline, "node never produced a block");
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "node never produced a block"
+            );
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
 
         async fn get(addr: &str, path: &str) -> String {
-            let req = format!("GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
+            let req =
+                format!("GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
             let mut s = TcpStream::connect(addr).await.expect("connect rpc");
             s.write_all(req.as_bytes()).await.expect("send get");
             let mut resp = Vec::new();
@@ -7519,13 +8364,26 @@ mod tests {
 
         // Plain directory → 200 with an empty page (no staged stake ops at genesis).
         let resp = get(rpc_addr, "/stake-ops").await;
-        assert!(resp.starts_with("HTTP/1.1 200 OK"), "stake-ops status: {resp}");
-        assert_eq!(body_of(&resp), "total=0", "stake-ops text envelope (empty pool)");
+        assert!(
+            resp.starts_with("HTTP/1.1 200 OK"),
+            "stake-ops status: {resp}"
+        );
+        assert_eq!(
+            body_of(&resp),
+            "total=0",
+            "stake-ops text envelope (empty pool)"
+        );
 
         // JSON representation → the `total`/`next`/`items` envelope with an empty array.
         let as_json = get(rpc_addr, "/stake-ops?format=json").await;
-        assert!(as_json.starts_with("HTTP/1.1 200 OK"), "stake-ops json status: {as_json}");
-        assert!(as_json.contains("Content-Type: application/json\r\n"), "json ct: {as_json}");
+        assert!(
+            as_json.starts_with("HTTP/1.1 200 OK"),
+            "stake-ops json status: {as_json}"
+        );
+        assert!(
+            as_json.contains("Content-Type: application/json\r\n"),
+            "json ct: {as_json}"
+        );
         assert_eq!(
             body_of(&as_json),
             "{\"total\":\"0\",\"next\":null,\"items\":[]}",
@@ -7545,22 +8403,31 @@ mod tests {
         let dir = tmp_dir("rpc-evidence-list");
         let mut cfg = node_config(31, 20371, &[31], dir.clone());
         let rpc_addr = "127.0.0.1:20391";
-        cfg.rpc = Some(crate::config::RpcConfig { enabled: true, listen: rpc_addr.into() });
+        cfg.rpc = Some(crate::config::RpcConfig {
+            enabled: true,
+            listen: rpc_addr.into(),
+        });
         let mut genesis = test_genesis();
         genesis.validators = vec![(31, kp(31).public(), 1)]; // quorum 1 ⇒ self-commit
-        let node = Node::start(cfg, genesis, Some(kp(31))).await.expect("start node");
+        let node = Node::start(cfg, genesis, Some(kp(31)))
+            .await
+            .expect("start node");
 
         let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
         loop {
             if node.status().await.map(|(h, _)| h >= 1).unwrap_or(false) {
                 break;
             }
-            assert!(tokio::time::Instant::now() < deadline, "node never produced a block");
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "node never produced a block"
+            );
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
 
         async fn get(addr: &str, path: &str) -> String {
-            let req = format!("GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
+            let req =
+                format!("GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
             let mut s = TcpStream::connect(addr).await.expect("connect rpc");
             s.write_all(req.as_bytes()).await.expect("send get");
             let mut resp = Vec::new();
@@ -7573,13 +8440,26 @@ mod tests {
 
         // Plain directory → 200 with an empty page (no staged evidence at genesis).
         let resp = get(rpc_addr, "/evidence").await;
-        assert!(resp.starts_with("HTTP/1.1 200 OK"), "evidence status: {resp}");
-        assert_eq!(body_of(&resp), "total=0", "evidence text envelope (empty pool)");
+        assert!(
+            resp.starts_with("HTTP/1.1 200 OK"),
+            "evidence status: {resp}"
+        );
+        assert_eq!(
+            body_of(&resp),
+            "total=0",
+            "evidence text envelope (empty pool)"
+        );
 
         // JSON representation → the `total`/`next`/`items` envelope with an empty array.
         let as_json = get(rpc_addr, "/evidence?format=json").await;
-        assert!(as_json.starts_with("HTTP/1.1 200 OK"), "evidence json status: {as_json}");
-        assert!(as_json.contains("Content-Type: application/json\r\n"), "json ct: {as_json}");
+        assert!(
+            as_json.starts_with("HTTP/1.1 200 OK"),
+            "evidence json status: {as_json}"
+        );
+        assert!(
+            as_json.contains("Content-Type: application/json\r\n"),
+            "json ct: {as_json}"
+        );
         assert_eq!(
             body_of(&as_json),
             "{\"total\":\"0\",\"next\":null,\"items\":[]}",
@@ -7601,22 +8481,31 @@ mod tests {
         // keep the RPC port clear of it.
         let mut cfg = node_config(32, 20401, &[32], dir.clone());
         let rpc_addr = "127.0.0.1:20421";
-        cfg.rpc = Some(crate::config::RpcConfig { enabled: true, listen: rpc_addr.into() });
+        cfg.rpc = Some(crate::config::RpcConfig {
+            enabled: true,
+            listen: rpc_addr.into(),
+        });
         let mut genesis = test_genesis();
         genesis.validators = vec![(32, kp(32).public(), 1)]; // quorum 1 ⇒ self-commit
-        let node = Node::start(cfg, genesis, Some(kp(32))).await.expect("start node");
+        let node = Node::start(cfg, genesis, Some(kp(32)))
+            .await
+            .expect("start node");
 
         let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
         loop {
             if node.status().await.map(|(h, _)| h >= 1).unwrap_or(false) {
                 break;
             }
-            assert!(tokio::time::Instant::now() < deadline, "node never produced a block");
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "node never produced a block"
+            );
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
 
         async fn get(addr: &str, path: &str) -> String {
-            let req = format!("GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
+            let req =
+                format!("GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
             let mut s = TcpStream::connect(addr).await.expect("connect rpc");
             s.write_all(req.as_bytes()).await.expect("send get");
             let mut resp = Vec::new();
@@ -7634,8 +8523,14 @@ mod tests {
 
         // JSON representation → the `total`/`next`/`items` envelope with an empty array.
         let as_json = get(rpc_addr, "/peers?format=json").await;
-        assert!(as_json.starts_with("HTTP/1.1 200 OK"), "peers json status: {as_json}");
-        assert!(as_json.contains("Content-Type: application/json\r\n"), "json ct: {as_json}");
+        assert!(
+            as_json.starts_with("HTTP/1.1 200 OK"),
+            "peers json status: {as_json}"
+        );
+        assert!(
+            as_json.contains("Content-Type: application/json\r\n"),
+            "json ct: {as_json}"
+        );
         assert_eq!(
             body_of(&as_json),
             "{\"total\":\"0\",\"next\":null,\"items\":[]}",
@@ -7653,18 +8548,27 @@ mod tests {
         // node_config p2p listen = 20521 + (36-21) = 20536; keep the RPC port clear.
         let mut cfg = node_config(36, 20521, &[36], dir.clone());
         let rpc_addr = "127.0.0.1:20541";
-        cfg.rpc = Some(crate::config::RpcConfig { enabled: true, listen: rpc_addr.into() });
+        cfg.rpc = Some(crate::config::RpcConfig {
+            enabled: true,
+            listen: rpc_addr.into(),
+        });
         let mut genesis = test_genesis();
         genesis.validators = vec![(36, kp(36).public(), 1)]; // quorum 1 ⇒ self-commit
-        let node = Node::start(cfg, genesis, Some(kp(36))).await.expect("start node");
+        let node = Node::start(cfg, genesis, Some(kp(36)))
+            .await
+            .expect("start node");
 
         // Admit a valid tx through the actor; capture its content hash (the mempool key).
         let tx = test_tx(1, 0, 1);
         let pending = tx.hash();
-        node.submit_tx(tx).await.expect("actor alive").expect("valid tx admitted");
+        node.submit_tx(tx)
+            .await
+            .expect("actor alive")
+            .expect("valid tx admitted");
 
         async fn get(addr: &str, path: &str) -> String {
-            let req = format!("GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
+            let req =
+                format!("GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
             let mut s = TcpStream::connect(addr).await.expect("connect rpc");
             s.write_all(req.as_bytes()).await.expect("send get");
             let mut resp = Vec::new();
@@ -7678,7 +8582,10 @@ mod tests {
         // The pending tx's hash → `present` (text) / `{"pending":true}` (JSON).
         let h = crate::hash::hex(&pending);
         let present = get(rpc_addr, &format!("/mempool/{h}")).await;
-        assert!(present.starts_with("HTTP/1.1 200 OK"), "present status: {present}");
+        assert!(
+            present.starts_with("HTTP/1.1 200 OK"),
+            "present status: {present}"
+        );
         assert_eq!(body_of(&present), "present", "pending tx ⇒ present");
         let present_json = get(rpc_addr, &format!("/mempool/{h}?format=json")).await;
         assert_eq!(body_of(&present_json), "{\"pending\":true}", "present JSON");
@@ -7686,12 +8593,18 @@ mod tests {
         // Any other (well-formed) hash → `absent`, still a 200 (the read succeeded).
         let other = crate::hash::hex(&[0x11u8; 32]);
         let absent = get(rpc_addr, &format!("/mempool/{other}")).await;
-        assert!(absent.starts_with("HTTP/1.1 200 OK"), "absent status: {absent}");
+        assert!(
+            absent.starts_with("HTTP/1.1 200 OK"),
+            "absent status: {absent}"
+        );
         assert_eq!(body_of(&absent), "absent", "unknown hash ⇒ absent");
 
         // A malformed hash is a routing miss → 404.
         let bad = get(rpc_addr, "/mempool/notahash").await;
-        assert!(bad.starts_with("HTTP/1.1 404 Not Found"), "malformed hash ⇒ 404: {bad}");
+        assert!(
+            bad.starts_with("HTTP/1.1 404 Not Found"),
+            "malformed hash ⇒ 404: {bad}"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -7704,13 +8617,19 @@ mod tests {
         // node_config p2p listen = 20811 + (44-21) = 20834; keep the RPC port clear.
         let mut cfg = node_config(44, 20811, &[44], dir.clone());
         let rpc_addr = "127.0.0.1:20841";
-        cfg.rpc = Some(crate::config::RpcConfig { enabled: true, listen: rpc_addr.into() });
+        cfg.rpc = Some(crate::config::RpcConfig {
+            enabled: true,
+            listen: rpc_addr.into(),
+        });
         let mut genesis = test_genesis();
         genesis.validators = vec![(44, kp(44).public(), 1)]; // quorum 1 ⇒ self-commit
-        let node = Node::start(cfg, genesis, Some(kp(44))).await.expect("start node");
+        let node = Node::start(cfg, genesis, Some(kp(44)))
+            .await
+            .expect("start node");
 
         async fn get(addr: &str, path: &str) -> String {
-            let req = format!("GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
+            let req =
+                format!("GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
             let mut s = TcpStream::connect(addr).await.expect("connect rpc");
             s.write_all(req.as_bytes()).await.expect("send get");
             let mut resp = Vec::new();
@@ -7723,24 +8642,39 @@ mod tests {
 
         // Empty pool ⇒ `total=0`.
         let empty = get(rpc_addr, "/mempool").await;
-        assert!(empty.starts_with("HTTP/1.1 200 OK"), "empty status: {empty}");
+        assert!(
+            empty.starts_with("HTTP/1.1 200 OK"),
+            "empty status: {empty}"
+        );
         assert_eq!(body_of(&empty), "total=0", "fresh mempool is empty");
 
         // Admit a valid tx, then it is listed with its hash + author.
         let tx = test_tx(1, 0, 1);
         let h = crate::hash::hex(&tx.hash());
-        node.submit_tx(tx).await.expect("actor alive").expect("valid tx admitted");
+        node.submit_tx(tx)
+            .await
+            .expect("actor alive")
+            .expect("valid tx admitted");
 
         let listed = get(rpc_addr, "/mempool").await;
-        assert!(listed.starts_with("HTTP/1.1 200 OK"), "listed status: {listed}");
+        assert!(
+            listed.starts_with("HTTP/1.1 200 OK"),
+            "listed status: {listed}"
+        );
         let body = body_of(&listed);
         assert!(body.starts_with("total=1\n"), "one pending tx: {body}");
-        assert!(body.contains(&format!("kind=pending_tx hash={h} author=1")), "lists the tx: {body}");
+        assert!(
+            body.contains(&format!("kind=pending_tx hash={h} author=1")),
+            "lists the tx: {body}"
+        );
 
         // JSON representation wraps the same entry in the page envelope.
         let as_json = get(rpc_addr, "/mempool?format=json").await;
         let jbody = body_of(&as_json);
-        assert!(jbody.contains(&format!("\"hash\":\"{h}\",\"author\":\"1\"")), "mempool json: {jbody}");
+        assert!(
+            jbody.contains(&format!("\"hash\":\"{h}\",\"author\":\"1\"")),
+            "mempool json: {jbody}"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -7754,13 +8688,19 @@ mod tests {
         // node_config p2p listen = 20851 + (45-21) = 20875; keep the RPC port clear.
         let mut cfg = node_config(45, 20851, &[45], dir.clone());
         let rpc_addr = "127.0.0.1:20881";
-        cfg.rpc = Some(crate::config::RpcConfig { enabled: true, listen: rpc_addr.into() });
+        cfg.rpc = Some(crate::config::RpcConfig {
+            enabled: true,
+            listen: rpc_addr.into(),
+        });
         let mut genesis = test_genesis();
         genesis.validators = vec![(45, kp(45).public(), 1)]; // quorum 1 ⇒ self-commit
-        let node = Node::start(cfg, genesis, Some(kp(45))).await.expect("start node");
+        let node = Node::start(cfg, genesis, Some(kp(45)))
+            .await
+            .expect("start node");
 
         async fn get(addr: &str, path: &str) -> String {
-            let req = format!("GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
+            let req =
+                format!("GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
             let mut s = TcpStream::connect(addr).await.expect("connect rpc");
             s.write_all(req.as_bytes()).await.expect("send get");
             let mut resp = Vec::new();
@@ -7774,7 +8714,10 @@ mod tests {
         // Submit a valid tx; capture its content hash.
         let tx = test_tx(1, 0, 1);
         let h = crate::hash::hex(&tx.hash());
-        node.submit_tx(tx).await.expect("actor alive").expect("valid tx admitted");
+        node.submit_tx(tx)
+            .await
+            .expect("actor alive")
+            .expect("valid tx admitted");
 
         // Poll /tx/{hash} until it reports a committed height.
         let deadline = tokio::time::Instant::now() + Duration::from_secs(8);
@@ -7783,24 +8726,40 @@ mod tests {
             if let Some(n) = body.strip_prefix("height=") {
                 break n.parse::<u64>().expect("height is a u64");
             }
-            assert!(tokio::time::Instant::now() < deadline, "tx never mined: last body `{body}`");
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "tx never mined: last body `{body}`"
+            );
             tokio::time::sleep(Duration::from_millis(50)).await;
         };
-        assert!(committed >= 1, "committed at a real height, got {committed}");
+        assert!(
+            committed >= 1,
+            "committed at a real height, got {committed}"
+        );
 
         // JSON form of the same read.
         let as_json = get(rpc_addr, &format!("/tx/{h}?format=json")).await;
-        assert_eq!(body_of(&as_json), format!("{{\"height\":\"{committed}\"}}"), "tx json");
+        assert_eq!(
+            body_of(&as_json),
+            format!("{{\"height\":\"{committed}\"}}"),
+            "tx json"
+        );
 
         // An unknown hash is `absent` / null (still a 200).
         let other = crate::hash::hex(&[0x33u8; 32]);
         let absent = get(rpc_addr, &format!("/tx/{other}")).await;
-        assert!(absent.starts_with("HTTP/1.1 200 OK"), "absent status: {absent}");
+        assert!(
+            absent.starts_with("HTTP/1.1 200 OK"),
+            "absent status: {absent}"
+        );
         assert_eq!(body_of(&absent), "absent", "unknown hash ⇒ absent");
 
         // A malformed hash is a routing miss → 404.
         let bad = get(rpc_addr, "/tx/notahash").await;
-        assert!(bad.starts_with("HTTP/1.1 404 Not Found"), "malformed ⇒ 404: {bad}");
+        assert!(
+            bad.starts_with("HTTP/1.1 404 Not Found"),
+            "malformed ⇒ 404: {bad}"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -7813,10 +8772,15 @@ mod tests {
         // node_config p2p listen = 20891 + (46-21) = 20916; keep the RPC port clear.
         let mut cfg = node_config(46, 20891, &[46], dir.clone());
         let rpc_addr = "127.0.0.1:20921";
-        cfg.rpc = Some(crate::config::RpcConfig { enabled: true, listen: rpc_addr.into() });
+        cfg.rpc = Some(crate::config::RpcConfig {
+            enabled: true,
+            listen: rpc_addr.into(),
+        });
         let mut genesis = test_genesis();
         genesis.validators = vec![(46, kp(46).public(), 1)]; // quorum 1 ⇒ self-commit
-        let node = Node::start(cfg, genesis, Some(kp(46))).await.expect("start node");
+        let node = Node::start(cfg, genesis, Some(kp(46)))
+            .await
+            .expect("start node");
 
         // Wait until the chain has at least one committed block.
         let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
@@ -7826,12 +8790,16 @@ mod tests {
                     break h;
                 }
             }
-            assert!(tokio::time::Instant::now() < deadline, "node never produced a block");
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "node never produced a block"
+            );
             tokio::time::sleep(Duration::from_millis(50)).await;
         };
 
         async fn get(addr: &str, path: &str) -> String {
-            let req = format!("GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
+            let req =
+                format!("GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
             let mut s = TcpStream::connect(addr).await.expect("connect rpc");
             s.write_all(req.as_bytes()).await.expect("send get");
             let mut resp = Vec::new();
@@ -7852,17 +8820,29 @@ mod tests {
 
         // JSON form of the same block.
         let b1_json = get(rpc_addr, "/block/1?format=json").await;
-        assert!(body_of(&b1_json).starts_with("{\"height\":\"1\","), "block 1 json: {b1_json}");
+        assert!(
+            body_of(&b1_json).starts_with("{\"height\":\"1\","),
+            "block 1 json: {b1_json}"
+        );
 
         // Genesis (height 0) has no log block ⇒ 404.
         let b0 = get(rpc_addr, "/block/0").await;
-        assert!(b0.starts_with("HTTP/1.1 404 Not Found"), "block 0 ⇒ 404: {b0}");
+        assert!(
+            b0.starts_with("HTTP/1.1 404 Not Found"),
+            "block 0 ⇒ 404: {b0}"
+        );
 
         // A height far past the tip ⇒ 404; a non-numeric height ⇒ 404.
         let past = get(rpc_addr, &format!("/block/{}", tip + 10_000)).await;
-        assert!(past.starts_with("HTTP/1.1 404 Not Found"), "future height ⇒ 404: {past}");
+        assert!(
+            past.starts_with("HTTP/1.1 404 Not Found"),
+            "future height ⇒ 404: {past}"
+        );
         let nan = get(rpc_addr, "/block/notanumber").await;
-        assert!(nan.starts_with("HTTP/1.1 404 Not Found"), "non-numeric ⇒ 404: {nan}");
+        assert!(
+            nan.starts_with("HTTP/1.1 404 Not Found"),
+            "non-numeric ⇒ 404: {nan}"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -7875,13 +8855,19 @@ mod tests {
         // node_config p2p listen = 20931 + (47-21) = 20957; keep the RPC port clear.
         let mut cfg = node_config(47, 20931, &[47], dir.clone());
         let rpc_addr = "127.0.0.1:20961";
-        cfg.rpc = Some(crate::config::RpcConfig { enabled: true, listen: rpc_addr.into() });
+        cfg.rpc = Some(crate::config::RpcConfig {
+            enabled: true,
+            listen: rpc_addr.into(),
+        });
         let mut genesis = test_genesis();
         genesis.validators = vec![(47, kp(47).public(), 1)]; // quorum 1 ⇒ self-commit
-        let node = Node::start(cfg, genesis, Some(kp(47))).await.expect("start node");
+        let node = Node::start(cfg, genesis, Some(kp(47)))
+            .await
+            .expect("start node");
 
         async fn get(addr: &str, path: &str) -> String {
-            let req = format!("GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
+            let req =
+                format!("GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
             let mut s = TcpStream::connect(addr).await.expect("connect rpc");
             s.write_all(req.as_bytes()).await.expect("send get");
             let mut resp = Vec::new();
@@ -7895,31 +8881,51 @@ mod tests {
         // Submit a tx and wait until `/tx/{hash}` reports the mined height.
         let tx = test_tx(1, 0, 1);
         let h = crate::hash::hex(&tx.hash());
-        node.submit_tx(tx).await.expect("actor alive").expect("valid tx admitted");
+        node.submit_tx(tx)
+            .await
+            .expect("actor alive")
+            .expect("valid tx admitted");
         let deadline = tokio::time::Instant::now() + Duration::from_secs(8);
         let height = loop {
             let body = body_of(&get(rpc_addr, &format!("/tx/{h}")).await).to_string();
             if let Some(n) = body.strip_prefix("height=") {
                 break n.parse::<u64>().expect("height u64");
             }
-            assert!(tokio::time::Instant::now() < deadline, "tx never mined: `{body}`");
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "tx never mined: `{body}`"
+            );
             tokio::time::sleep(Duration::from_millis(50)).await;
         };
 
         // That block's /txs lists our tx (as a committed `kind=tx` reference).
         let listed = get(rpc_addr, &format!("/block/{height}/txs")).await;
-        assert!(listed.starts_with("HTTP/1.1 200 OK"), "block txs status: {listed}");
+        assert!(
+            listed.starts_with("HTTP/1.1 200 OK"),
+            "block txs status: {listed}"
+        );
         let body = body_of(&listed);
         assert!(body.starts_with("total=1\n"), "one tx in the block: {body}");
-        assert!(body.contains(&format!("kind=tx hash={h} author=1")), "lists the tx: {body}");
+        assert!(
+            body.contains(&format!("kind=tx hash={h} author=1")),
+            "lists the tx: {body}"
+        );
 
         // JSON form of the same list.
         let as_json = get(rpc_addr, &format!("/block/{height}/txs?format=json")).await;
-        assert!(body_of(&as_json).contains(&format!("\"kind\":\"tx\",\"hash\":\"{h}\",\"author\":\"1\"")), "json: {as_json}");
+        assert!(
+            body_of(&as_json).contains(&format!(
+                "\"kind\":\"tx\",\"hash\":\"{h}\",\"author\":\"1\""
+            )),
+            "json: {as_json}"
+        );
 
         // A height with no committed block ⇒ 404.
         let past = get(rpc_addr, &format!("/block/{}/txs", height + 10_000)).await;
-        assert!(past.starts_with("HTTP/1.1 404 Not Found"), "future height ⇒ 404: {past}");
+        assert!(
+            past.starts_with("HTTP/1.1 404 Not Found"),
+            "future height ⇒ 404: {past}"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -7933,10 +8939,15 @@ mod tests {
         // node_config p2p listen = 20971 + (48-21) = 20998; keep the RPC port clear.
         let mut cfg = node_config(48, 20971, &[48], dir.clone());
         let rpc_addr = "127.0.0.1:21001";
-        cfg.rpc = Some(crate::config::RpcConfig { enabled: true, listen: rpc_addr.into() });
+        cfg.rpc = Some(crate::config::RpcConfig {
+            enabled: true,
+            listen: rpc_addr.into(),
+        });
         let mut genesis = test_genesis();
         genesis.validators = vec![(48, kp(48).public(), 1)]; // quorum 1 ⇒ self-commit
-        let _node = Node::start(cfg, genesis, Some(kp(48))).await.expect("start node");
+        let _node = Node::start(cfg, genesis, Some(kp(48)))
+            .await
+            .expect("start node");
 
         async fn post(addr: &str, path: &str, body: &[u8]) -> String {
             let mut req = format!(
@@ -7952,7 +8963,8 @@ mod tests {
             String::from_utf8_lossy(&resp).into_owned()
         }
         async fn get(addr: &str, path: &str) -> String {
-            let req = format!("GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
+            let req =
+                format!("GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
             let mut s = TcpStream::connect(addr).await.expect("connect rpc");
             s.write_all(req.as_bytes()).await.expect("send get");
             let mut resp = Vec::new();
@@ -7997,10 +9009,15 @@ mod tests {
         // node_config p2p listen = 21011 + (49-21) = 21039; keep the RPC port clear.
         let mut cfg = node_config(49, 21011, &[49], dir.clone());
         let rpc_addr = "127.0.0.1:21051";
-        cfg.rpc = Some(crate::config::RpcConfig { enabled: true, listen: rpc_addr.into() });
+        cfg.rpc = Some(crate::config::RpcConfig {
+            enabled: true,
+            listen: rpc_addr.into(),
+        });
         let mut genesis = test_genesis();
         genesis.validators = vec![(49, kp(49).public(), 1)]; // quorum 1 ⇒ self-commit
-        let _node = Node::start(cfg, genesis, Some(kp(49))).await.expect("start node");
+        let _node = Node::start(cfg, genesis, Some(kp(49)))
+            .await
+            .expect("start node");
 
         async fn post(addr: &str, path: &str, body: &[u8]) -> String {
             let mut req = format!(
@@ -8019,7 +9036,10 @@ mod tests {
         // test_tx(99, ..) has an author with no genesis account ⇒ rejected.
         let body = crate::codec::encode_tx(&test_tx(99, 1, 2));
         let bad = post(rpc_addr, "/validate", &body).await;
-        assert!(bad.starts_with("HTTP/1.1 422 Unprocessable Entity"), "invalid ⇒ 422: {bad}");
+        assert!(
+            bad.starts_with("HTTP/1.1 422 Unprocessable Entity"),
+            "invalid ⇒ 422: {bad}"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -8031,10 +9051,15 @@ mod tests {
         // node_config p2p listen = 21061 + (50-21) = 21090; keep the RPC port clear.
         let mut cfg = node_config(50, 21061, &[50], dir.clone());
         let rpc_addr = "127.0.0.1:21101";
-        cfg.rpc = Some(crate::config::RpcConfig { enabled: true, listen: rpc_addr.into() });
+        cfg.rpc = Some(crate::config::RpcConfig {
+            enabled: true,
+            listen: rpc_addr.into(),
+        });
         let mut genesis = test_genesis();
         genesis.validators = vec![(50, kp(50).public(), 1)]; // quorum 1 ⇒ self-commit
-        let _node = Node::start(cfg, genesis, Some(kp(50))).await.expect("start node");
+        let _node = Node::start(cfg, genesis, Some(kp(50)))
+            .await
+            .expect("start node");
 
         let body = b"not a tx";
         let mut req = format!(
@@ -8048,7 +9073,10 @@ mod tests {
         let mut resp = Vec::new();
         s.read_to_end(&mut resp).await.expect("read response");
         let resp = String::from_utf8_lossy(&resp);
-        assert!(resp.starts_with("HTTP/1.1 400 Bad Request"), "garbage ⇒ 400: {resp}");
+        assert!(
+            resp.starts_with("HTTP/1.1 400 Bad Request"),
+            "garbage ⇒ 400: {resp}"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -8062,22 +9090,31 @@ mod tests {
         // node_config p2p listen = 20551 + (37-21) = 20567; keep the RPC port clear.
         let mut cfg = node_config(37, 20551, &[37], dir.clone());
         let rpc_addr = "127.0.0.1:20571";
-        cfg.rpc = Some(crate::config::RpcConfig { enabled: true, listen: rpc_addr.into() });
+        cfg.rpc = Some(crate::config::RpcConfig {
+            enabled: true,
+            listen: rpc_addr.into(),
+        });
         let mut genesis = test_genesis();
         genesis.validators = vec![(37, kp(37).public(), 1)]; // quorum 1 ⇒ self-commit
-        let node = Node::start(cfg, genesis, Some(kp(37))).await.expect("start node");
+        let node = Node::start(cfg, genesis, Some(kp(37)))
+            .await
+            .expect("start node");
 
         let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
         loop {
             if node.status().await.map(|(h, _)| h >= 1).unwrap_or(false) {
                 break;
             }
-            assert!(tokio::time::Instant::now() < deadline, "node never produced a block");
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "node never produced a block"
+            );
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
 
         async fn get(addr: &str, path: &str) -> String {
-            let req = format!("GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
+            let req =
+                format!("GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
             let mut s = TcpStream::connect(addr).await.expect("connect rpc");
             s.write_all(req.as_bytes()).await.expect("send get");
             let mut resp = Vec::new();
@@ -8093,11 +9130,17 @@ mod tests {
         let body = body_of(&resp);
         // A fresh chain: zero slashed treasury, zero bonded/bridge pools; a nonzero supply.
         assert!(body.starts_with("supply="), "supply text: {body}");
-        assert!(body.contains("treasury=0 bonded=0 bridge_locked=0 bridge_minted=0"), "fresh pools: {body}");
+        assert!(
+            body.contains("treasury=0 bonded=0 bridge_locked=0 bridge_minted=0"),
+            "fresh pools: {body}"
+        );
 
         // JSON representation carries the same values as a quoted-u64 object.
         let as_json = get(rpc_addr, "/supply?format=json").await;
-        assert!(as_json.contains("Content-Type: application/json\r\n"), "json ct: {as_json}");
+        assert!(
+            as_json.contains("Content-Type: application/json\r\n"),
+            "json ct: {as_json}"
+        );
         let jbody = body_of(&as_json);
         assert!(jbody.starts_with("{\"supply\":\""), "supply json: {jbody}");
         assert!(jbody.contains("\"treasury\":\"0\",\"bonded\":\"0\",\"bridge_locked\":\"0\",\"bridge_minted\":\"0\""), "json pools: {jbody}");
@@ -8113,22 +9156,31 @@ mod tests {
         // node_config p2p listen = 20581 + (38-21) = 20597; keep the RPC port clear.
         let mut cfg = node_config(38, 20581, &[38], dir.clone());
         let rpc_addr = "127.0.0.1:20601";
-        cfg.rpc = Some(crate::config::RpcConfig { enabled: true, listen: rpc_addr.into() });
+        cfg.rpc = Some(crate::config::RpcConfig {
+            enabled: true,
+            listen: rpc_addr.into(),
+        });
         let mut genesis = test_genesis();
         genesis.validators = vec![(38, kp(38).public(), 1)]; // quorum 1 ⇒ self-commit
-        let node = Node::start(cfg, genesis, Some(kp(38))).await.expect("start node");
+        let node = Node::start(cfg, genesis, Some(kp(38)))
+            .await
+            .expect("start node");
 
         let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
         loop {
             if node.status().await.map(|(h, _)| h >= 1).unwrap_or(false) {
                 break;
             }
-            assert!(tokio::time::Instant::now() < deadline, "node never produced a block");
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "node never produced a block"
+            );
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
 
         async fn get(addr: &str, path: &str) -> String {
-            let req = format!("GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
+            let req =
+                format!("GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
             let mut s = TcpStream::connect(addr).await.expect("connect rpc");
             s.write_all(req.as_bytes()).await.expect("send get");
             let mut resp = Vec::new();
@@ -8143,16 +9195,46 @@ mod tests {
         assert!(resp.starts_with("HTTP/1.1 200 OK"), "params status: {resp}");
         let body = body_of(&resp);
         // Every knob appears at least once in the grep body.
-        for k in &["base_emission_micro=", "slash_bps=", "tau_dup=", "n_review_min=", "c_cap=", "n_min=", "lam=", "bonus_max=", "decay=", "fresh_min=", "delta_k_min="] {
+        for k in &[
+            "base_emission_micro=",
+            "slash_bps=",
+            "tau_dup=",
+            "n_review_min=",
+            "c_cap=",
+            "n_min=",
+            "lam=",
+            "bonus_max=",
+            "decay=",
+            "fresh_min=",
+            "delta_k_min=",
+        ] {
             assert!(body.contains(k), "missing {k} in {body}");
         }
 
         // JSON representation is a single object mirroring the same keys.
         let as_json = get(rpc_addr, "/params?format=json").await;
-        assert!(as_json.contains("Content-Type: application/json\r\n"), "json ct: {as_json}");
+        assert!(
+            as_json.contains("Content-Type: application/json\r\n"),
+            "json ct: {as_json}"
+        );
         let jbody = body_of(&as_json);
-        assert!(jbody.starts_with("{\"base_emission_micro\":\""), "params json: {jbody}");
-        for k in &["\"base_emission_micro\":", "\"slash_bps\":", "\"tau_dup\":", "\"n_review_min\":", "\"c_cap\":", "\"n_min\":", "\"lam\":", "\"bonus_max\":", "\"decay\":", "\"fresh_min\":", "\"delta_k_min\":"] {
+        assert!(
+            jbody.starts_with("{\"base_emission_micro\":\""),
+            "params json: {jbody}"
+        );
+        for k in &[
+            "\"base_emission_micro\":",
+            "\"slash_bps\":",
+            "\"tau_dup\":",
+            "\"n_review_min\":",
+            "\"c_cap\":",
+            "\"n_min\":",
+            "\"lam\":",
+            "\"bonus_max\":",
+            "\"decay\":",
+            "\"fresh_min\":",
+            "\"delta_k_min\":",
+        ] {
             assert!(jbody.contains(k), "missing {k} in {jbody}");
         }
 
@@ -8167,13 +9249,19 @@ mod tests {
         // node_config p2p listen = 21111 + (51-21) = 21141; keep the RPC port clear.
         let mut cfg = node_config(51, 21111, &[51], dir.clone());
         let rpc_addr = "127.0.0.1:21151";
-        cfg.rpc = Some(crate::config::RpcConfig { enabled: true, listen: rpc_addr.into() });
+        cfg.rpc = Some(crate::config::RpcConfig {
+            enabled: true,
+            listen: rpc_addr.into(),
+        });
         let mut genesis = test_genesis();
         genesis.validators = vec![(51, kp(51).public(), 1)]; // quorum 1 ⇒ self-commit
-        let _node = Node::start(cfg, genesis, Some(kp(51))).await.expect("start node");
+        let _node = Node::start(cfg, genesis, Some(kp(51)))
+            .await
+            .expect("start node");
 
         async fn get(addr: &str, path: &str) -> String {
-            let req = format!("GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
+            let req =
+                format!("GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
             let mut s = TcpStream::connect(addr).await.expect("connect rpc");
             s.write_all(req.as_bytes()).await.expect("send get");
             let mut resp = Vec::new();
@@ -8188,13 +9276,25 @@ mod tests {
         assert!(resp.starts_with("HTTP/1.1 200 OK"), "config status: {resp}");
         let body = body_of(&resp);
         assert!(body.contains("role=validator\n"), "config role: {body}");
-        for k in &["propose_timeout_ms=", "prevote_timeout_ms=", "precommit_timeout_ms=", "timeout_delta_ms=", "block_interval_ms=", "create_empty_blocks=", "mempool_capacity=", "mempool_per_account_limit="] {
+        for k in &[
+            "propose_timeout_ms=",
+            "prevote_timeout_ms=",
+            "precommit_timeout_ms=",
+            "timeout_delta_ms=",
+            "block_interval_ms=",
+            "create_empty_blocks=",
+            "mempool_capacity=",
+            "mempool_per_account_limit=",
+        ] {
             assert!(body.contains(k), "missing {k} in {body}");
         }
 
         let as_json = get(rpc_addr, "/config?format=json").await;
         let jbody = body_of(&as_json);
-        assert!(jbody.starts_with("{\"role\":\"validator\","), "config json: {jbody}");
+        assert!(
+            jbody.starts_with("{\"role\":\"validator\","),
+            "config json: {jbody}"
+        );
         assert!(jbody.contains("\"create_empty_blocks\":"), "{jbody}");
 
         let _ = std::fs::remove_dir_all(&dir);
@@ -8208,13 +9308,19 @@ mod tests {
         // node_config p2p listen = 21161 + (52-21) = 21192; keep the RPC port clear.
         let mut cfg = node_config(52, 21161, &[52], dir.clone());
         let rpc_addr = "127.0.0.1:21201";
-        cfg.rpc = Some(crate::config::RpcConfig { enabled: true, listen: rpc_addr.into() });
+        cfg.rpc = Some(crate::config::RpcConfig {
+            enabled: true,
+            listen: rpc_addr.into(),
+        });
         let mut genesis = test_genesis();
         genesis.validators = vec![(52, kp(52).public(), 1)]; // quorum 1 ⇒ self-commit
-        let _node = Node::start(cfg, genesis, Some(kp(52))).await.expect("start node");
+        let _node = Node::start(cfg, genesis, Some(kp(52)))
+            .await
+            .expect("start node");
 
         async fn get(addr: &str, path: &str) -> String {
-            let req = format!("GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
+            let req =
+                format!("GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
             let mut s = TcpStream::connect(addr).await.expect("connect rpc");
             s.write_all(req.as_bytes()).await.expect("send get");
             let mut resp = Vec::new();
@@ -8228,7 +9334,11 @@ mod tests {
         let v = env!("CARGO_PKG_VERSION");
         let resp = get(rpc_addr, "/node").await;
         assert!(resp.starts_with("HTTP/1.1 200 OK"), "node status: {resp}");
-        assert_eq!(body_of(&resp), format!("node_id=52\nrole=validator\nversion={v}"), "node text");
+        assert_eq!(
+            body_of(&resp),
+            format!("node_id=52\nrole=validator\nversion={v}"),
+            "node text"
+        );
 
         let as_json = get(rpc_addr, "/node?format=json").await;
         assert_eq!(
@@ -8248,24 +9358,33 @@ mod tests {
         // node_config p2p listen = 20611 + (39-21) = 20629; keep the RPC port clear.
         let mut cfg = node_config(39, 20611, &[39], dir.clone());
         let rpc_addr = "127.0.0.1:20641";
-        cfg.rpc = Some(crate::config::RpcConfig { enabled: true, listen: rpc_addr.into() });
+        cfg.rpc = Some(crate::config::RpcConfig {
+            enabled: true,
+            listen: rpc_addr.into(),
+        });
         let mut genesis = test_genesis();
         genesis.validators = vec![(39, kp(39).public(), 1)]; // quorum 1 ⇒ self-commit
-        // Independently stamp the same genesis to know the expected identity.
+                                                             // Independently stamp the same genesis to know the expected identity.
         let (_state, expected_gh) = crate::ChainState::genesis(genesis.clone());
-        let node = Node::start(cfg, genesis, Some(kp(39))).await.expect("start node");
+        let node = Node::start(cfg, genesis, Some(kp(39)))
+            .await
+            .expect("start node");
 
         let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
         loop {
             if node.status().await.map(|(h, _)| h >= 1).unwrap_or(false) {
                 break;
             }
-            assert!(tokio::time::Instant::now() < deadline, "node never produced a block");
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "node never produced a block"
+            );
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
 
         async fn get(addr: &str, path: &str) -> String {
-            let req = format!("GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
+            let req =
+                format!("GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
             let mut s = TcpStream::connect(addr).await.expect("connect rpc");
             s.write_all(req.as_bytes()).await.expect("send get");
             let mut resp = Vec::new();
@@ -8278,12 +9397,26 @@ mod tests {
 
         let h = crate::hash::hex(&expected_gh);
         let resp = get(rpc_addr, "/genesis").await;
-        assert!(resp.starts_with("HTTP/1.1 200 OK"), "genesis status: {resp}");
-        assert_eq!(body_of(&resp), format!("genesis_hash={h}"), "genesis text identity");
+        assert!(
+            resp.starts_with("HTTP/1.1 200 OK"),
+            "genesis status: {resp}"
+        );
+        assert_eq!(
+            body_of(&resp),
+            format!("genesis_hash={h}"),
+            "genesis text identity"
+        );
 
         let as_json = get(rpc_addr, "/genesis?format=json").await;
-        assert!(as_json.contains("Content-Type: application/json\r\n"), "json ct: {as_json}");
-        assert_eq!(body_of(&as_json), format!("{{\"genesis_hash\":\"{h}\"}}"), "genesis JSON identity");
+        assert!(
+            as_json.contains("Content-Type: application/json\r\n"),
+            "json ct: {as_json}"
+        );
+        assert_eq!(
+            body_of(&as_json),
+            format!("{{\"genesis_hash\":\"{h}\"}}"),
+            "genesis JSON identity"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -8297,23 +9430,32 @@ mod tests {
         // node_config p2p listen = 20651 + (40-21) = 20670; keep the RPC port clear.
         let mut cfg = node_config(40, 20651, &[40], dir.clone());
         let rpc_addr = "127.0.0.1:20681";
-        cfg.rpc = Some(crate::config::RpcConfig { enabled: true, listen: rpc_addr.into() });
+        cfg.rpc = Some(crate::config::RpcConfig {
+            enabled: true,
+            listen: rpc_addr.into(),
+        });
         let mut genesis = test_genesis();
         genesis.validators = vec![(40, kp(40).public(), 1)]; // quorum 1 ⇒ self-commit
         let (_state, expected_gh) = crate::ChainState::genesis(genesis.clone());
-        let node = Node::start(cfg, genesis, Some(kp(40))).await.expect("start node");
+        let node = Node::start(cfg, genesis, Some(kp(40)))
+            .await
+            .expect("start node");
 
         let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
         loop {
             if node.status().await.map(|(h, _)| h >= 1).unwrap_or(false) {
                 break;
             }
-            assert!(tokio::time::Instant::now() < deadline, "node never produced a block");
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "node never produced a block"
+            );
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
 
         async fn get(addr: &str, path: &str) -> String {
-            let req = format!("GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
+            let req =
+                format!("GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
             let mut s = TcpStream::connect(addr).await.expect("connect rpc");
             s.write_all(req.as_bytes()).await.expect("send get");
             let mut resp = Vec::new();
@@ -8328,18 +9470,33 @@ mod tests {
         assert!(info.starts_with("HTTP/1.1 200 OK"), "info status: {info}");
         let body = body_of(&info).to_string();
         // Identity line matches the independently-stamped genesis_hash.
-        assert!(body.contains(&format!("genesis_hash={}", crate::hash::hex(&expected_gh))), "info identity: {body}");
+        assert!(
+            body.contains(&format!("genesis_hash={}", crate::hash::hex(&expected_gh))),
+            "info identity: {body}"
+        );
         // The per-field lines match the individual endpoints.
         let height_body = body_of(&get(rpc_addr, "/height").await).to_string();
         let head_body = body_of(&get(rpc_addr, "/head").await).to_string();
-        assert!(body.contains(&format!("height={height_body}")), "info height matches /height: {body}");
-        assert!(body.contains(&format!("head={head_body}")), "info head matches /head: {body}");
+        assert!(
+            body.contains(&format!("height={height_body}")),
+            "info height matches /height: {body}"
+        );
+        assert!(
+            body.contains(&format!("head={head_body}")),
+            "info head matches /head: {body}"
+        );
 
         // JSON aggregate carries the same three fields.
         let as_json = get(rpc_addr, "/info?format=json").await;
         let jbody = body_of(&as_json);
-        assert!(jbody.starts_with("{\"genesis_hash\":\""), "info json: {jbody}");
-        assert!(jbody.contains(&format!("\"head\":\"{head_body}\"")), "info json head: {jbody}");
+        assert!(
+            jbody.starts_with("{\"genesis_hash\":\""),
+            "info json: {jbody}"
+        );
+        assert!(
+            jbody.contains(&format!("\"head\":\"{head_body}\"")),
+            "info json head: {jbody}"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -8352,13 +9509,19 @@ mod tests {
         // node_config p2p listen = 20771 + (43-21) = 20793; keep the RPC port clear.
         let mut cfg = node_config(43, 20771, &[43], dir.clone());
         let rpc_addr = "127.0.0.1:20801";
-        cfg.rpc = Some(crate::config::RpcConfig { enabled: true, listen: rpc_addr.into() });
+        cfg.rpc = Some(crate::config::RpcConfig {
+            enabled: true,
+            listen: rpc_addr.into(),
+        });
         let mut genesis = test_genesis();
         genesis.validators = vec![(43, kp(43).public(), 1)]; // quorum 1 ⇒ self-commit
-        let _node = Node::start(cfg, genesis, Some(kp(43))).await.expect("start node");
+        let _node = Node::start(cfg, genesis, Some(kp(43)))
+            .await
+            .expect("start node");
 
         async fn get(addr: &str, path: &str) -> String {
-            let req = format!("GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
+            let req =
+                format!("GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
             let mut s = TcpStream::connect(addr).await.expect("connect rpc");
             s.write_all(req.as_bytes()).await.expect("send get");
             let mut resp = Vec::new();
@@ -8371,12 +9534,22 @@ mod tests {
 
         let v = env!("CARGO_PKG_VERSION");
         let resp = get(rpc_addr, "/version").await;
-        assert!(resp.starts_with("HTTP/1.1 200 OK"), "version status: {resp}");
+        assert!(
+            resp.starts_with("HTTP/1.1 200 OK"),
+            "version status: {resp}"
+        );
         assert_eq!(body_of(&resp), format!("version={v}"), "version text");
 
         let as_json = get(rpc_addr, "/version?format=json").await;
-        assert!(as_json.contains("Content-Type: application/json\r\n"), "json ct: {as_json}");
-        assert_eq!(body_of(&as_json), format!("{{\"version\":\"{v}\"}}"), "version JSON");
+        assert!(
+            as_json.contains("Content-Type: application/json\r\n"),
+            "json ct: {as_json}"
+        );
+        assert_eq!(
+            body_of(&as_json),
+            format!("{{\"version\":\"{v}\"}}"),
+            "version JSON"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -8389,14 +9562,23 @@ mod tests {
         // node_config p2p listen = 20691 + (41-21) = 20711; keep the RPC port clear.
         let mut cfg = node_config(41, 20691, &[41], dir.clone());
         let rpc_addr = "127.0.0.1:20721";
-        cfg.rpc = Some(crate::config::RpcConfig { enabled: true, listen: rpc_addr.into() });
+        cfg.rpc = Some(crate::config::RpcConfig {
+            enabled: true,
+            listen: rpc_addr.into(),
+        });
         let mut genesis = test_genesis();
         genesis.validators = vec![(41, kp(41).public(), 1)]; // quorum 1 ⇒ self-commit
-        let _node = Node::start(cfg, genesis, Some(kp(41))).await.expect("start node");
+        let _node = Node::start(cfg, genesis, Some(kp(41)))
+            .await
+            .expect("start node");
 
         async fn req(addr: &str, path: &str, inm: Option<&str>) -> String {
-            let cond = inm.map(|v| format!("If-None-Match: {v}\r\n")).unwrap_or_default();
-            let r = format!("GET {path} HTTP/1.1\r\nHost: localhost\r\n{cond}Connection: close\r\n\r\n");
+            let cond = inm
+                .map(|v| format!("If-None-Match: {v}\r\n"))
+                .unwrap_or_default();
+            let r = format!(
+                "GET {path} HTTP/1.1\r\nHost: localhost\r\n{cond}Connection: close\r\n\r\n"
+            );
             let mut s = TcpStream::connect(addr).await.expect("connect rpc");
             s.write_all(r.as_bytes()).await.expect("send");
             let mut resp = Vec::new();
@@ -8415,21 +9597,42 @@ mod tests {
 
         // First read: 200 + an ETag + the body.
         let first = req(rpc_addr, "/genesis", None).await;
-        assert!(first.starts_with("HTTP/1.1 200 OK"), "first status: {first}");
+        assert!(
+            first.starts_with("HTTP/1.1 200 OK"),
+            "first status: {first}"
+        );
         let etag = etag_of(&first);
-        assert!(etag.starts_with('"') && etag.ends_with('"'), "quoted etag: {etag}");
-        assert!(body_of(&first).starts_with("genesis_hash="), "first body: {first}");
+        assert!(
+            etag.starts_with('"') && etag.ends_with('"'),
+            "quoted etag: {etag}"
+        );
+        assert!(
+            body_of(&first).starts_with("genesis_hash="),
+            "first body: {first}"
+        );
 
         // Conditional re-read with the matching validator → 304 Not Modified, no body.
         let again = req(rpc_addr, "/genesis", Some(&etag)).await;
-        assert!(again.starts_with("HTTP/1.1 304 Not Modified"), "conditional status: {again}");
-        assert!(again.contains(&format!("ETag: {etag}\r\n")), "304 repeats etag: {again}");
+        assert!(
+            again.starts_with("HTTP/1.1 304 Not Modified"),
+            "conditional status: {again}"
+        );
+        assert!(
+            again.contains(&format!("ETag: {etag}\r\n")),
+            "304 repeats etag: {again}"
+        );
         assert_eq!(body_of(&again), "", "304 carries no body");
 
         // A stale validator → the full 200 body again.
         let stale = req(rpc_addr, "/genesis", Some("\"stale\"")).await;
-        assert!(stale.starts_with("HTTP/1.1 200 OK"), "stale status: {stale}");
-        assert!(body_of(&stale).starts_with("genesis_hash="), "stale body served: {stale}");
+        assert!(
+            stale.starts_with("HTTP/1.1 200 OK"),
+            "stale status: {stale}"
+        );
+        assert!(
+            body_of(&stale).starts_with("genesis_hash="),
+            "stale body served: {stale}"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -8444,22 +9647,31 @@ mod tests {
         // keep the RPC port clear of it.
         let mut cfg = node_config(33, 20431, &[33], dir.clone());
         let rpc_addr = "127.0.0.1:20451";
-        cfg.rpc = Some(crate::config::RpcConfig { enabled: true, listen: rpc_addr.into() });
+        cfg.rpc = Some(crate::config::RpcConfig {
+            enabled: true,
+            listen: rpc_addr.into(),
+        });
         let mut genesis = test_genesis();
         genesis.validators = vec![(33, kp(33).public(), 1)]; // quorum 1 ⇒ self-commit
-        let node = Node::start(cfg, genesis, Some(kp(33))).await.expect("start node");
+        let node = Node::start(cfg, genesis, Some(kp(33)))
+            .await
+            .expect("start node");
 
         let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
         loop {
             if node.status().await.map(|(h, _)| h >= 1).unwrap_or(false) {
                 break;
             }
-            assert!(tokio::time::Instant::now() < deadline, "node never produced a block");
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "node never produced a block"
+            );
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
 
         async fn req(addr: &str, method: &str, path: &str) -> String {
-            let r = format!("{method} {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
+            let r =
+                format!("{method} {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
             let mut s = TcpStream::connect(addr).await.expect("connect rpc");
             s.write_all(r.as_bytes()).await.expect("send");
             let mut resp = Vec::new();
@@ -8477,9 +9689,18 @@ mod tests {
             let (head_headers, head_body) = split(&head);
 
             // Same status + headers (incl. the GET body's Content-Length), byte-identical.
-            assert!(get.starts_with("HTTP/1.1 200 OK"), "GET {path} status: {get}");
-            assert!(head.starts_with("HTTP/1.1 200 OK"), "HEAD {path} status: {head}");
-            assert_eq!(head_headers, get_headers, "HEAD {path} must mirror GET headers");
+            assert!(
+                get.starts_with("HTTP/1.1 200 OK"),
+                "GET {path} status: {get}"
+            );
+            assert!(
+                head.starts_with("HTTP/1.1 200 OK"),
+                "HEAD {path} status: {head}"
+            );
+            assert_eq!(
+                head_headers, get_headers,
+                "HEAD {path} must mirror GET headers"
+            );
             assert!(
                 head_headers.contains(&format!("Content-Length: {}\r\n", get_body.len())),
                 "HEAD {path} Content-Length must advertise the GET body ({} bytes): {head_headers}",
@@ -8501,22 +9722,32 @@ mod tests {
         // node_config p2p listen = 20461 + (34-21) = 20474; keep the RPC port clear.
         let mut cfg = node_config(34, 20461, &[34], dir.clone());
         let rpc_addr = "127.0.0.1:20481";
-        cfg.rpc = Some(crate::config::RpcConfig { enabled: true, listen: rpc_addr.into() });
+        cfg.rpc = Some(crate::config::RpcConfig {
+            enabled: true,
+            listen: rpc_addr.into(),
+        });
         let mut genesis = test_genesis();
         genesis.validators = vec![(34, kp(34).public(), 1)]; // quorum 1 ⇒ self-commit
-        let node = Node::start(cfg, genesis, Some(kp(34))).await.expect("start node");
+        let node = Node::start(cfg, genesis, Some(kp(34)))
+            .await
+            .expect("start node");
 
         let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
         loop {
             if node.status().await.map(|(h, _)| h >= 1).unwrap_or(false) {
                 break;
             }
-            assert!(tokio::time::Instant::now() < deadline, "node never produced a block");
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "node never produced a block"
+            );
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
 
         async fn req(addr: &str, method: &str, path: &str, extra: &str) -> String {
-            let r = format!("{method} {path} HTTP/1.1\r\nHost: localhost\r\n{extra}Connection: close\r\n\r\n");
+            let r = format!(
+                "{method} {path} HTTP/1.1\r\nHost: localhost\r\n{extra}Connection: close\r\n\r\n"
+            );
             let mut s = TcpStream::connect(addr).await.expect("connect rpc");
             s.write_all(r.as_bytes()).await.expect("send");
             let mut resp = Vec::new();
@@ -8529,16 +9760,34 @@ mod tests {
 
         for path in ["/accounts", "/"] {
             let resp = req(rpc_addr, "OPTIONS", path, "").await;
-            assert!(resp.starts_with("HTTP/1.1 204 No Content\r\n"), "OPTIONS {path}: {resp}");
-            assert!(resp.contains("Allow: GET, HEAD, OPTIONS, POST\r\n"), "OPTIONS {path} Allow: {resp}");
+            assert!(
+                resp.starts_with("HTTP/1.1 204 No Content\r\n"),
+                "OPTIONS {path}: {resp}"
+            );
+            assert!(
+                resp.contains("Allow: GET, HEAD, OPTIONS, POST\r\n"),
+                "OPTIONS {path} Allow: {resp}"
+            );
             assert_eq!(body_of(&resp), "", "OPTIONS {path} must not send a body");
         }
 
         // OPTIONS is answered before content negotiation: a hostile `Accept` that would make a
         // GET return `406` still yields the 204 capabilities response.
-        let hostile = req(rpc_addr, "OPTIONS", "/accounts", "Accept: application/xml\r\n").await;
-        assert!(hostile.starts_with("HTTP/1.1 204 No Content\r\n"), "OPTIONS ignores Accept: {hostile}");
-        assert!(hostile.contains("Allow: GET, HEAD, OPTIONS, POST\r\n"), "{hostile}");
+        let hostile = req(
+            rpc_addr,
+            "OPTIONS",
+            "/accounts",
+            "Accept: application/xml\r\n",
+        )
+        .await;
+        assert!(
+            hostile.starts_with("HTTP/1.1 204 No Content\r\n"),
+            "OPTIONS ignores Accept: {hostile}"
+        );
+        assert!(
+            hostile.contains("Allow: GET, HEAD, OPTIONS, POST\r\n"),
+            "{hostile}"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -8552,17 +9801,25 @@ mod tests {
         // node_config p2p listen = 20491 + (35-21) = 20505; keep the RPC port clear.
         let mut cfg = node_config(35, 20491, &[35], dir.clone());
         let rpc_addr = "127.0.0.1:20511";
-        cfg.rpc = Some(crate::config::RpcConfig { enabled: true, listen: rpc_addr.into() });
+        cfg.rpc = Some(crate::config::RpcConfig {
+            enabled: true,
+            listen: rpc_addr.into(),
+        });
         let mut genesis = test_genesis();
         genesis.validators = vec![(35, kp(35).public(), 1)]; // quorum 1 ⇒ self-commit
-        let node = Node::start(cfg, genesis, Some(kp(35))).await.expect("start node");
+        let node = Node::start(cfg, genesis, Some(kp(35)))
+            .await
+            .expect("start node");
 
         let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
         loop {
             if node.status().await.map(|(h, _)| h >= 1).unwrap_or(false) {
                 break;
             }
-            assert!(tokio::time::Instant::now() < deadline, "node never produced a block");
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "node never produced a block"
+            );
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
 
@@ -8572,8 +9829,15 @@ mod tests {
         let mut resp = Vec::new();
         s.read_to_end(&mut resp).await.expect("read response");
         let resp = String::from_utf8_lossy(&resp);
-        assert!(resp.starts_with("HTTP/1.1 200 OK"), "PUT falls back to health probe: {resp}");
-        assert_eq!(resp.split_once("\r\n\r\n").map(|(_, b)| b), Some("ok"), "probe body: {resp}");
+        assert!(
+            resp.starts_with("HTTP/1.1 200 OK"),
+            "PUT falls back to health probe: {resp}"
+        );
+        assert_eq!(
+            resp.split_once("\r\n\r\n").map(|(_, b)| b),
+            Some("ok"),
+            "probe body: {resp}"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -8587,22 +9851,31 @@ mod tests {
         let dir = tmp_dir("rpc-plain-entities");
         let mut cfg = node_config(21, 20131, &[21], dir.clone());
         let rpc_addr = "127.0.0.1:20141";
-        cfg.rpc = Some(crate::config::RpcConfig { enabled: true, listen: rpc_addr.into() });
+        cfg.rpc = Some(crate::config::RpcConfig {
+            enabled: true,
+            listen: rpc_addr.into(),
+        });
         let mut genesis = test_genesis();
         genesis.validators = vec![(21, kp(21).public(), 1)];
-        let node = Node::start(cfg, genesis, Some(kp(21))).await.expect("start node");
+        let node = Node::start(cfg, genesis, Some(kp(21)))
+            .await
+            .expect("start node");
 
         let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
         loop {
             if node.status().await.map(|(h, _)| h >= 1).unwrap_or(false) {
                 break;
             }
-            assert!(tokio::time::Instant::now() < deadline, "node never produced a block");
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "node never produced a block"
+            );
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
 
         async fn get(addr: &str, path: &str) -> String {
-            let req = format!("GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
+            let req =
+                format!("GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
             let mut s = TcpStream::connect(addr).await.expect("connect rpc");
             s.write_all(req.as_bytes()).await.expect("send get");
             let mut resp = Vec::new();
@@ -8616,18 +9889,33 @@ mod tests {
         // Reviewer 10 (reputation 1.0).
         let rev = get(rpc_addr, "/reviewer/10").await;
         assert!(rev.starts_with("HTTP/1.1 200 OK"), "reviewer status: {rev}");
-        assert!(body_of(&rev).contains("kind=reviewer id=10"), "reviewer body: {rev}");
-        assert!(body_of(&rev).contains("reputation=1"), "reviewer body: {rev}");
+        assert!(
+            body_of(&rev).contains("kind=reviewer id=10"),
+            "reviewer body: {rev}"
+        );
+        assert!(
+            body_of(&rev).contains("reputation=1"),
+            "reviewer body: {rev}"
+        );
 
         // Validator 21 (power 1, the only one in this single-validator genesis).
         let val = get(rpc_addr, "/validator/21").await;
-        assert!(val.starts_with("HTTP/1.1 200 OK"), "validator status: {val}");
-        assert!(body_of(&val).contains("kind=validator id=21 power=1"), "validator body: {val}");
+        assert!(
+            val.starts_with("HTTP/1.1 200 OK"),
+            "validator status: {val}"
+        );
+        assert!(
+            body_of(&val).contains("kind=validator id=21 power=1"),
+            "validator body: {val}"
+        );
 
         // Graph node 0 (the seed node, domain 0).
         let gr = get(rpc_addr, "/graph/0").await;
         assert!(gr.starts_with("HTTP/1.1 200 OK"), "graph status: {gr}");
-        assert!(body_of(&gr).contains("kind=graph node_id=0 domain=0"), "graph body: {gr}");
+        assert!(
+            body_of(&gr).contains("kind=graph node_id=0 domain=0"),
+            "graph body: {gr}"
+        );
 
         // Unknown reviewer id → 404.
         let miss = get(rpc_addr, "/reviewer/999").await;
@@ -8642,15 +9930,30 @@ mod tests {
         // addressed by insertion index. A non-numeric or empty id is NotFound (404);
         // a bare id is the M65 plain read (below). M59's account routes and the M58
         // health fallback are unaffected.
-        assert!(matches!(route_get("/reviewer/10/proof"), GetRoute::Proof(ProofKind::Reviewer, 10)));
-        assert!(matches!(route_get("/validator/21/proof"), GetRoute::Proof(ProofKind::Validator, 21)));
-        assert!(matches!(route_get("/graph/0/proof"), GetRoute::Proof(ProofKind::GraphNode, 0)));
+        assert!(matches!(
+            route_get("/reviewer/10/proof"),
+            GetRoute::Proof(ProofKind::Reviewer, 10)
+        ));
+        assert!(matches!(
+            route_get("/validator/21/proof"),
+            GetRoute::Proof(ProofKind::Validator, 21)
+        ));
+        assert!(matches!(
+            route_get("/graph/0/proof"),
+            GetRoute::Proof(ProofKind::GraphNode, 0)
+        ));
         assert!(matches!(route_get("/reviewer/x/proof"), GetRoute::NotFound));
         // M65: a bare id is now the plain read (was NotFound through M64).
-        assert!(matches!(route_get("/validator/21"), GetRoute::Plain(ProofKind::Validator, 21)));
+        assert!(matches!(
+            route_get("/validator/21"),
+            GetRoute::Plain(ProofKind::Validator, 21)
+        ));
         assert!(matches!(route_get("/graph//proof"), GetRoute::NotFound));
         // M59 account routes still resolve to their own variants.
-        assert!(matches!(route_get("/account/7/proof"), GetRoute::AccountProof(7)));
+        assert!(matches!(
+            route_get("/account/7/proof"),
+            GetRoute::AccountProof(7)
+        ));
         assert!(matches!(route_get("/account/7"), GetRoute::Account(7)));
         assert!(matches!(route_get("/"), GetRoute::Health));
     }
@@ -8660,11 +9963,23 @@ mod tests {
         // M65: a bare `/{reviewer,validator,graph}/{id}` is the plain (unverified) read,
         // the non-proof sibling of `/account/{id}`. The M60 `/proof` form still resolves
         // to `Proof`; a non-numeric or empty id is still NotFound (404).
-        assert!(matches!(route_get("/reviewer/10"), GetRoute::Plain(ProofKind::Reviewer, 10)));
-        assert!(matches!(route_get("/validator/21"), GetRoute::Plain(ProofKind::Validator, 21)));
-        assert!(matches!(route_get("/graph/0"), GetRoute::Plain(ProofKind::GraphNode, 0)));
+        assert!(matches!(
+            route_get("/reviewer/10"),
+            GetRoute::Plain(ProofKind::Reviewer, 10)
+        ));
+        assert!(matches!(
+            route_get("/validator/21"),
+            GetRoute::Plain(ProofKind::Validator, 21)
+        ));
+        assert!(matches!(
+            route_get("/graph/0"),
+            GetRoute::Plain(ProofKind::GraphNode, 0)
+        ));
         // No M60 regression.
-        assert!(matches!(route_get("/reviewer/10/proof"), GetRoute::Proof(ProofKind::Reviewer, 10)));
+        assert!(matches!(
+            route_get("/reviewer/10/proof"),
+            GetRoute::Proof(ProofKind::Reviewer, 10)
+        ));
         // Bad ids.
         assert!(matches!(route_get("/reviewer/x"), GetRoute::NotFound));
         assert!(matches!(route_get("/graph/"), GetRoute::NotFound));
@@ -8673,14 +9988,25 @@ mod tests {
     #[test]
     fn format_entity_renders() {
         // M65: each entity kind renders to a grep-friendly `key=value` line.
-        let r = format_entity(&EntityView::Reviewer { id: 10, reputation: 1.0 });
+        let r = format_entity(&EntityView::Reviewer {
+            id: 10,
+            reputation: 1.0,
+        });
         assert_eq!(r, "kind=reviewer id=10 reputation=1");
-        let v = format_entity(&EntityView::Validator { id: 21, power: 5, pubkey: [0xAB; 32] });
+        let v = format_entity(&EntityView::Validator {
+            id: 21,
+            power: 5,
+            pubkey: [0xAB; 32],
+        });
         assert!(v.starts_with("kind=validator id=21 power=5 pubkey="), "{v}");
         assert!(v.contains(&crate::hash::hex(&[0xABu8; 32])), "{v}");
         let mut emb = [0.0f32; crate::DIM];
         emb[0] = 1.0;
-        let g = format_entity(&EntityView::GraphNode { node_id: 3, domain: 7, embedding: emb });
+        let g = format_entity(&EntityView::GraphNode {
+            node_id: 3,
+            domain: 7,
+            embedding: emb,
+        });
         assert!(g.starts_with("kind=graph node_id=3 domain=7 "), "{g}");
         assert!(g.contains(&format!("dim={}", crate::DIM)), "{g}");
         assert!(g.contains("embedding=1,0"), "{g}");
@@ -8690,9 +10016,15 @@ mod tests {
     fn split_query_splits() {
         // M66: the query is split off at the first `?`; a query-less target leaves the
         // path byte-identical (so pre-M66 routing/responses are unchanged).
-        assert_eq!(split_query("/account/10?format=json"), ("/account/10", "format=json"));
+        assert_eq!(
+            split_query("/account/10?format=json"),
+            ("/account/10", "format=json")
+        );
         assert_eq!(split_query("/head"), ("/head", ""));
-        assert_eq!(split_query("/bridge/locks?a=1&format=json"), ("/bridge/locks", "a=1&format=json"));
+        assert_eq!(
+            split_query("/bridge/locks?a=1&format=json"),
+            ("/bridge/locks", "a=1&format=json")
+        );
         assert_eq!(split_query("/height?"), ("/height", ""));
     }
 
@@ -8710,7 +10042,10 @@ mod tests {
         // Not the first pair.
         assert_eq!(response_format("a=1&format=json"), Some(RespFormat::Json));
         // First `format=` wins — a later duplicate does not override it.
-        assert_eq!(response_format("format=text&format=json"), Some(RespFormat::Text));
+        assert_eq!(
+            response_format("format=text&format=json"),
+            Some(RespFormat::Text)
+        );
     }
 
     #[test]
@@ -8737,7 +10072,10 @@ mod tests {
         assert_eq!(paginate(&items, 2, None), &[2, 3, 4]); // tail
         assert_eq!(paginate(&items, 10, Some(3)), &[] as &[i32]); // offset past end
         assert_eq!(paginate(&items, 0, Some(99)), &items[..]); // limit clamps to len
-        assert_eq!(paginate(&items, usize::MAX, Some(usize::MAX)), &[] as &[i32]); // no overflow
+        assert_eq!(
+            paginate(&items, usize::MAX, Some(usize::MAX)),
+            &[] as &[i32]
+        ); // no overflow
     }
 
     #[test]
@@ -8762,7 +10100,10 @@ mod tests {
             json_page("[{\"x\":1}]", 3, Some(2)),
             "{\"total\":\"3\",\"next\":\"2\",\"items\":[{\"x\":1}]}"
         );
-        assert_eq!(format_page("lock_id=0 …", 3, Some(2)), "total=3\nnext=2\nlock_id=0 …");
+        assert_eq!(
+            format_page("lock_id=0 …", 3, Some(2)),
+            "total=3\nnext=2\nlock_id=0 …"
+        );
 
         // Last page (window reaches the end): `next = None`.
         assert_eq!(
@@ -8773,7 +10114,10 @@ mod tests {
 
         // Empty page: JSON keeps the `items:[]` array; text is exactly `total=0`
         // (no `next=` line, no trailing newline).
-        assert_eq!(json_page("[]", 0, None), "{\"total\":\"0\",\"next\":null,\"items\":[]}");
+        assert_eq!(
+            json_page("[]", 0, None),
+            "{\"total\":\"0\",\"next\":null,\"items\":[]}"
+        );
         assert_eq!(format_page("", 0, None), "total=0");
     }
 
@@ -8891,7 +10235,10 @@ mod tests {
         // representation we can emit (RFC 7231 §6.5.6), from the single OFFERED_MEDIA_TYPES
         // source of truth.
         let body = not_acceptable_json();
-        assert_eq!(body, "{\"error\":\"not_acceptable\",\"available\":[\"application/json\",\"text/plain\"]}");
+        assert_eq!(
+            body,
+            "{\"error\":\"not_acceptable\",\"available\":[\"application/json\",\"text/plain\"]}"
+        );
         assert!(body.contains("application/json"));
         assert!(body.contains("text/plain"));
         // JSON is listed first (it wins the negotiation q-tie when named).
@@ -8960,11 +10307,23 @@ mod tests {
         let body = not_acceptable_encoding_json();
         let full = http_response_ct("406 Not Acceptable", "application/json", &body);
         let head = maybe_head(true, full);
-        assert!(head.starts_with("HTTP/1.1 406 Not Acceptable\r\n"), "{head}");
-        assert!(head.contains("Content-Type: application/json\r\n"), "{head}");
-        assert!(head.contains(&format!("Content-Length: {}\r\n", body.len())), "{head}");
+        assert!(
+            head.starts_with("HTTP/1.1 406 Not Acceptable\r\n"),
+            "{head}"
+        );
+        assert!(
+            head.contains("Content-Type: application/json\r\n"),
+            "{head}"
+        );
+        assert!(
+            head.contains(&format!("Content-Length: {}\r\n", body.len())),
+            "{head}"
+        );
         assert!(head.ends_with("\r\n\r\n"), "{head}");
-        assert!(!head.contains("available_encodings"), "HEAD must drop the 406 body: {head}");
+        assert!(
+            !head.contains("available_encodings"),
+            "HEAD must drop the 406 body: {head}"
+        );
     }
 
     #[test]
@@ -8973,13 +10332,25 @@ mod tests {
         // (RFC 7231 §7.1.4) so shared caches key on both negotiation inputs, through
         // the single builder.
         let text = http_response("200 OK", "x");
-        assert!(text.contains("\r\nVary: Accept, Accept-Charset, Accept-Encoding\r\n"), "text: {text}");
+        assert!(
+            text.contains("\r\nVary: Accept, Accept-Charset, Accept-Encoding\r\n"),
+            "text: {text}"
+        );
         assert!(text.starts_with("HTTP/1.1 200 OK"), "text status: {text}");
-        assert!(text.contains("Content-Type: text/plain; charset=utf-8\r\n"), "text ct: {text}");
+        assert!(
+            text.contains("Content-Type: text/plain; charset=utf-8\r\n"),
+            "text ct: {text}"
+        );
         let json = http_response_ct("200 OK", "application/json", "{}");
-        assert!(json.contains("\r\nVary: Accept, Accept-Charset, Accept-Encoding\r\n"), "json: {json}");
+        assert!(
+            json.contains("\r\nVary: Accept, Accept-Charset, Accept-Encoding\r\n"),
+            "json: {json}"
+        );
         assert!(json.starts_with("HTTP/1.1 200 OK"), "json status: {json}");
-        assert!(json.contains("Content-Type: application/json\r\n"), "json ct: {json}");
+        assert!(
+            json.contains("Content-Type: application/json\r\n"),
+            "json ct: {json}"
+        );
     }
 
     #[test]
@@ -8998,25 +10369,52 @@ mod tests {
     fn json_account_renders() {
         // M66: u64 fields are JSON *strings* (lossless), pubkey is a hex string. A
         // `u64::MAX` value round-trips exactly as a string, not a lossy JSON number.
-        let a = Account { balance: u64::MAX, pubkey: [0xAB; 32], ..Default::default() };
+        let a = Account {
+            balance: u64::MAX,
+            pubkey: [0xAB; 32],
+            ..Default::default()
+        };
         let j = json_account(7, &a);
         assert!(j.starts_with("{\"id\":\"7\","), "{j}");
         assert!(j.contains("\"balance\":\"18446744073709551615\""), "{j}");
-        assert!(j.contains(&format!("\"pubkey\":\"{}\"", crate::hash::hex(&[0xABu8; 32]))), "{j}");
+        assert!(
+            j.contains(&format!(
+                "\"pubkey\":\"{}\"",
+                crate::hash::hex(&[0xABu8; 32])
+            )),
+            "{j}"
+        );
     }
 
     #[test]
     fn json_entity_renders() {
         // M66: each JSON entity object carries a `"kind"` discriminator; u64 fields are
         // strings, the graph embedding is a JSON array of numbers.
-        let r = json_entity(&EntityView::Reviewer { id: 10, reputation: 1.0 });
+        let r = json_entity(&EntityView::Reviewer {
+            id: 10,
+            reputation: 1.0,
+        });
         assert_eq!(r, "{\"kind\":\"reviewer\",\"id\":\"10\",\"reputation\":1}");
-        let v = json_entity(&EntityView::Validator { id: 21, power: 5, pubkey: [0xAB; 32] });
-        assert!(v.starts_with("{\"kind\":\"validator\",\"id\":\"21\",\"power\":\"5\","), "{v}");
+        let v = json_entity(&EntityView::Validator {
+            id: 21,
+            power: 5,
+            pubkey: [0xAB; 32],
+        });
+        assert!(
+            v.starts_with("{\"kind\":\"validator\",\"id\":\"21\",\"power\":\"5\","),
+            "{v}"
+        );
         let mut emb = [0.0f32; crate::DIM];
         emb[0] = 1.0;
-        let g = json_entity(&EntityView::GraphNode { node_id: 3, domain: 7, embedding: emb });
-        assert!(g.starts_with("{\"kind\":\"graph\",\"node_id\":\"3\",\"domain\":\"7\","), "{g}");
+        let g = json_entity(&EntityView::GraphNode {
+            node_id: 3,
+            domain: 7,
+            embedding: emb,
+        });
+        assert!(
+            g.starts_with("{\"kind\":\"graph\",\"node_id\":\"3\",\"domain\":\"7\","),
+            "{g}"
+        );
         assert!(g.contains(&format!("\"dim\":\"{}\"", crate::DIM)), "{g}");
         assert!(g.contains("\"embedding\":[1,0"), "{g}");
     }
@@ -9035,7 +10433,10 @@ mod tests {
             signature: [0u8; 64],
         };
         let j = json_lock_listing(&[(1, 5, lock)]);
-        assert!(j.starts_with("[{\"lock_id\":\"1\",\"height\":\"5\","), "{j}");
+        assert!(
+            j.starts_with("[{\"lock_id\":\"1\",\"height\":\"5\","),
+            "{j}"
+        );
         assert!(j.contains("\"amount\":\"18446744073709551615\""), "{j}");
         assert!(j.contains("\"nonce\":\"2\"}]"), "{j}");
     }
@@ -9050,8 +10451,16 @@ mod tests {
         assert_eq!(json_validator_listing(&[]), "[]");
 
         let vs = vec![
-            Validator { id: 21, pubkey: [0xAB; 32], power: 5 },
-            Validator { id: 22, pubkey: [0x01; 32], power: u64::MAX },
+            Validator {
+                id: 21,
+                pubkey: [0xAB; 32],
+                power: 5,
+            },
+            Validator {
+                id: 22,
+                pubkey: [0x01; 32],
+                power: u64::MAX,
+            },
         ];
         let hex_ab = crate::hash::hex(&[0xABu8; 32]);
         let hex_01 = crate::hash::hex(&[0x01u8; 32]);
@@ -9092,7 +10501,7 @@ mod tests {
             submissions: 6,
             accepted: 7,
             nonce: 0,
-};
+        };
         let a2 = Account {
             pubkey: [0x01; 32],
             balance: u64::MAX,
@@ -9102,7 +10511,7 @@ mod tests {
             submissions: 0,
             accepted: 0,
             nonce: 0,
-};
+        };
         let accounts = vec![(1u64, a1.clone()), (2u64, a2.clone())];
 
         // Text listing is exactly the per-item lines joined by `\n`.
@@ -9131,12 +10540,20 @@ mod tests {
         // Text listing is exactly the per-item lines joined by `\n`.
         assert_eq!(
             format_reviewer_listing(&reviewers),
-            format!("{}\n{}", format_entity(&ev(10, 1.0)), format_entity(&ev(11, 0.5))),
+            format!(
+                "{}\n{}",
+                format_entity(&ev(10, 1.0)),
+                format_entity(&ev(11, 0.5))
+            ),
         );
         // JSON listing is exactly the per-item objects wrapped in an array.
         assert_eq!(
             json_reviewer_listing(&reviewers),
-            format!("[{},{}]", json_entity(&ev(10, 1.0)), json_entity(&ev(11, 0.5))),
+            format!(
+                "[{},{}]",
+                json_entity(&ev(10, 1.0)),
+                json_entity(&ev(11, 0.5))
+            ),
         );
     }
 
@@ -9153,20 +10570,40 @@ mod tests {
         let mut e1 = [0.0f32; crate::DIM];
         e1[1] = 1.0;
         let nodes = vec![
-            crate::engine::GraphNode { node_id: 0, embedding: e0, domain: 7 },
-            crate::engine::GraphNode { node_id: 1, embedding: e1, domain: 9 },
+            crate::engine::GraphNode {
+                node_id: 0,
+                embedding: e0,
+                domain: 7,
+            },
+            crate::engine::GraphNode {
+                node_id: 1,
+                embedding: e1,
+                domain: 9,
+            },
         ];
-        let ev = |node_id, embedding, domain| EntityView::GraphNode { node_id, domain, embedding };
+        let ev = |node_id, embedding, domain| EntityView::GraphNode {
+            node_id,
+            domain,
+            embedding,
+        };
 
         // Text listing is exactly the per-item lines joined by `\n`.
         assert_eq!(
             format_graph_listing(&nodes),
-            format!("{}\n{}", format_entity(&ev(0, e0, 7)), format_entity(&ev(1, e1, 9))),
+            format!(
+                "{}\n{}",
+                format_entity(&ev(0, e0, 7)),
+                format_entity(&ev(1, e1, 9))
+            ),
         );
         // JSON listing is exactly the per-item objects wrapped in an array.
         assert_eq!(
             json_graph_listing(&nodes),
-            format!("[{},{}]", json_entity(&ev(0, e0, 7)), json_entity(&ev(1, e1, 9))),
+            format!(
+                "[{},{}]",
+                json_entity(&ev(0, e0, 7)),
+                json_entity(&ev(1, e1, 9))
+            ),
         );
     }
 
@@ -9178,7 +10615,10 @@ mod tests {
         // delegates to it with a 404 status line.
         let t = error_body(RespFormat::Text, "422 Unprocessable Entity", "nope");
         assert!(t.starts_with("HTTP/1.1 422 Unprocessable Entity"), "{t}");
-        assert!(t.contains("Content-Type: text/plain; charset=utf-8\r\n"), "{t}");
+        assert!(
+            t.contains("Content-Type: text/plain; charset=utf-8\r\n"),
+            "{t}"
+        );
         assert!(t.ends_with("\r\n\r\nnope"), "{t}");
 
         let j = error_body(RespFormat::Json, "422 Unprocessable Entity", "no\"pe");
@@ -9244,7 +10684,10 @@ mod tests {
         let ch_hex = crate::hash::hex(&crate::codec::encode_certified_header(&ch));
         let entry_hex = crate::hash::hex(&crate::codec::encode_proof_entry(&entry));
         let text = format_account_proof(&ch, &entry);
-        assert!(text.contains(&ch_hex) && text.contains(&entry_hex), "{text}");
+        assert!(
+            text.contains(&ch_hex) && text.contains(&entry_hex),
+            "{text}"
+        );
         assert_eq!(
             json_account_proof(&ch, &entry),
             format!(
@@ -9258,16 +10701,25 @@ mod tests {
         // `json_lock_envelope` (header/commit/validator-set/lock/merkle); the text
         // sibling `format_lock` still carries it as hex.
         let env = node.serve_lock(0).expect("serve_lock");
-        assert_eq!(json_lock(&env), format!("{{\"lock_envelope\":{}}}", json_lock_envelope(&env)));
+        assert_eq!(
+            json_lock(&env),
+            format!("{{\"lock_envelope\":{}}}", json_lock_envelope(&env))
+        );
 
         // Batch (M74/M76/M78): structured `certified_header` + `batch_envelope`;
         // `range_blocks` is now a structured array (here empty — Inclusion-only request
         // carries no Diff range).
         let (bch, benv, range) = node
-            .batch(vec![BatchItem::Inclusion { kind: ProofKind::Reviewer, id: 10 }])
+            .batch(vec![BatchItem::Inclusion {
+                kind: ProofKind::Reviewer,
+                id: 10,
+            }])
             .expect("batch");
         let jb = json_batch(&bch, &benv, &range);
-        assert!(jb.starts_with("{\"certified_header\":{\"header\":{"), "{jb}");
+        assert!(
+            jb.starts_with("{\"certified_header\":{\"header\":{"),
+            "{jb}"
+        );
         assert!(jb.contains("\"batch_envelope\":{\"items\":["), "{jb}");
         assert!(jb.contains("\"range_blocks\":[]"), "{jb}");
         assert!(jb.ends_with("]}"), "{jb}");
@@ -9277,11 +10729,23 @@ mod tests {
     fn route_get_parses_bridge_lock() {
         // M63: `/bridge/lock/{id}/proof` is the only form — a bridge lock has no
         // plain-read route, so a bare id or a non-numeric id is NotFound (404).
-        assert!(matches!(route_get("/bridge/lock/0/proof"), GetRoute::BridgeLock(0)));
-        assert!(matches!(route_get("/bridge/lock/42/proof"), GetRoute::BridgeLock(42)));
+        assert!(matches!(
+            route_get("/bridge/lock/0/proof"),
+            GetRoute::BridgeLock(0)
+        ));
+        assert!(matches!(
+            route_get("/bridge/lock/42/proof"),
+            GetRoute::BridgeLock(42)
+        ));
         assert!(matches!(route_get("/bridge/lock/0"), GetRoute::NotFound));
-        assert!(matches!(route_get("/bridge/lock/abc/proof"), GetRoute::NotFound));
-        assert!(matches!(route_get("/bridge/lock//proof"), GetRoute::NotFound));
+        assert!(matches!(
+            route_get("/bridge/lock/abc/proof"),
+            GetRoute::NotFound
+        ));
+        assert!(matches!(
+            route_get("/bridge/lock//proof"),
+            GetRoute::NotFound
+        ));
     }
 
     #[test]
@@ -9293,7 +10757,10 @@ mod tests {
         assert!(matches!(route_get("/bridge/locks"), GetRoute::BridgeLocks));
         assert!(matches!(route_get("/bridge/locks/"), GetRoute::Health));
         // M63 single-lock route still resolves to its own variant (no regression).
-        assert!(matches!(route_get("/bridge/lock/0/proof"), GetRoute::BridgeLock(0)));
+        assert!(matches!(
+            route_get("/bridge/lock/0/proof"),
+            GetRoute::BridgeLock(0)
+        ));
         assert!(matches!(route_get("/bridge/lock/0"), GetRoute::NotFound));
     }
 
@@ -9306,8 +10773,14 @@ mod tests {
         assert!(matches!(route_get("/validators"), GetRoute::Validators));
         assert!(matches!(route_get("/validators/"), GetRoute::Health));
         // M60/M65 single-validator routes still resolve to their own variants.
-        assert!(matches!(route_get("/validator/21"), GetRoute::Plain(ProofKind::Validator, 21)));
-        assert!(matches!(route_get("/validator/21/proof"), GetRoute::Proof(ProofKind::Validator, 21)));
+        assert!(matches!(
+            route_get("/validator/21"),
+            GetRoute::Plain(ProofKind::Validator, 21)
+        ));
+        assert!(matches!(
+            route_get("/validator/21/proof"),
+            GetRoute::Proof(ProofKind::Validator, 21)
+        ));
     }
 
     #[test]
@@ -9320,7 +10793,10 @@ mod tests {
         assert!(matches!(route_get("/accounts/"), GetRoute::Health));
         // M58/M59 single-account routes still resolve to their own variants.
         assert!(matches!(route_get("/account/7"), GetRoute::Account(7)));
-        assert!(matches!(route_get("/account/7/proof"), GetRoute::AccountProof(7)));
+        assert!(matches!(
+            route_get("/account/7/proof"),
+            GetRoute::AccountProof(7)
+        ));
     }
 
     #[test]
@@ -9331,8 +10807,14 @@ mod tests {
         assert!(matches!(route_get("/reviewers"), GetRoute::Reviewers));
         assert!(matches!(route_get("/reviewers/"), GetRoute::Health));
         // M65/M60 single-reviewer routes still resolve to their own variants.
-        assert!(matches!(route_get("/reviewer/10"), GetRoute::Plain(ProofKind::Reviewer, 10)));
-        assert!(matches!(route_get("/reviewer/10/proof"), GetRoute::Proof(ProofKind::Reviewer, 10)));
+        assert!(matches!(
+            route_get("/reviewer/10"),
+            GetRoute::Plain(ProofKind::Reviewer, 10)
+        ));
+        assert!(matches!(
+            route_get("/reviewer/10/proof"),
+            GetRoute::Proof(ProofKind::Reviewer, 10)
+        ));
     }
 
     #[test]
@@ -9343,8 +10825,14 @@ mod tests {
         assert!(matches!(route_get("/graph"), GetRoute::GraphNodes));
         assert!(matches!(route_get("/graph/"), GetRoute::NotFound));
         // M65/M60 single-node routes still resolve to their own variants.
-        assert!(matches!(route_get("/graph/0"), GetRoute::Plain(ProofKind::GraphNode, 0)));
-        assert!(matches!(route_get("/graph/0/proof"), GetRoute::Proof(ProofKind::GraphNode, 0)));
+        assert!(matches!(
+            route_get("/graph/0"),
+            GetRoute::Plain(ProofKind::GraphNode, 0)
+        ));
+        assert!(matches!(
+            route_get("/graph/0/proof"),
+            GetRoute::Proof(ProofKind::GraphNode, 0)
+        ));
     }
 
     #[test]
@@ -9377,7 +10865,10 @@ mod tests {
 {\"kind\":\"bond\",\"validator_id\":\"9\",\"bonded\":\"500000\"}]"
         );
         // Single-item renderers match what the listing emits per entry.
-        assert_eq!(format_bond(7, 3_000_000), "kind=bond validator_id=7 bonded=3000000");
+        assert_eq!(
+            format_bond(7, 3_000_000),
+            "kind=bond validator_id=7 bonded=3000000"
+        );
         assert_eq!(
             json_bond(9, 500_000),
             "{\"kind\":\"bond\",\"validator_id\":\"9\",\"bonded\":\"500000\"}"
@@ -9405,8 +10896,16 @@ mod tests {
         // and a JSON array of `kind=unbonding` objects with lossless quoted-u64 scalars; the
         // empty queue yields an empty text body and `[]`.
         let queue = vec![
-            crate::UnbondingEntry { account: 7, amount: 3_000_000, mature_height: 12 },
-            crate::UnbondingEntry { account: 9, amount: 500_000, mature_height: 15 },
+            crate::UnbondingEntry {
+                account: 7,
+                amount: 3_000_000,
+                mature_height: 12,
+            },
+            crate::UnbondingEntry {
+                account: 9,
+                amount: 500_000,
+                mature_height: 15,
+            },
         ];
         let text = format_unbonding_listing(&queue);
         assert_eq!(
@@ -9421,7 +10920,10 @@ kind=unbonding account=9 amount=500000 mature_height=15"
 {\"kind\":\"unbonding\",\"account\":\"9\",\"amount\":\"500000\",\"mature_height\":\"15\"}]"
         );
         // Single-item renderers match what the listing emits per entry.
-        assert_eq!(format_unbonding(&queue[0]), "kind=unbonding account=7 amount=3000000 mature_height=12");
+        assert_eq!(
+            format_unbonding(&queue[0]),
+            "kind=unbonding account=7 amount=3000000 mature_height=12"
+        );
         assert_eq!(
             json_unbonding(&queue[1]),
             "{\"kind\":\"unbonding\",\"account\":\"9\",\"amount\":\"500000\",\"mature_height\":\"15\"}"
@@ -9556,9 +11058,18 @@ vote_b.validator=5 vote_b.height=9 vote_b.round=2 vote_b.block_hash={b_h} vote_b
             GetRoute::MempoolContains(bytes) => assert_eq!(bytes, [0xabu8; 32]),
             _ => panic!("expected MempoolContains for a valid 64-hex hash"),
         }
-        assert!(matches!(route_get("/mempool/xyz"), GetRoute::NotFound), "non-hex ⇒ 404");
-        assert!(matches!(route_get("/mempool/abcd"), GetRoute::NotFound), "short ⇒ 404");
-        assert!(matches!(route_get("/mempool/"), GetRoute::NotFound), "empty hash ⇒ 404");
+        assert!(
+            matches!(route_get("/mempool/xyz"), GetRoute::NotFound),
+            "non-hex ⇒ 404"
+        );
+        assert!(
+            matches!(route_get("/mempool/abcd"), GetRoute::NotFound),
+            "short ⇒ 404"
+        );
+        assert!(
+            matches!(route_get("/mempool/"), GetRoute::NotFound),
+            "empty hash ⇒ 404"
+        );
         // M111: a bare `/mempool` (no hash) is now the pending-tx directory, not the health
         // catch-all — the membership read lives only under the `/mempool/{hash}` prefix.
         assert!(matches!(route_get("/mempool"), GetRoute::MempoolList));
@@ -9583,7 +11094,10 @@ vote_b.validator=5 vote_b.height=9 vote_b.round=2 vote_b.block_hash={b_h} vote_b
         // stays the M103 membership read; a malformed hash under the prefix ⇒ 404.
         assert!(matches!(route_get("/mempool"), GetRoute::MempoolList));
         let h = crate::hash::hex(&[0x5au8; 32]);
-        assert!(matches!(route_get(&format!("/mempool/{h}")), GetRoute::MempoolContains(_)));
+        assert!(matches!(
+            route_get(&format!("/mempool/{h}")),
+            GetRoute::MempoolContains(_)
+        ));
         assert!(matches!(route_get("/mempool/bad"), GetRoute::NotFound));
     }
 
@@ -9595,8 +11109,14 @@ vote_b.validator=5 vote_b.height=9 vote_b.round=2 vote_b.block_hash={b_h} vote_b
             GetRoute::TxHeight(bytes) => assert_eq!(bytes, [0x9au8; 32]),
             _ => panic!("expected TxHeight for a valid 64-hex hash"),
         }
-        assert!(matches!(route_get("/tx/bad"), GetRoute::NotFound), "non-hex ⇒ 404");
-        assert!(matches!(route_get("/tx/"), GetRoute::NotFound), "empty hash ⇒ 404");
+        assert!(
+            matches!(route_get("/tx/bad"), GetRoute::NotFound),
+            "non-hex ⇒ 404"
+        );
+        assert!(
+            matches!(route_get("/tx/"), GetRoute::NotFound),
+            "empty hash ⇒ 404"
+        );
     }
 
     #[test]
@@ -9613,8 +11133,14 @@ vote_b.validator=5 vote_b.height=9 vote_b.round=2 vote_b.block_hash={b_h} vote_b
         // M113: `/block/{height}` parses a u64 height; non-numeric or empty ⇒ 404.
         assert!(matches!(route_get("/block/7"), GetRoute::Block(7)));
         assert!(matches!(route_get("/block/0"), GetRoute::Block(0)));
-        assert!(matches!(route_get("/block/abc"), GetRoute::NotFound), "non-numeric ⇒ 404");
-        assert!(matches!(route_get("/block/"), GetRoute::NotFound), "empty ⇒ 404");
+        assert!(
+            matches!(route_get("/block/abc"), GetRoute::NotFound),
+            "non-numeric ⇒ 404"
+        );
+        assert!(
+            matches!(route_get("/block/"), GetRoute::NotFound),
+            "empty ⇒ 404"
+        );
     }
 
     #[test]
@@ -9654,7 +11180,10 @@ vote_b.validator=5 vote_b.height=9 vote_b.round=2 vote_b.block_hash={b_h} vote_b
         assert!(matches!(route_get("/block/7/txs"), GetRoute::BlockTxs(7)));
         assert!(matches!(route_get("/block/0/txs"), GetRoute::BlockTxs(0)));
         assert!(matches!(route_get("/block/7"), GetRoute::Block(7)));
-        assert!(matches!(route_get("/block/abc/txs"), GetRoute::NotFound), "non-numeric ⇒ 404");
+        assert!(
+            matches!(route_get("/block/abc/txs"), GetRoute::NotFound),
+            "non-numeric ⇒ 404"
+        );
     }
 
     #[test]
@@ -9700,7 +11229,10 @@ vote_b.validator=5 vote_b.height=9 vote_b.round=2 vote_b.block_hash={b_h} vote_b
             )
         );
         // Single-item renderers match the listing's per-entry output.
-        assert_eq!(format_pending_tx(&a, 7), format!("kind=pending_tx hash={ah} author=7"));
+        assert_eq!(
+            format_pending_tx(&a, 7),
+            format!("kind=pending_tx hash={ah} author=7")
+        );
         // Empty pool ⇒ empty text, `[]` JSON.
         assert_eq!(format_mempool_listing(&[]), "");
         assert_eq!(json_mempool_listing(&[]), "[]");
@@ -9762,7 +11294,10 @@ vote_b.validator=5 vote_b.height=9 vote_b.round=2 vote_b.block_hash={b_h} vote_b
             delta_k_min: 0.0,
         };
         let text = format_params(&p);
-        assert!(text.starts_with("base_emission_micro=1000\nslash_bps=500\n"), "{text}");
+        assert!(
+            text.starts_with("base_emission_micro=1000\nslash_bps=500\n"),
+            "{text}"
+        );
         assert!(text.contains("tau_dup=0.95\n"), "{text}");
         assert!(text.contains("n_review_min=3\n"), "{text}");
         assert!(text.contains("n_min=5\n"), "{text}");
@@ -9811,8 +11346,14 @@ vote_b.validator=5 vote_b.height=9 vote_b.round=2 vote_b.block_hash={b_h} vote_b
         assert!(json.contains("\"role\":\"validator\""), "{json}");
         assert!(json.contains("\"propose_timeout_ms\":\"1000\""), "{json}");
         assert!(json.contains("\"create_empty_blocks\":true"), "{json}");
-        assert!(json.contains("\"mempool_capacity\":\"unbounded\""), "{json}");
-        assert!(json.contains("\"mempool_per_account_limit\":\"32\""), "{json}");
+        assert!(
+            json.contains("\"mempool_capacity\":\"unbounded\""),
+            "{json}"
+        );
+        assert!(
+            json.contains("\"mempool_per_account_limit\":\"32\""),
+            "{json}"
+        );
         // bound_str maps a real bound to its number, the sentinel to `unbounded`.
         assert_eq!(bound_str(0), "0");
         assert_eq!(bound_str(usize::MAX), "unbounded");
@@ -9830,8 +11371,14 @@ vote_b.validator=5 vote_b.height=9 vote_b.round=2 vote_b.block_hash={b_h} vote_b
     fn node_renders_text_and_json() {
         // M120: node identity renders id + role + version; role follows the is_validator flag.
         let v = env!("CARGO_PKG_VERSION");
-        assert_eq!(format_node(7, true), format!("node_id=7\nrole=validator\nversion={v}"));
-        assert_eq!(format_node(9, false), format!("node_id=9\nrole=follower\nversion={v}"));
+        assert_eq!(
+            format_node(7, true),
+            format!("node_id=7\nrole=validator\nversion={v}")
+        );
+        assert_eq!(
+            format_node(9, false),
+            format!("node_id=9\nrole=follower\nversion={v}")
+        );
         assert_eq!(
             json_node(7, true),
             format!("{{\"node_id\":\"7\",\"role\":\"validator\",\"version\":\"{v}\"}}")
@@ -9874,10 +11421,17 @@ vote_b.validator=5 vote_b.height=9 vote_b.round=2 vote_b.block_hash={b_h} vote_b
     fn info_renders_text_and_json() {
         // M107: the handshake aggregate renders three grep lines and a JSON object; the fields
         // are byte-identical to the individual `/genesis`, `/height`, `/head` renderings.
-        let i = InfoView { genesis_hash: [0x11u8; 32], height: 7, head: [0x22u8; 32] };
+        let i = InfoView {
+            genesis_hash: [0x11u8; 32],
+            height: 7,
+            head: [0x22u8; 32],
+        };
         let gh = crate::hash::hex(&[0x11u8; 32]);
         let hd = crate::hash::hex(&[0x22u8; 32]);
-        assert_eq!(format_info(&i), format!("genesis_hash={gh}\nheight=7\nhead={hd}"));
+        assert_eq!(
+            format_info(&i),
+            format!("genesis_hash={gh}\nheight=7\nhead={hd}")
+        );
         assert_eq!(
             json_info(&i),
             format!("{{\"genesis_hash\":\"{gh}\",\"height\":\"7\",\"head\":\"{hd}\"}}")
@@ -9915,8 +11469,17 @@ vote_b.validator=5 vote_b.height=9 vote_b.round=2 vote_b.block_hash={b_h} vote_b
         // M118: the text index is one path per line; the JSON is a {"routes":[…]} array. Both
         // advertise the same set, including exact reads and `{param}` templates.
         let text = format_routes();
-        assert!(text.lines().count() == READ_ROUTES.len(), "one path per line");
-        for p in ["/info", "/supply", "/mempool", "/block/{height}", "/tx/{hash}"] {
+        assert!(
+            text.lines().count() == READ_ROUTES.len(),
+            "one path per line"
+        );
+        for p in [
+            "/info",
+            "/supply",
+            "/mempool",
+            "/block/{height}",
+            "/tx/{hash}",
+        ] {
             assert!(text.lines().any(|l| l == p), "text index lists {p}: {text}");
         }
         let json = json_routes();
@@ -9957,8 +11520,14 @@ vote_b.validator=5 vote_b.height=9 vote_b.round=2 vote_b.block_hash={b_h} vote_b
 {\"kind\":\"peer\",\"id\":\"9\",\"addr\":null}]"
         );
         // Single-item renderers match what the listing emits per entry.
-        assert_eq!(format_peer(7, &Some("127.0.0.1:9000".to_string())), "kind=peer id=7 addr=127.0.0.1:9000");
-        assert_eq!(json_peer(9, &None), "{\"kind\":\"peer\",\"id\":\"9\",\"addr\":null}");
+        assert_eq!(
+            format_peer(7, &Some("127.0.0.1:9000".to_string())),
+            "kind=peer id=7 addr=127.0.0.1:9000"
+        );
+        assert_eq!(
+            json_peer(9, &None),
+            "{\"kind\":\"peer\",\"id\":\"9\",\"addr\":null}"
+        );
         // Empty directory ⇒ empty text, `[]` JSON.
         assert_eq!(format_peer_listing(&[]), "");
         assert_eq!(json_peer_listing(&[]), "[]");
@@ -9975,7 +11544,12 @@ vote_b.validator=5 vote_b.height=9 vote_b.round=2 vote_b.block_hash={b_h} vote_b
 
         let head = maybe_head(true, get.clone());
         // Header block is byte-identical up to and including the blank-line terminator…
-        assert_eq!(head, get.split_once("\r\n\r\n").map(|(h, _)| format!("{h}\r\n\r\n")).unwrap());
+        assert_eq!(
+            head,
+            get.split_once("\r\n\r\n")
+                .map(|(h, _)| format!("{h}\r\n\r\n"))
+                .unwrap()
+        );
         // …so the status, Content-Type, the GET's Content-Length, and Vary all survive…
         assert!(head.starts_with("HTTP/1.1 200 OK\r\n"));
         assert!(head.contains("Content-Type: application/json\r\n"));
@@ -9997,18 +11571,31 @@ vote_b.validator=5 vote_b.height=9 vote_b.round=2 vote_b.block_hash={b_h} vote_b
         for body in [not_acceptable_json(), not_acceptable_charset_json()] {
             let full = http_response_ct("406 Not Acceptable", "application/json", &body);
             let head = maybe_head(true, full.clone());
-            assert!(head.starts_with("HTTP/1.1 406 Not Acceptable\r\n"), "{head}");
-            assert!(head.contains("Content-Type: application/json\r\n"), "{head}");
-            assert!(head.contains(&format!("Content-Length: {}\r\n", body.len())), "{head}");
+            assert!(
+                head.starts_with("HTTP/1.1 406 Not Acceptable\r\n"),
+                "{head}"
+            );
+            assert!(
+                head.contains("Content-Type: application/json\r\n"),
+                "{head}"
+            );
+            assert!(
+                head.contains(&format!("Content-Length: {}\r\n", body.len())),
+                "{head}"
+            );
             assert!(head.ends_with("\r\n\r\n"), "{head}");
-            assert!(!head.contains(&body), "406 HEAD must not send a body: {head}");
+            assert!(
+                !head.contains(&body),
+                "406 HEAD must not send a body: {head}"
+            );
         }
     }
 
     #[test]
     fn header_value_extracts_case_insensitively() {
         // M108: a header lookup is case-insensitive on the name and trims the value.
-        let head = "GET /x HTTP/1.1\r\nHost: localhost\r\nIf-None-Match: \"abc\"\r\nConnection: close";
+        let head =
+            "GET /x HTTP/1.1\r\nHost: localhost\r\nIf-None-Match: \"abc\"\r\nConnection: close";
         assert_eq!(header_value(head, "if-none-match"), Some("\"abc\""));
         assert_eq!(header_value(head, "IF-NONE-MATCH"), Some("\"abc\""));
         assert_eq!(header_value(head, "host"), Some("localhost"));
@@ -10020,26 +11607,46 @@ vote_b.validator=5 vote_b.height=9 vote_b.round=2 vote_b.block_hash={b_h} vote_b
         // M108: a 200 read gains a strong ETag = quoted hex of the body's sha256; a matching
         // `If-None-Match` short-circuits to a bodyless 304; a non-match keeps the body.
         let resp = http_response_ct("200 OK", "text/plain; charset=utf-8", "height=7");
-        let etag = format!("\"{}\"", crate::hash::hex(&crate::hash::sha256(b"height=7")));
+        let etag = format!(
+            "\"{}\"",
+            crate::hash::hex(&crate::hash::sha256(b"height=7"))
+        );
 
         // No conditional header ⇒ the ETag is injected, the body is preserved.
         let tagged = apply_etag(resp.clone(), None);
         assert!(tagged.contains(&format!("ETag: {etag}\r\n")), "{tagged}");
-        assert_eq!(tagged.split_once("\r\n\r\n").map(|(_, b)| b), Some("height=7"), "{tagged}");
+        assert_eq!(
+            tagged.split_once("\r\n\r\n").map(|(_, b)| b),
+            Some("height=7"),
+            "{tagged}"
+        );
         // Content-Length still advertises the body (the ETag header doesn't disturb it).
         assert!(tagged.contains("Content-Length: 8\r\n"), "{tagged}");
 
         // A matching validator ⇒ 304 Not Modified, no body, ETag repeated.
         let not_modified = apply_etag(resp.clone(), Some(etag.as_str()));
-        assert!(not_modified.starts_with("HTTP/1.1 304 Not Modified\r\n"), "{not_modified}");
-        assert!(not_modified.contains(&format!("ETag: {etag}\r\n")), "{not_modified}");
+        assert!(
+            not_modified.starts_with("HTTP/1.1 304 Not Modified\r\n"),
+            "{not_modified}"
+        );
+        assert!(
+            not_modified.contains(&format!("ETag: {etag}\r\n")),
+            "{not_modified}"
+        );
         assert!(not_modified.ends_with("\r\n\r\n"), "{not_modified}");
-        assert!(!not_modified.contains("height=7"), "304 carries no body: {not_modified}");
+        assert!(
+            !not_modified.contains("height=7"),
+            "304 carries no body: {not_modified}"
+        );
 
         // A stale validator ⇒ the full 200 body (with its current ETag).
         let stale = apply_etag(resp, Some("\"deadbeef\""));
         assert!(stale.starts_with("HTTP/1.1 200 OK"), "{stale}");
-        assert_eq!(stale.split_once("\r\n\r\n").map(|(_, b)| b), Some("height=7"), "{stale}");
+        assert_eq!(
+            stale.split_once("\r\n\r\n").map(|(_, b)| b),
+            Some("height=7"),
+            "{stale}"
+        );
     }
 
     #[test]
@@ -10048,15 +11655,25 @@ vote_b.validator=5 vote_b.height=9 vote_b.round=2 vote_b.block_hash={b_h} vote_b
         // the served methods, and no body.
         let resp = options_response();
         assert!(resp.starts_with("HTTP/1.1 204 No Content\r\n"), "{resp}");
-        assert!(resp.contains(&format!("Allow: {ALLOWED_METHODS}\r\n")), "{resp}");
+        assert!(
+            resp.contains(&format!("Allow: {ALLOWED_METHODS}\r\n")),
+            "{resp}"
+        );
         // The advertised set is exactly the methods the server handles.
         for m in ["GET", "HEAD", "OPTIONS", "POST"] {
-            assert!(ALLOWED_METHODS.contains(m), "Allow must list {m}: {ALLOWED_METHODS}");
+            assert!(
+                ALLOWED_METHODS.contains(m),
+                "Allow must list {m}: {ALLOWED_METHODS}"
+            );
         }
         // 204 carries no body (and thus no Content-Length) — the headers end the response.
         assert!(resp.ends_with("\r\n\r\n"), "{resp}");
         assert!(!resp.contains("Content-Length"), "204 has no body: {resp}");
-        assert_eq!(resp.split_once("\r\n\r\n").map(|(_, b)| b), Some(""), "no body: {resp}");
+        assert_eq!(
+            resp.split_once("\r\n\r\n").map(|(_, b)| b),
+            Some(""),
+            "no body: {resp}"
+        );
     }
 
     #[test]
@@ -10116,7 +11733,10 @@ vote_b.validator=5 vote_b.height=9 vote_b.round=2 vote_b.block_hash={b_h} vote_b
         assert_eq!(listing[1].0, 1, "second id is 1");
         assert_eq!(listing[0].2.amount, 3 * MICRO, "lock 0 fields preserved");
         assert_eq!(listing[1].2.dest_account, 7, "lock 1 fields preserved");
-        assert!(listing[0].1 >= 1 && listing[1].1 >= 1, "heights are real blocks");
+        assert!(
+            listing[0].1 >= 1 && listing[1].1 >= 1,
+            "heights are real blocks"
+        );
 
         let body = format_lock_listing(&listing);
         assert!(body.contains("lock_id=0"), "body lists id 0: {body}");
@@ -10141,7 +11761,9 @@ vote_b.validator=5 vote_b.height=9 vote_b.round=2 vote_b.block_hash={b_h} vote_b
         let cfg = node_config(21, 20011, &[21], dir.clone());
         let mut genesis = test_genesis();
         genesis.validators = vec![(21, kp(21).public(), 1)]; // quorum 1 ⇒ node self-commits
-        let node = Node::start(cfg, genesis.clone(), Some(kp(21))).await.expect("start node");
+        let node = Node::start(cfg, genesis.clone(), Some(kp(21)))
+            .await
+            .expect("start node");
 
         // Wait for a certified head so each proof has a signed header to verify against.
         let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
@@ -10149,7 +11771,10 @@ vote_b.validator=5 vote_b.height=9 vote_b.round=2 vote_b.block_hash={b_h} vote_b
             if node.status().await.map(|(h, _)| h >= 1).unwrap_or(false) {
                 break;
             }
-            assert!(tokio::time::Instant::now() < deadline, "node never produced a block");
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "node never produced a block"
+            );
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
 
@@ -10167,10 +11792,9 @@ vote_b.validator=5 vote_b.height=9 vote_b.round=2 vote_b.block_hash={b_h} vote_b
                 .expect("actor up")
                 .unwrap_or_else(|| panic!("{kind:?} {id} should exist in genesis"));
             // Round-trip through the wire codec, exactly as a remote client would.
-            let ch = crate::codec::decode_certified_header(
-                &crate::codec::encode_certified_header(&ch),
-            )
-            .expect("certified header round trip");
+            let ch =
+                crate::codec::decode_certified_header(&crate::codec::encode_certified_header(&ch))
+                    .expect("certified header round trip");
             let entry = crate::codec::decode_proof_entry(&crate::codec::encode_proof_entry(&entry))
                 .expect("proof entry round trip");
             crate::light::ValidatorTracker::verify_proof_against_header(
@@ -10180,9 +11804,21 @@ vote_b.validator=5 vote_b.height=9 vote_b.round=2 vote_b.block_hash={b_h} vote_b
         }
 
         // Unknown id / index for each kind → inner None.
-        assert!(node.proof(ProofKind::Reviewer, 99).await.expect("actor up").is_none());
-        assert!(node.proof(ProofKind::Validator, 99).await.expect("actor up").is_none());
-        assert!(node.proof(ProofKind::GraphNode, 9999).await.expect("actor up").is_none());
+        assert!(node
+            .proof(ProofKind::Reviewer, 99)
+            .await
+            .expect("actor up")
+            .is_none());
+        assert!(node
+            .proof(ProofKind::Validator, 99)
+            .await
+            .expect("actor up")
+            .is_none());
+        assert!(node
+            .proof(ProofKind::GraphNode, 9999)
+            .await
+            .expect("actor up")
+            .is_none());
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -10195,10 +11831,15 @@ vote_b.validator=5 vote_b.height=9 vote_b.round=2 vote_b.block_hash={b_h} vote_b
         let dir = tmp_dir("rpc-other-proofs");
         let mut cfg = node_config(21, 20031, &[21], dir.clone());
         let rpc_addr = "127.0.0.1:20051";
-        cfg.rpc = Some(crate::config::RpcConfig { enabled: true, listen: rpc_addr.into() });
+        cfg.rpc = Some(crate::config::RpcConfig {
+            enabled: true,
+            listen: rpc_addr.into(),
+        });
         let mut genesis = test_genesis();
         genesis.validators = vec![(21, kp(21).public(), 1)];
-        let node = Node::start(cfg, genesis, Some(kp(21))).await.expect("start node");
+        let node = Node::start(cfg, genesis, Some(kp(21)))
+            .await
+            .expect("start node");
 
         // Wait for a certified head so the proof routes have something to verify against.
         let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
@@ -10206,12 +11847,16 @@ vote_b.validator=5 vote_b.height=9 vote_b.round=2 vote_b.block_hash={b_h} vote_b
             if node.status().await.map(|(h, _)| h >= 1).unwrap_or(false) {
                 break;
             }
-            assert!(tokio::time::Instant::now() < deadline, "node never produced a block");
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "node never produced a block"
+            );
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
 
         async fn get(addr: &str, path: &str) -> String {
-            let req = format!("GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
+            let req =
+                format!("GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
             let mut s = TcpStream::connect(addr).await.expect("connect rpc");
             s.write_all(req.as_bytes()).await.expect("send get");
             let mut resp = Vec::new();
@@ -10223,7 +11868,11 @@ vote_b.validator=5 vote_b.height=9 vote_b.round=2 vote_b.block_hash={b_h} vote_b
         }
 
         // Each known entity → 200 + two labeled hex lines.
-        for path in ["/validator/21/proof", "/reviewer/10/proof", "/graph/0/proof"] {
+        for path in [
+            "/validator/21/proof",
+            "/reviewer/10/proof",
+            "/graph/0/proof",
+        ] {
             let p = get(rpc_addr, path).await;
             assert!(p.starts_with("HTTP/1.1 200 OK"), "{path} status: {p}");
             let body = body_of(&p);
@@ -10238,7 +11887,10 @@ vote_b.validator=5 vote_b.height=9 vote_b.round=2 vote_b.block_hash={b_h} vote_b
         // a `key=value` body, the non-proof sibling of `/account/{id}`.
         let bare = get(rpc_addr, "/validator/21").await;
         assert!(bare.starts_with("HTTP/1.1 200 OK"), "bare id: {bare}");
-        assert!(body_of(&bare).contains("kind=validator id=21"), "bare id body: {bare}");
+        assert!(
+            body_of(&bare).contains("kind=validator id=21"),
+            "bare id body: {bare}"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -10251,22 +11903,31 @@ vote_b.validator=5 vote_b.height=9 vote_b.round=2 vote_b.block_hash={b_h} vote_b
         let dir = tmp_dir("rpc-json");
         let mut cfg = node_config(21, 20151, &[21], dir.clone());
         let rpc_addr = "127.0.0.1:20161";
-        cfg.rpc = Some(crate::config::RpcConfig { enabled: true, listen: rpc_addr.into() });
+        cfg.rpc = Some(crate::config::RpcConfig {
+            enabled: true,
+            listen: rpc_addr.into(),
+        });
         let mut genesis = test_genesis();
         genesis.validators = vec![(21, kp(21).public(), 1)]; // quorum 1 ⇒ self-commit
-        let node = Node::start(cfg, genesis, Some(kp(21))).await.expect("start node");
+        let node = Node::start(cfg, genesis, Some(kp(21)))
+            .await
+            .expect("start node");
 
         let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
         loop {
             if node.status().await.map(|(h, _)| h >= 1).unwrap_or(false) {
                 break;
             }
-            assert!(tokio::time::Instant::now() < deadline, "node never produced a block");
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "node never produced a block"
+            );
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
 
         async fn get(addr: &str, path: &str) -> String {
-            let req = format!("GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
+            let req =
+                format!("GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
             let mut s = TcpStream::connect(addr).await.expect("connect rpc");
             s.write_all(req.as_bytes()).await.expect("send get");
             let mut resp = Vec::new();
@@ -10280,40 +11941,79 @@ vote_b.validator=5 vote_b.height=9 vote_b.round=2 vote_b.block_hash={b_h} vote_b
         // Each JSON read is 200 + application/json + the expected JSON shape.
         let h = get(rpc_addr, "/height?format=json").await;
         assert!(h.starts_with("HTTP/1.1 200 OK"), "height: {h}");
-        assert!(h.contains("Content-Type: application/json\r\n"), "height ct: {h}");
+        assert!(
+            h.contains("Content-Type: application/json\r\n"),
+            "height ct: {h}"
+        );
         // M71/M82: representation-selected responses advertise `Vary: Accept, Accept-Charset`.
-        assert!(h.contains("Vary: Accept, Accept-Charset, Accept-Encoding\r\n"), "height vary: {h}");
-        assert!(body_of(&h).starts_with("{\"height\":\""), "height body: {h}");
+        assert!(
+            h.contains("Vary: Accept, Accept-Charset, Accept-Encoding\r\n"),
+            "height vary: {h}"
+        );
+        assert!(
+            body_of(&h).starts_with("{\"height\":\""),
+            "height body: {h}"
+        );
 
         let a = get(rpc_addr, "/account/1?format=json").await;
         assert!(a.starts_with("HTTP/1.1 200 OK"), "account: {a}");
-        assert!(a.contains("Content-Type: application/json\r\n"), "account ct: {a}");
+        assert!(
+            a.contains("Content-Type: application/json\r\n"),
+            "account ct: {a}"
+        );
         assert!(body_of(&a).contains("\"balance\":\""), "account body: {a}");
 
         let r = get(rpc_addr, "/reviewer/10?format=json").await;
         assert!(r.starts_with("HTTP/1.1 200 OK"), "reviewer: {r}");
-        assert!(body_of(&r).contains("\"kind\":\"reviewer\""), "reviewer body: {r}");
+        assert!(
+            body_of(&r).contains("\"kind\":\"reviewer\""),
+            "reviewer body: {r}"
+        );
 
         let locks = get(rpc_addr, "/bridge/locks?format=json").await;
         assert!(locks.starts_with("HTTP/1.1 200 OK"), "locks: {locks}");
-        assert!(locks.contains("Content-Type: application/json\r\n"), "locks ct: {locks}");
+        assert!(
+            locks.contains("Content-Type: application/json\r\n"),
+            "locks ct: {locks}"
+        );
         // M79: JSON locks are now the pagination envelope `{"total":…,"next":…,"items":[…]}`.
-        assert!(body_of(&locks).starts_with("{\"total\":"), "locks body: {locks}");
-        assert!(body_of(&locks).contains("\"items\":["), "locks body: {locks}");
+        assert!(
+            body_of(&locks).starts_with("{\"total\":"),
+            "locks body: {locks}"
+        );
+        assert!(
+            body_of(&locks).contains("\"items\":["),
+            "locks body: {locks}"
+        );
 
         // A data miss under JSON → 404 + application/json + {"error":…}.
         let miss = get(rpc_addr, "/reviewer/999?format=json").await;
         assert!(miss.starts_with("HTTP/1.1 404"), "miss: {miss}");
-        assert!(miss.contains("Content-Type: application/json\r\n"), "miss ct: {miss}");
-        assert!(body_of(&miss).starts_with("{\"error\":"), "miss body: {miss}");
+        assert!(
+            miss.contains("Content-Type: application/json\r\n"),
+            "miss ct: {miss}"
+        );
+        assert!(
+            body_of(&miss).starts_with("{\"error\":"),
+            "miss body: {miss}"
+        );
 
         // Head invariant at the response layer: a query-less read is byte-identical to
         // the pre-M66 plaintext response (text/plain, bare decimal height).
         let plain = get(rpc_addr, "/height").await;
-        assert!(plain.contains("Content-Type: text/plain; charset=utf-8\r\n"), "plain ct: {plain}");
+        assert!(
+            plain.contains("Content-Type: text/plain; charset=utf-8\r\n"),
+            "plain ct: {plain}"
+        );
         // M71/M82: the text representation also carries `Vary: Accept, Accept-Charset`.
-        assert!(plain.contains("Vary: Accept, Accept-Charset, Accept-Encoding\r\n"), "plain vary: {plain}");
-        assert!(body_of(&plain).chars().all(|c| c.is_ascii_digit()), "plain body: {plain}");
+        assert!(
+            plain.contains("Vary: Accept, Accept-Charset, Accept-Encoding\r\n"),
+            "plain vary: {plain}"
+        );
+        assert!(
+            body_of(&plain).chars().all(|c| c.is_ascii_digit()),
+            "plain body: {plain}"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -10326,22 +12026,32 @@ vote_b.validator=5 vote_b.height=9 vote_b.round=2 vote_b.block_hash={b_h} vote_b
         let dir = tmp_dir("rpc-accept");
         let mut cfg = node_config(21, 20191, &[21], dir.clone());
         let rpc_addr = "127.0.0.1:20201";
-        cfg.rpc = Some(crate::config::RpcConfig { enabled: true, listen: rpc_addr.into() });
+        cfg.rpc = Some(crate::config::RpcConfig {
+            enabled: true,
+            listen: rpc_addr.into(),
+        });
         let mut genesis = test_genesis();
         genesis.validators = vec![(21, kp(21).public(), 1)]; // quorum 1 ⇒ self-commit
-        let node = Node::start(cfg, genesis, Some(kp(21))).await.expect("start node");
+        let node = Node::start(cfg, genesis, Some(kp(21)))
+            .await
+            .expect("start node");
 
         let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
         loop {
             if node.status().await.map(|(h, _)| h >= 1).unwrap_or(false) {
                 break;
             }
-            assert!(tokio::time::Instant::now() < deadline, "node never produced a block");
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "node never produced a block"
+            );
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
 
         async fn get(addr: &str, path: &str, accept: Option<&str>) -> String {
-            let accept_line = accept.map(|a| format!("Accept: {a}\r\n")).unwrap_or_default();
+            let accept_line = accept
+                .map(|a| format!("Accept: {a}\r\n"))
+                .unwrap_or_default();
             let req = format!(
                 "GET {path} HTTP/1.1\r\nHost: localhost\r\n{accept_line}Connection: close\r\n\r\n"
             );
@@ -10358,28 +12068,55 @@ vote_b.validator=5 vote_b.height=9 vote_b.round=2 vote_b.block_hash={b_h} vote_b
         // Accept: application/json with no query param ⇒ JSON.
         let h = get(rpc_addr, "/height", Some("application/json")).await;
         assert!(h.starts_with("HTTP/1.1 200 OK"), "height: {h}");
-        assert!(h.contains("Content-Type: application/json\r\n"), "height ct: {h}");
-        assert!(body_of(&h).starts_with("{\"height\":\""), "height body: {h}");
+        assert!(
+            h.contains("Content-Type: application/json\r\n"),
+            "height ct: {h}"
+        );
+        assert!(
+            body_of(&h).starts_with("{\"height\":\""),
+            "height body: {h}"
+        );
 
         let a = get(rpc_addr, "/account/1", Some("application/json")).await;
         assert!(a.starts_with("HTTP/1.1 200 OK"), "account: {a}");
-        assert!(a.contains("Content-Type: application/json\r\n"), "account ct: {a}");
+        assert!(
+            a.contains("Content-Type: application/json\r\n"),
+            "account ct: {a}"
+        );
         assert!(body_of(&a).starts_with("{\""), "account body: {a}");
 
         // An explicit `?format=text` overrides `Accept: application/json`.
         let q = get(rpc_addr, "/height?format=text", Some("application/json")).await;
-        assert!(q.contains("Content-Type: text/plain; charset=utf-8\r\n"), "query-wins ct: {q}");
-        assert!(body_of(&q).chars().all(|c| c.is_ascii_digit()), "query-wins body: {q}");
+        assert!(
+            q.contains("Content-Type: text/plain; charset=utf-8\r\n"),
+            "query-wins ct: {q}"
+        );
+        assert!(
+            body_of(&q).chars().all(|c| c.is_ascii_digit()),
+            "query-wins body: {q}"
+        );
 
         // A browser-style `Accept: text/html,*/*` keeps the plaintext representation.
         let b = get(rpc_addr, "/height", Some("text/html,*/*")).await;
-        assert!(b.contains("Content-Type: text/plain; charset=utf-8\r\n"), "browser ct: {b}");
-        assert!(body_of(&b).chars().all(|c| c.is_ascii_digit()), "browser body: {b}");
+        assert!(
+            b.contains("Content-Type: text/plain; charset=utf-8\r\n"),
+            "browser ct: {b}"
+        );
+        assert!(
+            body_of(&b).chars().all(|c| c.is_ascii_digit()),
+            "browser body: {b}"
+        );
 
         // Head invariant: no Accept header and no query ⇒ byte-identical plaintext.
         let plain = get(rpc_addr, "/height", None).await;
-        assert!(plain.contains("Content-Type: text/plain; charset=utf-8\r\n"), "plain ct: {plain}");
-        assert!(body_of(&plain).chars().all(|c| c.is_ascii_digit()), "plain body: {plain}");
+        assert!(
+            plain.contains("Content-Type: text/plain; charset=utf-8\r\n"),
+            "plain ct: {plain}"
+        );
+        assert!(
+            body_of(&plain).chars().all(|c| c.is_ascii_digit()),
+            "plain body: {plain}"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -10392,22 +12129,32 @@ vote_b.validator=5 vote_b.height=9 vote_b.round=2 vote_b.block_hash={b_h} vote_b
         let dir = tmp_dir("rpc-406");
         let mut cfg = node_config(21, 20211, &[21], dir.clone());
         let rpc_addr = "127.0.0.1:20221";
-        cfg.rpc = Some(crate::config::RpcConfig { enabled: true, listen: rpc_addr.into() });
+        cfg.rpc = Some(crate::config::RpcConfig {
+            enabled: true,
+            listen: rpc_addr.into(),
+        });
         let mut genesis = test_genesis();
         genesis.validators = vec![(21, kp(21).public(), 1)]; // quorum 1 ⇒ self-commit
-        let node = Node::start(cfg, genesis, Some(kp(21))).await.expect("start node");
+        let node = Node::start(cfg, genesis, Some(kp(21)))
+            .await
+            .expect("start node");
 
         let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
         loop {
             if node.status().await.map(|(h, _)| h >= 1).unwrap_or(false) {
                 break;
             }
-            assert!(tokio::time::Instant::now() < deadline, "node never produced a block");
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "node never produced a block"
+            );
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
 
         async fn get(addr: &str, path: &str, accept: Option<&str>) -> String {
-            let accept_line = accept.map(|a| format!("Accept: {a}\r\n")).unwrap_or_default();
+            let accept_line = accept
+                .map(|a| format!("Accept: {a}\r\n"))
+                .unwrap_or_default();
             let req = format!(
                 "GET {path} HTTP/1.1\r\nHost: localhost\r\n{accept_line}Connection: close\r\n\r\n"
             );
@@ -10425,36 +12172,80 @@ vote_b.validator=5 vote_b.height=9 vote_b.round=2 vote_b.block_hash={b_h} vote_b
         // lists the representations we *can* emit (M70/M80, RFC 7231 §6.5.6).
         let x = get(rpc_addr, "/height", Some("application/xml")).await;
         assert!(x.starts_with("HTTP/1.1 406 Not Acceptable"), "xml: {x}");
-        assert!(x.contains("Content-Type: application/json\r\n"), "xml ct: {x}");
+        assert!(
+            x.contains("Content-Type: application/json\r\n"),
+            "xml ct: {x}"
+        );
         // M71/M82: the negotiated-error path varies by `Accept, Accept-Charset` too.
-        assert!(x.contains("Vary: Accept, Accept-Charset, Accept-Encoding\r\n"), "xml vary: {x}");
-        assert!(body_of(&x).contains("\"error\":\"not_acceptable\""), "xml body is JSON error: {x}");
-        assert!(body_of(&x).contains("application/json"), "xml body lists json: {x}");
-        assert!(body_of(&x).contains("text/plain"), "xml body lists text: {x}");
+        assert!(
+            x.contains("Vary: Accept, Accept-Charset, Accept-Encoding\r\n"),
+            "xml vary: {x}"
+        );
+        assert!(
+            body_of(&x).contains("\"error\":\"not_acceptable\""),
+            "xml body is JSON error: {x}"
+        );
+        assert!(
+            body_of(&x).contains("application/json"),
+            "xml body lists json: {x}"
+        );
+        assert!(
+            body_of(&x).contains("text/plain"),
+            "xml body lists text: {x}"
+        );
 
         // An explicit q=0 rejects our JSON type ⇒ 406 (no text alternative offered).
         let z = get(rpc_addr, "/height", Some("application/json;q=0")).await;
         assert!(z.starts_with("HTTP/1.1 406 Not Acceptable"), "q0: {z}");
-        assert!(z.contains("Content-Type: application/json\r\n"), "q0 ct: {z}");
-        assert!(body_of(&z).contains("\"error\":\"not_acceptable\""), "q0 body is JSON error: {z}");
-        assert!(body_of(&z).contains("application/json"), "q0 body lists json: {z}");
-        assert!(body_of(&z).contains("text/plain"), "q0 body lists text: {z}");
+        assert!(
+            z.contains("Content-Type: application/json\r\n"),
+            "q0 ct: {z}"
+        );
+        assert!(
+            body_of(&z).contains("\"error\":\"not_acceptable\""),
+            "q0 body is JSON error: {z}"
+        );
+        assert!(
+            body_of(&z).contains("application/json"),
+            "q0 body lists json: {z}"
+        );
+        assert!(
+            body_of(&z).contains("text/plain"),
+            "q0 body lists text: {z}"
+        );
 
         // Weighted preference: JSON outranks text ⇒ 200 + application/json.
-        let w = get(rpc_addr, "/height", Some("text/plain;q=0.3, application/json;q=0.9")).await;
+        let w = get(
+            rpc_addr,
+            "/height",
+            Some("text/plain;q=0.3, application/json;q=0.9"),
+        )
+        .await;
         assert!(w.starts_with("HTTP/1.1 200 OK"), "weighted: {w}");
-        assert!(w.contains("Content-Type: application/json\r\n"), "weighted ct: {w}");
+        assert!(
+            w.contains("Content-Type: application/json\r\n"),
+            "weighted ct: {w}"
+        );
 
         // An explicit `?format=json` overrides a would-be-406 Accept.
         let q = get(rpc_addr, "/height?format=json", Some("application/xml")).await;
         assert!(q.starts_with("HTTP/1.1 200 OK"), "query-wins: {q}");
-        assert!(q.contains("Content-Type: application/json\r\n"), "query-wins ct: {q}");
+        assert!(
+            q.contains("Content-Type: application/json\r\n"),
+            "query-wins ct: {q}"
+        );
 
         // Head invariant: no Accept header ⇒ byte-identical plaintext (never 406).
         let plain = get(rpc_addr, "/height", None).await;
         assert!(plain.starts_with("HTTP/1.1 200 OK"), "plain: {plain}");
-        assert!(plain.contains("Content-Type: text/plain; charset=utf-8\r\n"), "plain ct: {plain}");
-        assert!(body_of(&plain).chars().all(|c| c.is_ascii_digit()), "plain body: {plain}");
+        assert!(
+            plain.contains("Content-Type: text/plain; charset=utf-8\r\n"),
+            "plain ct: {plain}"
+        );
+        assert!(
+            body_of(&plain).chars().all(|c| c.is_ascii_digit()),
+            "plain body: {plain}"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -10467,22 +12258,32 @@ vote_b.validator=5 vote_b.height=9 vote_b.round=2 vote_b.block_hash={b_h} vote_b
         let dir = tmp_dir("rpc-charset-406");
         let mut cfg = node_config(23, 20231, &[23], dir.clone());
         let rpc_addr = "127.0.0.1:20241";
-        cfg.rpc = Some(crate::config::RpcConfig { enabled: true, listen: rpc_addr.into() });
+        cfg.rpc = Some(crate::config::RpcConfig {
+            enabled: true,
+            listen: rpc_addr.into(),
+        });
         let mut genesis = test_genesis();
         genesis.validators = vec![(23, kp(23).public(), 1)]; // quorum 1 ⇒ self-commit
-        let node = Node::start(cfg, genesis, Some(kp(23))).await.expect("start node");
+        let node = Node::start(cfg, genesis, Some(kp(23)))
+            .await
+            .expect("start node");
 
         let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
         loop {
             if node.status().await.map(|(h, _)| h >= 1).unwrap_or(false) {
                 break;
             }
-            assert!(tokio::time::Instant::now() < deadline, "node never produced a block");
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "node never produced a block"
+            );
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
 
         async fn get(addr: &str, path: &str, charset: Option<&str>) -> String {
-            let charset_line = charset.map(|c| format!("Accept-Charset: {c}\r\n")).unwrap_or_default();
+            let charset_line = charset
+                .map(|c| format!("Accept-Charset: {c}\r\n"))
+                .unwrap_or_default();
             let req = format!(
                 "GET {path} HTTP/1.1\r\nHost: localhost\r\n{charset_line}Connection: close\r\n\r\n"
             );
@@ -10499,26 +12300,50 @@ vote_b.validator=5 vote_b.height=9 vote_b.round=2 vote_b.block_hash={b_h} vote_b
         // Accept-Charset: utf-8 ⇒ 200, our only charset.
         let ok = get(rpc_addr, "/height", Some("utf-8")).await;
         assert!(ok.starts_with("HTTP/1.1 200 OK"), "utf-8: {ok}");
-        assert!(ok.contains("Content-Type: text/plain; charset=utf-8\r\n"), "utf-8 ct: {ok}");
+        assert!(
+            ok.contains("Content-Type: text/plain; charset=utf-8\r\n"),
+            "utf-8 ct: {ok}"
+        );
 
         // A charset that rules out utf-8 ⇒ 406 with a machine-readable charset list.
         let bad = get(rpc_addr, "/height", Some("iso-8859-1")).await;
         assert!(bad.starts_with("HTTP/1.1 406 Not Acceptable"), "iso: {bad}");
-        assert!(bad.contains("Content-Type: application/json\r\n"), "iso ct: {bad}");
-        assert!(bad.contains("Vary: Accept, Accept-Charset, Accept-Encoding\r\n"), "iso vary: {bad}");
-        assert!(body_of(&bad).contains("\"error\":\"not_acceptable\""), "iso body: {bad}");
-        assert!(body_of(&bad).contains("utf-8"), "iso body lists utf-8: {bad}");
+        assert!(
+            bad.contains("Content-Type: application/json\r\n"),
+            "iso ct: {bad}"
+        );
+        assert!(
+            bad.contains("Vary: Accept, Accept-Charset, Accept-Encoding\r\n"),
+            "iso vary: {bad}"
+        );
+        assert!(
+            body_of(&bad).contains("\"error\":\"not_acceptable\""),
+            "iso body: {bad}"
+        );
+        assert!(
+            body_of(&bad).contains("utf-8"),
+            "iso body lists utf-8: {bad}"
+        );
 
         // An explicit utf-8;q=0 is also a rejection ⇒ 406.
         let q0 = get(rpc_addr, "/height", Some("utf-8;q=0")).await;
         assert!(q0.starts_with("HTTP/1.1 406 Not Acceptable"), "q0: {q0}");
-        assert!(q0.contains("Content-Type: application/json\r\n"), "q0 ct: {q0}");
+        assert!(
+            q0.contains("Content-Type: application/json\r\n"),
+            "q0 ct: {q0}"
+        );
 
         // Head invariant: no Accept-Charset header ⇒ byte-identical plaintext (never 406).
         let plain = get(rpc_addr, "/height", None).await;
         assert!(plain.starts_with("HTTP/1.1 200 OK"), "plain: {plain}");
-        assert!(plain.contains("Content-Type: text/plain; charset=utf-8\r\n"), "plain ct: {plain}");
-        assert!(body_of(&plain).chars().all(|c| c.is_ascii_digit()), "plain body: {plain}");
+        assert!(
+            plain.contains("Content-Type: text/plain; charset=utf-8\r\n"),
+            "plain ct: {plain}"
+        );
+        assert!(
+            body_of(&plain).chars().all(|c| c.is_ascii_digit()),
+            "plain body: {plain}"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -10532,23 +12357,35 @@ vote_b.validator=5 vote_b.height=9 vote_b.round=2 vote_b.block_hash={b_h} vote_b
         // node_config p2p listen = 20731 + (42-21) = 20752; keep the RPC port clear.
         let mut cfg = node_config(42, 20731, &[42], dir.clone());
         let rpc_addr = "127.0.0.1:20761";
-        cfg.rpc = Some(crate::config::RpcConfig { enabled: true, listen: rpc_addr.into() });
+        cfg.rpc = Some(crate::config::RpcConfig {
+            enabled: true,
+            listen: rpc_addr.into(),
+        });
         let mut genesis = test_genesis();
         genesis.validators = vec![(42, kp(42).public(), 1)]; // quorum 1 ⇒ self-commit
-        let node = Node::start(cfg, genesis, Some(kp(42))).await.expect("start node");
+        let node = Node::start(cfg, genesis, Some(kp(42)))
+            .await
+            .expect("start node");
 
         let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
         loop {
             if node.status().await.map(|(h, _)| h >= 1).unwrap_or(false) {
                 break;
             }
-            assert!(tokio::time::Instant::now() < deadline, "node never produced a block");
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "node never produced a block"
+            );
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
 
         async fn get(addr: &str, path: &str, enc: Option<&str>) -> String {
-            let enc_line = enc.map(|c| format!("Accept-Encoding: {c}\r\n")).unwrap_or_default();
-            let req = format!("GET {path} HTTP/1.1\r\nHost: localhost\r\n{enc_line}Connection: close\r\n\r\n");
+            let enc_line = enc
+                .map(|c| format!("Accept-Encoding: {c}\r\n"))
+                .unwrap_or_default();
+            let req = format!(
+                "GET {path} HTTP/1.1\r\nHost: localhost\r\n{enc_line}Connection: close\r\n\r\n"
+            );
             let mut s = TcpStream::connect(addr).await.expect("connect rpc");
             s.write_all(req.as_bytes()).await.expect("send get");
             let mut resp = Vec::new();
@@ -10562,19 +12399,37 @@ vote_b.validator=5 vote_b.height=9 vote_b.round=2 vote_b.block_hash={b_h} vote_b
         // identity, gzip (identity default-accepted), and absent all ⇒ 200.
         for ae in [Some("identity"), Some("gzip"), None] {
             let ok = get(rpc_addr, "/height", ae).await;
-            assert!(ok.starts_with("HTTP/1.1 200 OK"), "{ae:?} should be 200: {ok}");
+            assert!(
+                ok.starts_with("HTTP/1.1 200 OK"),
+                "{ae:?} should be 200: {ok}"
+            );
         }
 
         // identity;q=0 explicitly refuses our only coding ⇒ 406 with a machine-readable list.
         let bad = get(rpc_addr, "/height", Some("identity;q=0")).await;
-        assert!(bad.starts_with("HTTP/1.1 406 Not Acceptable"), "identity;q=0: {bad}");
-        assert!(bad.contains("Content-Type: application/json\r\n"), "406 ct: {bad}");
-        assert!(bad.contains("Vary: Accept, Accept-Charset, Accept-Encoding\r\n"), "406 vary: {bad}");
-        assert!(body_of(&bad).contains("\"available_encodings\":[\"identity\"]"), "406 body: {bad}");
+        assert!(
+            bad.starts_with("HTTP/1.1 406 Not Acceptable"),
+            "identity;q=0: {bad}"
+        );
+        assert!(
+            bad.contains("Content-Type: application/json\r\n"),
+            "406 ct: {bad}"
+        );
+        assert!(
+            bad.contains("Vary: Accept, Accept-Charset, Accept-Encoding\r\n"),
+            "406 vary: {bad}"
+        );
+        assert!(
+            body_of(&bad).contains("\"available_encodings\":[\"identity\"]"),
+            "406 body: {bad}"
+        );
 
         // `*;q=0` (no identity override) also refuses ⇒ 406.
         let star = get(rpc_addr, "/height", Some("*;q=0")).await;
-        assert!(star.starts_with("HTTP/1.1 406 Not Acceptable"), "*;q=0: {star}");
+        assert!(
+            star.starts_with("HTTP/1.1 406 Not Acceptable"),
+            "*;q=0: {star}"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -10588,22 +12443,31 @@ vote_b.validator=5 vote_b.height=9 vote_b.round=2 vote_b.block_hash={b_h} vote_b
         let dir = tmp_dir("rpc-json-proofs");
         let mut cfg = node_config(21, 20171, &[21], dir.clone());
         let rpc_addr = "127.0.0.1:20181";
-        cfg.rpc = Some(crate::config::RpcConfig { enabled: true, listen: rpc_addr.into() });
+        cfg.rpc = Some(crate::config::RpcConfig {
+            enabled: true,
+            listen: rpc_addr.into(),
+        });
         let mut genesis = test_genesis();
         genesis.validators = vec![(21, kp(21).public(), 1)]; // quorum 1 ⇒ self-commit
-        let node = Node::start(cfg, genesis, Some(kp(21))).await.expect("start node");
+        let node = Node::start(cfg, genesis, Some(kp(21)))
+            .await
+            .expect("start node");
 
         let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
         loop {
             if node.status().await.map(|(h, _)| h >= 1).unwrap_or(false) {
                 break;
             }
-            assert!(tokio::time::Instant::now() < deadline, "node never produced a block");
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "node never produced a block"
+            );
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
 
         async fn get(addr: &str, path: &str) -> String {
-            let req = format!("GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
+            let req =
+                format!("GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
             let mut s = TcpStream::connect(addr).await.expect("connect rpc");
             s.write_all(req.as_bytes()).await.expect("send get");
             let mut resp = Vec::new();
@@ -10630,8 +12494,14 @@ vote_b.validator=5 vote_b.height=9 vote_b.round=2 vote_b.block_hash={b_h} vote_b
         // Account proof under JSON → 200 + application/json + {"certified_header":…}.
         let ap = get(rpc_addr, "/account/1/proof?format=json").await;
         assert!(ap.starts_with("HTTP/1.1 200 OK"), "account proof: {ap}");
-        assert!(ap.contains("Content-Type: application/json\r\n"), "account proof ct: {ap}");
-        assert!(body_of(&ap).starts_with("{\"certified_header\":{\"header\":{"), "account proof body: {ap}");
+        assert!(
+            ap.contains("Content-Type: application/json\r\n"),
+            "account proof ct: {ap}"
+        );
+        assert!(
+            body_of(&ap).starts_with("{\"certified_header\":{\"header\":{"),
+            "account proof body: {ap}"
+        );
 
         // Entity proof reuses the same renderer → carries the proof_entry field.
         let rp = get(rpc_addr, "/reviewer/10/proof?format=json").await;
@@ -10644,34 +12514,75 @@ vote_b.validator=5 vote_b.height=9 vote_b.round=2 vote_b.block_hash={b_h} vote_b
         // The daemon drives no bridge locks → data miss → 404 + {"error":…}.
         let lk = get(rpc_addr, "/bridge/lock/1/proof?format=json").await;
         assert!(lk.starts_with("HTTP/1.1 404"), "bridge lock: {lk}");
-        assert!(lk.contains("Content-Type: application/json\r\n"), "bridge lock ct: {lk}");
-        assert!(body_of(&lk).starts_with("{\"error\":"), "bridge lock body: {lk}");
+        assert!(
+            lk.contains("Content-Type: application/json\r\n"),
+            "bridge lock ct: {lk}"
+        );
+        assert!(
+            body_of(&lk).starts_with("{\"error\":"),
+            "bridge lock body: {lk}"
+        );
 
         // POST /submit_tx?format=json with a valid tx → {"hash":…}.
         let tx = test_tx(1, 0, 1);
         let hx = crate::hash::hex(&tx.hash());
-        let ok = post(rpc_addr, "/submit_tx?format=json", &crate::codec::encode_tx(&tx)).await;
+        let ok = post(
+            rpc_addr,
+            "/submit_tx?format=json",
+            &crate::codec::encode_tx(&tx),
+        )
+        .await;
         assert!(ok.starts_with("HTTP/1.1 200 OK"), "submit json: {ok}");
-        assert!(ok.contains("Content-Type: application/json\r\n"), "submit json ct: {ok}");
-        assert_eq!(body_of(&ok), format!("{{\"hash\":\"{hx}\"}}"), "submit json body: {ok}");
+        assert!(
+            ok.contains("Content-Type: application/json\r\n"),
+            "submit json ct: {ok}"
+        );
+        assert_eq!(
+            body_of(&ok),
+            format!("{{\"hash\":\"{hx}\"}}"),
+            "submit json body: {ok}"
+        );
 
         // A malformed submit body under JSON → 400 + {"error":…}.
         let bad = post(rpc_addr, "/submit_tx?format=json", b"not a tx").await;
         assert!(bad.starts_with("HTTP/1.1 400"), "submit bad: {bad}");
-        assert!(body_of(&bad).starts_with("{\"error\":"), "submit bad body: {bad}");
+        assert!(
+            body_of(&bad).starts_with("{\"error\":"),
+            "submit bad body: {bad}"
+        );
 
         // POST /batch?format=json with an encoded request → {"certified_header":…}.
-        let items = vec![BatchItem::Inclusion { kind: ProofKind::Reviewer, id: 10 }];
-        let batch = post(rpc_addr, "/batch?format=json", &crate::net::encode_batch_request(&items)).await;
+        let items = vec![BatchItem::Inclusion {
+            kind: ProofKind::Reviewer,
+            id: 10,
+        }];
+        let batch = post(
+            rpc_addr,
+            "/batch?format=json",
+            &crate::net::encode_batch_request(&items),
+        )
+        .await;
         assert!(batch.starts_with("HTTP/1.1 200 OK"), "batch json: {batch}");
-        assert!(batch.contains("Content-Type: application/json\r\n"), "batch json ct: {batch}");
-        assert!(body_of(&batch).starts_with("{\"certified_header\":{\"header\":{"), "batch json body: {batch}");
+        assert!(
+            batch.contains("Content-Type: application/json\r\n"),
+            "batch json ct: {batch}"
+        );
+        assert!(
+            body_of(&batch).starts_with("{\"certified_header\":{\"header\":{"),
+            "batch json body: {batch}"
+        );
 
         // Head invariant at the response layer: a query-less proof read is byte-identical
         // to the pre-M67 plaintext (text/plain, labeled `certified_header=` hex line).
         let plain = get(rpc_addr, "/account/1/proof").await;
-        assert!(plain.contains("Content-Type: text/plain; charset=utf-8\r\n"), "plain ct: {plain}");
-        assert!(body_of(&plain).starts_with("certified_header="), "plain body: {plain}");
+        assert!(
+            plain.contains("Content-Type: text/plain; charset=utf-8\r\n"),
+            "plain ct: {plain}"
+        );
+        assert!(
+            body_of(&plain).starts_with("certified_header="),
+            "plain body: {plain}"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -10688,7 +12599,9 @@ vote_b.validator=5 vote_b.height=9 vote_b.round=2 vote_b.block_hash={b_h} vote_b
         let cfg = node_config(21, 20012, &[21], dir.clone());
         let mut genesis = test_genesis();
         genesis.validators = vec![(21, kp(21).public(), 1)]; // quorum 1 ⇒ node self-commits
-        let node = Node::start(cfg, genesis.clone(), Some(kp(21))).await.expect("start node");
+        let node = Node::start(cfg, genesis.clone(), Some(kp(21)))
+            .await
+            .expect("start node");
 
         // Wait for a certified head so the batch has a signed header to verify against.
         let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
@@ -10696,22 +12609,41 @@ vote_b.validator=5 vote_b.height=9 vote_b.round=2 vote_b.block_hash={b_h} vote_b
             if node.status().await.map(|(h, _)| h >= 1).unwrap_or(false) {
                 break;
             }
-            assert!(tokio::time::Instant::now() < deadline, "node never produced a block");
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "node never produced a block"
+            );
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
 
         let items = vec![
-            BatchItem::Inclusion { kind: ProofKind::Reviewer, id: 10 },
-            BatchItem::Inclusion { kind: ProofKind::Validator, id: 21 },
-            BatchItem::Knn { query: unit(0), k: 1 },
-            BatchItem::Range { query: unit(0), min_sim: 0.0 },
+            BatchItem::Inclusion {
+                kind: ProofKind::Reviewer,
+                id: 10,
+            },
+            BatchItem::Inclusion {
+                kind: ProofKind::Validator,
+                id: 21,
+            },
+            BatchItem::Knn {
+                query: unit(0),
+                k: 1,
+            },
+            BatchItem::Range {
+                query: unit(0),
+                min_sim: 0.0,
+            },
         ];
         let (ch, env, range) = node
             .batch_proof(items.clone())
             .await
             .expect("actor up")
             .expect("batch served");
-        assert_eq!(env.items.len(), items.len(), "one response slot per request item");
+        assert_eq!(
+            env.items.len(),
+            items.len(),
+            "one response slot per request item"
+        );
         // M62: no Diff item ⇒ the shipped range is empty.
         assert!(range.is_empty(), "a Diff-free batch ships no range blocks");
 
@@ -10728,15 +12660,32 @@ vote_b.validator=5 vote_b.height=9 vote_b.round=2 vote_b.block_hash={b_h} vote_b
             .expect("batch must verify against the tracked genesis set");
 
         // An unknown inclusion id yields an inner None slot and still verifies (no-op).
-        let miss_items = vec![BatchItem::Inclusion { kind: ProofKind::Reviewer, id: 99 }];
+        let miss_items = vec![BatchItem::Inclusion {
+            kind: ProofKind::Reviewer,
+            id: 99,
+        }];
         let (ch2, env2, _range2) = node
             .batch_proof(miss_items.clone())
             .await
             .expect("actor up")
             .expect("batch served");
-        assert!(matches!(env2.items[0], crate::light::BatchResponseItem::Inclusion(None)), "unknown id ⇒ None slot");
+        assert!(
+            matches!(
+                env2.items[0],
+                crate::light::BatchResponseItem::Inclusion(None)
+            ),
+            "unknown id ⇒ None slot"
+        );
         tracker
-            .verify_batch(&genesis, &ch2.header, &ch2.cert, &tracked, &[], &miss_items, &env2)
+            .verify_batch(
+                &genesis,
+                &ch2.header,
+                &ch2.cert,
+                &tracked,
+                &[],
+                &miss_items,
+                &env2,
+            )
             .expect("a None slot is a verified no-op");
 
         let _ = std::fs::remove_dir_all(&dir);
@@ -10750,10 +12699,15 @@ vote_b.validator=5 vote_b.height=9 vote_b.round=2 vote_b.block_hash={b_h} vote_b
         let dir = tmp_dir("rpc-batch");
         let mut cfg = node_config(21, 20032, &[21], dir.clone());
         let rpc_addr = "127.0.0.1:20052";
-        cfg.rpc = Some(crate::config::RpcConfig { enabled: true, listen: rpc_addr.into() });
+        cfg.rpc = Some(crate::config::RpcConfig {
+            enabled: true,
+            listen: rpc_addr.into(),
+        });
         let mut genesis = test_genesis();
         genesis.validators = vec![(21, kp(21).public(), 1)];
-        let node = Node::start(cfg, genesis, Some(kp(21))).await.expect("start node");
+        let node = Node::start(cfg, genesis, Some(kp(21)))
+            .await
+            .expect("start node");
 
         // Wait for a certified head so the batch route has something to verify against.
         let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
@@ -10761,7 +12715,10 @@ vote_b.validator=5 vote_b.height=9 vote_b.round=2 vote_b.block_hash={b_h} vote_b
             if node.status().await.map(|(h, _)| h >= 1).unwrap_or(false) {
                 break;
             }
-            assert!(tokio::time::Instant::now() < deadline, "node never produced a block");
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "node never produced a block"
+            );
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
 
@@ -10784,10 +12741,21 @@ vote_b.validator=5 vote_b.height=9 vote_b.round=2 vote_b.block_hash={b_h} vote_b
 
         // POST /batch with a valid encoded request → 200 + two labeled hex lines.
         let items = vec![
-            BatchItem::Inclusion { kind: ProofKind::Reviewer, id: 10 },
-            BatchItem::Knn { query: unit(0), k: 1 },
+            BatchItem::Inclusion {
+                kind: ProofKind::Reviewer,
+                id: 10,
+            },
+            BatchItem::Knn {
+                query: unit(0),
+                k: 1,
+            },
         ];
-        let ok = post(rpc_addr, "/batch", &crate::net::encode_batch_request(&items)).await;
+        let ok = post(
+            rpc_addr,
+            "/batch",
+            &crate::net::encode_batch_request(&items),
+        )
+        .await;
         assert!(ok.starts_with("HTTP/1.1 200 OK"), "batch status: {ok}");
         let body = body_of(&ok);
         assert!(body.contains("certified_header="), "batch body: {body:?}");
@@ -10800,7 +12768,10 @@ vote_b.validator=5 vote_b.height=9 vote_b.round=2 vote_b.block_hash={b_h} vote_b
         // A non-`/batch` POST still routes to the M53 submit path (undecodable tx → 400,
         // proving it took the tx branch rather than the batch branch).
         let submit = post(rpc_addr, "/submit_tx", b"not a tx").await;
-        assert!(submit.starts_with("HTTP/1.1 400"), "submit path status: {submit}");
+        assert!(
+            submit.starts_with("HTTP/1.1 400"),
+            "submit path status: {submit}"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -10813,10 +12784,15 @@ vote_b.validator=5 vote_b.height=9 vote_b.round=2 vote_b.block_hash={b_h} vote_b
         let dir = tmp_dir("rpc-batch-diff");
         let mut cfg = node_config(21, 20112, &[21], dir.clone());
         let rpc_addr = "127.0.0.1:20113";
-        cfg.rpc = Some(crate::config::RpcConfig { enabled: true, listen: rpc_addr.into() });
+        cfg.rpc = Some(crate::config::RpcConfig {
+            enabled: true,
+            listen: rpc_addr.into(),
+        });
         let mut genesis = test_genesis();
         genesis.validators = vec![(21, kp(21).public(), 1)];
-        let node = Node::start(cfg, genesis, Some(kp(21))).await.expect("start node");
+        let node = Node::start(cfg, genesis, Some(kp(21)))
+            .await
+            .expect("start node");
 
         // Diff{1,2} needs height ≥ 2.
         let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
@@ -10824,7 +12800,10 @@ vote_b.validator=5 vote_b.height=9 vote_b.round=2 vote_b.block_hash={b_h} vote_b
             if node.status().await.map(|(h, _)| h >= 2).unwrap_or(false) {
                 break;
             }
-            assert!(tokio::time::Instant::now() < deadline, "node never reached height 2");
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "node never reached height 2"
+            );
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
 
@@ -10853,9 +12832,17 @@ vote_b.validator=5 vote_b.height=9 vote_b.round=2 vote_b.block_hash={b_h} vote_b
 
         let items = vec![
             BatchItem::Diff { h1: 1, h2: 2 },
-            BatchItem::Inclusion { kind: ProofKind::Reviewer, id: 10 },
+            BatchItem::Inclusion {
+                kind: ProofKind::Reviewer,
+                id: 10,
+            },
         ];
-        let ok = post(rpc_addr, "/batch", &crate::net::encode_batch_request(&items)).await;
+        let ok = post(
+            rpc_addr,
+            "/batch",
+            &crate::net::encode_batch_request(&items),
+        )
+        .await;
         assert!(ok.starts_with("HTTP/1.1 200 OK"), "batch status: {ok}");
         let body = body_of(&ok);
         assert!(body.contains("certified_header="), "batch body: {body:?}");
@@ -10868,7 +12855,11 @@ vote_b.validator=5 vote_b.height=9 vote_b.round=2 vote_b.block_hash={b_h} vote_b
             .find_map(|l| l.strip_prefix("range_blocks="))
             .expect("range_blocks line present");
         let range = crate::net::decode_blocks(&unhex(range_hex)).expect("decode range blocks");
-        assert_eq!(range.len(), 2, "Diff{{1,2}} ships the full [1..=2] range over RPC");
+        assert_eq!(
+            range.len(),
+            2,
+            "Diff{{1,2}} ships the full [1..=2] range over RPC"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -10879,7 +12870,10 @@ vote_b.validator=5 vote_b.height=9 vote_b.round=2 vote_b.block_hash={b_h} vote_b
         // time passes; refill is `rate`/sec and capped at `burst`.
         let t0 = Instant::now();
         let (rate, burst) = (1.0, 2.0);
-        let mut b = TokenBucket { tokens: burst, last: t0 };
+        let mut b = TokenBucket {
+            tokens: burst,
+            last: t0,
+        };
         // Two tokens available, both consumed; the third is denied (no time passes).
         assert!(b.allow(t0, rate, burst));
         assert!(b.allow(t0, rate, burst));
@@ -10903,7 +12897,9 @@ vote_b.validator=5 vote_b.height=9 vote_b.round=2 vote_b.block_hash={b_h} vote_b
         let dir = tmp_dir("submit-tx-full");
         let mut cfg = node_config(21, 19741, &[21], dir.clone());
         cfg.mempool.capacity = 1;
-        let node = Node::start(cfg, test_genesis(), None).await.expect("start node");
+        let node = Node::start(cfg, test_genesis(), None)
+            .await
+            .expect("start node");
 
         let first = node.submit_tx(test_tx(1, 0, 1)).await.expect("actor alive");
         assert!(first.is_ok(), "first tx admitted, got {first:?}");
@@ -10929,10 +12925,17 @@ vote_b.validator=5 vote_b.height=9 vote_b.round=2 vote_b.block_hash={b_h} vote_b
     ) -> NodeConfig {
         let addr = |i: u64| format!("127.0.0.1:{}", port_base + (i - 21) as u16);
         NodeConfig {
-            node: crate::config::NodeSection { id, listen: addr(id), data_dir },
+            node: crate::config::NodeSection {
+                id,
+                listen: addr(id),
+                data_dir,
+            },
             peers: peers
                 .iter()
-                .map(|&p| crate::config::PeerConfig { id: p, addr: addr(p) })
+                .map(|&p| crate::config::PeerConfig {
+                    id: p,
+                    addr: addr(p),
+                })
                 .collect(),
             genesis: String::new(),
             validator: None,
@@ -10965,7 +12968,9 @@ vote_b.validator=5 vote_b.height=9 vote_b.round=2 vote_b.block_hash={b_h} vote_b
             let dir = tmp_dir(&format!("disc-n{id}"));
             data_dirs.insert(id, dir.clone());
             let cfg = discovery_config(id, port_base, &peers, dir, true);
-            let node = Node::start(cfg, genesis.clone(), Some(kp(id))).await.expect("start node");
+            let node = Node::start(cfg, genesis.clone(), Some(kp(id)))
+                .await
+                .expect("start node");
             nodes.push((id, node));
         }
 
@@ -11005,7 +13010,9 @@ vote_b.validator=5 vote_b.height=9 vote_b.round=2 vote_b.block_hash={b_h} vote_b
             let dir = tmp_dir(&format!("noexch-n{id}"));
             data_dirs.insert(id, dir.clone());
             let cfg = discovery_config(id, port_base, &peers, dir, false);
-            let node = Node::start(cfg, genesis.clone(), Some(kp(id))).await.expect("start node");
+            let node = Node::start(cfg, genesis.clone(), Some(kp(id)))
+                .await
+                .expect("start node");
             nodes.push((id, node));
         }
 
@@ -11013,7 +13020,10 @@ vote_b.validator=5 vote_b.height=9 vote_b.round=2 vote_b.block_hash={b_h} vote_b
         // path doesn't leak an address book when exchange is off.
         tokio::time::sleep(Duration::from_millis(2500)).await;
         let peers = nodes[0].1.metrics().await.map(|m| m.peers).unwrap_or(0);
-        assert_eq!(peers, 1, "with exchange off, node 21 must stay at its 1 seeded peer");
+        assert_eq!(
+            peers, 1,
+            "with exchange off, node 21 must stay at its 1 seeded peer"
+        );
 
         cleanup(&data_dirs);
     }
@@ -11037,13 +13047,18 @@ vote_b.validator=5 vote_b.height=9 vote_b.round=2 vote_b.block_hash={b_h} vote_b
             data_dirs.insert(id, dir.clone());
             let mut cfg = node_config(id, port_base, &ids, dir);
             cfg.network.require_peer_auth = true;
-            let node = Node::start(cfg, genesis.clone(), Some(kp(id))).await.expect("start node");
+            let node = Node::start(cfg, genesis.clone(), Some(kp(id)))
+                .await
+                .expect("start node");
             nodes.push((id, node));
         }
 
         // If authentication works, consensus proceeds and heads agree.
         let states = await_converged(&nodes, 2, Duration::from_secs(30)).await;
-        assert!(states.windows(2).all(|w| w[0] == w[1]), "authenticated mesh converged");
+        assert!(
+            states.windows(2).all(|w| w[0] == w[1]),
+            "authenticated mesh converged"
+        );
 
         cleanup(&data_dirs);
     }
@@ -11063,7 +13078,9 @@ vote_b.validator=5 vote_b.height=9 vote_b.round=2 vote_b.block_hash={b_h} vote_b
 
         let mut cfg = node_config(21, port_base, &[21], dir);
         cfg.network.require_peer_auth = true;
-        let node = Node::start(cfg, genesis.clone(), Some(kp(21))).await.expect("start node");
+        let node = Node::start(cfg, genesis.clone(), Some(kp(21)))
+            .await
+            .expect("start node");
 
         // Give the listener a moment, then connect as a bogus peer.
         tokio::time::sleep(Duration::from_millis(200)).await;
@@ -11092,7 +13109,10 @@ vote_b.validator=5 vote_b.height=9 vote_b.round=2 vote_b.block_hash={b_h} vote_b
         // The honest node must never register this peer.
         tokio::time::sleep(Duration::from_millis(500)).await;
         let peers = node.metrics().await.map(|m| m.peers).unwrap_or(99);
-        assert_eq!(peers, 0, "impostor without the genesis key must be rejected");
+        assert_eq!(
+            peers, 0,
+            "impostor without the genesis key must be rejected"
+        );
 
         cleanup(&data_dirs);
     }
@@ -11116,12 +13136,17 @@ vote_b.validator=5 vote_b.height=9 vote_b.round=2 vote_b.block_hash={b_h} vote_b
             data_dirs.insert(id, dir.clone());
             let mut cfg = node_config(id, port_base, &ids, dir);
             cfg.network.enable_tls = true;
-            let node = Node::start(cfg, genesis.clone(), Some(kp(id))).await.expect("start node");
+            let node = Node::start(cfg, genesis.clone(), Some(kp(id)))
+                .await
+                .expect("start node");
             nodes.push((id, node));
         }
 
         let states = await_converged(&nodes, 2, Duration::from_secs(30)).await;
-        assert!(states.windows(2).all(|w| w[0] == w[1]), "TLS mesh converged");
+        assert!(
+            states.windows(2).all(|w| w[0] == w[1]),
+            "TLS mesh converged"
+        );
 
         cleanup(&data_dirs);
     }
@@ -11143,12 +13168,17 @@ vote_b.validator=5 vote_b.height=9 vote_b.round=2 vote_b.block_hash={b_h} vote_b
             let mut cfg = node_config(id, port_base, &ids, dir);
             cfg.network.enable_tls = true;
             cfg.network.require_peer_auth = true;
-            let node = Node::start(cfg, genesis.clone(), Some(kp(id))).await.expect("start node");
+            let node = Node::start(cfg, genesis.clone(), Some(kp(id)))
+                .await
+                .expect("start node");
             nodes.push((id, node));
         }
 
         let states = await_converged(&nodes, 2, Duration::from_secs(30)).await;
-        assert!(states.windows(2).all(|w| w[0] == w[1]), "TLS+auth mesh converged");
+        assert!(
+            states.windows(2).all(|w| w[0] == w[1]),
+            "TLS+auth mesh converged"
+        );
 
         cleanup(&data_dirs);
     }
@@ -11167,7 +13197,9 @@ vote_b.validator=5 vote_b.height=9 vote_b.round=2 vote_b.block_hash={b_h} vote_b
 
         let mut cfg = node_config(21, port_base, &[21], dir);
         cfg.network.enable_tls = true;
-        let node = Node::start(cfg, genesis.clone(), Some(kp(21))).await.expect("start node");
+        let node = Node::start(cfg, genesis.clone(), Some(kp(21)))
+            .await
+            .expect("start node");
 
         tokio::time::sleep(Duration::from_millis(200)).await;
         let addr = format!("127.0.0.1:{port_base}");
@@ -11206,12 +13238,17 @@ vote_b.validator=5 vote_b.height=9 vote_b.round=2 vote_b.block_hash={b_h} vote_b
             cfg.network.enable_tls = true;
             cfg.network.require_peer_auth = true;
             cfg.network.bind_channel = true;
-            let node = Node::start(cfg, genesis.clone(), Some(kp(id))).await.expect("start node");
+            let node = Node::start(cfg, genesis.clone(), Some(kp(id)))
+                .await
+                .expect("start node");
             nodes.push((id, node));
         }
 
         let states = await_converged(&nodes, 2, Duration::from_secs(30)).await;
-        assert!(states.windows(2).all(|w| w[0] == w[1]), "channel-bound mesh converged");
+        assert!(
+            states.windows(2).all(|w| w[0] == w[1]),
+            "channel-bound mesh converged"
+        );
 
         cleanup(&data_dirs);
     }
@@ -11231,7 +13268,10 @@ vote_b.validator=5 vote_b.height=9 vote_b.round=2 vote_b.block_hash={b_h} vote_b
         let mut cfg = node_config(21, 19931, &[21], dir);
         cfg.network.bind_channel = true;
         let err = Node::start(cfg, genesis.clone(), Some(kp(21))).await;
-        assert!(err.is_err(), "bind_channel without enable_tls must fail fast");
+        assert!(
+            err.is_err(),
+            "bind_channel without enable_tls must fail fast"
+        );
 
         cleanup(&data_dirs);
     }
@@ -11256,8 +13296,14 @@ vote_b.validator=5 vote_b.height=9 vote_b.round=2 vote_b.block_hash={b_h} vote_b
         assert_eq!(decoded, Keypair::from_seed(seed).public());
 
         // Malformed SPKIs are rejected rather than mis-sliced.
-        assert!(spki_to_ed25519(&[0u8; 44]).is_none(), "wrong prefix rejected");
-        assert!(spki_to_ed25519(&spki.as_ref()[..40]).is_none(), "wrong length rejected");
+        assert!(
+            spki_to_ed25519(&[0u8; 44]).is_none(),
+            "wrong prefix rejected"
+        );
+        assert!(
+            spki_to_ed25519(&spki.as_ref()[..40]).is_none(),
+            "wrong length rejected"
+        );
     }
 
     #[test]
@@ -11286,7 +13332,9 @@ vote_b.validator=5 vote_b.height=9 vote_b.round=2 vote_b.block_hash={b_h} vote_b
         assert!(v.verify_server_cert(&inside, &[], &name, &[], now).is_ok());
         assert!(v.verify_client_cert(&inside, &[], now).is_ok());
         // An out-of-set key is rejected by both directions.
-        assert!(v.verify_server_cert(&outside, &[], &name, &[], now).is_err());
+        assert!(v
+            .verify_server_cert(&outside, &[], &name, &[], now)
+            .is_err());
         assert!(v.verify_client_cert(&outside, &[], now).is_err());
     }
 
@@ -11310,12 +13358,17 @@ vote_b.validator=5 vote_b.height=9 vote_b.round=2 vote_b.block_hash={b_h} vote_b
             cfg.network.enable_tls = true;
             cfg.network.require_peer_certs = true;
             cfg.network.require_peer_auth = true;
-            let node = Node::start(cfg, genesis.clone(), Some(kp(id))).await.expect("start node");
+            let node = Node::start(cfg, genesis.clone(), Some(kp(id)))
+                .await
+                .expect("start node");
             nodes.push((id, node));
         }
 
         let states = await_converged(&nodes, 2, Duration::from_secs(30)).await;
-        assert!(states.windows(2).all(|w| w[0] == w[1]), "mTLS mesh converged");
+        assert!(
+            states.windows(2).all(|w| w[0] == w[1]),
+            "mTLS mesh converged"
+        );
 
         cleanup(&data_dirs);
     }
@@ -11339,13 +13392,15 @@ vote_b.validator=5 vote_b.height=9 vote_b.round=2 vote_b.block_hash={b_h} vote_b
         let mut cfg22 = node_config(22, port_base, &[22, 23], dir22);
         cfg22.network.enable_tls = true;
         cfg22.network.require_peer_certs = true;
-        let node22 =
-            Node::start(cfg22, genesis.clone(), Some(kp(22))).await.expect("start mtls node");
+        let node22 = Node::start(cfg22, genesis.clone(), Some(kp(22)))
+            .await
+            .expect("start mtls node");
 
         let mut cfg23 = node_config(23, port_base, &[22, 23], dir23);
         cfg23.network.enable_tls = true; // encryption-only, no mTLS
-        let _node23 =
-            Node::start(cfg23, genesis.clone(), Some(kp(23))).await.expect("start tls node");
+        let _node23 = Node::start(cfg23, genesis.clone(), Some(kp(23)))
+            .await
+            .expect("start tls node");
 
         tokio::time::sleep(Duration::from_millis(800)).await;
         let peers = node22.metrics().await.map(|m| m.peers).unwrap_or(99);
@@ -11367,7 +13422,10 @@ vote_b.validator=5 vote_b.height=9 vote_b.round=2 vote_b.block_hash={b_h} vote_b
         let mut cfg = node_config(21, 19991, &[21], dir);
         cfg.network.require_peer_certs = true; // but enable_tls left off
         let err = Node::start(cfg, genesis.clone(), Some(kp(21))).await;
-        assert!(err.is_err(), "require_peer_certs without enable_tls must fail fast");
+        assert!(
+            err.is_err(),
+            "require_peer_certs without enable_tls must fail fast"
+        );
 
         cleanup(&data_dirs);
     }
@@ -11399,7 +13457,7 @@ vote_b.validator=5 vote_b.height=9 vote_b.round=2 vote_b.block_hash={b_h} vote_b
             bridge_headers_commitment: [0x0a; 32],
             bridge_redeems_commitment: [0x0b; 32],
             proposer: 0,
-};
+        };
         let cert = Commit {
             height: 7,
             round: 0,
@@ -11418,13 +13476,31 @@ vote_b.validator=5 vote_b.height=9 vote_b.round=2 vote_b.block_hash={b_h} vote_b
         // The certified header renders as a nested object, not an opaque hex string.
         let j = json_certified_header(&ch);
         assert!(j.starts_with("{\"header\":{"), "nested header object: {j}");
-        assert!(j.contains("\"height\":\"7\""), "u64 rendered as a quoted string: {j}");
-        assert!(j.contains(&format!("\"state_root\":\"{}\"", "ab".repeat(32))), "{j}");
-        assert!(j.contains("\"timestamp_days\":1.5"), "f32 as a bare number: {j}");
-        assert!(j.contains("\"validator_updates\":[{"), "non-empty update array: {j}");
+        assert!(
+            j.contains("\"height\":\"7\""),
+            "u64 rendered as a quoted string: {j}"
+        );
+        assert!(
+            j.contains(&format!("\"state_root\":\"{}\"", "ab".repeat(32))),
+            "{j}"
+        );
+        assert!(
+            j.contains("\"timestamp_days\":1.5"),
+            "f32 as a bare number: {j}"
+        );
+        assert!(
+            j.contains("\"validator_updates\":[{"),
+            "non-empty update array: {j}"
+        );
         assert!(j.contains("\"round\":\"0\""), "u32 as a quoted string: {j}");
-        assert!(j.contains("\"vote_type\":\"precommit\""), "enum as discriminator: {j}");
-        assert!(j.contains("\"precommits\":[{"), "non-empty precommit array: {j}");
+        assert!(
+            j.contains("\"vote_type\":\"precommit\""),
+            "enum as discriminator: {j}"
+        );
+        assert!(
+            j.contains("\"precommits\":[{"),
+            "non-empty precommit array: {j}"
+        );
         // Hand-rolled body is well-formed: braces balance.
         assert_eq!(
             j.matches('{').count(),
@@ -11445,11 +13521,14 @@ vote_b.validator=5 vote_b.height=9 vote_b.round=2 vote_b.block_hash={b_h} vote_b
                 submissions: 0,
                 accepted: 0,
                 nonce: 0,
-},
+            },
             proof: crate::merkle::Proof { steps: vec![] },
         };
         let p = json_account_proof(&ch, &entry);
-        assert!(p.starts_with("{\"certified_header\":{\"header\":{"), "embedded object: {p}");
+        assert!(
+            p.starts_with("{\"certified_header\":{\"header\":{"),
+            "embedded object: {p}"
+        );
         assert!(
             p.contains("\"proof_entry\":{\"kind\":\"account\""),
             "proof_entry is now a structured object: {p}"
@@ -11486,28 +13565,45 @@ vote_b.validator=5 vote_b.height=9 vote_b.round=2 vote_b.block_hash={b_h} vote_b
                 submissions: 0,
                 accepted: 0,
                 nonce: 0,
-},
+            },
             proof: path.clone(),
         };
         let a = json_proof_entry(&acct);
         assert!(a.starts_with("{\"kind\":\"account\",\"account\":{"), "{a}");
-        assert!(a.contains("\"balance\":\"42\"") && a.contains("\"pubkey\":\""), "{a}");
+        assert!(
+            a.contains("\"balance\":\"42\"") && a.contains("\"pubkey\":\""),
+            "{a}"
+        );
         assert!(a.contains(merkle_json), "{a}");
 
         // Reviewer leaf: bare reputation.
-        let rev = ProofEntry::Reviewer { id: 10, reputation: 1.5, proof: path.clone() };
+        let rev = ProofEntry::Reviewer {
+            id: 10,
+            reputation: 1.5,
+            proof: path.clone(),
+        };
         let r = json_proof_entry(&rev);
-        assert!(r.starts_with("{\"kind\":\"reviewer\",\"id\":\"10\",\"reputation\":1.5,"), "{r}");
+        assert!(
+            r.starts_with("{\"kind\":\"reviewer\",\"id\":\"10\",\"reputation\":1.5,"),
+            "{r}"
+        );
         assert!(r.contains(merkle_json), "{r}");
 
         // Validator leaf: id / power / pubkey.
         let val = ProofEntry::Validator {
             id: 21,
-            validator: crate::validator::Validator { id: 21, pubkey: kp(21).public(), power: 7 },
+            validator: crate::validator::Validator {
+                id: 21,
+                pubkey: kp(21).public(),
+                power: 7,
+            },
             proof: path.clone(),
         };
         let v = json_proof_entry(&val);
-        assert!(v.starts_with("{\"kind\":\"validator\",\"id\":\"21\",\"power\":\"7\","), "{v}");
+        assert!(
+            v.starts_with("{\"kind\":\"validator\",\"id\":\"21\",\"power\":\"7\","),
+            "{v}"
+        );
         assert!(v.contains("\"pubkey\":\""), "{v}");
         assert!(v.contains(merkle_json), "{v}");
 
@@ -11522,9 +13618,14 @@ vote_b.validator=5 vote_b.height=9 vote_b.round=2 vote_b.block_hash={b_h} vote_b
             proof: path.clone(),
         };
         let g = json_proof_entry(&gn);
-        assert!(g.starts_with("{\"kind\":\"graph\",\"node_id\":\"99\","), "{g}");
         assert!(
-            g.contains("\"domain\":\"3\"") && g.contains("\"dim\":\"8\"") && g.contains("\"embedding\":["),
+            g.starts_with("{\"kind\":\"graph\",\"node_id\":\"99\","),
+            "{g}"
+        );
+        assert!(
+            g.contains("\"domain\":\"3\"")
+                && g.contains("\"dim\":\"8\"")
+                && g.contains("\"embedding\":["),
             "{g}"
         );
         assert!(g.contains(merkle_json), "{g}");
@@ -11547,7 +13648,11 @@ vote_b.validator=5 vote_b.height=9 vote_b.round=2 vote_b.block_hash={b_h} vote_b
             BatchResponseEnvelope, BatchResponseItem, DiffEnvelope, KnnClaim, ProofEntry,
             RangeClaim,
         };
-        let g = crate::engine::GraphNode { node_id: 7, embedding: [0.25; 8], domain: 42 };
+        let g = crate::engine::GraphNode {
+            node_id: 7,
+            embedding: [0.25; 8],
+            domain: 42,
+        };
         let path = crate::merkle::Proof {
             steps: vec![crate::merkle::Step::Left([0xAA; 32])],
         };
@@ -11568,8 +13673,13 @@ vote_b.validator=5 vote_b.height=9 vote_b.round=2 vote_b.block_hash={b_h} vote_b
             bridge_headers_commitment: [0u8; 32],
             bridge_redeems_commitment: [0u8; 32],
             proposer: 0,
-};
-        let cert = |height: u64| Commit { height, round: 0, block_hash: [0u8; 32], precommits: vec![] };
+        };
+        let cert = |height: u64| Commit {
+            height,
+            round: 0,
+            block_hash: [0u8; 32],
+            precommits: vec![],
+        };
         let acct = crate::Account {
             pubkey: kp(1).public(),
             balance: 100,
@@ -11579,7 +13689,7 @@ vote_b.validator=5 vote_b.height=9 vote_b.round=2 vote_b.block_hash={b_h} vote_b
             submissions: 0,
             accepted: 0,
             nonce: 0,
-};
+        };
         let diff_env = DiffEnvelope {
             header_prev: hdr(1),
             cert_prev: cert(1),
@@ -11593,11 +13703,13 @@ vote_b.validator=5 vote_b.height=9 vote_b.round=2 vote_b.block_hash={b_h} vote_b
                 }],
                 dropped: vec![],
             },
-            tracked_set_h1: crate::validator::ValidatorSet::new(vec![crate::validator::Validator {
-                id: 21,
-                pubkey: kp(21).public(),
-                power: 1,
-            }]),
+            tracked_set_h1: crate::validator::ValidatorSet::new(vec![
+                crate::validator::Validator {
+                    id: 21,
+                    pubkey: kp(21).public(),
+                    power: 1,
+                },
+            ]),
             tracked_set_h2: crate::validator::ValidatorSet::new(vec![]),
         };
         let env = BatchResponseEnvelope {
@@ -11625,24 +13737,44 @@ vote_b.validator=5 vote_b.height=9 vote_b.round=2 vote_b.block_hash={b_h} vote_b
 
         // Envelope scaffold + each kind tag.
         assert!(j.starts_with("{\"items\":["), "{j}");
-        assert!(j.contains("{\"kind\":\"inclusion\",\"entry\":{\"kind\":\"account\""), "{j}");
+        assert!(
+            j.contains("{\"kind\":\"inclusion\",\"entry\":{\"kind\":\"account\""),
+            "{j}"
+        );
         assert!(j.contains("{\"kind\":\"inclusion\",\"entry\":null}"), "{j}");
-        assert!(j.contains("{\"kind\":\"knn\",\"claim\":{\"query\":["), "{j}");
+        assert!(
+            j.contains("{\"kind\":\"knn\",\"claim\":{\"query\":["),
+            "{j}"
+        );
         assert!(j.contains("\"k\":\"3\""), "{j}");
-        assert!(j.contains("{\"kind\":\"range\",\"claim\":{\"query\":["), "{j}");
+        assert!(
+            j.contains("{\"kind\":\"range\",\"claim\":{\"query\":["),
+            "{j}"
+        );
         assert!(j.contains("\"min_sim\":0.5"), "{j}");
-        assert!(j.contains("{\"kind\":\"diff\",\"envelope\":{\"header_prev\":{\"height\":\"1\""), "{j}");
+        assert!(
+            j.contains("{\"kind\":\"diff\",\"envelope\":{\"header_prev\":{\"height\":\"1\""),
+            "{j}"
+        );
 
         // Graph leaf: nested graph_node + merkle path.
         assert!(
-            j.contains("\"graph_node\":{\"node_id\":\"7\",\"domain\":\"42\",\"dim\":\"8\",\"embedding\":["),
+            j.contains(
+                "\"graph_node\":{\"node_id\":\"7\",\"domain\":\"42\",\"dim\":\"8\",\"embedding\":["
+            ),
             "{j}"
         );
-        assert!(j.contains("\"proof\":{\"steps\":[{\"side\":\"left\",\"hash\":\""), "{j}");
+        assert!(
+            j.contains("\"proof\":{\"steps\":[{\"side\":\"left\",\"hash\":\""),
+            "{j}"
+        );
 
         // Diff body + tracked validator sets.
         assert!(j.contains("\"diff\":{\"added\":[{\"node_id\":\"7\""), "{j}");
-        assert!(j.contains("\"tracked_set_h1\":[{\"id\":\"21\",\"pubkey\":"), "{j}");
+        assert!(
+            j.contains("\"tracked_set_h1\":[{\"id\":\"21\",\"pubkey\":"),
+            "{j}"
+        );
         assert!(j.contains("\"tracked_set_h2\":[]"), "{j}");
 
         // Braces balance.
@@ -11675,16 +13807,23 @@ vote_b.validator=5 vote_b.height=9 vote_b.round=2 vote_b.block_hash={b_h} vote_b
             bridge_headers_commitment: [0u8; 32],
             bridge_redeems_commitment: [0u8; 32],
             proposer: 0,
-};
-        let cert = |height: u64| Commit { height, round: 0, block_hash: [0u8; 32], precommits: vec![] };
+        };
+        let cert = |height: u64| Commit {
+            height,
+            round: 0,
+            block_hash: [0u8; 32],
+            precommits: vec![],
+        };
         let env = crate::bridge::LockEnvelope {
             source_header: hdr(5),
             source_cert: cert(5),
-            source_tracked_set: crate::validator::ValidatorSet::new(vec![crate::validator::Validator {
-                id: 21,
-                pubkey: kp(21).public(),
-                power: 2,
-            }]),
+            source_tracked_set: crate::validator::ValidatorSet::new(vec![
+                crate::validator::Validator {
+                    id: 21,
+                    pubkey: kp(21).public(),
+                    power: 2,
+                },
+            ]),
             lock_id: 3,
             lock: crate::BridgeLock {
                 account: 1,
@@ -11695,7 +13834,10 @@ vote_b.validator=5 vote_b.height=9 vote_b.round=2 vote_b.block_hash={b_h} vote_b
                 signature: [9u8; 64],
             },
             proof: crate::merkle::Proof {
-                steps: vec![crate::merkle::Step::Left([1u8; 32]), crate::merkle::Step::Right([2u8; 32])],
+                steps: vec![
+                    crate::merkle::Step::Left([1u8; 32]),
+                    crate::merkle::Step::Right([2u8; 32]),
+                ],
             },
         };
         let j = json_lock(&env);
@@ -11704,15 +13846,27 @@ vote_b.validator=5 vote_b.height=9 vote_b.round=2 vote_b.block_hash={b_h} vote_b
         assert!(j.starts_with("{\"lock_envelope\":{"), "{j}");
         assert!(j.contains("\"source_header\":{\"height\":\"5\""), "{j}");
         assert!(j.contains("\"source_cert\":{"), "{j}");
-        assert!(j.contains("\"source_tracked_set\":[{\"id\":\"21\",\"pubkey\":"), "{j}");
+        assert!(
+            j.contains("\"source_tracked_set\":[{\"id\":\"21\",\"pubkey\":"),
+            "{j}"
+        );
         assert!(j.contains("\"lock_id\":\"3\""), "{j}");
 
         // The lock leaf: all six fields incl. signature.
-        assert!(j.contains("\"lock\":{\"account\":\"1\",\"amount\":\"4000000\",\"dest_chain\":\""), "{j}");
-        assert!(j.contains("\"dest_account\":\"7\",\"nonce\":\"2\",\"signature\":\""), "{j}");
+        assert!(
+            j.contains("\"lock\":{\"account\":\"1\",\"amount\":\"4000000\",\"dest_chain\":\""),
+            "{j}"
+        );
+        assert!(
+            j.contains("\"dest_account\":\"7\",\"nonce\":\"2\",\"signature\":\""),
+            "{j}"
+        );
 
         // Merkle inclusion path.
-        assert!(j.contains("\"proof\":{\"steps\":[{\"side\":\"left\",\"hash\":\""), "{j}");
+        assert!(
+            j.contains("\"proof\":{\"steps\":[{\"side\":\"left\",\"hash\":\""),
+            "{j}"
+        );
         assert!(j.contains("{\"side\":\"right\",\"hash\":\""), "{j}");
 
         // Braces balance.
@@ -11748,8 +13902,13 @@ vote_b.validator=5 vote_b.height=9 vote_b.round=2 vote_b.block_hash={b_h} vote_b
             bridge_headers_commitment: [0u8; 32],
             bridge_redeems_commitment: [0u8; 32],
             proposer: 0,
-};
-        let cert = |height: u64| Commit { height, round: 0, block_hash: [0u8; 32], precommits: vec![] };
+        };
+        let cert = |height: u64| Commit {
+            height,
+            round: 0,
+            block_hash: [0u8; 32],
+            precommits: vec![],
+        };
         let vote = |block_hash: [u8; 32]| crate::consensus::Vote {
             validator: 22,
             height: 9,
@@ -11783,21 +13942,45 @@ vote_b.validator=5 vote_b.height=9 vote_b.round=2 vote_b.block_hash={b_h} vote_b
                 domain: 2,
                 stake: 2_000_000,
                 reviews: vec![
-                    crate::Review { reviewer: 10, score: 0.9 },
-                    crate::Review { reviewer: 11, score: 0.75 },
+                    crate::Review {
+                        reviewer: 10,
+                        score: 0.9,
+                    },
+                    crate::Review {
+                        reviewer: 11,
+                        score: 0.75,
+                    },
                 ],
                 repl_success: 2,
                 repl_total: 3,
                 timestamp_days: 3.0,
                 signature: [9u8; 64],
-                fee: 0, nonce: 0,
-}],
-            validator_updates: vec![crate::validator::ValidatorUpdate { id: 25, pubkey: [5u8; 32], power: 3 }],
+                fee: 0,
+                nonce: 0,
+            }],
+            validator_updates: vec![crate::validator::ValidatorUpdate {
+                id: 25,
+                pubkey: [5u8; 32],
+                power: 3,
+            }],
             stake_ops: vec![
-                crate::StakeOp { account: 1, kind: crate::BondKind::Bond, amount: 5_000_000, signature: [7u8; 64] },
-                crate::StakeOp { account: 2, kind: crate::BondKind::Unbond, amount: 2_000_000, signature: [8u8; 64] },
+                crate::StakeOp {
+                    account: 1,
+                    kind: crate::BondKind::Bond,
+                    amount: 5_000_000,
+                    signature: [7u8; 64],
+                },
+                crate::StakeOp {
+                    account: 2,
+                    kind: crate::BondKind::Unbond,
+                    amount: 2_000_000,
+                    signature: [8u8; 64],
+                },
             ],
-            slashing_evidence: vec![crate::SlashEvidence { vote_a: vote([1u8; 32]), vote_b: vote([2u8; 32]) }],
+            slashing_evidence: vec![crate::SlashEvidence {
+                vote_a: vote([1u8; 32]),
+                vote_b: vote([2u8; 32]),
+            }],
             bridge_locks: vec![lock.clone()],
             bridge_headers: vec![crate::BridgeHeader {
                 source_chain: [55u8; 32],
@@ -11815,10 +13998,12 @@ vote_b.validator=5 vote_b.height=9 vote_b.round=2 vote_b.block_hash={b_h} vote_b
                 source_cert: cert(7),
                 lock_id: 3,
                 lock,
-                proof: crate::merkle::Proof { steps: vec![crate::merkle::Step::Right([4u8; 32])] },
+                proof: crate::merkle::Proof {
+                    steps: vec![crate::merkle::Step::Right([4u8; 32])],
+                },
             }],
             proposer: 0,
-};
+        };
         let j = json_range_blocks(&[(block, cert(7))]);
 
         // Range scaffold + block header scalars.
@@ -11826,19 +14011,37 @@ vote_b.validator=5 vote_b.height=9 vote_b.round=2 vote_b.block_hash={b_h} vote_b
         assert!(j.contains("\"state_root\":\""), "{j}");
 
         // Txs: nested embedding + reviews.
-        assert!(j.contains("\"txs\":[{\"author\":\"1\",\"embedding\":["), "{j}");
-        assert!(j.contains("\"reviews\":[{\"reviewer\":\"10\",\"score\":0.9"), "{j}");
+        assert!(
+            j.contains("\"txs\":[{\"author\":\"1\",\"embedding\":["),
+            "{j}"
+        );
+        assert!(
+            j.contains("\"reviews\":[{\"reviewer\":\"10\",\"score\":0.9"),
+            "{j}"
+        );
 
         // Validator updates / stake ops (both bond kinds) / evidence.
         assert!(j.contains("\"validator_updates\":[{\"id\":\"25\""), "{j}");
-        assert!(j.contains("\"stake_ops\":[{\"account\":\"1\",\"kind\":\"bond\""), "{j}");
+        assert!(
+            j.contains("\"stake_ops\":[{\"account\":\"1\",\"kind\":\"bond\""),
+            "{j}"
+        );
         assert!(j.contains("\"kind\":\"unbond\""), "{j}");
-        assert!(j.contains("\"slashing_evidence\":[{\"vote_a\":{\"validator\":\"22\""), "{j}");
+        assert!(
+            j.contains("\"slashing_evidence\":[{\"vote_a\":{\"validator\":\"22\""),
+            "{j}"
+        );
 
         // Bridge ops: locks + headers + redeems (nested lock leaf).
         assert!(j.contains("\"bridge_locks\":[{\"account\":\"1\""), "{j}");
-        assert!(j.contains("\"bridge_headers\":[{\"source_chain\":\""), "{j}");
-        assert!(j.contains("\"bridge_redeems\":[{\"source_chain\":\""), "{j}");
+        assert!(
+            j.contains("\"bridge_headers\":[{\"source_chain\":\""),
+            "{j}"
+        );
+        assert!(
+            j.contains("\"bridge_redeems\":[{\"source_chain\":\""),
+            "{j}"
+        );
         assert!(j.contains("\"lock\":{\"account\":\"1\""), "{j}");
 
         // Paired commit + range close.

@@ -88,7 +88,10 @@ impl std::fmt::Display for BridgeError {
                 hex8(got),
                 hex8(expected)
             ),
-            BridgeError::AlreadyConsumed { source_chain, lock_id } => write!(
+            BridgeError::AlreadyConsumed {
+                source_chain,
+                lock_id,
+            } => write!(
                 f,
                 "bridge: lock {lock_id} from {} already consumed",
                 hex8(source_chain)
@@ -278,7 +281,7 @@ impl BridgeEndpoint {
 mod tests {
     use super::*;
     use crate::consensus::{commit_block, Commit};
-    use crate::{Block, Chain, Genesis, Keypair, DeltaKParams, MICRO};
+    use crate::{Block, Chain, DeltaKParams, Genesis, Keypair, MICRO};
 
     fn kp(id: u64) -> Keypair {
         let mut seed = [0u8; 32];
@@ -323,7 +326,9 @@ mod tests {
 
     /// The set of validators that sign, as a keypair list (matching genesis).
     fn validator_kps() -> std::collections::BTreeMap<u64, Keypair> {
-        vec![(21, kp(21)), (22, kp(22)), (23, kp(23))].into_iter().collect()
+        vec![(21, kp(21)), (22, kp(22)), (23, kp(23))]
+            .into_iter()
+            .collect()
     }
 
     fn all_voters() -> Vec<u64> {
@@ -350,12 +355,11 @@ mod tests {
             bridge_headers: Vec::new(),
             bridge_redeems: Vec::new(),
             proposer: 0,
-};
+        };
         chain.seal(&mut b).expect("seal");
         // Certify the SEALED hash under the active set.
         let set = chain.state.validators.clone();
-        let cert = commit_block(&set, &validator_kps(), &b, 0, &all_voters())
-            .expect("certify");
+        let cert = commit_block(&set, &validator_kps(), &b, 0, &all_voters()).expect("certify");
         chain.commit(&mut b).expect("commit");
         (b, cert)
     }
@@ -433,7 +437,9 @@ mod tests {
             proof,
         };
         let mut endpoint = BridgeEndpoint::new(&gb, &ga);
-        endpoint.follow_source(&header, &cert, &set).expect("follow");
+        endpoint
+            .follow_source(&header, &cert, &set)
+            .expect("follow");
         (endpoint, env)
     }
 
@@ -489,7 +495,9 @@ mod tests {
             proof,
         };
         let mut endpoint = BridgeEndpoint::new(&gb, &ga);
-        endpoint.follow_source(&header, &cert, &set).expect("follow");
+        endpoint
+            .follow_source(&header, &cert, &set)
+            .expect("follow");
         let err = endpoint.verify_lock(&env).unwrap_err();
         assert!(matches!(err, BridgeError::WrongDestination { .. }));
     }
@@ -572,7 +580,9 @@ mod tests {
         };
         // A-side endpoint follows B.
         let mut endpoint = BridgeEndpoint::new(&ga, &gb);
-        endpoint.follow_source(&header, &cert, &set).expect("follow");
+        endpoint
+            .follow_source(&header, &cert, &set)
+            .expect("follow");
         let v = endpoint.verify_lock(&env).expect("verify");
         endpoint.consume(&v).expect("consume");
         assert_eq!(endpoint.minted(2), 4 * MICRO);

@@ -129,7 +129,11 @@ impl ValidatorSet {
             } else {
                 by_id.insert(
                     u.id,
-                    Validator { id: u.id, pubkey: u.pubkey, power: u.power },
+                    Validator {
+                        id: u.id,
+                        pubkey: u.pubkey,
+                        power: u.power,
+                    },
                 );
             }
         }
@@ -208,7 +212,7 @@ mod tests {
     fn quorum_is_strictly_more_than_two_thirds() {
         assert_eq!(vset(&[(1, 1), (2, 1), (3, 1)]).quorum(), 3); // 3 of 3
         assert_eq!(vset(&[(1, 1), (2, 1), (3, 1), (4, 1)]).quorum(), 3); // 3 of 4
-        // stake-weighted: total 100, quorum 67
+                                                                         // stake-weighted: total 100, quorum 67
         assert_eq!(vset(&[(1, 50), (2, 30), (3, 20)]).quorum(), 67);
     }
 
@@ -252,7 +256,11 @@ mod tests {
     }
 
     fn upd(id: u64, power: u64) -> ValidatorUpdate {
-        ValidatorUpdate { id, pubkey: kp(id).public(), power }
+        ValidatorUpdate {
+            id,
+            pubkey: kp(id).public(),
+            power,
+        }
     }
 
     #[test]
@@ -293,9 +301,21 @@ mod tests {
         // same members, different construction order -> identical root (the set
         // canonicalizes by id), and any field change flips the root.
         let a = ValidatorSet::new(vec![
-            Validator { id: 3, pubkey: kp(3).public(), power: 3 },
-            Validator { id: 1, pubkey: kp(1).public(), power: 1 },
-            Validator { id: 2, pubkey: kp(2).public(), power: 2 },
+            Validator {
+                id: 3,
+                pubkey: kp(3).public(),
+                power: 3,
+            },
+            Validator {
+                id: 1,
+                pubkey: kp(1).public(),
+                power: 1,
+            },
+            Validator {
+                id: 2,
+                pubkey: kp(2).public(),
+                power: 2,
+            },
         ]);
         let b = vset(&[(1, 1), (2, 2), (3, 3)]);
         assert_eq!(a.merkle_root(), b.merkle_root());
@@ -325,7 +345,11 @@ mod tests {
         let root = vs.merkle_root();
         let proof = vs.proof(2).expect("proof exists");
         // a validator with the right id but a tampered power must not verify.
-        let forged = Validator { id: 2, pubkey: kp(2).public(), power: 21 };
+        let forged = Validator {
+            id: 2,
+            pubkey: kp(2).public(),
+            power: 21,
+        };
         let leaf = crate::merkle::leaf_hash(&forged.merkle_leaf());
         assert!(!crate::merkle::verify(&root, &leaf, &proof));
     }

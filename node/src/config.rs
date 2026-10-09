@@ -57,7 +57,10 @@ impl std::fmt::Display for ConfigError {
                 write!(f, "config seed embedding has {got} dims, expected {DIM}")
             }
             ConfigError::BadLogFormat { value } => {
-                write!(f, "config bad log format: `{value}` (expected \"text\" or \"json\")")
+                write!(
+                    f,
+                    "config bad log format: `{value}` (expected \"text\" or \"json\")"
+                )
             }
             ConfigError::BadLogRotation { value } => {
                 write!(
@@ -560,11 +563,19 @@ impl LoggingConfig {
     pub fn validate(&self) -> Result<(), ConfigError> {
         match self.format.as_str() {
             "text" | "json" => {}
-            _ => return Err(ConfigError::BadLogFormat { value: self.format.clone() }),
+            _ => {
+                return Err(ConfigError::BadLogFormat {
+                    value: self.format.clone(),
+                })
+            }
         }
         match self.rotation.as_str() {
             "daily" | "hourly" | "minutely" | "never" => {}
-            _ => return Err(ConfigError::BadLogRotation { value: self.rotation.clone() }),
+            _ => {
+                return Err(ConfigError::BadLogRotation {
+                    value: self.rotation.clone(),
+                })
+            }
         }
         // M49: per-sink formats are validated like `format`; empty ⇒ inherit `format`.
         for fmt in [&self.stderr_format, &self.file_format] {
@@ -659,14 +670,20 @@ impl GenesisConfig {
     pub fn to_genesis(&self) -> Result<Genesis, ConfigError> {
         let mut accounts = Vec::with_capacity(self.accounts.len());
         for a in &self.accounts {
-            accounts.push((a.id, a.balance_micro, decode_pubkey(&a.pubkey_hex, "accounts.pubkey_hex")?));
+            accounts.push((
+                a.id,
+                a.balance_micro,
+                decode_pubkey(&a.pubkey_hex, "accounts.pubkey_hex")?,
+            ));
         }
         let reviewers = self.reviewers.iter().map(|r| (r.id, r.weight)).collect();
 
         let mut seed_nodes = Vec::with_capacity(self.seed_nodes.len());
         for s in &self.seed_nodes {
             if s.embedding.len() != DIM {
-                return Err(ConfigError::BadEmbedding { got: s.embedding.len() });
+                return Err(ConfigError::BadEmbedding {
+                    got: s.embedding.len(),
+                });
             }
             let mut emb: Embedding = [0.0f32; DIM];
             emb.copy_from_slice(&s.embedding);
@@ -675,7 +692,11 @@ impl GenesisConfig {
 
         let mut validators = Vec::with_capacity(self.validators.len());
         for v in &self.validators {
-            validators.push((v.id, decode_pubkey(&v.pubkey_hex, "validators.pubkey_hex")?, v.power));
+            validators.push((
+                v.id,
+                decode_pubkey(&v.pubkey_hex, "validators.pubkey_hex")?,
+                v.power,
+            ));
         }
 
         Ok(Genesis {
@@ -765,7 +786,9 @@ pub fn load_keystore(path: &str) -> Result<KeystoreConfig, ConfigError> {
 // ----------------------------------------------------------------------------
 
 fn parse_addr(s: &str) -> Result<SocketAddr, ConfigError> {
-    s.parse().map_err(|_| ConfigError::BadAddr { value: s.to_string() })
+    s.parse().map_err(|_| ConfigError::BadAddr {
+        value: s.to_string(),
+    })
 }
 
 /// Strict lowercase/uppercase hex decode into a fixed-size array of `N` bytes.
@@ -774,7 +797,11 @@ fn decode_hex_n<const N: usize>(s: &str, field: &str) -> Result<[u8; N], ConfigE
     if bytes.len() != N {
         return Err(ConfigError::BadHex {
             field: field.to_string(),
-            detail: format!("expected {N} bytes ({} hex chars), got {}", N * 2, bytes.len()),
+            detail: format!(
+                "expected {N} bytes ({} hex chars), got {}",
+                N * 2,
+                bytes.len()
+            ),
         });
     }
     let mut out = [0u8; N];
@@ -850,8 +877,14 @@ mod tests {
                 data_dir: "./data/n21".to_string(),
             },
             peers: vec![
-                PeerConfig { id: 22, addr: "127.0.0.1:9022".to_string() },
-                PeerConfig { id: 23, addr: "127.0.0.1:9023".to_string() },
+                PeerConfig {
+                    id: 22,
+                    addr: "127.0.0.1:9022".to_string(),
+                },
+                PeerConfig {
+                    id: 23,
+                    addr: "127.0.0.1:9023".to_string(),
+                },
             ],
             genesis: "genesis.toml".to_string(),
             validator: Some(ValidatorKeyConfig {
@@ -874,7 +907,10 @@ mod tests {
         let vc = back.validator.as_ref().unwrap();
         assert!(vc.enabled);
         // the seed decodes to the id-21 demo keypair
-        assert_eq!(vc.keypair().unwrap().public(), crate::Keypair::from_seed(demo_seed(21)).public());
+        assert_eq!(
+            vc.keypair().unwrap().public(),
+            crate::Keypair::from_seed(demo_seed(21)).public()
+        );
     }
 
     #[test]
@@ -887,7 +923,10 @@ mod tests {
         assert_eq!(c.precommit_timeout_ms, 1000);
         assert_eq!(c.timeout_delta_ms, 500);
         assert_eq!(c.block_interval_ms, 1000);
-        assert!(c.create_empty_blocks, "empty-block heartbeat on by default (M33 behavior)");
+        assert!(
+            c.create_empty_blocks,
+            "empty-block heartbeat on by default (M33 behavior)"
+        );
     }
 
     #[test]
@@ -1253,7 +1292,7 @@ mod tests {
         assert_eq!(m.per_peer_tx_burst, 256.0);
         assert_eq!(m.seen_cache, 0); // M55: 0 ⇒ dedup sets unbounded (pre-M55)
         assert_eq!(m.per_account_limit, 0); // M57: 0 ⇒ per-account quota off (pre-M57)
-        // And a config with no `[mempool]` table yields exactly those defaults.
+                                            // And a config with no `[mempool]` table yields exactly those defaults.
         let s = r#"
             genesis = "genesis.toml"
             [node]
@@ -1400,10 +1439,24 @@ mod tests {
     #[test]
     fn logging_rejects_bad_format() {
         // Valid formats pass `validate`; anything else is a typed error.
-        assert!(LoggingConfig { format: "text".into(), ..Default::default() }.validate().is_ok());
-        assert!(LoggingConfig { format: "json".into(), ..Default::default() }.validate().is_ok());
+        assert!(LoggingConfig {
+            format: "text".into(),
+            ..Default::default()
+        }
+        .validate()
+        .is_ok());
+        assert!(LoggingConfig {
+            format: "json".into(),
+            ..Default::default()
+        }
+        .validate()
+        .is_ok());
         assert!(matches!(
-            LoggingConfig { format: "yaml".into(), ..Default::default() }.validate(),
+            LoggingConfig {
+                format: "yaml".into(),
+                ..Default::default()
+            }
+            .validate(),
             Err(ConfigError::BadLogFormat { .. })
         ));
 
@@ -1418,7 +1471,8 @@ mod tests {
             [logging]
             format = "yaml"
         "#;
-        let path = std::env::temp_dir().join(format!("zhixing-m44-badfmt-{}.toml", std::process::id()));
+        let path =
+            std::env::temp_dir().join(format!("zhixing-m44-badfmt-{}.toml", std::process::id()));
         std::fs::write(&path, s).unwrap();
         let got = load_node_config(path.to_str().unwrap());
         let _ = std::fs::remove_file(&path);
@@ -1481,12 +1535,21 @@ mod tests {
         // Every valid rotation passes `validate`; anything else is a typed error.
         for r in ["daily", "hourly", "minutely", "never"] {
             assert!(
-                LoggingConfig { rotation: r.into(), ..Default::default() }.validate().is_ok(),
+                LoggingConfig {
+                    rotation: r.into(),
+                    ..Default::default()
+                }
+                .validate()
+                .is_ok(),
                 "rotation {r} should be valid"
             );
         }
         assert!(matches!(
-            LoggingConfig { rotation: "weekly".into(), ..Default::default() }.validate(),
+            LoggingConfig {
+                rotation: "weekly".into(),
+                ..Default::default()
+            }
+            .validate(),
             Err(ConfigError::BadLogRotation { .. })
         ));
 
@@ -1501,7 +1564,8 @@ mod tests {
             file = "data/logs/node.log"
             rotation = "weekly"
         "#;
-        let path = std::env::temp_dir().join(format!("zhixing-m45-badrot-{}.toml", std::process::id()));
+        let path =
+            std::env::temp_dir().join(format!("zhixing-m45-badrot-{}.toml", std::process::id()));
         std::fs::write(&path, s).unwrap();
         let got = load_node_config(path.to_str().unwrap());
         let _ = std::fs::remove_file(&path);
@@ -1618,7 +1682,7 @@ mod tests {
         assert_eq!(l.levels, vec!["info", "tokio=warn"]);
         assert_eq!(l.file_levels, vec!["debug"]);
         assert!(l.stderr_levels.is_empty()); // unspecified ⇒ empty
-        // arrays are free-form directives (like `level`) ⇒ no validate rejection
+                                             // arrays are free-form directives (like `level`) ⇒ no validate rejection
         l.validate().expect("directive arrays are not validated");
 
         // a bare `[logging]` table ⇒ all arrays empty (⇒ scalars verbatim, back-compat)
@@ -1663,13 +1727,20 @@ mod tests {
         assert_eq!(l.stderr_format, "text");
         assert_eq!(l.file_format, "json");
         // per-sink formats are enum-like (like `format`) ⇒ validated, both valid here
-        l.validate().expect("text + json per-sink formats are valid");
+        l.validate()
+            .expect("text + json per-sink formats are valid");
 
         // empty per-sink formats pass validate (inherit `format`)
-        LoggingConfig::default().validate().expect("empty per-sink formats inherit");
+        LoggingConfig::default()
+            .validate()
+            .expect("empty per-sink formats inherit");
         // an unknown per-sink format is a typed rejection, like the scalar `format`
         assert!(matches!(
-            LoggingConfig { stderr_format: "yaml".into(), ..Default::default() }.validate(),
+            LoggingConfig {
+                stderr_format: "yaml".into(),
+                ..Default::default()
+            }
+            .validate(),
             Err(ConfigError::BadLogFormat { .. })
         ));
 
@@ -1765,13 +1836,22 @@ mod tests {
                     pubkey_hex: hex(&kp(id).public()),
                 })
                 .collect(),
-            reviewers: (10..=12).map(|id| ReviewerConfig { id, weight: 1.0 }).collect(),
-            seed_nodes: vec![SeedNodeConfig { embedding: unit_vec(0), domain: 0 }],
+            reviewers: (10..=12)
+                .map(|id| ReviewerConfig { id, weight: 1.0 })
+                .collect(),
+            seed_nodes: vec![SeedNodeConfig {
+                embedding: unit_vec(0),
+                domain: 0,
+            }],
             base_emission_micro: 8 * crate::MICRO,
             slash_bps: 10_000,
             timestamp_days: 0.0,
             validators: (21..=24)
-                .map(|id| ValidatorConfig { id, pubkey_hex: hex(&kp(id).public()), power: 1 })
+                .map(|id| ValidatorConfig {
+                    id,
+                    pubkey_hex: hex(&kp(id).public()),
+                    power: 1,
+                })
                 .collect(),
             params: None,
         };
@@ -1787,7 +1867,12 @@ mod tests {
     #[test]
     fn keystore_converts_to_seed_map() {
         let ks = KeystoreConfig {
-            keys: (21..=24).map(|id| KeyEntry { id, seed_hex: hex(&demo_seed(id)) }).collect(),
+            keys: (21..=24)
+                .map(|id| KeyEntry {
+                    id,
+                    seed_hex: hex(&demo_seed(id)),
+                })
+                .collect(),
         };
         let seeds = ks.to_seeds().unwrap();
         assert_eq!(seeds.len(), 4);
@@ -1797,7 +1882,11 @@ mod tests {
 
     #[test]
     fn bad_hex_and_addr_are_typed_errors() {
-        let bad_pk = AccountConfig { id: 1, balance_micro: 0, pubkey_hex: "zz".to_string() };
+        let bad_pk = AccountConfig {
+            id: 1,
+            balance_micro: 0,
+            pubkey_hex: "zz".to_string(),
+        };
         let gc = GenesisConfig {
             accounts: vec![bad_pk],
             reviewers: vec![],
@@ -1811,10 +1900,18 @@ mod tests {
         assert!(matches!(gc.to_genesis(), Err(ConfigError::BadHex { .. })));
 
         // wrong length hex
-        let short = KeystoreConfig { keys: vec![KeyEntry { id: 1, seed_hex: "abcd".to_string() }] };
+        let short = KeystoreConfig {
+            keys: vec![KeyEntry {
+                id: 1,
+                seed_hex: "abcd".to_string(),
+            }],
+        };
         assert!(matches!(short.to_seeds(), Err(ConfigError::BadHex { .. })));
 
-        let pc = PeerConfig { id: 1, addr: "not-an-addr".to_string() };
+        let pc = PeerConfig {
+            id: 1,
+            addr: "not-an-addr".to_string(),
+        };
         assert!(matches!(pc.socket_addr(), Err(ConfigError::BadAddr { .. })));
     }
 
@@ -1830,8 +1927,11 @@ mod tests {
 
         // M33: every one of the four nodes is an enabled validator (no
         // sequencer), and each node's own seed must reproduce its genesis pubkey.
-        let by_id: std::collections::BTreeMap<u64, PubKey> =
-            genesis.validators.iter().map(|(id, pk, _)| (*id, *pk)).collect();
+        let by_id: std::collections::BTreeMap<u64, PubKey> = genesis
+            .validators
+            .iter()
+            .map(|(id, pk, _)| (*id, *pk))
+            .collect();
         for name in ["node21.toml", "node22.toml", "node23.toml", "node24.toml"] {
             let n = load_node_config(dir.join(name).to_str().unwrap()).unwrap();
             assert!(n.listen_addr().is_ok());
@@ -1853,10 +1953,16 @@ mod tests {
         // pubkey the genesis assigns its id. We model that check here: a seed for
         // id 99 does not match the id-21 genesis validator.
         let genesis_pk = crate::Keypair::from_seed(demo_seed(21)).public();
-        let vc = ValidatorKeyConfig { enabled: true, seed_hex: hex(&demo_seed(99)) };
+        let vc = ValidatorKeyConfig {
+            enabled: true,
+            seed_hex: hex(&demo_seed(99)),
+        };
         assert_ne!(vc.keypair().unwrap().public(), genesis_pk);
         // the matching seed agrees
-        let ok = ValidatorKeyConfig { enabled: true, seed_hex: hex(&demo_seed(21)) };
+        let ok = ValidatorKeyConfig {
+            enabled: true,
+            seed_hex: hex(&demo_seed(21)),
+        };
         assert_eq!(ok.keypair().unwrap().public(), genesis_pk);
     }
 
@@ -1879,19 +1985,36 @@ mod tests {
 
         let genesis = GenesisConfig {
             accounts: (1..=3)
-                .map(|id| AccountConfig { id, balance_micro: 30 * crate::MICRO, pubkey_hex: hex(&kp(id).public()) })
+                .map(|id| AccountConfig {
+                    id,
+                    balance_micro: 30 * crate::MICRO,
+                    pubkey_hex: hex(&kp(id).public()),
+                })
                 .collect(),
-            reviewers: (10..=12).map(|id| ReviewerConfig { id, weight: 1.0 }).collect(),
-            seed_nodes: vec![SeedNodeConfig { embedding: unit_vec(0), domain: 0 }],
+            reviewers: (10..=12)
+                .map(|id| ReviewerConfig { id, weight: 1.0 })
+                .collect(),
+            seed_nodes: vec![SeedNodeConfig {
+                embedding: unit_vec(0),
+                domain: 0,
+            }],
             base_emission_micro: 8 * crate::MICRO,
             slash_bps: 10_000,
             timestamp_days: 0.0,
             validators: (21..=24)
-                .map(|id| ValidatorConfig { id, pubkey_hex: hex(&kp(id).public()), power: 1 })
+                .map(|id| ValidatorConfig {
+                    id,
+                    pubkey_hex: hex(&kp(id).public()),
+                    power: 1,
+                })
                 .collect(),
             params: None,
         };
-        std::fs::write(dir.join("genesis.toml"), toml::to_string_pretty(&genesis).unwrap()).unwrap();
+        std::fs::write(
+            dir.join("genesis.toml"),
+            toml::to_string_pretty(&genesis).unwrap(),
+        )
+        .unwrap();
 
         // M33: no keystore.toml and no sequencer — each node carries only its own
         // signing key in a `[validator]` section.
@@ -1906,7 +2029,10 @@ mod tests {
                 peers: ids
                     .iter()
                     .filter(|&&p| p != id)
-                    .map(|&p| PeerConfig { id: p, addr: format!("127.0.0.1:{}", 9000 + p) })
+                    .map(|&p| PeerConfig {
+                        id: p,
+                        addr: format!("127.0.0.1:{}", 9000 + p),
+                    })
                     .collect(),
                 genesis: "testnet/genesis.toml".to_string(),
                 validator: Some(ValidatorKeyConfig {
@@ -1920,7 +2046,11 @@ mod tests {
                 logging: None,
                 mempool: MempoolConfig::default(),
             };
-            std::fs::write(dir.join(format!("node{id}.toml")), toml::to_string_pretty(&cfg).unwrap()).unwrap();
+            std::fs::write(
+                dir.join(format!("node{id}.toml")),
+                toml::to_string_pretty(&cfg).unwrap(),
+            )
+            .unwrap();
         }
 
         // Remove the now-obsolete pre-M33 keystore if a prior run left one.
