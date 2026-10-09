@@ -1341,6 +1341,19 @@ M116 的 `node rpc` 只能 GET。M117 补上写侧，让它成为**全能** RPC 
 
 **已知边界（顺延至 M121+）**：身份读三类已齐（`/genesis` 链 / `/node` 节点 / `/info` 链尖）；读面两分（`/params`/`/config`）已齐；RPC 自带端点发现 + 全能客户端 + 完整链读/写面；内容协商三轴已齐（仅 `identity`，真压缩顺延）；离线工具篮子已补；运维篮子剩余：证书/密钥轮换与落盘、follower 认证、指标端 TLS、OTel/push exporter、每-sink 独立 rotation 覆盖、时延直方图；keygen 篮子剩余：助记词 / BIP-39、口令加密 keystore、密钥轮换；剩余：游标分页、未知方法 `405`；共识 / wire 篮子（破 head 不变量）：**货币费用** + 费用优先排序、nonce / 序列号反重放。
 
+## Wire v1 冻结：交易费（付出块验证人）+ nonce 反重放（Milestone 122）
+
+生产路线的第二步，也是**唯一一次有意破链身份**的改动：把两个真经济缺口——**无交易费**（垃圾/DoS 经济学不完整、验证人无出块激励）与**无 nonce 序列反重放**（此前仅靠内容哈希去重）——一次性打包进 block/tx/account 编码，**只破一次 head**、重算并重新锁定 canonical 哈希，此后冻结，命名为「wire v1」。M121 先把哈希换成审计过的 `sha2`，为本次把"哈希来源"洗白。
+
+- **交易费（`SubmissionTx.fee: u64`）**：作者在 `stake` 之外无条件支付、入块后 credit 给**出块验证人（proposer）**；两种结局（accept/reject）都花掉、不像 `stake` 退回。`validate_tx` 检 `balance >= stake + fee`（u128 防溢出）。
+- **费用去向进 header**：`Block` 加 `proposer: u64`，且**必须进 `BlockHeader`**（`Block::hash()` 哈希的是 header 投影）——故同时进 `encode_header`/`encode_block`（`timestamp_days` 之后、`next_validators_root` 之前，保持 `encode_header(from_block(b)) == encode_block(b)[..header_end]` 前缀契约）、`from_block`/`to_block`、`decode_certified_header` 的固定偏移（212→220）。只有进 header，proposer 才被 cert 签名、被 `replay_verified` 的 `block_hash` 校验覆盖。块级 apply 把本块所有 tx 的 `fee` 之和 credit 给 `block.proposer` 账户（无账户则落 `treasury`——守恒兜底）。
+- **nonce 反重放（`SubmissionTx.nonce` + `Account.nonce`）**：`validate_tx` 检 `tx.nonce == acct.nonce`（严格等于当前序号，先于余额检查），`apply_tx` 时 `acct.nonce += 1`。`nonce` 进 `Account::merkle_leaf` / `state_root` 账户循环 / `encode_account`（账户 proof leaf 长度 88→96）。
+- **费用优先出块排序**：`Mempool::build_block` 从 `BTreeMap` 哈希序改为 **fee 降序、再 hash 升序** 选 tx（验证人经济理性 + 确定性 tie-break）；`apply_tx` 仍是 try-apply，乱序 nonce 的较高者被拒、留待下块。proposer 由调用方设：daemon `build_candidate` 填自身 `self.id`、driver `produce` 填该高度 round-0 选中提议人，均在 `seal` 前。
+- **供应守恒不变**：fee 从 `author.balance` 流向 `proposer.balance`（或 `treasury`），`supply_conserved` 等式无需改。**整套测试全绿（489 lib + 43 bin = 532，+3 针对性测试**：`fee_credited_to_proposer_conserves_supply` / `nonce_must_equal_account_nonce` / `build_block_orders_by_fee`）——守恒 + codec round-trip 绿即证明新编码自洽。
+- **Re-baseline（有意破 head）**：wire 升 **v1**。新 canonical 值：`demo` 创世 head `c1e14184…028fdf`、高度 2 head `8c3a5d9e…f3da80`、`state_root 64184dab…0070e6`、`merkle_root 5312ecf6…ee8c6b`；`localnet` 4 验证人收敛 head（h=3）`a045426e…3b87bc`；M7 持久化 `status` state_root `c8593472…4d3b79`。changelog 中 M6–M121 各条的 `head 44309755…ea04ba` / `state_root 1a2ec34c…9935b0` 是 **wire v0** 历史记录，保留不改。
+
+**已知边界（顺延至 M123+）**：wire v1 冻结已落地（费用 + proposer 入头 + nonce）；此后原则上**不再破 head**。生产路线下一步是便利依赖（keystore 口令加密、可选 gzip）与状态裁剪/快照/快速同步；读写面边角（游标分页、未知方法 `405`）仍可在"零新依赖 + 不破 head"下继续；运维/keygen 篮子剩余项不变。
+
 ## SHA-256 换用审计过的 `sha2`（Milestone 121）
 
 这是生产就绪路线的第一步，也是本仓库从「零依赖、全手搓」自律转向「关键密码学走已审计库」的刻意松绑。内容寻址的 block/state 哈希是**共识关键**原语，此前 `hash.rs` 是 bring-up 期为离线零依赖保留的**手搓 SHA-256**——这是审计红旗（手搓共识级密码学是负债，不是资产）。M121 把它换成审计过的 RustCrypto `sha2` crate。

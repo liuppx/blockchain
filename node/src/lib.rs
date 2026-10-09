@@ -138,6 +138,14 @@ pub struct SubmissionTx {
     /// Escrow staked with the submission, in micro-$COG. Returned on accept,
     /// slashed to treasury on reject.
     pub stake: u64,
+    /// M122 (wire v1): transaction fee in micro-$COG, paid unconditionally by the author and
+    /// credited to the block's proposer. Spent either way (not returned like `stake`). Covered
+    /// by the signature (`tx_signing_bytes`).
+    pub fee: u64,
+    /// M122 (wire v1): the author's expected account sequence number — must equal the
+    /// account's current `nonce` at apply time, then increments. Sequence-based replay
+    /// protection (beyond content-hash dedup). Covered by the signature.
+    pub nonce: u64,
     pub reviews: Vec<Review>,
     pub repl_success: u32,
     pub repl_total: u32,
@@ -399,6 +407,11 @@ pub struct Block {
     pub prev_hash: Hash,
     /// Wall-clock of the block in days; becomes `now_days` for ΔK freshness.
     pub timestamp_days: f32,
+    /// M122 (wire v1): the id of the validator who produced this block — the recipient
+    /// of the cumulative `tx.fee` for every tx in `txs` (treasury fallback if the
+    /// proposer has no account). Cert-signed via `block.hash()` so a light client
+    /// can independently verify fee routing.
+    pub proposer: u64,
     /// Merkle commitment to the validator set that certifies the *next* height —
     /// i.e. the post-apply set this block hands off to. Because the field is part
     /// of the block hash (which the finality certificate signs), a light client
@@ -532,6 +545,9 @@ pub struct Account {
     pub slashed_total: u64,
     pub submissions: u64,
     pub accepted: u64,
+    /// M122 (wire v1): sequence number — every accepted tx from this account increments it.
+    /// Mirrored on the tx side as `SubmissionTx::nonce`; both must agree at validate/apply.
+    pub nonce: u64,
 }
 
 impl Account {
@@ -549,6 +565,7 @@ impl Account {
         e.u64(self.slashed_total);
         e.u64(self.submissions);
         e.u64(self.accepted);
+        e.u64(self.nonce);
         e.0
     }
 }
@@ -676,6 +693,9 @@ pub enum ChainError {
     UnknownAccount(u64),
     UnknownReviewer(u64),
     InsufficientBalance { account: u64, need: u64, have: u64 },
+    /// M122: the tx's `nonce` did not equal the account's current sequence number
+    /// (replay, gap, or out-of-order submission).
+    BadNonce { account: u64, expected: u64, got: u64 },
     BadScore { reviewer: u64, score: f32 },
     EmptyReviews(u64),
     BadSignature(u64),
@@ -783,6 +803,10 @@ impl std::fmt::Display for ChainError {
             ChainError::InsufficientBalance { account, need, have } => write!(
                 f,
                 "account {account} cannot stake {need} (has {have})"
+            ),
+            ChainError::BadNonce { account, expected, got } => write!(
+                f,
+                "account {account} nonce mismatch: expected {expected}, got {got}"
             ),
             ChainError::BadScore { reviewer, score } => {
                 write!(f, "reviewer {reviewer} score {score} out of [0,1]")
@@ -926,6 +950,8 @@ pub struct TxReceipt {
     pub delta_k: f32,
     pub minted: u64,
     pub slashed: u64,
+    /// M122: the fee this tx paid (credited to the block proposer at block apply).
+    pub fee: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -1083,6 +1109,10 @@ impl ChainState {
             height: 0,
             prev_hash: [0u8; 32],
             timestamp_days: g.timestamp_days,
+            // M122: genesis has no proposer (no prior block to attribute it to); the
+            // treasury-fallback path in `apply_block_inner` handles any nonzero fee
+            // total at height 0, but genesis has no txs so fees_total is always 0.
+            proposer: 0,
             next_validators_root: state.validators.merkle_root(),
             state_root: state.state_root(),
             accounts_root: state.merkle_root(),
@@ -1162,6 +1192,7 @@ impl ChainState {
         let mut receipts = Vec::with_capacity(block.txs.len());
         let mut minted_total = 0u64;
         let mut slashed_total = 0u64;
+        let mut fees_total = 0u64;
         let mut n_accept = 0usize;
         let mut n_reject = 0usize;
 
@@ -1169,12 +1200,26 @@ impl ChainState {
             let r = self.apply_tx(tx)?;
             minted_total += r.minted;
             slashed_total += r.slashed;
+            fees_total += r.fee;
             if r.accepted {
                 n_accept += 1;
             } else {
                 n_reject += 1;
             }
             receipts.push(r);
+        }
+
+        // M122: credit the block's transaction fees to its proposer. Each tx already
+        // debited `fee` from its author in `apply_tx` (fee spent, not escrowed); this
+        // moves the pooled fees into the proposer's balance, so supply is conserved
+        // (author balance → proposer balance). If the proposer has no account (e.g. a
+        // genesis validator never endowed), the fees fall back to the treasury — still
+        // a balance → pool move, so `supply_conserved` holds either way.
+        if fees_total > 0 {
+            match self.accounts.get_mut(&block.proposer) {
+                Some(acct) => acct.balance += fees_total,
+                None => self.treasury += fees_total,
+            }
         }
 
         // staking operations: move funds between balance / bonded pool / unbonding
@@ -1644,18 +1689,38 @@ impl ChainState {
                 have: acct.balance,
             });
         }
+        // M122: sequence-based replay protection — the tx must carry the account's current
+        // nonce (checked before the balance gate so a replay is rejected as such, not as a
+        // balance error).
+        if tx.nonce != acct.nonce {
+            return Err(ChainError::BadNonce {
+                account: tx.author,
+                expected: acct.nonce,
+                got: tx.nonce,
+            });
+        }
+        // M122: the author must cover both the escrowed stake and the (spent) fee. u128 add
+        // avoids overflow on adversarial `stake + fee`.
+        let need = tx.stake as u128 + tx.fee as u128;
+        if (acct.balance as u128) < need {
+            return Err(ChainError::InsufficientBalance {
+                account: tx.author,
+                need: need.min(u64::MAX as u128) as u64,
+                have: acct.balance,
+            });
+        }
         Ok(())
     }
-
     pub(crate) fn apply_tx(&mut self, tx: &SubmissionTx) -> Result<TxReceipt, ChainError> {
         // -- validate (never mutates; see validate_tx) -----------------------
         self.validate_tx(tx)?;
-        // -- escrow stake ----------------------------------------------------
+        // -- escrow stake + spend fee + advance nonce ------------------------
         {
             let acct = self.accounts.get_mut(&tx.author).unwrap();
-            acct.balance -= tx.stake;
+            acct.balance -= tx.stake + tx.fee; // stake escrowed, fee spent
             acct.staked_total += tx.stake;
             acct.submissions += 1;
+            acct.nonce += 1; // M122: consume the sequence number
         }
 
         // -- ΔK via the shared B.2.3 contract --------------------------------
@@ -1714,6 +1779,7 @@ impl ChainState {
             delta_k: dk,
             minted,
             slashed,
+            fee: tx.fee,
         })
     }
 
@@ -1751,6 +1817,10 @@ impl ChainState {
             e.u64(a.slashed_total);
             e.u64(a.submissions);
             e.u64(a.accepted);
+            // M122: include nonce in the state digest (matches the account's
+            // own merkle_leaf so the state root and accounts_root agree on the
+            // preimage for any account).
+            e.u64(a.nonce);
         }
         e.u64(self.reviewers.len() as u64);
         for (id, rep) in &self.reviewers {
@@ -2314,11 +2384,18 @@ mod tests {
     }
 
     fn novel_tx(author: u64, domain: u32, dim: usize, day: f32) -> SubmissionTx {
+        novel_tx_full(author, domain, dim, day, 0, 0)
+    }
+
+    /// M122: fee/nonce-explicit variant for the wire-v1 tests.
+    fn novel_tx_full(author: u64, domain: u32, dim: usize, day: f32, fee: u64, nonce: u64) -> SubmissionTx {
         SubmissionTx {
             author,
             embedding: unit(1.0, dim),
             domain,
             stake: 2 * MICRO,
+            fee,
+            nonce,
             reviews: good_reviews(),
             repl_success: 3,
             repl_total: 3,
@@ -2333,6 +2410,7 @@ mod tests {
             height,
             prev_hash: chain.head,
             timestamp_days: height as f32,
+            proposer: 0,
             next_validators_root: [0u8; 32],
             state_root: [0u8; 32],
             accounts_root: [0u8; 32],
@@ -2379,7 +2457,8 @@ mod tests {
             repl_total: 3,
             timestamp_days: 1.0,
             signature: [0u8; 64],
-        }
+            fee: 0, nonce: 0,
+}
         .signed(&kp(1));
         let mut b = block(&chain, 1, vec![dup]);
         let r = chain.commit(&mut b).unwrap();
@@ -2884,7 +2963,8 @@ mod tests {
             bridge_locks: Vec::new(),
             bridge_headers: Vec::new(),
             bridge_redeems: Vec::new(),
-        };
+            proposer: 0,
+};
         live.seal(&mut b2).unwrap();
         live.commit(&mut b2).unwrap();
         log.append(&b2).unwrap();
@@ -3916,5 +3996,106 @@ mod tests {
             chain_b.state.accounts.get(&5).unwrap().balance,
             10 * MICRO
         );
+    }
+
+    // ---- M122 (wire v1) targeted tests ----
+
+    #[test]
+    fn fee_credited_to_proposer_conserves_supply() {
+        // author = 1, proposer = 2 (both pre-funded in base_genesis). Author loses
+        // stake+fee, proposer gains fee; supply only changes by the ΔK mint.
+        let mut chain = Chain::new(base_genesis());
+        let start_supply = chain.state.supply;
+        let proposer_start = chain.state.accounts.get(&2).unwrap().balance;
+        let fee = MICRO;
+
+        let tx = novel_tx_full(1, 1, 1, 1.0, fee, 0);
+        let mut b = block(&chain, 1, vec![tx]);
+        b.proposer = 2; // distinct from author
+        chain.seal(&mut b).unwrap();
+        let r = chain.commit(&mut b).unwrap();
+        assert_eq!(r.accepted, 1);
+        assert_eq!(r.txs[0].fee, fee);
+
+        let proposer_after = chain.state.accounts.get(&2).unwrap().balance;
+        assert_eq!(chain.state.supply, start_supply + r.minted);
+        assert!(chain.state.supply_conserved());
+        assert_eq!(
+            proposer_after,
+            proposer_start + fee,
+            "proposer balance must reflect the credited fee"
+        );
+    }
+
+    #[test]
+    fn nonce_must_equal_account_nonce() {
+        // A tx whose nonce != the account's current nonce is rejected with BadNonce;
+        // a correctly-numbered follow-up is accepted.
+        let mut chain = Chain::new(base_genesis());
+        let tx0 = novel_tx_full(1, 1, 1, 1.0, 0, 0);
+        let mut b0 = block(&chain, 1, vec![tx0]);
+        b0.proposer = 2;
+        chain.seal(&mut b0).unwrap();
+        chain.commit(&mut b0).unwrap();
+        assert_eq!(chain.state.accounts.get(&1).unwrap().nonce, 1);
+
+        // Skip nonce 1, submit nonce 2: rejected. Build the block directly (the
+        // seal helper would also run apply and error on the bad tx); `commit`
+        // auto-stamps roots for a non-pre-sealed block.
+        let tx2 = novel_tx_full(1, 2, 2, 1.0, 0, 2);
+        let mut b2 = Block {
+            height: 2,
+            prev_hash: chain.head,
+            timestamp_days: 2.0,
+            proposer: 2,
+            next_validators_root: [0u8; 32],
+            state_root: [0u8; 32],
+            accounts_root: [0u8; 32],
+            graph_root: [0u8; 32],
+            bridge_root: [0u8; 32],
+            txs: vec![tx2],
+            validator_updates: Vec::new(),
+            stake_ops: Vec::new(),
+            slashing_evidence: Vec::new(),
+            bridge_locks: Vec::new(),
+            bridge_headers: Vec::new(),
+            bridge_redeems: Vec::new(),
+        };
+        match chain.commit(&mut b2) {
+            Err(ChainError::BadNonce { account, expected, got }) => {
+                assert_eq!(account, 1);
+                assert_eq!(expected, 1);
+                assert_eq!(got, 2);
+            }
+            other => panic!("expected BadNonce, got {other:?}"),
+        }
+        assert_eq!(chain.state.accounts.get(&1).unwrap().nonce, 1);
+
+        // Correct follow-up (nonce 1) is accepted.
+        let tx1 = novel_tx_full(1, 3, 3, 1.0, 0, 1);
+        let mut b1 = block(&chain, 2, vec![tx1]);
+        b1.proposer = 2;
+        chain.seal(&mut b1).unwrap();
+        let r = chain.commit(&mut b1).unwrap();
+        assert_eq!(r.accepted, 1);
+        assert_eq!(chain.state.accounts.get(&1).unwrap().nonce, 2);
+    }
+
+    #[test]
+    fn build_block_orders_by_fee() {
+        // The mempool builder sorts by fee desc (then hash asc): the highest-fee tx
+        // must be first in the produced block.
+        use crate::mempool::Mempool;
+        let mut chain = Chain::new(base_genesis());
+        let mut mp = Mempool::new(16);
+        mp.insert(&chain, novel_tx_full(1, 1, 1, 1.0, MICRO, 0)).unwrap();
+        mp.insert(&chain, novel_tx_full(2, 2, 2, 1.0, 3 * MICRO, 0)).unwrap();
+        mp.insert(&chain, novel_tx_full(3, 3, 3, 1.0, 2 * MICRO, 0)).unwrap();
+        let mut blk = mp.build_block(&chain, 1.0).unwrap();
+        blk.proposer = 21;
+        chain.seal(&mut blk).unwrap();
+        chain.commit(&mut blk).unwrap();
+        assert_eq!(blk.txs[0].author, 2);
+        assert_eq!(blk.txs[0].fee, 3 * MICRO);
     }
 }

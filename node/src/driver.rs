@@ -241,6 +241,7 @@ impl ChainDriver {
                     height: self.chain.state.height + 1,
                     prev_hash: self.chain.head,
                     timestamp_days,
+            proposer: 0,
                     next_validators_root: [0u8; 32],
                     // M23: state_root/accounts_root are stamped by
                     // `Chain::commit` after the trial apply succeeds.
@@ -265,6 +266,15 @@ impl ChainDriver {
         candidate.bridge_locks = self.pending_bridge_locks.clone();
         candidate.bridge_headers = self.pending_bridge_headers.clone();
         candidate.bridge_redeems = self.pending_bridge_redeems.clone();
+        // M122: credit this block's fees to its producer — the round-0 elected
+        // proposer for this height (the driver's happy path commits at round 0).
+        // Set before `seal` so it is folded into the cert-signed header hash.
+        candidate.proposer = self
+            .chain
+            .state
+            .validators
+            .proposer_for_round(candidate.height, 0)
+            .unwrap_or(0);
         // seal the validator-set commitment now that the block's contents are
         // final, so consensus votes on (and the post-consensus commit checks)
         // the header a light client will follow.
@@ -403,7 +413,8 @@ mod tests {
             repl_total: 3,
             timestamp_days: 1.0,
             signature: [0u8; 64],
-        }
+            fee: 0, nonce: 0,
+}
         .signed(&kp(author))
     }
 

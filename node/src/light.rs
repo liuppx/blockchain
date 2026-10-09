@@ -500,6 +500,7 @@ impl ValidatorTracker {
             height: 0,
             prev_hash: [0u8; 32],
             timestamp_days: g.timestamp_days,
+            proposer: 0, // M122: genesis has no proposer
             next_validators_root: set.merkle_root(),
             state_root: crate::ChainState::state_root_for_genesis(g),
             accounts_root: crate::ChainState::merkle_root_for_genesis(g),
@@ -1331,11 +1332,19 @@ mod tests {
     }
 
     fn novel_tx(author: u64, domain: u32, dim: usize, day: f32) -> SubmissionTx {
+        novel_tx_nonce(author, domain, dim, day, 0)
+    }
+
+    /// M122: when the same author submits more than one tx in a test, pass
+    /// incrementing nonces (0, 1, 2, …) so the strict-equality check accepts them.
+    fn novel_tx_nonce(author: u64, domain: u32, dim: usize, day: f32, nonce: u64) -> SubmissionTx {
         SubmissionTx {
             author,
             embedding: unit(1.0, dim),
             domain,
             stake: 2 * MICRO,
+            fee: 0,
+            nonce,
             reviews: vec![
                 Review { reviewer: 10, score: 0.9 },
                 Review { reviewer: 11, score: 0.85 },
@@ -1370,7 +1379,7 @@ mod tests {
     fn follows_a_plain_chain() {
         let mut d = driver(base_genesis());
         for h in 1..=3u64 {
-            d.submit(novel_tx(1, 100 + h as u32, (h as usize) + 1, h as f32)).unwrap();
+            d.submit(novel_tx_nonce(1, 100 + h as u32, (h as usize) + 1, h as f32, h - 1)).unwrap();
             d.produce(h as f32, &no_silence()).unwrap().expect("block");
         }
         let mut lt = ValidatorTracker::from_genesis(&base_genesis());

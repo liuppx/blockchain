@@ -698,7 +698,8 @@ mod tests {
             bridge_locks: Vec::new(),
             bridge_headers: Vec::new(),
             bridge_redeems: Vec::new(),
-        }
+            proposer: 0,
+}
     }
 
     #[test]

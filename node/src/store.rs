@@ -178,14 +178,16 @@ mod tests {
                 repl_total: 3,
                 timestamp_days: height as f32,
                 signature: [7u8; 64],
-            }],
+                fee: 0, nonce: 0,
+}],
             validator_updates: Vec::new(),
             stake_ops: Vec::new(),
             slashing_evidence: Vec::new(),
             bridge_locks: Vec::new(),
             bridge_headers: Vec::new(),
             bridge_redeems: Vec::new(),
-        }
+            proposer: 0,
+}
     }
 
     #[test]

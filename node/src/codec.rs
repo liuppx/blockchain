@@ -45,6 +45,7 @@ pub fn encode_block(b: &Block) -> Vec<u8> {
     e.u64(b.height);
     e.raw(&b.prev_hash);
     e.f32(b.timestamp_days);
+    e.u64(b.proposer); // M122 (wire v1) — in the cert-signed header prefix
     e.raw(&b.next_validators_root);
     // M23: cert-signed state commitments, written into the cert-signed prefix
     // (between `next_validators_root` and the length-prefixed validator_updates
@@ -120,6 +121,7 @@ pub fn encode_header(h: &BlockHeader) -> Vec<u8> {
     e.u64(h.height);
     e.raw(&h.prev_hash);
     e.f32(h.timestamp_days);
+    e.u64(h.proposer); // M122 (wire v1) — must match encode_block's offset
     e.raw(&h.next_validators_root);
     // M23: the two cert-signed state commitments travel with the header so a
     // light client can verify account-inclusion proofs (`accounts_root`) and
@@ -166,6 +168,7 @@ pub fn decode_header(buf: &[u8]) -> Result<BlockHeader, CodecError> {
     let mut prev_hash = [0u8; 32];
     prev_hash.copy_from_slice(d.take(32)?);
     let timestamp_days = d.f32()?;
+    let proposer = d.u64()?; // M122 (wire v1)
     let mut next_validators_root = [0u8; 32];
     next_validators_root.copy_from_slice(d.take(32)?);
     // M23: the two cert-signed state commitments sit in the same prefix slot
@@ -214,6 +217,7 @@ pub fn decode_header(buf: &[u8]) -> Result<BlockHeader, CodecError> {
         height,
         prev_hash,
         timestamp_days,
+        proposer,
         next_validators_root,
         state_root,
         accounts_root,
@@ -245,17 +249,18 @@ pub fn encode_certified_header(ch: &CertifiedHeader) -> Vec<u8> {
 /// buffer must decode as exactly one [`Commit`] (the cert codec rejects
 /// trailing bytes, so any padding after the cert is an error).
 pub fn decode_certified_header(buf: &[u8]) -> Result<CertifiedHeader, CodecError> {
-    // Header layout: 8 (height) + 32 (prev) + 4 (timestamp) + 32 (next_validators_root)
-    //   + 32 (state_root) + 32 (accounts_root) + 32 (graph_root, M27)
-    //   + 32 (bridge_root, M30) + 8 (n_updates u64) = 212-byte fixed prefix ‖
-    //   n_updates * 48 bytes (u64 id ‖ 32-byte pubkey ‖ u64 power) ‖
-    //   6 * 32-byte commitments = 192 bytes tail (M30 adds bridge_locks_commitment;
-    //   M31 adds bridge_headers_commitment + bridge_redeems_commitment).
-    if buf.len() < 212 {
+    // Header layout: 8 (height) + 32 (prev) + 4 (timestamp) + 8 (proposer, M122)
+    //   + 32 (next_validators_root) + 32 (state_root) + 32 (accounts_root)
+    //   + 32 (graph_root, M27) + 32 (bridge_root, M30) + 8 (n_updates u64) =
+    //   220-byte fixed prefix ‖ n_updates * 48 bytes (u64 id ‖ 32-byte pubkey ‖
+    //   u64 power) ‖ 6 * 32-byte commitments = 192 bytes tail (M30 adds
+    //   bridge_locks_commitment; M31 adds bridge_headers_commitment +
+    //   bridge_redeems_commitment).
+    if buf.len() < 220 {
         return Err(CodecError::UnexpectedEof);
     }
-    let n_updates = u64::from_be_bytes(buf[204..212].try_into().unwrap());
-    let header_len = 212 + (n_updates as usize) * 48 + 192; // 404 base + 48 per update
+    let n_updates = u64::from_be_bytes(buf[212..220].try_into().unwrap());
+    let header_len = 220 + (n_updates as usize) * 48 + 192; // 412 base + 48 per update
     if buf.len() < header_len {
         return Err(CodecError::UnexpectedEof);
     }
@@ -281,6 +286,12 @@ pub struct BlockHeader {
     pub height: u64,
     pub prev_hash: crate::Hash,
     pub timestamp_days: f32,
+    /// M122 (wire v1): the validator who produced this block. Cert-signed so a
+    /// light client can independently verify fee routing. Set by the producer
+    /// before `Chain::seal`; zero at genesis (the genesis-fallback path in
+    /// `apply_block_inner` absorbs any non-zero fee at height 0 into the
+    /// treasury, but genesis has no txs so it stays 0).
+    pub proposer: u64,
     pub next_validators_root: crate::Hash,
     /// M23: full flat digest of every consensus-state field at this height
     /// (accounts/reviewers/graph/validators/bonds/bonded/unbonding/treasury/supply).
@@ -330,6 +341,7 @@ impl BlockHeader {
             height: b.height,
             prev_hash: b.prev_hash,
             timestamp_days: b.timestamp_days,
+            proposer: b.proposer,
             next_validators_root: b.next_validators_root,
             state_root: b.state_root,
             accounts_root: b.accounts_root,
@@ -377,6 +389,7 @@ impl BlockHeader {
             height: self.height,
             prev_hash: self.prev_hash,
             timestamp_days: self.timestamp_days,
+            proposer: self.proposer,
             next_validators_root: self.next_validators_root,
             state_root: self.state_root,
             accounts_root: self.accounts_root,
@@ -463,6 +476,8 @@ fn enc_tx(e: &mut Enc, t: &SubmissionTx, include_sig: bool) {
     e.emb(&t.embedding);
     e.u32(t.domain);
     e.u64(t.stake);
+    e.u64(t.fee); // M122 (wire v1)
+    e.u64(t.nonce); // M122 (wire v1)
     e.u64(t.reviews.len() as u64);
     for r in &t.reviews {
         e.u64(r.reviewer);
@@ -908,6 +923,7 @@ pub fn encode_account(a: &Account) -> Vec<u8> {
     e.u64(a.slashed_total);
     e.u64(a.submissions);
     e.u64(a.accepted);
+    e.u64(a.nonce); // M122 (wire v1)
     e.0
 }
 
@@ -923,6 +939,7 @@ pub fn decode_account(buf: &[u8]) -> Result<Account, CodecError> {
     let slashed_total = d.u64()?;
     let submissions = d.u64()?;
     let accepted = d.u64()?;
+    let nonce = d.u64()?; // M122 (wire v1)
     if d.pos != d.buf.len() {
         return Err(CodecError::TrailingBytes);
     }
@@ -934,6 +951,7 @@ pub fn decode_account(buf: &[u8]) -> Result<Account, CodecError> {
         slashed_total,
         submissions,
         accepted,
+        nonce,
     })
 }
 
@@ -1165,8 +1183,8 @@ pub fn decode_proof_entry(buf: &[u8]) -> Result<ProofEntry, CodecError> {
     // 4 bytes per entry.
     let leaf_byte_len = match kind {
         // Account: u64 id ‖ raw pubkey ‖ 6 × u64 (balance, staked, earned,
-        // slashed, submissions, accepted) = 8 + 32 + 48 = 88.
-        ProofKind::Account => 88,
+        // slashed, submissions, accepted) ‖ u64 nonce (M122) = 8 + 32 + 48 + 8 = 96.
+        ProofKind::Account => 96,
         // Reviewer: u64 id ‖ f32 reputation = 8 + 4 = 12.
         ProofKind::Reviewer => 12,
         // Validator: u64 id ‖ raw pubkey ‖ u64 power = 8 + 32 + 8 = 48.
@@ -1192,6 +1210,7 @@ pub fn decode_proof_entry(buf: &[u8]) -> Result<ProofEntry, CodecError> {
             let slashed_total = d2.u64()?;
             let submissions = d2.u64()?;
             let accepted = d2.u64()?;
+            let nonce = d2.u64()?; // M122 (wire v1)
             ProofEntry::Account {
                 id,
                 account: Account {
@@ -1202,6 +1221,7 @@ pub fn decode_proof_entry(buf: &[u8]) -> Result<ProofEntry, CodecError> {
                     slashed_total,
                     submissions,
                     accepted,
+                    nonce,
                 },
                 proof,
             }
@@ -1264,6 +1284,7 @@ pub fn decode_block(buf: &[u8]) -> Result<Block, CodecError> {
     let mut prev_hash = [0u8; 32];
     prev_hash.copy_from_slice(d.take(32)?);
     let timestamp_days = d.f32()?;
+    let proposer = d.u64()?; // M122 (wire v1)
     let mut next_validators_root = [0u8; 32];
     next_validators_root.copy_from_slice(d.take(32)?);
     // M23: cert-signed state commitments travel in the same prefix slot the
@@ -1330,6 +1351,7 @@ pub fn decode_block(buf: &[u8]) -> Result<Block, CodecError> {
         height,
         prev_hash,
         timestamp_days,
+        proposer,
         next_validators_root,
         state_root,
         accounts_root,
@@ -1357,6 +1379,8 @@ fn dec_tx(d: &mut Dec) -> Result<SubmissionTx, CodecError> {
     let embedding = d.emb()?;
     let domain = d.u32()?;
     let stake = d.u64()?;
+    let fee = d.u64()?; // M122 (wire v1)
+    let nonce = d.u64()?; // M122 (wire v1)
     let n_rev = d.count()?;
     let mut reviews = Vec::with_capacity(n_rev as usize);
     for _ in 0..n_rev {
@@ -1375,6 +1399,8 @@ fn dec_tx(d: &mut Dec) -> Result<SubmissionTx, CodecError> {
         embedding,
         domain,
         stake,
+        fee,
+        nonce,
         reviews,
         repl_success,
         repl_total,
@@ -1496,6 +1522,7 @@ mod tests {
                 repl_total: 3,
                 timestamp_days: 3.0,
                 signature: [9u8; 64],
+                fee: 0, nonce: 0,
             }],
             validator_updates: vec![
                 ValidatorUpdate { id: 25, pubkey: [5u8; 32], power: 3 },
@@ -1520,7 +1547,8 @@ mod tests {
             // encode/decode fns have their own dedicated round-trip tests.
             bridge_headers: Vec::new(),
             bridge_redeems: Vec::new(),
-        }
+            proposer: 0,
+}
     }
 
     #[test]
@@ -1922,6 +1950,7 @@ mod tests {
             slashed_total: 0,
             submissions: 4,
             accepted: 3,
+            nonce: 0,
         };
         let validator = Validator {
             id: 25,
@@ -2089,6 +2118,7 @@ mod tests {
             slashed_total: 0,
             submissions: 0,
             accepted: 0,
+            nonce: 0,
         };
         let inclusion_entry = ProofEntry::Account {
             id: 1,
@@ -2112,6 +2142,7 @@ mod tests {
                 bridge_locks_commitment: [0u8; 32],
                 bridge_headers_commitment: [0u8; 32],
                 bridge_redeems_commitment: [0u8; 32],
+                proposer: 0,
             },
             cert_prev: crate::consensus::Commit {
                 height: 1,
@@ -2135,6 +2166,7 @@ mod tests {
                 bridge_locks_commitment: [0u8; 32],
                 bridge_headers_commitment: [0u8; 32],
                 bridge_redeems_commitment: [0u8; 32],
+                proposer: 0,
             },
             cert_new: crate::consensus::Commit {
                 height: 2,
@@ -2257,6 +2289,7 @@ mod tests {
                         bridge_locks_commitment: [0u8; 32],
                         bridge_headers_commitment: [0u8; 32],
                         bridge_redeems_commitment: [0u8; 32],
+                        proposer: 0,
                     },
                     cert_prev: crate::consensus::Commit {
                         height: 1,
@@ -2280,6 +2313,7 @@ mod tests {
                         bridge_locks_commitment: [0u8; 32],
                         bridge_headers_commitment: [0u8; 32],
                         bridge_redeems_commitment: [0u8; 32],
+                        proposer: 0,
                     },
                     cert_new: crate::consensus::Commit {
                         height: 2,

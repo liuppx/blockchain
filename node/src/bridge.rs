@@ -349,7 +349,8 @@ mod tests {
             bridge_locks: locks,
             bridge_headers: Vec::new(),
             bridge_redeems: Vec::new(),
-        };
+            proposer: 0,
+};
         chain.seal(&mut b).expect("seal");
         // Certify the SEALED hash under the active set.
         let set = chain.state.validators.clone();

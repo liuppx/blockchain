@@ -149,7 +149,14 @@ impl Mempool {
         let mut trial = chain.state.clone();
         trial.now_days = timestamp_days;
         let mut included = Vec::new();
-        for tx in self.pending.values() {
+        // M122: fee-priority selection — highest fee first, with the content hash
+        // (the BTreeMap key) as the deterministic tie-break so every honest builder
+        // lays out the same block. `apply_tx` is a try-apply: a tx that fails (bad
+        // nonce ordering, insufficient balance after a prior tx, …) leaves `trial`
+        // untouched and is simply skipped, deferring it to a later block.
+        let mut candidates: Vec<(&Hash, &SubmissionTx)> = self.pending.iter().collect();
+        candidates.sort_by(|(ha, ta), (hb, tb)| tb.fee.cmp(&ta.fee).then(ha.cmp(hb)));
+        for (_, tx) in candidates {
             if included.len() >= self.max_txs {
                 break;
             }
@@ -166,6 +173,9 @@ impl Mempool {
             height: chain.state.height + 1,
             prev_hash: chain.head,
             timestamp_days,
+            // M122: the builder has no validator id; the caller (daemon: own id;
+            // driver: the round's elected proposer) sets this before `Chain::seal`.
+            proposer: 0,
             // left unsealed: the driver appends ops then seals via `Chain::seal`.
             next_validators_root: [0u8; 32],
             // M23: state_root/accounts_root are stamped by `Chain::commit`
@@ -254,11 +264,19 @@ mod tests {
     }
 
     fn tx(author: u64, dim: usize, domain: u32, stake: u64) -> SubmissionTx {
+        tx_nonce(author, dim, domain, stake, 0)
+    }
+
+    /// M122: explicit-nonce variant for tests that submit a follow-up tx after a
+    /// prior one has already advanced the author's account nonce.
+    fn tx_nonce(author: u64, dim: usize, domain: u32, stake: u64, nonce: u64) -> SubmissionTx {
         SubmissionTx {
             author,
             embedding: unit(dim),
             domain,
             stake,
+            fee: 0,
+            nonce,
             reviews: reviews(),
             repl_success: 3,
             repl_total: 3,
@@ -450,8 +468,8 @@ mod tests {
         mp.remove_included(&blk);
         assert!(mp.is_empty());
 
-        // slot freed: author 1 can be admitted again
-        assert!(mp.insert(&c, tx(1, 2, 2, 2 * MICRO)).is_ok());
+        // slot freed: author 1 can be admitted again (M122: account nonce is now 1)
+        assert!(mp.insert(&c, tx_nonce(1, 2, 2, 2 * MICRO, 1)).is_ok());
     }
 
     #[test]

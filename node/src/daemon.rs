@@ -6015,7 +6015,8 @@ mod tests {
             repl_total: 3,
             timestamp_days: 1.0,
             signature: [0u8; 64],
-        }
+            fee: 0, nonce: 0,
+}
         .signed(&kp(author))
     }
 
@@ -6719,7 +6720,8 @@ mod tests {
             slashed_total: 5,
             submissions: 6,
             accepted: 7,
-        };
+            nonce: 0,
+};
         assert_eq!(
             format_account(1, &a),
             format!(
@@ -7196,7 +7198,8 @@ mod tests {
             slashed_total: 0,
             submissions: 0,
             accepted: 0,
-        };
+            nonce: 0,
+};
 
         // Plain directory → 200 with the single account.
         let resp = get(rpc_addr, "/accounts").await;
@@ -9088,7 +9091,8 @@ mod tests {
             slashed_total: 5,
             submissions: 6,
             accepted: 7,
-        };
+            nonce: 0,
+};
         let a2 = Account {
             pubkey: [0x01; 32],
             balance: u64::MAX,
@@ -9097,7 +9101,8 @@ mod tests {
             slashed_total: 0,
             submissions: 0,
             accepted: 0,
-        };
+            nonce: 0,
+};
         let accounts = vec![(1u64, a1.clone()), (2u64, a2.clone())];
 
         // Text listing is exactly the per-item lines joined by `\n`.
@@ -11393,7 +11398,8 @@ vote_b.validator=5 vote_b.height=9 vote_b.round=2 vote_b.block_hash={b_h} vote_b
             bridge_locks_commitment: [0x09; 32],
             bridge_headers_commitment: [0x0a; 32],
             bridge_redeems_commitment: [0x0b; 32],
-        };
+            proposer: 0,
+};
         let cert = Commit {
             height: 7,
             round: 0,
@@ -11438,7 +11444,8 @@ vote_b.validator=5 vote_b.height=9 vote_b.round=2 vote_b.block_hash={b_h} vote_b
                 slashed_total: 0,
                 submissions: 0,
                 accepted: 0,
-            },
+                nonce: 0,
+},
             proof: crate::merkle::Proof { steps: vec![] },
         };
         let p = json_account_proof(&ch, &entry);
@@ -11478,7 +11485,8 @@ vote_b.validator=5 vote_b.height=9 vote_b.round=2 vote_b.block_hash={b_h} vote_b
                 slashed_total: 0,
                 submissions: 0,
                 accepted: 0,
-            },
+                nonce: 0,
+},
             proof: path.clone(),
         };
         let a = json_proof_entry(&acct);
@@ -11559,7 +11567,8 @@ vote_b.validator=5 vote_b.height=9 vote_b.round=2 vote_b.block_hash={b_h} vote_b
             bridge_locks_commitment: [0u8; 32],
             bridge_headers_commitment: [0u8; 32],
             bridge_redeems_commitment: [0u8; 32],
-        };
+            proposer: 0,
+};
         let cert = |height: u64| Commit { height, round: 0, block_hash: [0u8; 32], precommits: vec![] };
         let acct = crate::Account {
             pubkey: kp(1).public(),
@@ -11569,7 +11578,8 @@ vote_b.validator=5 vote_b.height=9 vote_b.round=2 vote_b.block_hash={b_h} vote_b
             slashed_total: 0,
             submissions: 0,
             accepted: 0,
-        };
+            nonce: 0,
+};
         let diff_env = DiffEnvelope {
             header_prev: hdr(1),
             cert_prev: cert(1),
@@ -11664,7 +11674,8 @@ vote_b.validator=5 vote_b.height=9 vote_b.round=2 vote_b.block_hash={b_h} vote_b
             bridge_locks_commitment: [0u8; 32],
             bridge_headers_commitment: [0u8; 32],
             bridge_redeems_commitment: [0u8; 32],
-        };
+            proposer: 0,
+};
         let cert = |height: u64| Commit { height, round: 0, block_hash: [0u8; 32], precommits: vec![] };
         let env = crate::bridge::LockEnvelope {
             source_header: hdr(5),
@@ -11736,7 +11747,8 @@ vote_b.validator=5 vote_b.height=9 vote_b.round=2 vote_b.block_hash={b_h} vote_b
             bridge_locks_commitment: [0u8; 32],
             bridge_headers_commitment: [0u8; 32],
             bridge_redeems_commitment: [0u8; 32],
-        };
+            proposer: 0,
+};
         let cert = |height: u64| Commit { height, round: 0, block_hash: [0u8; 32], precommits: vec![] };
         let vote = |block_hash: [u8; 32]| crate::consensus::Vote {
             validator: 22,
@@ -11778,7 +11790,8 @@ vote_b.validator=5 vote_b.height=9 vote_b.round=2 vote_b.block_hash={b_h} vote_b
                 repl_total: 3,
                 timestamp_days: 3.0,
                 signature: [9u8; 64],
-            }],
+                fee: 0, nonce: 0,
+}],
             validator_updates: vec![crate::validator::ValidatorUpdate { id: 25, pubkey: [5u8; 32], power: 3 }],
             stake_ops: vec![
                 crate::StakeOp { account: 1, kind: crate::BondKind::Bond, amount: 5_000_000, signature: [7u8; 64] },
@@ -11804,7 +11817,8 @@ vote_b.validator=5 vote_b.height=9 vote_b.round=2 vote_b.block_hash={b_h} vote_b
                 lock,
                 proof: crate::merkle::Proof { steps: vec![crate::merkle::Step::Right([4u8; 32])] },
             }],
-        };
+            proposer: 0,
+};
         let j = json_range_blocks(&[(block, cert(7))]);
 
         // Range scaffold + block header scalars.

@@ -986,6 +986,7 @@ impl GossipNode {
             height: self.chain.state.height + 1,
             prev_hash: self.chain.head,
             timestamp_days,
+            proposer: 0,
             next_validators_root: [0u8; 32],
             state_root: [0u8; 32],
             accounts_root: [0u8; 32],
@@ -1001,6 +1002,10 @@ impl GossipNode {
         });
         candidate.stake_ops = self.pending_stake_ops.clone();
         candidate.slashing_evidence = self.pending_evidence.clone();
+        // M122: this node is the proposer of the block it builds — credit its own
+        // validator id so the tx fees route to it. Only a block actually elected and
+        // committed keeps this; a losing candidate is discarded.
+        candidate.proposer = self.id;
         // Seal on a best-effort basis: if the staged contents fail the trial
         // apply the candidate is unproposable, so drop it (honest nodes then time
         // out rather than propose a block that cannot commit).
@@ -2586,7 +2591,8 @@ mod tests {
             repl_total: 3,
             timestamp_days: 1.0,
             signature: [0u8; 64],
-        }
+            fee: 0, nonce: 0,
+}
         .signed(&kp(author))
     }
 

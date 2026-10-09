@@ -80,13 +80,32 @@ fn reviews(scores: &[(u64, f32)]) -> Vec<Review> {
         .collect()
 }
 
-/// Build and sign a submission with `author`'s key.
+/// Build and sign a submission with `author`'s key. `nonce: 0` — call
+/// `tx_nonce` instead for follow-up txs from the same author.
 fn tx(author: u64, emb: Emb, domain: u32, revs: Vec<Review>, repl: (u32, u32), day: f32) -> SubmissionTx {
+    tx_nonce(author, emb, domain, revs, repl, day, 0)
+}
+
+/// M122: explicit-nonce variant. The demo and the gossip `submit-tx` flow
+/// build each tx with the author's current account nonce; this variant exists
+/// so a single block carrying > 1 tx from the same author can label them
+/// 0, 1, 2, … in the order they would apply.
+fn tx_nonce(
+    author: u64,
+    emb: Emb,
+    domain: u32,
+    revs: Vec<Review>,
+    repl: (u32, u32),
+    day: f32,
+    nonce: u64,
+) -> SubmissionTx {
     SubmissionTx {
         author,
         embedding: emb,
         domain,
         stake: 2 * MICRO,
+        fee: 0,
+        nonce,
         reviews: revs,
         repl_success: repl.0,
         repl_total: repl.1,
@@ -163,6 +182,7 @@ fn demo_blocks(chain: &Chain) -> Vec<Block> {
         height: 1,
         prev_hash: trial.head,
         timestamp_days: 1.0,
+        proposer: 0, // M122
         next_validators_root: [0u8; 32],
         // M23: state commitments stamped by `Chain::commit`.
         state_root: [0u8; 32],
@@ -188,6 +208,7 @@ fn demo_blocks(chain: &Chain) -> Vec<Block> {
         height: 2,
         prev_hash: b1.hash(),
         timestamp_days: 2.0,
+        proposer: 0, // M122
         next_validators_root: [0u8; 32],
         // M23: state commitments stamped by `Chain::commit`.
         state_root: [0u8; 32],
@@ -196,7 +217,8 @@ fn demo_blocks(chain: &Chain) -> Vec<Block> {
         bridge_root: [0u8; 32],
         txs: vec![
             tx(3, blend(1, 2), 3, reviews(&[(10, 0.9), (11, 0.9), (12, 0.85)]), (3, 3), 2.0),
-            tx(1, unit(0), 0, reviews(&[(10, 0.7), (11, 0.6), (12, 0.65)]), (0, 3), 2.0),
+            // M122: author 1's first tx was in b1, so this follow-up is nonce 1.
+            tx_nonce(1, unit(0), 0, reviews(&[(10, 0.7), (11, 0.6), (12, 0.65)]), (0, 3), 2.0, 1),
         ],
         validator_updates: Vec::new(),
         stake_ops: Vec::new(),
@@ -324,7 +346,7 @@ fn usage() {
     eprintln!("  node inspect-genesis --config F  dump the config's genesis contents: every account (id/balance/pubkey), reviewer, validator, plus params (the detail view to genesis-hash's identity)");
     eprintln!("  node submit-tx --config F --tx F  submit a codec-encoded tx to a running daemon's [rpc] ingress endpoint; print accepted hash or reject reason");
     eprintln!("  node rpc --config F --path P [--post FILE]  send a request to the config's [rpc] endpoint and print the response body; GET by default, or POST FILE's raw bytes (e.g. /validate, /submit_tx, /batch)");
-    eprintln!("  node encode-tx --key-file F --out F --author N --domain N --stake N --embedding f,..(DIM) --review R:S.. --repl-success N --repl-total N --timestamp-days F [--config F]  author+sign a tx offline into a submit-tx file; print its hash");
+    eprintln!("  node encode-tx --key-file F --out F --author N --domain N --stake N --embedding f,..(DIM) --review R:S.. --repl-success N --repl-total N --timestamp-days F [--fee MICRO] [--nonce N] [--config F]  author+sign a tx offline into a submit-tx file; print its hash; M122: --fee paid to the proposer (default 0), --nonce must equal the author's account nonce (default 0)");
     eprintln!("  node inspect-tx --tx F [--pubkey HEX]  decode a codec-encoded tx file and print its fields + content hash; with --pubkey, also verify the signature (the read-side companion to encode-tx)");
     eprintln!("  node keygen --out F [--seed HEX]  generate (or derive from a 64-hex seed) an ed25519 keypair; write the seed file (for encode-tx --key-file) and print the pubkey");
     eprintln!("  node keygen ... --genesis-id N [--balance MICRO] [--power P]  also print a ready-to-paste genesis [[accounts]] (and, with --power, [[validators]]) entry");
@@ -2554,6 +2576,7 @@ fn empty_next_block(chain: &Chain, timestamp_days: f32) -> Block {
         height: chain.state.height + 1,
         prev_hash: chain.head,
         timestamp_days,
+        proposer: 0, // M122
         next_validators_root: [0u8; 32],
         state_root: [0u8; 32],
         accounts_root: [0u8; 32],
@@ -3257,6 +3280,8 @@ fn build_signed_tx(
     embedding: Emb,
     domain: u32,
     stake: u64,
+    fee: u64,
+    nonce: u64,
     reviews: Vec<Review>,
     repl_success: u32,
     repl_total: u32,
@@ -3267,6 +3292,8 @@ fn build_signed_tx(
         embedding,
         domain,
         stake,
+        fee,
+        nonce,
         reviews,
         repl_success,
         repl_total,
@@ -3290,6 +3317,14 @@ fn cmd_encode_tx(args: &[String]) {
     let author: u64 = parse_arg(args, "--author");
     let domain: u32 = parse_arg(args, "--domain");
     let stake: u64 = parse_arg(args, "--stake");
+    // M122 (wire v1): fee defaults to 0, nonce to 0 (the account's first tx). A
+    // second tx from the same author must pass `--nonce 1`, etc.
+    let fee: u64 = opt_arg(args, "--fee")
+        .map(|s| s.parse().unwrap_or_else(|_| fail_msg("--fee", &format!("`{s}` is not a u64"))))
+        .unwrap_or(0);
+    let nonce: u64 = opt_arg(args, "--nonce")
+        .map(|s| s.parse().unwrap_or_else(|_| fail_msg("--nonce", &format!("`{s}` is not a u64"))))
+        .unwrap_or(0);
     let repl_success: u32 = parse_arg(args, "--repl-success");
     let repl_total: u32 = parse_arg(args, "--repl-total");
     let timestamp_days: f32 = parse_arg(args, "--timestamp-days");
@@ -3329,7 +3364,8 @@ fn cmd_encode_tx(args: &[String]) {
     }
 
     let tx = build_signed_tx(
-        seed, author, embedding, domain, stake, reviews, repl_success, repl_total, timestamp_days,
+        seed, author, embedding, domain, stake, fee, nonce, reviews, repl_success, repl_total,
+        timestamp_days,
     );
 
     // Self-check the encoding round-trips (the same guard submit-tx applies to its
@@ -3773,6 +3809,8 @@ mod tests {
             unit(1),
             1,
             2 * MICRO,
+            0,
+            0,
             reviews(&[(10, 0.9), (11, 0.85), (12, 0.9)]),
             3,
             3,
@@ -4199,7 +4237,8 @@ mod tests {
             repl_total: 2,
             timestamp_days: 10.0,
             signature: [0u8; 64],
-        }
+            fee: 0, nonce: 0,
+}
         .signed(kp);
         zhixing_node::codec::encode_tx(&tx)
     }
@@ -4294,7 +4333,8 @@ mod tests {
             bridge_locks: vec![],
             bridge_headers: vec![],
             bridge_redeems: vec![],
-        }
+            proposer: 0,
+}
     }
 
     fn test_tx(author: u64) -> SubmissionTx {
@@ -4308,7 +4348,8 @@ mod tests {
             repl_total: 0,
             timestamp_days: 0.0,
             signature: [0u8; 64],
-        }
+            fee: 0, nonce: 0,
+}
         .signed(&Keypair::from_seed(seed_for(author)))
     }
 
