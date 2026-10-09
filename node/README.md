@@ -1341,6 +1341,20 @@ M116 的 `node rpc` 只能 GET。M117 补上写侧，让它成为**全能** RPC 
 
 **已知边界（顺延至 M121+）**：身份读三类已齐（`/genesis` 链 / `/node` 节点 / `/info` 链尖）；读面两分（`/params`/`/config`）已齐；RPC 自带端点发现 + 全能客户端 + 完整链读/写面；内容协商三轴已齐（仅 `identity`，真压缩顺延）；离线工具篮子已补；运维篮子剩余：证书/密钥轮换与落盘、follower 认证、指标端 TLS、OTel/push exporter、每-sink 独立 rotation 覆盖、时延直方图；keygen 篮子剩余：助记词 / BIP-39、口令加密 keystore、密钥轮换；剩余：游标分页、未知方法 `405`；共识 / wire 篮子（破 head 不变量）：**货币费用** + 费用优先排序、nonce / 序列号反重放。
 
+## `GET /leaf/{kind}/{id}` — 实体的 Merkle 叶字节 + 叶哈希（Milestone 124）
+
+读面补上**明文读**与**证明读**之间缺失的信任桥：此前客户端要么拿明文字段（信任节点）、要么拉完整 `/…/proof`（自验）。M124 加 `GET /leaf/{kind}/{id}` 回**实体的规范 Merkle 叶字节**（hex）及其 **SHA-256 叶哈希**——即 SPV 验证器在校验包含证明时本地重算的那串**确切原像**与**摘要**。钱包可先 pin 下这个叶哈希，日后对一个**可信 header 的 `accounts_root`**（或其它 root）校验，无需当场跑完整证明。
+
+- **kind**：`account` / `reviewer` / `validator` / `graph`，与 `/…/proof` 路径同名。
+- **字节一致保证**：actor 侧 `GossipNode::leaf(kind, id)` 复用与证明同一条 `serve_inclusion` 路径再取 `ProofEntry::leaf()`，故 `/leaf` 回的字节与 `/…/proof` 内嵌的叶**逐字节相同**；但不算证明路径、不需 certified header，所以**首块落定前**也能回。
+- **wire v1 一致**：`Account::merkle_leaf` 自 M122 含 `nonce`，故本端点回的账户叶已是 wire v1 形态。
+- **渲染**：文本 `leaf=<hex>\nleaf_hash=<hex>`、JSON `{"leaf":"…","leaf_hash":"…"}`（复用 `json_str`/`hash::hex`）。未知实体 → `404`。
+- **改动**：`GetRoute::Leaf(ProofKind, u64)` + 路由 `/leaf/` 前缀臂（新 `leaf_route` 把 kind 串映射到 `ProofKind`）；`Cmd::QueryLeaf` → `actor.node.leaf(...)`；纯渲染器 `format_leaf`/`json_leaf`；四条 `/leaf/{kind}/{id}` 模板入 `READ_ROUTES`（M118 发现索引）。
+- **不变量保持**：纯读、无 wire/共识/状态/依赖改动、RPC 默认关，故 `localnet` head 仍 wire v1 `a045426e…3b87bc`。
+- **测试（+3 → 536）**：纯 `route_get_parses_leaf`（四 kind + 坏 kind/id/缺 id 全 404）、`leaf_render_matches_proof_leaf`（渲染的 `leaf_hash` 等于 `merkle::leaf_hash(leaf)`）、TCP `rpc_leaf_over_tcp`（`/leaf/account/1` 回的叶本地重算哈希一致、`/leaf/validator/21` 可解析、未知 id → 404）。
+
+**已知边界（顺延至 M125+）**：读写面已非常完整；剩余多需引依赖（`Accept-Encoding` 真压缩、keystore 口令加密、OTel/push exporter、指标端 TLS）或属运维篮子（证书/密钥轮换与落盘、follower 认证、每-sink rotation、时延直方图）；生产路线大件：状态裁剪/快照/快速同步。均在"不破 head"（wire v1 已冻结）前提下推进。
+
 ## RPC 未知方法回 `405 Method Not Allowed`（Milestone 123）
 
 补齐 RFC 9110 的方法处理三连（M92 `HEAD`、M93 `OPTIONS`、本轮 `405`）：此前 RPC 对非 `GET`/`HEAD`/`OPTIONS`/`POST` 的方法（`PUT`/`DELETE`/`PATCH`/`TRACE`/垃圾方法）一律回落到 `200 OK`/`"ok"` 健康探针——**不符合规范**（§15.5.6 要求不支持的方法回 `405` 并带 `Allow` 头）。M123 把那个兜底换成 `405 Method Not Allowed`。

@@ -543,6 +543,15 @@ impl GossipNode {
         self.inclusion(crate::light::ProofKind::Account, id)
     }
 
+    /// M124: the canonical Merkle *leaf bytes* for one entity — the exact preimage a light
+    /// client feeds to [`merkle::leaf_hash`] when verifying an inclusion proof. Identical to
+    /// the leaf inside what [`inclusion`](Self::inclusion) would ship, but without computing
+    /// (or requiring) the proof path or certified header, so it answers even before the first
+    /// block is committed. `None` when no such entity exists.
+    pub fn leaf(&self, kind: crate::light::ProofKind, id: u64) -> Option<Vec<u8>> {
+        self.serve_inclusion(kind, id).map(|e| e.leaf())
+    }
+
     /// M29: serve a heterogeneous batched proof request. Walks
     /// `items`, dispatches each one to the matching existing
     /// `serve_*` helper, and assembles a typed

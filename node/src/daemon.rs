@@ -417,6 +417,13 @@ enum Cmd {
         id: u64,
         reply: oneshot::Sender<Option<EntityView>>,
     },
+    /// M124: read one entity's canonical Merkle leaf bytes (account/reviewer/validator/graph),
+    /// the exact preimage `merkle::leaf_hash` consumes. `None` ⇒ no such entity (404).
+    QueryLeaf {
+        kind: ProofKind,
+        id: u64,
+        reply: oneshot::Sender<Option<Vec<u8>>>,
+    },
     /// M59: read one account's inclusion proof + the certified head it verifies
     /// against, for the verifiable read-class RPC. `None` ⇒ unknown id or no
     /// certified head yet (height 0).
@@ -1231,6 +1238,11 @@ async fn run_actor(mut actor: Actor, mut rx: mpsc::UnboundedReceiver<Cmd>) {
                     ProofKind::Account => None,
                 };
                 let _ = reply.send(view);
+            }
+            Cmd::QueryLeaf { kind, id, reply } => {
+                // M124: the entity's canonical Merkle leaf bytes, byte-identical to the leaf
+                // inside the matching `/…/proof` entry (reuses the same `serve_inclusion` path).
+                let _ = reply.send(actor.node.leaf(kind, id));
             }
             Cmd::QueryAccountProof { id, reply } => {
                 let _ = reply.send(actor.node.account_inclusion(id));
@@ -2448,6 +2460,11 @@ enum GetRoute {
     /// `/genesis` (the *chain's* identity) this answers "which node am I talking to", useful
     /// across a multi-node deployment. Exact-match; no id.
     Node,
+    /// M124: `GET /leaf/{kind}/{id}` — the canonical Merkle *leaf bytes* (+ their leaf-hash) for
+    /// an `account`/`reviewer`/`validator`/`graph` entity: the exact preimage an SPV client
+    /// re-hashes when verifying an inclusion proof. The trust bridge between a plain read and a
+    /// `/…/proof` read. A bad/unknown kind or non-numeric id ⇒ `NotFound`.
+    Leaf(ProofKind, u64),
     NotFound,
 }
 
@@ -2806,6 +2823,10 @@ fn route_get(path: &str) -> GetRoute {
                 entity_route(rest, ProofKind::Validator)
             } else if let Some(rest) = p.strip_prefix("/graph/") {
                 entity_route(rest, ProofKind::GraphNode)
+            } else if let Some(rest) = p.strip_prefix("/leaf/") {
+                // M124: `/leaf/{kind}/{id}` — the entity's canonical Merkle leaf bytes. `{kind}`
+                // is one of account|reviewer|validator|graph; a bad kind or non-numeric id ⇒ 404.
+                leaf_route(rest)
             } else if let Some(rest) = p.strip_prefix("/bridge/lock/") {
                 // M63: `{id}/proof` is the only form — a bridge lock has no plain
                 // read, so a bare id (no `/proof`) or a non-numeric id ⇒ 404.
@@ -2863,6 +2884,26 @@ fn entity_route(rest: &str, kind: ProofKind) -> GetRoute {
             .map(|id| GetRoute::Plain(kind, id))
             .unwrap_or(GetRoute::NotFound),
     }
+}
+
+/// M124: parse `{kind}/{id}` (the tail of `/leaf/…`) into a [`GetRoute::Leaf`]. `{kind}` maps
+/// `account`/`reviewer`/`validator`/`graph` to the matching [`ProofKind`]; an unknown kind,
+/// missing id, or non-numeric id ⇒ [`GetRoute::NotFound`].
+fn leaf_route(rest: &str) -> GetRoute {
+    let Some((kind_str, id_str)) = rest.split_once('/') else {
+        return GetRoute::NotFound;
+    };
+    let kind = match kind_str {
+        "account" => ProofKind::Account,
+        "reviewer" => ProofKind::Reviewer,
+        "validator" => ProofKind::Validator,
+        "graph" => ProofKind::GraphNode,
+        _ => return GetRoute::NotFound,
+    };
+    id_str
+        .parse::<u64>()
+        .map(|id| GetRoute::Leaf(kind, id))
+        .unwrap_or(GetRoute::NotFound)
 }
 
 /// M103: parse a 64-hex content hash (the `Mempool` key type). Returns the 32 bytes on
@@ -3183,6 +3224,28 @@ fn json_head(head: &[u8; 32]) -> String {
     format!("{{\"head\":{}}}", json_str(&crate::hash::hex(head)))
 }
 
+/// M124: text rendering of an entity's Merkle leaf — the raw leaf bytes (hex) and their
+/// SHA-256 leaf-hash (`merkle::leaf_hash`), the two values an SPV client needs to verify an
+/// inclusion proof. Grep-friendly `key=value` lines, like the other single reads.
+fn format_leaf(leaf: &[u8]) -> String {
+    let hash = crate::merkle::leaf_hash(leaf);
+    format!(
+        "leaf={}\nleaf_hash={}",
+        crate::hash::hex(leaf),
+        crate::hash::hex(&hash)
+    )
+}
+
+/// M124: JSON sibling of [`format_leaf`].
+fn json_leaf(leaf: &[u8]) -> String {
+    let hash = crate::merkle::leaf_hash(leaf);
+    format!(
+        "{{\"leaf\":{},\"leaf_hash\":{}}}",
+        json_str(&crate::hash::hex(leaf)),
+        json_str(&crate::hash::hex(&hash)),
+    )
+}
+
 /// M106: render this node's chain identity as a grep-friendly `genesis_hash={hex}` line.
 fn format_genesis(gh: &crate::Hash) -> String {
     format!("genesis_hash={}", crate::hash::hex(gh))
@@ -3272,6 +3335,10 @@ const READ_ROUTES: &[&str] = &[
     "/validator/{id}/proof",
     "/graph/{id}",
     "/graph/{id}/proof",
+    "/leaf/account/{id}",
+    "/leaf/reviewer/{id}",
+    "/leaf/validator/{id}",
+    "/leaf/graph/{id}",
     "/bridge/lock/{id}/proof",
     "/mempool/{hash}",
     "/tx/{hash}",
@@ -4712,6 +4779,23 @@ async fn serve_rpc_conn(mut stream: TcpStream, cmd: mpsc::UnboundedSender<Cmd>) 
                 } else {
                     match rx.await {
                         Ok(Some(v)) => ok_body(fmt, &format_entity(&v), &json_entity(&v)),
+                        Ok(None) => not_found_body(
+                            fmt,
+                            &format!("{} {id} not found", proof_kind_label(kind)),
+                        ),
+                        Err(_) => http_response("503 Service Unavailable", "node stopped"),
+                    }
+                }
+            }
+            GetRoute::Leaf(kind, id) => {
+                // M124: the entity's canonical Merkle leaf bytes + leaf-hash — the preimage and
+                // digest an SPV client recomputes to verify a `/…/proof`. 404 when no such entity.
+                let (reply, rx) = oneshot::channel();
+                if cmd.send(Cmd::QueryLeaf { kind, id, reply }).is_err() {
+                    http_response("503 Service Unavailable", "node stopped")
+                } else {
+                    match rx.await {
+                        Ok(Some(leaf)) => ok_body(fmt, &format_leaf(&leaf), &json_leaf(&leaf)),
                         Ok(None) => not_found_body(
                             fmt,
                             &format!("{} {id} not found", proof_kind_label(kind)),
@@ -7552,6 +7636,88 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    #[tokio::test]
+    async fn rpc_leaf_over_tcp() {
+        // M124: `/leaf/{kind}/{id}` over real TCP — a known account returns the `leaf=`/
+        // `leaf_hash=` lines whose hash matches the local `merkle::leaf_hash` of the leaf; an
+        // unknown id is 404; a validator leaf resolves too.
+        let dir = tmp_dir("rpc-leaf");
+        let mut cfg = node_config(21, 21251, &[21], dir.clone());
+        let rpc_addr = "127.0.0.1:21261";
+        cfg.rpc = Some(crate::config::RpcConfig {
+            enabled: true,
+            listen: rpc_addr.into(),
+        });
+        let mut genesis = test_genesis();
+        genesis.validators = vec![(21, kp(21).public(), 1)];
+        let node = Node::start(cfg, genesis, Some(kp(21)))
+            .await
+            .expect("start node");
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            if node.status().await.map(|(h, _)| h >= 1).unwrap_or(false) {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "node never produced a block"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+
+        async fn get(addr: &str, path: &str) -> String {
+            let req =
+                format!("GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
+            let mut s = TcpStream::connect(addr).await.expect("connect rpc");
+            s.write_all(req.as_bytes()).await.expect("send get");
+            let mut resp = Vec::new();
+            s.read_to_end(&mut resp).await.expect("read response");
+            String::from_utf8_lossy(&resp).into_owned()
+        }
+        fn body_of(resp: &str) -> &str {
+            resp.rsplit("\r\n\r\n").next().unwrap_or("")
+        }
+
+        // /leaf/account/1 → 200 with leaf= + leaf_hash= lines, the hash matching leaf_hash(leaf).
+        let resp = get(rpc_addr, "/leaf/account/1").await;
+        assert!(resp.starts_with("HTTP/1.1 200 OK"), "leaf status: {resp}");
+        let body = body_of(&resp);
+        let leaf_hex = body
+            .lines()
+            .find_map(|l| l.strip_prefix("leaf="))
+            .expect("leaf= line");
+        let hash_hex = body
+            .lines()
+            .find_map(|l| l.strip_prefix("leaf_hash="))
+            .expect("leaf_hash= line");
+        // Re-derive the hash locally from the advertised leaf bytes — they must agree, which is
+        // exactly the SPV check against a trusted header's accounts_root.
+        let leaf_bytes: Vec<u8> = (0..leaf_hex.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&leaf_hex[i..i + 2], 16).unwrap())
+            .collect();
+        assert_eq!(
+            crate::hash::hex(&crate::merkle::leaf_hash(&leaf_bytes)),
+            hash_hex,
+            "leaf_hash must equal local merkle::leaf_hash(leaf)"
+        );
+
+        // /leaf/validator/21 resolves too (validator set is non-empty).
+        let v = get(rpc_addr, "/leaf/validator/21").await;
+        assert!(v.starts_with("HTTP/1.1 200 OK"), "validator leaf: {v}");
+        assert!(
+            body_of(&v).contains("leaf_hash="),
+            "validator leaf body: {v}"
+        );
+
+        // Unknown account → 404.
+        let miss = get(rpc_addr, "/leaf/account/999999").await;
+        assert!(miss.starts_with("HTTP/1.1 404"), "unknown leaf: {miss}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn lock_proof_formats_and_verifies() {
         // M63: the `/bridge/lock/{id}/proof` body is the single hex line
@@ -10012,6 +10178,60 @@ mod tests {
         // Bad ids.
         assert!(matches!(route_get("/reviewer/x"), GetRoute::NotFound));
         assert!(matches!(route_get("/graph/"), GetRoute::NotFound));
+    }
+
+    #[test]
+    fn route_get_parses_leaf() {
+        // M124: `/leaf/{kind}/{id}` parses to `Leaf(kind, id)` for the four kinds; an unknown
+        // kind, missing id, or non-numeric id ⇒ NotFound. A bare `/leaf/` ⇒ Health fallthrough.
+        assert!(matches!(
+            route_get("/leaf/account/7"),
+            GetRoute::Leaf(ProofKind::Account, 7)
+        ));
+        assert!(matches!(
+            route_get("/leaf/reviewer/10"),
+            GetRoute::Leaf(ProofKind::Reviewer, 10)
+        ));
+        assert!(matches!(
+            route_get("/leaf/validator/21"),
+            GetRoute::Leaf(ProofKind::Validator, 21)
+        ));
+        assert!(matches!(
+            route_get("/leaf/graph/0"),
+            GetRoute::Leaf(ProofKind::GraphNode, 0)
+        ));
+        // Unknown kind, non-numeric id, and missing id all 404.
+        assert!(matches!(route_get("/leaf/bogus/1"), GetRoute::NotFound));
+        assert!(matches!(route_get("/leaf/account/x"), GetRoute::NotFound));
+        assert!(matches!(route_get("/leaf/account/"), GetRoute::NotFound));
+        assert!(matches!(route_get("/leaf/account"), GetRoute::NotFound));
+    }
+
+    #[test]
+    fn leaf_render_matches_proof_leaf() {
+        // M124: `format_leaf`/`json_leaf` emit the raw leaf bytes (hex) and their
+        // `merkle::leaf_hash`. The leaf-hash must equal what an inclusion verifier recomputes,
+        // so this pins the rendering to the canonical `merkle::leaf_hash` of the same bytes.
+        let leaf = crate::Account {
+            pubkey: [0xAB; 32],
+            balance: 42,
+            nonce: 3,
+            ..Default::default()
+        }
+        .merkle_leaf(7);
+        let want_hash = crate::hash::hex(&crate::merkle::leaf_hash(&leaf));
+        let text = format_leaf(&leaf);
+        assert!(
+            text.contains(&format!("leaf={}", crate::hash::hex(&leaf))),
+            "{text}"
+        );
+        assert!(text.contains(&format!("leaf_hash={want_hash}")), "{text}");
+        let json = json_leaf(&leaf);
+        assert!(
+            json.contains(&format!("\"leaf_hash\":\"{want_hash}\"")),
+            "{json}"
+        );
+        assert!(json.starts_with("{\"leaf\":\""), "{json}");
     }
 
     #[test]
