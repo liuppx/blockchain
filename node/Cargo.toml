@@ -38,9 +38,17 @@ path = "src/main.rs"
 # (the tokio adapter for rustls) + rcgen for the ephemeral self-signed cert. Both
 # are pinned to the `ring` crypto backend (not the default aws-lc-rs) to avoid a
 # cmake/NASM C-toolchain build dependency. Node-crate only; engine stays zero-dep.
+#
+# M121 swaps the hand-rolled SHA-256 for the audited `sha2` crate (RustCrypto).
+# Content-addressed block/state hashing is consensus-critical, so it must be a
+# vetted primitive, not in-tree code. The output is byte-identical (SHA-256 is
+# SHA-256), so the head invariant and every persisted hash are unchanged — this
+# is a pure supply-chain hardening, not a protocol change. Node-crate only; the
+# engine does no hashing and stays zero-dep.
 [dependencies]
 zhixing-engine = { path = "../engine" }
 ed25519-dalek = "2"
+sha2 = "0.10"
 getrandom = "0.2"
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12", "logging"] }
 rcgen = { version = "0.13", default-features = false, features = ["ring", "pem"] }

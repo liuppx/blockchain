@@ -1001,6 +1001,7 @@ dependencies = [
  "getrandom",
  "rcgen",
  "serde",
+ "sha2",
  "tokio",
  "tokio-rustls",
  "toml",

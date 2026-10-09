@@ -1341,6 +1341,17 @@ M116 的 `node rpc` 只能 GET。M117 补上写侧，让它成为**全能** RPC 
 
 **已知边界（顺延至 M121+）**：身份读三类已齐（`/genesis` 链 / `/node` 节点 / `/info` 链尖）；读面两分（`/params`/`/config`）已齐；RPC 自带端点发现 + 全能客户端 + 完整链读/写面；内容协商三轴已齐（仅 `identity`，真压缩顺延）；离线工具篮子已补；运维篮子剩余：证书/密钥轮换与落盘、follower 认证、指标端 TLS、OTel/push exporter、每-sink 独立 rotation 覆盖、时延直方图；keygen 篮子剩余：助记词 / BIP-39、口令加密 keystore、密钥轮换；剩余：游标分页、未知方法 `405`；共识 / wire 篮子（破 head 不变量）：**货币费用** + 费用优先排序、nonce / 序列号反重放。
 
+## SHA-256 换用审计过的 `sha2`（Milestone 121）
+
+这是生产就绪路线的第一步，也是本仓库从「零依赖、全手搓」自律转向「关键密码学走已审计库」的刻意松绑。内容寻址的 block/state 哈希是**共识关键**原语，此前 `hash.rs` 是 bring-up 期为离线零依赖保留的**手搓 SHA-256**——这是审计红旗（手搓共识级密码学是负债，不是资产）。M121 把它换成审计过的 RustCrypto `sha2` crate。
+
+- **为什么是"引依赖"而非"改 wire"**：SHA-256 就是 SHA-256，换实现**输出逐字节不变**。所以这是纯粹的**供应链加固**——协议、链身份、已落盘哈希全不动，与「改 wire/共识」那条路（会改链身份、须协调分叉）性质完全不同。两条路里，这条**低风险、可逆、只降风险**，故排在最前。
+- **改动**：`hash.rs` 的 `sha256(&[u8]) -> [u8;32]` 从约 70 行手搓压缩函数，改为 `Sha256::new().update(data).finalize().into()` 的薄封装；签名、`hex`、公共 API 一字不变。`node/Cargo.toml` 加 `sha2 = "0.10"`。engine **不做哈希**、仍零依赖。
+- **逐字节不变的证明**：**整套 529 测不改一个断言全绿**——包括 `codec` 的 block/header 哈希一致性、轻客户端 Merkle 包含/邻域/范围证明、`localnet` 逐字节确定性、以及 `head` 不变量（`44309755…ea04ba`）。这些测试全都间接依赖 `sha256` 的具体字节；它们不动即证明摘要未移位。`hash::known_vectors` 另补一条多块（>64 字节）FIPS 180-4 向量显式复核。
+- **不变量保持**：`state_root`/`merkle_root`/`genesis_hash`/`head` 等所有 cert-signed 常量不变；无 wire/共识/状态编码改动；engine 零依赖不破。唯一变化是 `node` crate 多一条**已审计**的供应链依赖——这正是目的。
+
+**已知边界（顺延至 M122+）**：关键密码学（ed25519 + SHA-256）已全走审计库；生产路线下一步（按建议）是**一次性「wire v1 冻结」**（交易费 + 费用优先排序 + nonce 反重放 + 预留字段），那将**有意**改 block/tx 编码、重算并重新锁定 canonical 哈希，此后冻结——与本轮"不破 head"的边角清理不同；再后是便利依赖（keystore 口令加密、可选 gzip）与状态裁剪/快照/快速同步。其余读写面边角仍可在"零新依赖 + 不破 head"下继续。
+
 ## 持久化与重放（Milestone 7）
 
 节点状态不再只活在内存里：区块以**追加式日志**（`DIR/blocks.log`）落盘，重启后从创世**重放**日志即可重建**逐字节相同**的状态。
@@ -1359,7 +1370,7 @@ cargo run --release --bin node -- status --dir "$D"   # state_root=1a2ec34c…99
 
 提交不再是"裸整数 id 声明"，而是**经 ed25519 签名认证**的交易：账户在创世登记公钥，每笔 `SubmissionTx` 携带作者对交易规范字节（`codec::tx_signing_bytes`，即除签名外的全部字段）的签名。`apply_tx` 先验签，再判断余额/ΔK——**无法冒用他人账户，也无法在签名后篡改任何字段**。
 
-- 签名用**审计过的 `ed25519-dalek`**，绝不自实现签名算法（对照：内置 SHA-256 仅用于哈希演示，生产亦应换 `sha2`）。
+- 签名用**审计过的 `ed25519-dalek`**，绝不自实现签名算法；内容哈希（SHA-256）自 M121 起亦用**审计过的 `sha2`**（RustCrypto），不再是内置手搓实现——共识关键的密码学原语都走已审计库。
 - **引擎仍零依赖**：`ed25519-dalek` 只进 node（应用层）；`engine`（可嵌入/WASM）保持纯 std。
 - 签名字段纳入区块编码与哈希，但**不纳入签名字节**（自然地避免自指）。
 
@@ -1895,7 +1906,7 @@ peer_exchange_disabled_stays_seeded                   同链拓扑关发现 → 
 | `src/store.rs` | 追加式日志（长度前缀记录、残缺尾检测）：`BlockLog`（区块）+ `CertLog`（证书）+ 测试 |
 | `src/config.rs` | 配置文件解析（`[consensus]`/`[network]`/`[metrics]`/`[rpc]` 等 TOML 段，共识类型仍 serde-free）——详见下方 [§`src/config.rs`](#srcconfigrs) |
 | `src/daemon.rs` | 联网 tokio 守护进程 + RPC 服务端（单属主 actor，TCP P2P + 分布式 BFT 投票）——详见下方 [§`src/daemon.rs`](#srcdaemonrs) |
-| `src/hash.rs` | 纯 std SHA-256（FIPS 180-4，含已知向量测试）——离线零依赖 |
+| `src/hash.rs` | SHA-256（FIPS 180-4）薄封装，M121 起后端为审计过的 `sha2` crate；含已知向量测试 |
 | `src/main.rs` | 节点 CLI：`demo` / `build` / `prove` / `bft` / `live` / `chain` / `validators` / `gossip`（含 M19 证据 flood 演示） / `light`（M20 跟随 + M21 免迁移 `follow_committed` 演示） / `vprove`（M21 验证人 Merkle 成员证明） / `lsync`（M22 头部轻同步演示：全+光节点同总线、光端 0 笔交易入眼即够到全节点高度，附线缆字节节省 + `verify_membership_against_header`） / **`account`（M23 钱包账户-成员 SPV 演示：光端经 `GetAccountProof` 取账户、本地重算 leaf 对头里的 `accounts_root` 验证，含双根对比）** / **`graph`（M25 图节点 cert-signed 包含证明演示：单次 GetProof 拿图节点 + 账户，光端对 accounts_root 重算 leaf、零信任 prover）** / **`knn`（M26 cert-signed 邻域证明演示：full peer 本地 kNN → KnnClaim，wallet 端 verify_knn_against_header 重排 + cut）** / **`range`（M27 cert-signed 范围查询演示：full peer 本地 cosine cutoff → RangeClaim，wallet 端 verify_range_against_header 对 graph_root 重排 + cut，含 cut/根/cutoff 三类负测）** / **`diff`（M28 cert-signed 时序 diff 演示：full peer 本地 h₁→h₂ diff → DiffEnvelope，wallet 端 verify_diff_against_headers 局部重放等比 + 每 leaf 对各自 accounts_root 验，含 leaf-proof / accounts_root / dropped-added 三类负测）** / **`batch`（M29 异构批 SPV 演示：full peer 一次性出 `(Inclusion, Knn, Range, Diff)` 四 slot 的 `BatchResponseEnvelope`，wallet 端 `verify_batch` 派回四个 per-primitive 验证器，含 inclusion/knn-ordering/diff 三类负测）** / **`bridge`（M30 信任无关跨链桥演示：两条不同创世 A↔B，A 锁 12 µ$COG 到 B 账户 7，relayer 从 A 拿 `LockEnvelope` 投到 B 的 `BridgeEndpoint`，B 端 `verify_lock` → Ok → `minted(7)=12`，含 tampered-proof / wrong-destination / replay / tampered-root 四类 `BridgeError` 负测）** / `staking` / `slashing` / `certs` / **`localnet`（M33 进程内 tokio 4 验证人测试网经真实 loopback socket BFT 收敛）** / `run`（**M33 起 `--config` 联网 tokio 守护进程 + 分布式 BFT 投票；旧 `--dir` 播种语义由 `localnet` 取代**） / **`submit-tx`（M53 向运行中守护进程的 `[rpc]` 入口提交交易：加载配置、要求 `[rpc]` 启用、读 `--tx` 文件的 codec 编码字节、本地先 `decode_tx` 自检、阻塞 `std::net::TcpStream` POST 到 `rpc.listen`、打印接受的 hash 或拒绝原因，非 2xx ⇒ 非零退出）** / **`encode-tx`（M56 离线编写交易 = submit-tx 的生产端：从命令行旗标装配 `SubmissionTx`、`--key-file` 64-hex 32 字节种子经 `config::decode_seed` → `Keypair::from_seed` ed25519 签名、可选 `--config` 交叉校验派生 pubkey 对 genesis 作者（防"键/作者不匹配"）、纯函数 `parse_embedding`/`parse_review`/`multi_arg`/`build_signed_tx` + 新 `#[cfg(test)] mod tests`（+9）、`cmd_encode_tx` 自检 `decode_tx∘encode_tx` 往返后 `fs::write` 并打印 `encoded`/`bytes`/`out`；纯离线、无共识/wire/依赖变更）** / `status`（含确定性演示密钥） |
 
 ### `src/config.rs`
@@ -2141,5 +2152,6 @@ peer_exchange_disabled_stays_seeded                   同链拓扑关发现 → 
 - ~~M118 端点发现 `GET /routes`——建了几十个读端点却无从自我发现；M118 加 `GET /routes` 回自文档化索引（精确路径 + `{param}` 模板），静态列表故 dispatch 直接 `ok_body`、无 actor 往返；单一真相源 `const READ_ROUTES` + 纯渲染器 `format_routes`/`json_routes`，`GetRoute::Routes` + `route_get` 精确臂 `/routes`；漂移守卫 `advertised_exact_routes_resolve` 把发现索引钉死在真实路由器上；新纯测 `route_get_parses_routes`/`routes_index_lists_endpoints`/`advertised_exact_routes_resolve`，共 523 测、localnet head 不变~~ ✅
 - ~~M119 运营配置读 `GET /config`——`/params` 读经济/ΔK 旋钮，`/config` 读本节点实际在跑的运营配置：共识计时（propose/prevote/precommit/delta/block_interval ms + `create_empty_blocks`）+ mempool 上限（capacity/per_account_limit）+ 角色（validator|follower）；新增 `ConfigView` + 纯渲染器 `format_config`/`json_config`，`bound_str`（`usize::MAX` ⇒ `unbounded`、否则数字；JSON 引号串使有界/无界同形）；`Cmd::QueryConfig` actor 由 `actor.timing`/`node.mempool`/`kp.is_some()` 拍快照；`GetRoute::Config` + `route_get` 精确臂 `/config` + 入 `READ_ROUTES`；新纯测 `route_get_parses_config`/`config_renders_text_and_json` + TCP `rpc_config_over_tcp`，共 526 测、localnet head 不变~~ ✅
 - ~~M120 节点身份读 `GET /node`——`/genesis` 是链身份、`/node` 是节点身份（回「我在跟哪个节点说话」）：node_id + role + version，其中 `node_id` 此前任何端点都不暴露；新增纯渲染器 `format_node`/`json_node`（id lossless 引号 u64、role/version 引号串），`Cmd::QueryNode` actor 回 `(actor.node.id, actor.kp.is_some())`；`GetRoute::Node` + `route_get` 精确臂 `/node` + 入 `READ_ROUTES`；新纯测 `route_get_parses_node`/`node_renders_text_and_json` + TCP `rpc_node_over_tcp`（validator 52 ⇒ node_id=52/role=validator/version），共 529 测、localnet head 不变~~ ✅
+- ~~M121 SHA-256 换用审计过的 `sha2`——内容寻址的 block/state 哈希是共识关键原语，此前是 bring-up 期手搓 SHA-256（审计红旗）；M121 把 `hash.rs` 的 `sha256` 改为薄封装委托 RustCrypto `sha2` crate，输出逐字节不变（SHA-256 就是 SHA-256），故协议/链身份/已落盘哈希/head 不变量全不动——纯供应链加固、非 wire/共识改动；证明：整套 529 测（codec block/header 哈希、轻客户端 Merkle 证明、localnet 确定性、head 不变量）不改一断言全绿；仅 node crate 引 `sha2`（engine 仍零依赖），`known_vectors` 补多块 FIPS 向量；生产路线第一步「先用审计库消除手搓密码学红旗」，共 529 测、localnet head 不变~~ ✅
 
-……；运维篮子剩余（货币费用（独立共识里程碑）、费用优先出块排序、nonce 反重放、身份读三类（`/genesis` 链 / `/node` 节点 / `/info` 链尖）已齐、读面两分（`/params`/`/config`）已齐、RPC 自带端点发现 + 全能客户端 + 完整链读/写面、读面列表端点篮子已收口、HTTP `HEAD`/`OPTIONS`/`ETag` 条件 GET/`Accept-Encoding`（identity）协商 已补、keyfile `0600` 已补、现成 genesis 条目已补、`check-config`/`genesis-hash`/`inspect-genesis`/`inspect-tx`/`pubkey`/`inspect-block`/`inspect-cert` 已补、助记词/BIP-39、口令 keystore、密钥轮换、游标分页、真压缩（gzip/deflate，须引新依赖）、未知方法 `405`、RPC auth/TLS、证书/密钥轮换与落盘、follower 认证、每-sink 独立 rotation 覆盖、OTEL/结构化日志 exporter、指标端 TLS、指标 push exporter/直方图/每-peer/每-轮次时延序列）顺延至 M121+，每步仍遵循"可运行、可测试、契约一致"。
+……；运维篮子剩余（货币费用（独立共识里程碑）、费用优先出块排序、nonce 反重放、关键密码学（ed25519 + SHA-256）已全走审计库、身份读三类（`/genesis`/`/node`/`/info`）已齐、读面两分（`/params`/`/config`）已齐、RPC 自带端点发现 + 全能客户端 + 完整链读/写面、读面列表端点篮子已收口、HTTP `HEAD`/`OPTIONS`/`ETag` 条件 GET/`Accept-Encoding`（identity）协商 已补、keyfile `0600` 已补、现成 genesis 条目已补、`check-config`/`genesis-hash`/`inspect-genesis`/`inspect-tx`/`pubkey`/`inspect-block`/`inspect-cert` 已补、助记词/BIP-39、口令 keystore、密钥轮换、游标分页、真压缩（gzip/deflate，须引新依赖）、未知方法 `405`、RPC auth/TLS、证书/密钥轮换与落盘、follower 认证、每-sink 独立 rotation 覆盖、OTEL/结构化日志 exporter、指标端 TLS、指标 push exporter/直方图/每-peer/每-轮次时延序列、状态裁剪/快照/快速同步、wire v1 冻结（费用/nonce，有意破 head））顺延至 M122+，每步仍遵循"可运行、可测试、契约一致"。

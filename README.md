@@ -420,9 +420,9 @@ cargo test --release                                 # 529 项单元测试（见
 | $COG / $WATT / $FLOP | 认知币（主）/ 电力凭证 / 算力凭证 |
 | cNFT | 认知贡献证书 |
 
-## 里程碑变更日志（M6–M120）
+## 里程碑变更日志（M6–M121）
 
-截至 M120 共 **529** 项单元测试。早期里程碑（M6–M23）主题：确定性/守恒/回滚/持久化/Merkle/BFT/认证链/最终性复验/动态验证人集/P2P gossip/质押绑定/等价双签罚没/块级 ops 走 gossip/轻客户端跟随验证人集/验证人集 Merkle 承诺入头/头部轻同步传输/钱包 SPV 账户证明。此后逐里程碑：
+截至 M121 共 **529** 项单元测试。早期里程碑（M6–M23）主题：确定性/守恒/回滚/持久化/Merkle/BFT/认证链/最终性复验/动态验证人集/P2P gossip/质押绑定/等价双签罚没/块级 ops 走 gossip/轻客户端跟随验证人集/验证人集 Merkle 承诺入头/头部轻同步传输/钱包 SPV 账户证明。此后逐里程碑：
 
 - **M24** 泛化批量化证明请求总线：Account/Reviewer/Validator 同一 GetProof 对、单一 verify_proof_against_header 验证器、reviewer_proof 闭合审阅人路径、MAX_PROOF_BATCH=32 上限
 - **M25** 图节点 cert-signed 包含证明
@@ -529,6 +529,7 @@ cargo test --release                                 # 529 项单元测试（见
 - **M118** `GET /routes` 端点发现（我们建了几十个读端点、却无从**自我发现**；M118 加 `GET /routes` 回一份**自文档化**的读端点索引——精确（无参）路径 + `{param}` 模板；因是静态列表、**无需 actor 往返**（继 `OPTIONS`/`/version` 之后又一直接应答的读）；单一真相源 `const READ_ROUTES: &[&str]`（精确路径在前、模板在后）+ 纯渲染器 `format_routes`（每行一路径）/`json_routes`（`{"routes":[…]}`）；`enum GetRoute` 加 `Routes`、`route_get` 在 `/version` 后加精确臂 `/routes`、dispatch 臂直接 `ok_body`；新纯测 `route_get_parses_routes`/`routes_index_lists_endpoints` + **漂移守卫** `advertised_exact_routes_resolve`（遍历 `READ_ROUTES` 中每个不含 `{` 的精确路径、断言 `route_get` 不落 `Health`/`NotFound`——把发现索引钉死在真实路由器上、防广告与实现脱节），共 523 测；纯读面新单读类、无 `serde_json`/无 wire/共识/状态/依赖、RPC 默认关故 localnet head 不变 顺延至 M119
 - **M119** `GET /config` 运营配置读（`/params` 读**经济/ΔK** 旋钮，而 `/config` 读**运营**配置——让运营者核对节点**实际在跑**的参数；M119 加 `GET /config` 回 actor 已解析的共识计时（propose/prevote/precommit/delta/block_interval ms + `create_empty_blocks`）+ mempool 上限（capacity / per_account_limit）+ 角色（validator|follower）；新增 `ConfigView` 结构 + 纯渲染器 `format_config`/`json_config`——计时 lossless 引号 u64、`create_empty_blocks` 裸 JSON bool、mempool 上限经 `bound_str`（`usize::MAX` ⇒ `unbounded`、否则数字，JSON 为引号串使二者同形、不泄露 sentinel `18446744073709551615`）；`Cmd::QueryConfig` actor 由 `actor.timing`/`node.mempool.capacity()`/`per_account_limit()`/`kp.is_some()` 拍快照；`enum GetRoute` 加 `Config`、`route_get` 精确臂 `/config`、`/config` 入 `READ_ROUTES`（M118 发现索引）；新纯测 `route_get_parses_config`/`config_renders_text_and_json`（含 `unbounded`/`bound_str` 边界）+ TCP `rpc_config_over_tcp`（validator 节点 role=validator、全计时/mempool 键齐备），共 526 测；纯读面新单读类、无 `serde_json`/无 wire/共识/状态/依赖、RPC 默认关故 localnet head 不变 顺延至 M120
 - **M120** `GET /node` 节点身份读（`/genesis` 是**链**身份、`/node` 是**节点**身份——回「我在跟哪个节点说话」：node_id + role + version；`node_id` 此前任何端点都不暴露，是本里程碑的新数据；新增纯渲染器 `format_node`/`json_node`（id lossless 引号 u64、role/version 引号串），`Cmd::QueryNode` actor 回 `(actor.node.id, actor.kp.is_some())`；`enum GetRoute` 加 `Node`、`route_get` 精确臂 `/node` + 入 `READ_ROUTES`；新纯测 `route_get_parses_node`/`node_renders_text_and_json` + TCP `rpc_node_over_tcp`（validator 52 ⇒ node_id=52/role=validator/version），共 529 测；纯读面新单读类、无 `serde_json`/无 wire/共识/状态/依赖、RPC 默认关故 localnet head 不变 顺延至 M121
+- **M121** SHA-256 换用审计过的 `sha2`（**供应链加固，非协议改动**：内容寻址的 block/state 哈希是共识关键，此前是 bring-up 期为「零依赖」留的**手搓** SHA-256；M121 把 `hash.rs` 的 `sha256` 改为薄封装委托给审计过的 RustCrypto `sha2` crate；**输出逐字节不变**——SHA-256 就是 SHA-256——故所有已落盘哈希、`state_root`/`merkle_root` 常量、localnet `head` 不变量全部不动，这是纯粹的供应链加固而非 wire/共识改动；**证明**：整套 529 测（含 codec 的 block/header 哈希、轻客户端 Merkle 证明、localnet 逐字节确定性、head 不变量）**不改一个断言全绿**，即摘要未移位；仅 `node` crate 引 `sha2`（engine 不做哈希、仍零依赖），`hash::known_vectors` 补一条多块 FIPS 向量，测数仍 529；此即生产路线建议的第一步「先用审计库消除手搓密码学的审计红旗」，为后续 wire 冻结把哈希来源先清白）
 
 ## 状态
 
