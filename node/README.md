@@ -1341,6 +1341,19 @@ M116 的 `node rpc` 只能 GET。M117 补上写侧，让它成为**全能** RPC 
 
 **已知边界（顺延至 M121+）**：身份读三类已齐（`/genesis` 链 / `/node` 节点 / `/info` 链尖）；读面两分（`/params`/`/config`）已齐；RPC 自带端点发现 + 全能客户端 + 完整链读/写面；内容协商三轴已齐（仅 `identity`，真压缩顺延）；离线工具篮子已补；运维篮子剩余：证书/密钥轮换与落盘、follower 认证、指标端 TLS、OTel/push exporter、每-sink 独立 rotation 覆盖、时延直方图；keygen 篮子剩余：助记词 / BIP-39、口令加密 keystore、密钥轮换；剩余：游标分页、未知方法 `405`；共识 / wire 篮子（破 head 不变量）：**货币费用** + 费用优先排序、nonce / 序列号反重放。
 
+## 指标端点加区块落定时延直方图（Milestone 125）
+
+补齐 Prometheus 数据模型三型：M38 给了 **gauge**、M52 给了 **counter**，M125 加 **histogram**——区块**落定时延**（共识 decided → `apply_certified` 提交的状态转移耗时）。运营者据此可画 SLO/p99、发现状态转移变慢。
+
+- **计量点**：actor 的 `on_decided` 里用 `Instant` 包住 `apply_certified`，成功时把微秒耗时折入直方图（`record_block_apply`）。只计本节点**自身共识**落定的块（anti-entropy 同步来的块走别的路径、不计），与 `blocks_committed` 计数同源。
+- **桶**：固定上界（微秒）`[500, 1k, 2.5k, 5k, 10k, 25k, 50k, 100k, 250k, 500k, 1M]`（落定是内存态转移、通常亚毫秒，故低端密集）；超过末界的观测只进总 `_count`（Prometheus `+Inf` 桶）。
+- **渲染**：`render_prometheus` 发 `# TYPE zhixing_block_apply_seconds histogram` + 每界一条**累积** `_bucket{le="<秒>"}`（微秒界转秒）+ `_bucket{le="+Inf"}`（== `_count`）+ `_sum`（秒）+ `_count`。
+- **改动**：`Metrics` + actor 各加 `block_apply_buckets:[u64;11]`/`block_apply_sum_micros`/`block_apply_count`（`Node::start` 初始化 0）；`record_block_apply` 折桶；`Cmd::Metrics` 快照带出。全 actor-owned、单写者、无原子。
+- **不变量保持**：纯观测、指标端默认关、无 wire/共识/状态/依赖改动，故 `localnet` head 仍 wire v1 `a045426e…3b87bc`。
+- **测试（+2 → 538）**：纯 `render_prometheus_emits_latency_histogram`（累积桶 1/3/3/6…、`+Inf`==count==8、`_sum`=0.123456、`_count`=8）、`block_apply_bucket_selection_is_le_boundary`（`le` 边界语义：500→桶0、501→桶1、1M→末桶、1M+1→仅 `+Inf`）。
+
+**已知边界（顺延至 M126+）**：观测面三型已齐；剩余多需引依赖（`Accept-Encoding` 真压缩、keystore 口令加密、OTel/push exporter、指标端 TLS）或属运维篮子（证书/密钥轮换与落盘、follower 认证、每-sink rotation、更多直方图如 RPC 时延——需跨任务原子/共享计数）；生产路线大件：状态裁剪/快照/快速同步。均在"不破 head"（wire v1 已冻结）前提下推进。
+
 ## `GET /leaf/{kind}/{id}` — 实体的 Merkle 叶字节 + 叶哈希（Milestone 124）
 
 读面补上**明文读**与**证明读**之间缺失的信任桥：此前客户端要么拿明文字段（信任节点）、要么拉完整 `/…/proof`（自验）。M124 加 `GET /leaf/{kind}/{id}` 回**实体的规范 Merkle 叶字节**（hex）及其 **SHA-256 叶哈希**——即 SPV 验证器在校验包含证明时本地重算的那串**确切原像**与**摘要**。钱包可先 pin 下这个叶哈希，日后对一个**可信 header 的 `accounts_root`**（或其它 root）校验，无需当场跑完整证明。

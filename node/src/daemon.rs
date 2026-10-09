@@ -558,6 +558,16 @@ enum Cmd {
     Metrics(oneshot::Sender<Metrics>),
 }
 
+/// M125: upper bounds (in microseconds) of the finite block-apply latency histogram buckets,
+/// ascending. Block apply is a fast in-memory state transition (typically sub-millisecond), so
+/// the buckets are dense at the low end. An observation above the last bound only increments the
+/// total count (the Prometheus `+Inf` bucket).
+const BLOCK_APPLY_BUCKET_MICROS: [u64; N_APPLY_BUCKETS] = [
+    500, 1_000, 2_500, 5_000, 10_000, 25_000, 50_000, 100_000, 250_000, 500_000, 1_000_000,
+];
+/// Number of finite histogram buckets (see [`BLOCK_APPLY_BUCKET_MICROS`]).
+const N_APPLY_BUCKETS: usize = 11;
+
 /// M38: a read-only snapshot of the daemon's runtime state, rendered to the
 /// Prometheus text-exposition format by [`render_prometheus`]. Built inside the
 /// actor (the single owner of all this state) in response to [`Cmd::Metrics`].
@@ -609,6 +619,14 @@ pub struct Metrics {
     /// M57: cumulative admissions rejected by the per-account mempool quota
     /// (monotonic counter; `0` when the quota is disabled).
     pub txs_quota_rejected: u64,
+    /// M125: block-apply (consensus→committed) latency histogram. `block_apply_buckets[i]`
+    /// is the *non-cumulative* count of applies that fell in bucket `i` (≤ `BLOCK_APPLY_BUCKET_MICROS[i]`
+    /// and above the previous bound); applies slower than the last finite bound land only in the
+    /// total `block_apply_count` (the Prometheus `+Inf` bucket). `block_apply_sum_micros` is the
+    /// summed latency. Rendered as a Prometheus `histogram` by [`render_prometheus`].
+    pub block_apply_buckets: [u64; N_APPLY_BUCKETS],
+    pub block_apply_sum_micros: u64,
+    pub block_apply_count: u64,
 }
 
 /// A handle to a running node (for the in-process `localnet` demo and tests).
@@ -780,6 +798,11 @@ struct Actor {
     local_txs: u64,
     blocks_committed: u64,
     slashing_events: u64,
+    /// M125: block-apply latency histogram accumulators (actor-owned; the actor is the sole
+    /// writer). Non-cumulative finite bucket counts, summed latency, and total observations.
+    block_apply_buckets: [u64; N_APPLY_BUCKETS],
+    block_apply_sum_micros: u64,
+    block_apply_count: u64,
     /// M54: per-peer gossip-tx token buckets (DoS hardening). Keyed by peer id;
     /// the actor task is the sole writer. Empty when rate limiting is disabled.
     peer_tx_buckets: HashMap<u64, TokenBucket>,
@@ -1089,13 +1112,28 @@ impl Actor {
         };
         // hash is unchanged by commit (block was sealed), so the certificate still
         // verifies against the active set inside apply_certified.
-        if self.node.apply_certified(block, commit) {
+        // M125: time the apply (consensus→committed state transition) for the latency histogram.
+        let t0 = std::time::Instant::now();
+        let applied = self.node.apply_certified(block, commit);
+        if applied {
+            self.record_block_apply(t0.elapsed().as_micros() as u64);
             self.blocks_committed += 1; // M52
             self.persist();
             self.broadcast_status();
         }
         self.cons = None;
         self.schedule_start(self.node.height() + 1, self.timing.block_interval_ms);
+    }
+
+    /// M125: fold one block-apply latency (microseconds) into the histogram — bump the first
+    /// finite bucket whose bound ≥ `micros` (slower applies land only in the total), and the
+    /// summed latency and observation count.
+    fn record_block_apply(&mut self, micros: u64) {
+        if let Some(i) = BLOCK_APPLY_BUCKET_MICROS.iter().position(|&b| micros <= b) {
+            self.block_apply_buckets[i] += 1;
+        }
+        self.block_apply_sum_micros = self.block_apply_sum_micros.saturating_add(micros);
+        self.block_apply_count += 1;
     }
 
     /// M33: sync always wins. Called after an inbound advanced our height: any
@@ -1453,6 +1491,9 @@ async fn run_actor(mut actor: Actor, mut rx: mpsc::UnboundedReceiver<Cmd>) {
                     slashing_events: actor.slashing_events,
                     txs_rate_limited: actor.txs_rate_limited,
                     txs_quota_rejected: actor.node.mempool.rejected_quota(),
+                    block_apply_buckets: actor.block_apply_buckets,
+                    block_apply_sum_micros: actor.block_apply_sum_micros,
+                    block_apply_count: actor.block_apply_count,
                 });
             }
         }
@@ -2068,6 +2109,34 @@ fn render_prometheus(m: &Metrics) -> String {
         "Cumulative admissions rejected by the per-account mempool quota.",
         m.txs_quota_rejected,
     );
+    // M125: block-apply latency histogram (the `histogram` half of the Prometheus data model).
+    // `_bucket{le="X"}` is the cumulative count of applies ≤ X seconds; `le="+Inf"` equals the
+    // total `_count`. Bounds are stored in micros; emit them in seconds for Prometheus.
+    s.push_str(
+        "# HELP zhixing_block_apply_seconds Block apply (consensus\u{2192}committed) latency.\n",
+    );
+    s.push_str("# TYPE zhixing_block_apply_seconds histogram\n");
+    let mut cumulative = 0u64;
+    for (i, &bound_micros) in BLOCK_APPLY_BUCKET_MICROS.iter().enumerate() {
+        cumulative += m.block_apply_buckets[i];
+        s.push_str(&format!(
+            "zhixing_block_apply_seconds_bucket{{le=\"{:.6}\"}} {}\n",
+            bound_micros as f64 / 1_000_000.0,
+            cumulative,
+        ));
+    }
+    s.push_str(&format!(
+        "zhixing_block_apply_seconds_bucket{{le=\"+Inf\"}} {}\n",
+        m.block_apply_count,
+    ));
+    s.push_str(&format!(
+        "zhixing_block_apply_seconds_sum {:.6}\n",
+        m.block_apply_sum_micros as f64 / 1_000_000.0,
+    ));
+    s.push_str(&format!(
+        "zhixing_block_apply_seconds_count {}\n",
+        m.block_apply_count,
+    ));
     s
 }
 
@@ -5818,6 +5887,9 @@ impl Node {
             local_txs: 0,
             blocks_committed: 0,
             slashing_events: 0,
+            block_apply_buckets: [0; N_APPLY_BUCKETS],
+            block_apply_sum_micros: 0,
+            block_apply_count: 0,
             peer_tx_buckets: HashMap::new(),
             tx_rate: cfg.mempool.per_peer_tx_per_sec,
             tx_burst: cfg.mempool.per_peer_tx_burst,
@@ -7112,6 +7184,11 @@ mod tests {
             slashing_events: 19,
             txs_rate_limited: 23,
             txs_quota_rejected: 29,
+            // M125: a sample latency histogram — buckets sum to 6, with two applies above the
+            // last finite bound (count 8 > finite total 6).
+            block_apply_buckets: [1, 2, 0, 3, 0, 0, 0, 0, 0, 0, 0],
+            block_apply_sum_micros: 123_456,
+            block_apply_count: 8,
         }
     }
 
@@ -7180,6 +7257,65 @@ mod tests {
                 "missing `{name} {value}`"
             );
         }
+    }
+
+    #[test]
+    fn render_prometheus_emits_latency_histogram() {
+        // M125: the block-apply latency histogram renders RFC-ish Prometheus histogram lines:
+        // one cumulative `_bucket{le="…"}` per finite bound, a `+Inf` bucket equal to `_count`,
+        // plus `_sum` (seconds) and `_count`.
+        let out = render_prometheus(&sample_metrics());
+        assert!(
+            out.contains("# TYPE zhixing_block_apply_seconds histogram"),
+            "missing histogram TYPE: {out}"
+        );
+        // Buckets are cumulative: le=0.0005 →1, le=0.001 →3 (1+2), le=0.0025 →3, le=0.005 →6 (+3).
+        assert!(
+            out.contains("zhixing_block_apply_seconds_bucket{le=\"0.000500\"} 1\n"),
+            "{out}"
+        );
+        assert!(
+            out.contains("zhixing_block_apply_seconds_bucket{le=\"0.001000\"} 3\n"),
+            "{out}"
+        );
+        assert!(
+            out.contains("zhixing_block_apply_seconds_bucket{le=\"0.002500\"} 3\n"),
+            "{out}"
+        );
+        assert!(
+            out.contains("zhixing_block_apply_seconds_bucket{le=\"0.005000\"} 6\n"),
+            "{out}"
+        );
+        // Last finite bound stays at the finite total (6); +Inf carries the full count (8).
+        assert!(
+            out.contains("zhixing_block_apply_seconds_bucket{le=\"1.000000\"} 6\n"),
+            "{out}"
+        );
+        assert!(
+            out.contains("zhixing_block_apply_seconds_bucket{le=\"+Inf\"} 8\n"),
+            "{out}"
+        );
+        // _sum is the summed latency in seconds; _count the observation total.
+        assert!(
+            out.contains("zhixing_block_apply_seconds_sum 0.123456\n"),
+            "{out}"
+        );
+        assert!(
+            out.contains("zhixing_block_apply_seconds_count 8\n"),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn block_apply_bucket_selection_is_le_boundary() {
+        // M125: an observation lands in the first bucket whose bound is ≥ it (`le` semantics);
+        // an observation above the last finite bound selects no finite bucket (only `+Inf`).
+        let pick = |micros: u64| BLOCK_APPLY_BUCKET_MICROS.iter().position(|&b| micros <= b);
+        assert_eq!(pick(0), Some(0)); // ≤ 500 → bucket 0
+        assert_eq!(pick(500), Some(0)); // exactly the bound → still bucket 0 (le)
+        assert_eq!(pick(501), Some(1)); // just over → next bucket
+        assert_eq!(pick(1_000_000), Some(N_APPLY_BUCKETS - 1)); // the last finite bound
+        assert_eq!(pick(1_000_001), None); // slower than every finite bound → +Inf only
     }
 
     #[tokio::test]
