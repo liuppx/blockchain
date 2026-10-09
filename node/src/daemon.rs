@@ -518,6 +518,10 @@ enum Cmd {
     QueryConfig {
         reply: oneshot::Sender<ConfigView>,
     },
+    /// M120: read this node's identity — (node id, is_validator) — for the `/node` read.
+    QueryNode {
+        reply: oneshot::Sender<(u64, bool)>,
+    },
     /// M106: read this node's chain identity (`genesis_hash`) for the `/genesis` read.
     QueryGenesisHash {
         reply: oneshot::Sender<crate::Hash>,
@@ -1336,6 +1340,10 @@ async fn run_actor(mut actor: Actor, mut rx: mpsc::UnboundedReceiver<Cmd>) {
                     mempool_capacity: actor.node.mempool.capacity(),
                     mempool_per_account_limit: actor.node.mempool.per_account_limit(),
                 });
+            }
+            Cmd::QueryNode { reply } => {
+                // M120: this node's own id + whether it holds a voting key.
+                let _ = reply.send((actor.node.id, actor.kp.is_some()));
             }
             Cmd::QueryGenesisHash { reply } => {
                 // M106: this node's chain identity, stamped into state at genesis_split.
@@ -2313,6 +2321,10 @@ enum GetRoute {
     /// mempool bounds, and role (validator|follower). Distinct from `/params` (economic/ΔK
     /// knobs). Lets an operator verify what is actually running. Exact-match; no id.
     Config,
+    /// M120: `GET /node` — this node's own identity: node id + role + software version. Unlike
+    /// `/genesis` (the *chain's* identity) this answers "which node am I talking to", useful
+    /// across a multi-node deployment. Exact-match; no id.
+    Node,
     NotFound,
 }
 
@@ -2632,6 +2644,8 @@ fn route_get(path: &str) -> GetRoute {
         "/routes" => GetRoute::Routes,
         // M119: the operational config snapshot. Exact-match; no id, no prefix sibling.
         "/config" => GetRoute::Config,
+        // M120: this node's own identity. Exact-match; no id, no prefix sibling.
+        "/node" => GetRoute::Node,
         // M111: the pending-tx directory. Exact-match here, so it never collides with the
         // M103 `/mempool/{hash}` membership prefix below (`…mempool` exact, not `…mempool/`).
         "/mempool" => GetRoute::MempoolList,
@@ -3050,6 +3064,8 @@ const READ_ROUTES: &[&str] = &[
     "/info",
     "/version",
     "/routes",
+    "/config",
+    "/node",
     "/supply",
     "/params",
     "/config",
@@ -3644,6 +3660,25 @@ fn json_config(c: &ConfigView) -> String {
         json_bool(c.create_empty_blocks),
         json_str(&bound_str(c.mempool_capacity)),
         json_str(&bound_str(c.mempool_per_account_limit)),
+    )
+}
+
+/// M120: render this node's identity — node id + role + software version — as grep lines.
+fn format_node(id: u64, is_validator: bool) -> String {
+    format!(
+        "node_id={id}\nrole={}\nversion={NODE_VERSION}",
+        if is_validator { "validator" } else { "follower" },
+    )
+}
+
+/// M120: `GET /node?format=json` — the JSON sibling (id lossless quoted-u64, role + version
+/// quoted strings).
+fn json_node(id: u64, is_validator: bool) -> String {
+    format!(
+        "{{\"node_id\":{},\"role\":{},\"version\":{}}}",
+        json_u64(id),
+        json_str(if is_validator { "validator" } else { "follower" }),
+        json_str(NODE_VERSION),
     )
 }
 
@@ -4821,6 +4856,18 @@ async fn serve_rpc_conn(mut stream: TcpStream, cmd: mpsc::UnboundedSender<Cmd>) 
                 } else {
                     match rx.await {
                         Ok(c) => ok_body(fmt, &format_config(&c), &json_config(&c)),
+                        Err(_) => http_response("503 Service Unavailable", "node stopped"),
+                    }
+                }
+            }
+            GetRoute::Node => {
+                // M120: node identity snapshot — always a `200`.
+                let (reply, rx) = oneshot::channel();
+                if cmd.send(Cmd::QueryNode { reply }).is_err() {
+                    http_response("503 Service Unavailable", "node stopped")
+                } else {
+                    match rx.await {
+                        Ok((id, is_val)) => ok_body(fmt, &format_node(id, is_val), &json_node(id, is_val)),
                         Err(_) => http_response("503 Service Unavailable", "node stopped"),
                     }
                 }
@@ -8151,6 +8198,46 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn rpc_node_over_tcp() {
+        // M120: `GET /node` reports this node's own id + role + version. A node started as
+        // validator 52 reports node_id=52, role=validator, and the crate version.
+        let dir = tmp_dir("rpc-node");
+        // node_config p2p listen = 21161 + (52-21) = 21192; keep the RPC port clear.
+        let mut cfg = node_config(52, 21161, &[52], dir.clone());
+        let rpc_addr = "127.0.0.1:21201";
+        cfg.rpc = Some(crate::config::RpcConfig { enabled: true, listen: rpc_addr.into() });
+        let mut genesis = test_genesis();
+        genesis.validators = vec![(52, kp(52).public(), 1)]; // quorum 1 ⇒ self-commit
+        let _node = Node::start(cfg, genesis, Some(kp(52))).await.expect("start node");
+
+        async fn get(addr: &str, path: &str) -> String {
+            let req = format!("GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
+            let mut s = TcpStream::connect(addr).await.expect("connect rpc");
+            s.write_all(req.as_bytes()).await.expect("send get");
+            let mut resp = Vec::new();
+            s.read_to_end(&mut resp).await.expect("read response");
+            String::from_utf8_lossy(&resp).into_owned()
+        }
+        fn body_of(resp: &str) -> &str {
+            resp.split_once("\r\n\r\n").map(|(_, b)| b).unwrap_or("")
+        }
+
+        let v = env!("CARGO_PKG_VERSION");
+        let resp = get(rpc_addr, "/node").await;
+        assert!(resp.starts_with("HTTP/1.1 200 OK"), "node status: {resp}");
+        assert_eq!(body_of(&resp), format!("node_id=52\nrole=validator\nversion={v}"), "node text");
+
+        let as_json = get(rpc_addr, "/node?format=json").await;
+        assert_eq!(
+            body_of(&as_json),
+            format!("{{\"node_id\":\"52\",\"role\":\"validator\",\"version\":\"{v}\"}}"),
+            "node json"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
     async fn rpc_genesis_over_tcp() {
         // M106: `GET /genesis` returns the node's chain identity — exactly the `genesis_hash`
         // that `ChainState::genesis` stamps for the same genesis the node was started with.
@@ -9724,6 +9811,30 @@ vote_b.validator=5 vote_b.height=9 vote_b.round=2 vote_b.block_hash={b_h} vote_b
         // bound_str maps a real bound to its number, the sentinel to `unbounded`.
         assert_eq!(bound_str(0), "0");
         assert_eq!(bound_str(usize::MAX), "unbounded");
+    }
+
+    #[test]
+    fn route_get_parses_node() {
+        // M120: `/node` is an exact-match read; a trailing slash is not the route.
+        assert!(matches!(route_get("/node"), GetRoute::Node));
+        assert!(matches!(route_get("/node/"), GetRoute::Health));
+        assert!(matches!(route_get("/config"), GetRoute::Config));
+    }
+
+    #[test]
+    fn node_renders_text_and_json() {
+        // M120: node identity renders id + role + version; role follows the is_validator flag.
+        let v = env!("CARGO_PKG_VERSION");
+        assert_eq!(format_node(7, true), format!("node_id=7\nrole=validator\nversion={v}"));
+        assert_eq!(format_node(9, false), format!("node_id=9\nrole=follower\nversion={v}"));
+        assert_eq!(
+            json_node(7, true),
+            format!("{{\"node_id\":\"7\",\"role\":\"validator\",\"version\":\"{v}\"}}")
+        );
+        assert_eq!(
+            json_node(9, false),
+            format!("{{\"node_id\":\"9\",\"role\":\"follower\",\"version\":\"{v}\"}}")
+        );
     }
 
     #[test]

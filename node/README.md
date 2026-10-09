@@ -1327,6 +1327,20 @@ M116 的 `node rpc` 只能 GET。M117 补上写侧，让它成为**全能** RPC 
 
 **已知边界（顺延至 M120+）**：读面两分已齐——`/params`（经济/共识规则）+ `/config`（本地运营配置）；RPC 自带端点发现 + 全能客户端 + 完整链读/写面；内容协商三轴已齐（仅 `identity`，真压缩顺延）；离线工具篮子已补；运维篮子剩余：证书/密钥轮换与落盘、follower 认证、指标端 TLS、OTel/push exporter、每-sink 独立 rotation 覆盖、时延直方图；keygen 篮子剩余：助记词 / BIP-39、口令加密 keystore、密钥轮换；剩余：游标分页、未知方法 `405`；共识 / wire 篮子（破 head 不变量）：**货币费用** + 费用优先排序、nonce / 序列号反重放。
 
+## 节点身份读 `GET /node`（Milestone 120）
+
+`/genesis` 回的是**链**的身份（`genesis_hash`），`/info` 回链尖。但多节点部署里还缺一个「**我在跟哪个节点说话**」——节点自身的身份。M120 加 `GET /node` 回 node_id + role + version。其中 **`node_id` 此前任何端点都不暴露**，是本里程碑真正新增的数据（role 在 `/config` 有、version 在 `/version` 有，`/node` 把三者并一处作节点名片）。纯读面，不触 wire/共识/状态，`[rpc]`/`localnet` head 不变量（`44309755…ea04ba`，RPC 默认关）不受影响。
+
+- **语义**：始终 `200`。文本 `node_id=…`\n`role=validator|follower`\n`version=…`；JSON `{"node_id":"…","role":"…","version":"…"}`。
+- **渲染器**：新增纯 `format_node(id, is_validator)`/`json_node(id, is_validator)`（id lossless 引号 u64、role/version 引号串），可直接单测。
+- **Cmd + actor**：`Cmd::QueryNode { reply: oneshot::Sender<(u64, bool)> }`，actor 回 `(actor.node.id, actor.kp.is_some())`。
+- **路由 + 发现**：`enum GetRoute` 加 `Node`、`route_get` 精确臂 `"/node" => GetRoute::Node`、`/node` 入 `READ_ROUTES`（受 M118 漂移守卫覆盖）。
+- **三类身份读各司其职**：`/genesis` = 链身份（这是哪条链）；`/node` = 节点身份（这是哪台节点）；`/info` = 链尖（链现在到哪了）。
+- **测试（+3 → 529）**：新纯 `route_get_parses_node`（`/node` ⇒ `Node`、`/node/` ⇒ `Health`）/`node_renders_text_and_json`（validator/follower 两态的文本与 JSON），新 TCP `rpc_node_over_tcp`（以验证人 52 启动 ⇒ `node_id=52`/`role=validator`/crate 版本）。
+- **不变量保持**：纯读面增量、无 `serde_json`、无引擎 / codec / crypto / wire / 共识 / 状态变更、无新依赖，RPC 默认关，故 `localnet` 逐字节同块、head 仍 `44309755…ea04ba`。
+
+**已知边界（顺延至 M121+）**：身份读三类已齐（`/genesis` 链 / `/node` 节点 / `/info` 链尖）；读面两分（`/params`/`/config`）已齐；RPC 自带端点发现 + 全能客户端 + 完整链读/写面；内容协商三轴已齐（仅 `identity`，真压缩顺延）；离线工具篮子已补；运维篮子剩余：证书/密钥轮换与落盘、follower 认证、指标端 TLS、OTel/push exporter、每-sink 独立 rotation 覆盖、时延直方图；keygen 篮子剩余：助记词 / BIP-39、口令加密 keystore、密钥轮换；剩余：游标分页、未知方法 `405`；共识 / wire 篮子（破 head 不变量）：**货币费用** + 费用优先排序、nonce / 序列号反重放。
+
 ## 持久化与重放（Milestone 7）
 
 节点状态不再只活在内存里：区块以**追加式日志**（`DIR/blocks.log`）落盘，重启后从创世**重放**日志即可重建**逐字节相同**的状态。
@@ -2126,5 +2140,6 @@ peer_exchange_disabled_stays_seeded                   同链拓扑关发现 → 
 - ~~M117 `node rpc --post FILE` 全能 RPC 客户端——M116 的 `node rpc` 只能 GET；M117 补写侧：`node rpc --config F --path /validate --post FILE` POST 文件原始字节到任一端点（codec-tx → `/submit_tx`/`/validate`、批量 → `/batch`），缺省仍 GET；新增纯函数 `rpc_post_request(host, path, body) -> Vec<u8>` 返回字节（非 String）故二进制 codec body 逐字节透传、`Content-Length` 为精确体长，`cmd_rpc` 按 `--post` 分流、响应处理不变，usage 更新 `[--post FILE]`；新纯测 `rpc_post_request_includes_content_length_and_body`/`rpc_post_request_preserves_binary_body`/`rpc_post_request_empty_body`，共 520 测、localnet head 不变~~ ✅
 - ~~M118 端点发现 `GET /routes`——建了几十个读端点却无从自我发现；M118 加 `GET /routes` 回自文档化索引（精确路径 + `{param}` 模板），静态列表故 dispatch 直接 `ok_body`、无 actor 往返；单一真相源 `const READ_ROUTES` + 纯渲染器 `format_routes`/`json_routes`，`GetRoute::Routes` + `route_get` 精确臂 `/routes`；漂移守卫 `advertised_exact_routes_resolve` 把发现索引钉死在真实路由器上；新纯测 `route_get_parses_routes`/`routes_index_lists_endpoints`/`advertised_exact_routes_resolve`，共 523 测、localnet head 不变~~ ✅
 - ~~M119 运营配置读 `GET /config`——`/params` 读经济/ΔK 旋钮，`/config` 读本节点实际在跑的运营配置：共识计时（propose/prevote/precommit/delta/block_interval ms + `create_empty_blocks`）+ mempool 上限（capacity/per_account_limit）+ 角色（validator|follower）；新增 `ConfigView` + 纯渲染器 `format_config`/`json_config`，`bound_str`（`usize::MAX` ⇒ `unbounded`、否则数字；JSON 引号串使有界/无界同形）；`Cmd::QueryConfig` actor 由 `actor.timing`/`node.mempool`/`kp.is_some()` 拍快照；`GetRoute::Config` + `route_get` 精确臂 `/config` + 入 `READ_ROUTES`；新纯测 `route_get_parses_config`/`config_renders_text_and_json` + TCP `rpc_config_over_tcp`，共 526 测、localnet head 不变~~ ✅
+- ~~M120 节点身份读 `GET /node`——`/genesis` 是链身份、`/node` 是节点身份（回「我在跟哪个节点说话」）：node_id + role + version，其中 `node_id` 此前任何端点都不暴露；新增纯渲染器 `format_node`/`json_node`（id lossless 引号 u64、role/version 引号串），`Cmd::QueryNode` actor 回 `(actor.node.id, actor.kp.is_some())`；`GetRoute::Node` + `route_get` 精确臂 `/node` + 入 `READ_ROUTES`；新纯测 `route_get_parses_node`/`node_renders_text_and_json` + TCP `rpc_node_over_tcp`（validator 52 ⇒ node_id=52/role=validator/version），共 529 测、localnet head 不变~~ ✅
 
-……；运维篮子剩余（货币费用（独立共识里程碑）、费用优先出块排序、nonce 反重放、读面两分（`/params` 经济规则 + `/config` 本地运营）已齐、RPC 自带端点发现（`/routes`）+ 全能客户端 + 完整链读/写面、读面列表端点篮子已收口、HTTP `HEAD`/`OPTIONS`/`ETag` 条件 GET/`Accept-Encoding`（identity）协商 已补、keyfile `0600` 已补、现成 genesis 条目已补、`check-config`/`genesis-hash`/`inspect-genesis`/`inspect-tx`/`pubkey`/`inspect-block`/`inspect-cert` 已补、助记词/BIP-39、口令 keystore、密钥轮换、游标分页、真压缩（gzip/deflate，须引新依赖）、未知方法 `405`、RPC auth/TLS、证书/密钥轮换与落盘、follower 认证、每-sink 独立 rotation 覆盖、OTEL/结构化日志 exporter、指标端 TLS、指标 push exporter/直方图/每-peer/每-轮次时延序列）顺延至 M120+，每步仍遵循"可运行、可测试、契约一致"。
+……；运维篮子剩余（货币费用（独立共识里程碑）、费用优先出块排序、nonce 反重放、身份读三类（`/genesis` 链 / `/node` 节点 / `/info` 链尖）已齐、读面两分（`/params`/`/config`）已齐、RPC 自带端点发现 + 全能客户端 + 完整链读/写面、读面列表端点篮子已收口、HTTP `HEAD`/`OPTIONS`/`ETag` 条件 GET/`Accept-Encoding`（identity）协商 已补、keyfile `0600` 已补、现成 genesis 条目已补、`check-config`/`genesis-hash`/`inspect-genesis`/`inspect-tx`/`pubkey`/`inspect-block`/`inspect-cert` 已补、助记词/BIP-39、口令 keystore、密钥轮换、游标分页、真压缩（gzip/deflate，须引新依赖）、未知方法 `405`、RPC auth/TLS、证书/密钥轮换与落盘、follower 认证、每-sink 独立 rotation 覆盖、OTEL/结构化日志 exporter、指标端 TLS、指标 push exporter/直方图/每-peer/每-轮次时延序列）顺延至 M121+，每步仍遵循"可运行、可测试、契约一致"。
