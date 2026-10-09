@@ -430,6 +430,14 @@ enum Cmd {
         height: u64,
         reply: oneshot::Sender<Option<CertifiedHeader>>,
     },
+    /// M127: read a contiguous range of certified headers for heights `[from, from+limit)`,
+    /// clipped at the tip. The reply is the assembled `Vec<CertifiedHeader>` (empty if `from`
+    /// is past the tip or `from == 0`).
+    QueryHeaders {
+        from: u64,
+        limit: usize,
+        reply: oneshot::Sender<(Vec<CertifiedHeader>, u64)>,
+    },
     /// M59: read one account's inclusion proof + the certified head it verifies
     /// against, for the verifiable read-class RPC. `None` ⇒ unknown id or no
     /// certified head yet (height 0).
@@ -1291,6 +1299,11 @@ async fn run_actor(mut actor: Actor, mut rx: mpsc::UnboundedReceiver<Cmd>) {
             Cmd::QueryHeader { height, reply } => {
                 // M126: the standalone certified header at `height`.
                 let _ = reply.send(actor.node.certified_header(height));
+            }
+            Cmd::QueryHeaders { from, limit, reply } => {
+                // M127: a contiguous certified-header range (clipped at the tip) + the tip height
+                // (the pagination `total`).
+                let _ = reply.send((actor.node.headers_range(from, limit), actor.node.height()));
             }
             Cmd::QueryAccountProof { id, reply } => {
                 let _ = reply.send(actor.node.account_inclusion(id));
@@ -2548,6 +2561,10 @@ enum GetRoute {
     /// finality `Commit`) at a committed height, decoupled from any proof. The unit a light
     /// client verifies against. Genesis (no log block) and a past-the-tip height ⇒ 404.
     Header(u64),
+    /// M127: `GET /headers?from=H&limit=N` — a paginated contiguous range of certified headers
+    /// (the RPC analog of gossip header-sync), so a light client bootstraps its header chain over
+    /// plain HTTP. Exact-match; the range is taken from the `from`/`limit` query params.
+    Headers,
     NotFound,
 }
 
@@ -2886,6 +2903,9 @@ fn route_get(path: &str) -> GetRoute {
         // M111: the pending-tx directory. Exact-match here, so it never collides with the
         // M103 `/mempool/{hash}` membership prefix below (`…mempool` exact, not `…mempool/`).
         "/mempool" => GetRoute::MempoolList,
+        // M127: a paginated cert-signed header range (RPC analog of gossip header-sync); the
+        // range is taken from `?from=H&limit=N` query params, defaults `from=1, limit=DEFAULT`.
+        "/headers" => GetRoute::Headers,
         p => {
             if let Some(rest) = p.strip_prefix("/account/") {
                 // M59: `{id}/proof` is the verifiable read; a bare `{id}` is the M58
@@ -3415,6 +3435,7 @@ const READ_ROUTES: &[&str] = &[
     "/evidence",
     "/peers",
     "/mempool",
+    "/headers",
     "/bridge/locks",
     // parameterized templates (documentation only)
     "/account/{id}",
@@ -4218,6 +4239,31 @@ fn json_certified_header(ch: &CertifiedHeader) -> String {
     )
 }
 
+/// M127: text rendering of a certified-header range — one `certified_header=<hex>` line per
+/// header (same hex form as the single `/header/{height}` read). Empty slice ⇒ empty string.
+fn format_header_listing(headers: &[CertifiedHeader]) -> String {
+    headers
+        .iter()
+        .map(|ch| {
+            format!(
+                "certified_header={}",
+                crate::hash::hex(&crate::codec::encode_certified_header(ch))
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// M127: JSON array of structured certified headers (each the M74 `{"header":…,"cert":…}`).
+fn json_header_listing(headers: &[CertifiedHeader]) -> String {
+    let items = headers
+        .iter()
+        .map(json_certified_header)
+        .collect::<Vec<_>>()
+        .join(",");
+    format!("[{items}]")
+}
+
 /// M75: a `merkle::Proof` as `{"steps":[{"side":"left|right","hash":"<hex>"}, …]}`.
 /// Each step is one sibling hash tagged by the side it hashes in on.
 fn json_merkle_proof(p: &crate::merkle::Proof) -> String {
@@ -4913,6 +4959,38 @@ async fn serve_rpc_conn(mut stream: TcpStream, cmd: mpsc::UnboundedSender<Cmd>) 
                         ),
                         Ok(None) => {
                             not_found_body(fmt, &format!("no certified header at height {height}"))
+                        }
+                        Err(_) => http_response("503 Service Unavailable", "node stopped"),
+                    }
+                }
+            }
+            GetRoute::Headers => {
+                // M127: a paginated certified-header range. `from` defaults to 1 (genesis has no
+                // header); `limit` is clamped by `effective_limit`. `total` is the tip height and
+                // `next` the height to request for the following page (absent at the tip).
+                let from = usize_param(query, "from").unwrap_or(1).max(1) as u64;
+                let limit = effective_limit(usize_param(query, "limit"));
+                let (reply, rx) = oneshot::channel();
+                if cmd.send(Cmd::QueryHeaders { from, limit, reply }).is_err() {
+                    http_response("503 Service Unavailable", "node stopped")
+                } else {
+                    match rx.await {
+                        Ok((headers, total)) => {
+                            let end = from + headers.len() as u64; // one past the last returned height
+                            let next = if end <= total && !headers.is_empty() {
+                                Some(end as usize)
+                            } else {
+                                None
+                            };
+                            ok_body(
+                                fmt,
+                                &format_page(
+                                    &format_header_listing(&headers),
+                                    total as usize,
+                                    next,
+                                ),
+                                &json_page(&json_header_listing(&headers), total as usize, next),
+                            )
                         }
                         Err(_) => http_response("503 Service Unavailable", "node stopped"),
                     }
@@ -7974,6 +8052,84 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    #[tokio::test]
+    async fn rpc_headers_range_over_tcp() {
+        // M127: `/headers?from=H&limit=N` over real TCP — returns a paginated certified-header
+        // range whose hex lines each decode and chain by height; the `total`/`next` envelope
+        // tracks the tip, and a `from` past the tip yields an empty page.
+        let dir = tmp_dir("rpc-headers");
+        let mut cfg = node_config(21, 21291, &[21], dir.clone());
+        let rpc_addr = "127.0.0.1:21301";
+        cfg.rpc = Some(crate::config::RpcConfig {
+            enabled: true,
+            listen: rpc_addr.into(),
+        });
+        let mut genesis = test_genesis();
+        genesis.validators = vec![(21, kp(21).public(), 1)];
+        let node = Node::start(cfg, genesis, Some(kp(21)))
+            .await
+            .expect("start node");
+
+        // Wait for a few committed heights so a range has something to return.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(6);
+        loop {
+            if node.status().await.map(|(h, _)| h >= 2).unwrap_or(false) {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "node never produced two blocks"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+
+        async fn get(addr: &str, path: &str) -> String {
+            let req =
+                format!("GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
+            let mut s = TcpStream::connect(addr).await.expect("connect rpc");
+            s.write_all(req.as_bytes()).await.expect("send get");
+            let mut resp = Vec::new();
+            s.read_to_end(&mut resp).await.expect("read response");
+            String::from_utf8_lossy(&resp).into_owned()
+        }
+        fn body_of(resp: &str) -> &str {
+            resp.rsplit("\r\n\r\n").next().unwrap_or("")
+        }
+
+        // /headers?from=1&limit=1 → exactly one header (height 1), total ≥ 2, next = 2.
+        let resp = get(rpc_addr, "/headers?from=1&limit=1").await;
+        assert!(
+            resp.starts_with("HTTP/1.1 200 OK"),
+            "headers status: {resp}"
+        );
+        let body = body_of(&resp);
+        let hexes: Vec<&str> = body
+            .lines()
+            .filter_map(|l| l.strip_prefix("certified_header="))
+            .collect();
+        assert_eq!(hexes.len(), 1, "one header requested: {body}");
+        assert!(body.contains("next=2"), "next points at height 2: {body}");
+        // The returned header decodes and is height 1.
+        let bytes: Vec<u8> = (0..hexes[0].len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&hexes[0][i..i + 2], 16).unwrap())
+            .collect();
+        let ch = crate::codec::decode_certified_header(&bytes).expect("decode");
+        assert_eq!(ch.header.height, 1);
+
+        // A `from` past the tip → empty page, no `next`.
+        let empty = get(rpc_addr, "/headers?from=999999").await;
+        assert!(
+            empty.starts_with("HTTP/1.1 200 OK"),
+            "empty page status: {empty}"
+        );
+        let eb = body_of(&empty);
+        assert!(!eb.contains("certified_header="), "no items past tip: {eb}");
+        assert!(!eb.contains("next="), "no next past tip: {eb}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn lock_proof_formats_and_verifies() {
         // M63: the `/bridge/lock/{id}/proof` body is the single hex line
@@ -10473,6 +10629,25 @@ mod tests {
         assert!(matches!(route_get("/header/x"), GetRoute::NotFound));
         assert!(matches!(route_get("/header/"), GetRoute::NotFound));
         assert!(matches!(route_get("/head"), GetRoute::Head));
+    }
+
+    #[test]
+    fn route_get_parses_headers_list() {
+        // M127: `/headers` is the exact-match range route (params in the query string), distinct
+        // from both `/head` (tip hash) and `/header/{height}` (single).
+        assert!(matches!(route_get("/headers"), GetRoute::Headers));
+        assert!(matches!(route_get("/head"), GetRoute::Head));
+        assert!(matches!(route_get("/header/3"), GetRoute::Header(3)));
+        // trailing slash is not the range route — falls through to Health (a liveness probe).
+        assert!(matches!(route_get("/headers/"), GetRoute::Health));
+    }
+
+    #[test]
+    fn header_listing_renders_hex_and_json() {
+        // M127: the range renderers emit one `certified_header=<hex>` line each (text) and a JSON
+        // array; an empty range is an empty string / `[]`.
+        assert_eq!(format_header_listing(&[]), "");
+        assert_eq!(json_header_listing(&[]), "[]");
     }
 
     #[test]

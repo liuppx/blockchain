@@ -566,6 +566,20 @@ impl GossipNode {
         Some(CertifiedHeader::from_certified(block, cert))
     }
 
+    /// M127: a contiguous range of certified headers for heights `[from, from+limit)` that are
+    /// committed — the RPC analog of gossip header-sync, so a light client can bootstrap its
+    /// header chain over plain HTTP. `from == 0` (genesis has no log header) yields an empty
+    /// range; the result stops at the tip.
+    pub fn headers_range(&self, from: u64, limit: usize) -> Vec<CertifiedHeader> {
+        if from == 0 {
+            return Vec::new();
+        }
+        let start = (from - 1) as usize;
+        (start..self.blocks.len().min(start.saturating_add(limit)))
+            .map(|i| CertifiedHeader::from_certified(&self.blocks[i], &self.certs[i]))
+            .collect()
+    }
+
     /// M29: serve a heterogeneous batched proof request. Walks
     /// `items`, dispatches each one to the matching existing
     /// `serve_*` helper, and assembles a typed

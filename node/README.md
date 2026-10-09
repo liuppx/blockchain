@@ -1341,6 +1341,20 @@ M116 的 `node rpc` 只能 GET。M117 补上写侧，让它成为**全能** RPC 
 
 **已知边界（顺延至 M121+）**：身份读三类已齐（`/genesis` 链 / `/node` 节点 / `/info` 链尖）；读面两分（`/params`/`/config`）已齐；RPC 自带端点发现 + 全能客户端 + 完整链读/写面；内容协商三轴已齐（仅 `identity`，真压缩顺延）；离线工具篮子已补；运维篮子剩余：证书/密钥轮换与落盘、follower 认证、指标端 TLS、OTel/push exporter、每-sink 独立 rotation 覆盖、时延直方图；keygen 篮子剩余：助记词 / BIP-39、口令加密 keystore、密钥轮换；剩余：游标分页、未知方法 `405`；共识 / wire 篮子（破 head 不变量）：**货币费用** + 费用优先排序、nonce / 序列号反重放。
 
+## `GET /headers?from=H&limit=N` — 认证头区间读（Milestone 127）
+
+承接 M126 的单头读：轻客户端自创世（或可信检查点）走到链尖、逐高度验 cert 时，单头端点要 N 次往返。M127 加 `GET /headers?from=H&limit=N`——**gossip 头同步的 RPC 对应**，一次回一段连续认证头，让轻客户端经**纯 HTTP** 引导其头链（无需 P2P gossip）。
+
+- **装配**：`GossipNode::headers_range(from, limit)` 从 `blocks[from-1..]`/`certs[..]` 经 `CertifiedHeader::from_certified` 批量组装，截到链尖；`from==0` 回空。
+- **分页**：复用既有信封——`from` 默认 1（创世无头）、`limit` 经 `effective_limit` 封顶；`total` = 链尖高度、`next` = 下页起始高度（到链尖则无）。`from` 超尖 → 空页。
+- **渲染**：文本每头一行 `certified_header=<hex>`（与单头读同形）、JSON 为结构化 `json_certified_header` 的数组（复用 M74）。
+- **路由**：`/headers` **精确匹配**（参数在 query），与 `/head`（链尖哈希）、`/header/{height}`（单头）三者互不相撞；入 `READ_ROUTES`。
+- **改动**：`GetRoute::Headers` + 精确路由臂 + `Cmd::QueryHeaders{from,limit}`（回 `(Vec<CertifiedHeader>, 链尖高度)`）+ handler + 列表渲染器 `format_header_listing`/`json_header_listing`。
+- **不变量保持**：纯读、无 wire/共识/状态/依赖改动、RPC 默认关，故 `localnet` head 仍 wire v1 `a045426e…3b87bc`。
+- **测试（+3 → 543）**：纯 `route_get_parses_headers_list`（`/headers`/`/head`/`/header/3` 三分、`/headers/` 落 Health）、`header_listing_renders_hex_and_json`（空区间 `""`/`[]`）、TCP `rpc_headers_range_over_tcp`（`?from=1&limit=1` 回一头、`decode_certified_header` 通过且高度 1、`next=2`；`from` 超尖回空页无 `next`）。
+
+**已知边界（顺延至 M128+）**：轻客户端 over-RPC 面（单/批头、证明、叶）已齐；剩余多需引依赖（`Accept-Encoding` 真压缩、keystore 口令加密、OTel/push exporter、指标端 TLS）或属运维篮子（证书/密钥轮换与落盘、follower 认证、每-sink rotation、RPC 时延直方图——需跨任务原子）；生产路线大件：状态裁剪/快照/快速同步。均在"不破 head"（wire v1 已冻结）前提下推进。
+
 ## `GET /header/{height}` — 任意已提交高度的认证头（Milestone 126）
 
 补齐轻客户端头面：此前 **认证头（`CertifiedHeader` = 头 + 其最终性 `Commit`）** 只能**随证明附带**取回（`/account/{id}/proof`、`/batch`），且只是**链尖**那个；没有独立端点按**任意历史高度**取认证头。M126 加 `GET /header/{height}`，回该高度**独立的** `CertifiedHeader`——SPV 客户端据以验证历史状态、复算 `header.hash()`、对自持验证人集验 cert，而无需先拉某个账户证明。
