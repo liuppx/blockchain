@@ -1341,6 +1341,19 @@ M116 的 `node rpc` 只能 GET。M117 补上写侧，让它成为**全能** RPC 
 
 **已知边界（顺延至 M121+）**：身份读三类已齐（`/genesis` 链 / `/node` 节点 / `/info` 链尖）；读面两分（`/params`/`/config`）已齐；RPC 自带端点发现 + 全能客户端 + 完整链读/写面；内容协商三轴已齐（仅 `identity`，真压缩顺延）；离线工具篮子已补；运维篮子剩余：证书/密钥轮换与落盘、follower 认证、指标端 TLS、OTel/push exporter、每-sink 独立 rotation 覆盖、时延直方图；keygen 篮子剩余：助记词 / BIP-39、口令加密 keystore、密钥轮换；剩余：游标分页、未知方法 `405`；共识 / wire 篮子（破 head 不变量）：**货币费用** + 费用优先排序、nonce / 序列号反重放。
 
+## `node inspect-snapshot --snapshot F` — 快照检视 CLI（Milestone 133 · 快速同步第 3 步)
+
+承接 M132 的导出：M133 加 `node inspect-snapshot --snapshot FILE`——解码 M131 blob 并打印一行健康报告：`height`/`genesis_hash`/三个 cert-signed state 根（state_root/accounts_root/bridge_root）/`supply`/账户数/`supply_conserved`。`--snapshot -` 读 stdin（配 `snapshot --out -` 可管道：`node snapshot … --out - | node inspect-snapshot --snapshot -`）。
+
+- **运维用途**：导入前先**人工比对**快照的 `state_root` 与一个**可信 cert-signed header**（经 `GET /header/{height}` 取、M126）——若相等则该快照确为那条链在该高度的真状态。M133 把比对所需的值打出来；自动比对留给 M134 的 bootstrap。
+- **纯核心 + 薄壳**：`inspect_snapshot(&ChainState) -> String` 纯渲染、可单测；`cmd_inspect_snapshot` 读文件/stdin→`decode_snapshot`→打印，错误（读失败/坏 blob）映射非零退出 + stderr。
+- **未引入新依赖**：复用 M131 codec + 既有 `hex`/`short`。纯离线、不碰 head。
+- **测试（+2 → 552）**：`inspect_snapshot_decodes_and_renders_summary`（导出→解码→summary 的三根与源链相等、`supply_conserved=true`）、`inspect_snapshot_rejects_bad_blob`（clobber 版本字节→`decode_snapshot` 报错）。
+
+**后续步骤**：第 4 步（M134）daemon bootstrap——启动时若 `--snapshot` 给定则从快照加载状态、对其 `state_root` 自动核对一个随附的 cert-signed header，再从该高度续 gossip 同步，跳过全量重放。
+
+**已知边界（顺延至 M134+）**：其余运维/读/依赖项不变。
+
 ## `node snapshot --dir D --out F` — 快照导出 CLI（Milestone 132 · 快速同步第 2 步)
 
 承接 M131 的 codec：M132 加 `node snapshot --dir DIR --out FILE`——经 `replay_verified` 加载磁盘链（与 M128 `verify` 同源，确保**只导出经证书验证的最终性状态**），再经 `codec::encode_snapshot` 写出 M131 blob。`--out -` 写 stdout（便于管道）。错误映射非零退出 + stderr。

@@ -315,6 +315,7 @@ fn main() {
         "status" => cmd_status(dir_arg(&args)),
         "verify" => cmd_verify(dir_arg(&args)),
         "snapshot" => cmd_snapshot(dir_arg(&args), req_arg(&args, "--out").to_string()),
+        "inspect-snapshot" => cmd_inspect_snapshot(req_arg(&args, "--snapshot").to_string()),
         "inspect-block" => cmd_inspect_block(&args),
         "inspect-cert" => cmd_inspect_cert(&args),
         "certs" => cmd_certs(dir_arg(&args)),
@@ -408,6 +409,7 @@ fn usage() {
     eprintln!("  node status --dir DIR   replay the block log and print state");
     eprintln!("  node verify --dir DIR   replay blocks+certs logs through finality verification; non-zero exit on any integrity error (missing log, length mismatch, cert mismatch, < 2/3 quorum)");
     eprintln!("  node snapshot --dir DIR --out FILE  export the chain (replay-verified) as a M131 snapshot blob; --out - writes to stdout");
+    eprintln!("  node inspect-snapshot --snapshot FILE  decode a M131 snapshot blob and print height/roots/supply_conserved; --snapshot - reads stdin");
     eprintln!("  node inspect-block --dir DIR [--height N]  read the persisted block log and print a per-block summary, or (with --height) one block's header + contents + tx hashes");
     eprintln!("  node inspect-cert  --dir DIR [--height N]  read the persisted cert log and print a per-cert summary, or (with --height) one finality certificate's height/round/block_hash + precommit voters");
     eprintln!("  node certs  --dir DIR   persist a certified chain (blocks+certs) and re-verify finality on reload");
@@ -4473,6 +4475,55 @@ fn cmd_snapshot(dir: String, out: String) {
     );
 }
 
+/// M133: a one-line summary of a decoded M131 snapshot — `height`/`genesis_hash`/the three
+/// cert-signed state roots + the `conserved` verdict — so a `node inspect-snapshot F` reads
+/// like a compact health report. Pure (no I/O) so it can be unit-tested.
+fn inspect_snapshot(state: &zhixing_node::ChainState) -> String {
+    format!(
+        "height={} genesis_hash={} state_root={} accounts_root={} bridge_root={} supply={} accounts={} supply_conserved={}",
+        state.height,
+        hex(&state.genesis_hash),
+        short(&state.state_root()),
+        short(&state.merkle_root()),
+        short(&state.bridge_merkle_root()),
+        state.supply,
+        state.accounts.len(),
+        state.supply_conserved(),
+    )
+}
+
+/// M133: `node inspect-snapshot FILE` — decode a M131 snapshot blob and print the
+/// summary. Use `-` to read from stdin (handy for `snapshot --out - | inspect-snapshot -`).
+/// Errors map to non-zero exit + stderr.
+fn cmd_inspect_snapshot(path: String) {
+    let bytes = if path == "-" {
+        let mut buf = Vec::new();
+        use std::io::Read;
+        if let Err(e) = std::io::stdin().read_to_end(&mut buf) {
+            eprintln!("error: read snapshot from stdin: {e}");
+            exit(1);
+        }
+        buf
+    } else {
+        match std::fs::read(&path) {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!("error: read snapshot {path}: {e}");
+                exit(1);
+            }
+        }
+    };
+    let state = match zhixing_node::codec::decode_snapshot(&bytes) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("error: decode snapshot: {e:?}");
+            exit(1);
+        }
+    };
+    println!("snapshot  bytes={}", bytes.len());
+    println!("{summary}", summary = inspect_snapshot(&state));
+}
+
 /// Demonstrate certificate persistence and *replay-as-finality-verification*.
 /// First run: produce a BFT-certified chain and persist both `blocks.log` and
 /// `certs.log`. Every run: reload both logs and replay them re-verifying each
@@ -4949,6 +5000,56 @@ mod tests {
             chain.state.bridge_merkle_root(),
             "bridge_root"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn inspect_snapshot_decodes_and_renders_summary() {
+        // M133: a snapshot blob, decoded by `inspect_snapshot`'s underlying codec, renders a
+        // summary line whose `state_root`/`merkle_root`/`bridge_root` all match the replayed
+        // source — so a CLI invocation would print the same roots the operator compares to a
+        // trusted header.
+        let dir = tmpdir("inspect-snapshot");
+        persist_demo_chain(&dir);
+        let chain = replay_for_snapshot(&dir.to_string_lossy()).expect("replay for snapshot");
+        let bytes = zhixing_node::codec::encode_snapshot(&chain.state);
+        let decoded = zhixing_node::codec::decode_snapshot(&bytes).expect("decode");
+        let summary = inspect_snapshot(&decoded);
+        // Heights + supply shape.
+        assert!(
+            summary.starts_with(&format!("height={} ", decoded.height)),
+            "{summary}"
+        );
+        assert!(summary.contains("supply_conserved=true"), "{summary}");
+        // The three roots match the chain.
+        let want_state = short(&chain.state.state_root());
+        let want_acct = short(&chain.state.merkle_root());
+        let want_bridge = short(&chain.state.bridge_merkle_root());
+        assert!(
+            summary.contains(&format!("state_root={want_state}")),
+            "{summary}"
+        );
+        assert!(
+            summary.contains(&format!("accounts_root={want_acct}")),
+            "{summary}"
+        );
+        assert!(
+            summary.contains(&format!("bridge_root={want_bridge}")),
+            "{summary}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn inspect_snapshot_rejects_bad_blob() {
+        // M133: the helper's underlying decoder rejects an unknown version (the CLI turns this
+        // into a non-zero exit + stderr); a corrupt blob never yields a bogus summary.
+        let dir = tmpdir("inspect-bad");
+        persist_demo_chain(&dir);
+        let chain = replay_for_snapshot(&dir.to_string_lossy()).expect("replay");
+        let mut bytes = zhixing_node::codec::encode_snapshot(&chain.state);
+        bytes[0..4].copy_from_slice(&999u32.to_be_bytes()); // clobber the version
+        assert!(zhixing_node::codec::decode_snapshot(&bytes).is_err());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
