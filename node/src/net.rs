@@ -460,6 +460,14 @@ impl GossipNode {
         self.chain.head
     }
 
+    /// M140: the highest height whose block has been **pruned** — `0` for a fresh-from-
+    /// genesis node (today's contract), the snapshot's tip height for a snapshot-booted
+    /// node (M139). Exposed so the daemon's HTTP layer can disambiguate "pruned"
+    /// (410 Gone) from "not found" (404) on height-keyed reads.
+    pub fn base_height(&self) -> u64 {
+        self.base_height
+    }
+
     pub fn blocks(&self) -> &[Block] {
         &self.blocks
     }

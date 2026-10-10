@@ -136,6 +136,27 @@ pub struct NodeConfig {
     /// capacity, `max_block_txs = 64`, rate limiting disabled).
     #[serde(default)]
     pub mempool: MempoolConfig,
+    /// M140: opt-in snapshot-boot config. When `Some`, `Node::start` reads the
+    /// M131-format snapshot blob at `path`, verifies the three cert-signed
+    /// roots in the supplied `BlockHeader` hex match the snapshot's `state_root`/
+    /// `accounts_root`/`bridge_root` (the same `node check-snapshot` check at boot
+    /// time, since the operator has no cert + tracked set yet), truncates the on-disk
+    /// `blocks.log`/`certs.log` to zero, and constructs `GossipNode::from_snapshot`
+    /// at the snapshot's tip. Absent (default) ⇒ byte-identical genesis-start boot.
+    /// `path` is resolved relative to CWD; `header_hex` is the on-wire form
+    /// `GET /header/{h}` returns.
+    #[serde(default)]
+    pub snapshot: Option<SnapshotBootConfig>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SnapshotBootConfig {
+    /// Path to a M131-format snapshot file.
+    pub path: String,
+    /// Hex-encoded cert-signed `BlockHeader` (the same on-wire form
+    /// `GET /header/{h}` produces); the boot-time check verifies its
+    /// `state_root`/`accounts_root`/`bridge_root` match the snapshot.
+    pub header_hex: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -897,6 +918,7 @@ mod tests {
             rpc: None,
             logging: None,
             mempool: MempoolConfig::default(),
+            snapshot: None,
         };
         let s = toml::to_string(&cfg).unwrap();
         let back: NodeConfig = toml::from_str(&s).unwrap();
@@ -2045,6 +2067,7 @@ mod tests {
                 rpc: None,
                 logging: None,
                 mempool: MempoolConfig::default(),
+                snapshot: None,
             };
             std::fs::write(
                 dir.join(format!("node{id}.toml")),

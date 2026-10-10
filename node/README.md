@@ -1341,6 +1341,21 @@ M116 的 `node rpc` 只能 GET。M117 补上写侧，让它成为**全能** RPC 
 
 **已知边界（顺延至 M121+）**：身份读三类已齐（`/genesis` 链 / `/node` 节点 / `/info` 链尖）；读面两分（`/params`/`/config`）已齐；RPC 自带端点发现 + 全能客户端 + 完整链读/写面；内容协商三轴已齐（仅 `identity`，真压缩顺延）；离线工具篮子已补；运维篮子剩余：证书/密钥轮换与落盘、follower 认证、指标端 TLS、OTel/push exporter、每-sink 独立 rotation 覆盖、时延直方图；keygen 篮子剩余：助记词 / BIP-39、口令加密 keystore、密钥轮换；剩余：游标分页、未知方法 `405`；共识 / wire 篮子（破 head 不变量）：**货币费用** + 费用优先排序、nonce / 序列号反重放。
 
+## `node run --snapshot` — full-node 快照 fast-sync 启动（Milestone 140 · 快速同步 full-node 闭环）
+
+承接 M139（`GossipNode` 偏移感知基础）：本轮把 daemon + CLI + config + 410-Gone HTTP 接起来，让一个 full-node 在启动时**采纳快照**并从其尖端继续 gossip——`node run --config F --snapshot FILE --snapshot-header HEX`。至此 M131–M139 的快照工具链对 **full-node** 端到端可用（此前只服务 `light::ValidatorTracker` M136）。**M140 纯 wiring**：无新库代码、无 offset 改动（M139 已覆盖）、无状态/wire 变更；密码学校验复用 M134/M135。
+
+- **CLI**（`src/main.rs`）：`--snapshot` 与 `--snapshot-header` 是一对（给了其一必给其二，否则 `fail_msg`）。快照文件是 M131 字节；头是 `GET /header/{h}` 返回的同款 on-wire hex。`cmd_run` 读两旗标、就地改写加载后的 `NodeConfig`——TOML keypath（`[snapshot]`）与 CLI keypath 等价。
+- **Config**（`src/config.rs`）：`NodeConfig` 加 `#[serde(default)] pub snapshot: Option<SnapshotBootConfig>`（`Some` 才启用，镜像 `validator`/`rpc` 等 opt-in 模式）；新结构 `SnapshotBootConfig { path: String, header_hex: String }`。
+- **Boot 分支**（`src/daemon.rs` `Node::start`）：`cfg.snapshot` 为 `Some` 时——`load_snapshot_boot` 读文件 `decode_snapshot` + 解析 `header_hex` `decode_header`，**校验门**：`state.height`/`state_root`/`accounts_root`/`bridge_root` 四项必须与头一致（M135 cert-less 检查——启动时操作员无 cert + 已知验证人集，故这是正确强度；未来 M141 可加 `--cert`/`--validators` 做 M134 法定人数检查）；再**截断** `blocks.log`/`certs.log`（非空 log + 快照互相矛盾，带 `eprintln!` 明示），用 `GossipNode::from_snapshot` 构造而非 `::new`。`load_certified` + `tx_index` pre-seed 在空 log 上自然是 no-op。
+- **首高修复**：启动驱动的首高取 `node.height() + 1`（而非 `appended + 1`）——创世节点 `appended == height` 两者相等，快照节点 log 空（`appended == 0`）而 live 高度是快照尖端，两者分叉。此前用 `appended + 1` 会调度一个被 `start_height` 拒绝的陈旧高度，节点永不续块。
+- **410 Gone pruned-serve**：高度键端点（`/header/{h}`、`/block/{h}`、`/block/{h}/txs`）在 `GossipNode` 查询返 `None` 时，经 `query_base_height` 判 `height > 0 && height <= base_height` → **410 Gone**（"pruned: ... does not retain pre-snapshot history"），否则 404。新 `gone_body`/`height_miss_body` helper 镜像 `not_found_body`；`Cmd::BaseHeight` 一次性读 `base_height`（失败降级为 404，绝不误报）。
+- **不变量保持**：默认配置无 `snapshot` 字段 → 所有 base=0 路径逐字节不变；`localnet` 头仍 wire v1 `a045426e…3b87bc`。
+- **已知能力缩减**：快照启动后无 pre-snapshot `/tx/{hash}` 历史查（返 404）——fast-sync 的诚实代价，已文档化。
+- **测试（+1 → 563）**：`snapshot_booted_node_starts_at_tip_and_serves_post_snapshot`（E2E）——driver 产 3 块 → `encode_snapshot` + 尖端头 hex → `Node::start(cfg.snapshot=Some)` → `Cmd::BaseHeight` 返 3（已采纳）→ 单验证人自认证续到高度 4 → `GET /block/1` 得 **410 Gone**、`GET /block/4` 得 200 `height=4 proposer=21`。
+
+**已知边界（顺延至 M141+）**：quorum-bound 启动校验（`--cert`/`--validators`）+ light 端 `LightGossipNode` 快照种子均为可选后续。
+
 ## `GossipNode` 偏移感知 + 快照构造函数（Milestone 139 · 快速同步 full-node 基础）
 
 承接 M136 的轻客户端 fast-sync：full-node 端 `node run --snapshot` 仍待做，但**最深的依赖**——让 `GossipNode` 能从任意高度起算（而非硬假设 `blocks[0]` = 高度 1）——本轮做成。M139 是**仅做 `GossipNode` 改造**（+ `Chain::from_snapshot`/`replay_from` 两个新构造函数），daemon wiring + log 截断 + E2E 留给 M140。

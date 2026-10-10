@@ -570,6 +570,11 @@ enum Cmd {
     },
     /// M38: read a richer runtime snapshot for the metrics/health endpoint.
     Metrics(oneshot::Sender<Metrics>),
+    /// M140: read the `GossipNode::base_height()` (0 for genesis-start, >0 for
+    /// snapshot-boot). Cheap — the HTTP layer caches it once per request and
+    /// uses it to disambiguate 410 Gone (pruned) from 404 Not Found on
+    /// height-keyed reads.
+    BaseHeight(oneshot::Sender<u64>),
 }
 
 /// M125: upper bounds (in microseconds) of the finite block-apply latency histogram buckets,
@@ -677,6 +682,75 @@ pub struct Metrics {
 #[derive(Clone)]
 pub struct Node {
     cmd: mpsc::UnboundedSender<Cmd>,
+}
+
+/// M140: decode + verify a snapshot-boot config into `(state, tip_head_hash)`. The
+/// cert-signed `header_hex` (the on-wire form `GET /header/{h}` returns) must agree
+/// with the snapshot's height and all three cert-signed roots — the same cert-less
+/// check `node check-snapshot` runs, which is the right strength at boot (the operator
+/// has no cert + tracked validator set to do the M134 quorum check). The returned head
+/// is `header.hash()` — the tip block hash `GossipNode::from_snapshot` needs. Any
+/// decode/mismatch is surfaced as an `io::Error` so `Node::start` fails fast without
+/// touching the on-disk log.
+fn load_snapshot_boot(
+    s: &crate::config::SnapshotBootConfig,
+) -> io::Result<(crate::ChainState, Hash)> {
+    let bytes = std::fs::read(&s.path)?;
+    let state = crate::codec::decode_snapshot(&bytes).map_err(|e| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("decode snapshot {}: {e:?}", s.path),
+        )
+    })?;
+    let header_bytes = hex_to_bytes(&s.header_hex).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "snapshot header_hex is not valid hex",
+        )
+    })?;
+    let header = crate::codec::decode_header(&header_bytes).map_err(|e| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("decode snapshot header: {e:?}"),
+        )
+    })?;
+    // The cert-signed header binds these commitments; proving the snapshot recomputes
+    // them is what makes a downloaded snapshot trustworthy (M135 semantics).
+    if state.height != header.height
+        || state.state_root() != header.state_root
+        || state.merkle_root() != header.accounts_root
+        || state.bridge_merkle_root() != header.bridge_root
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "snapshot does not match header at height {} (height/state_root/accounts_root/bridge_root mismatch)",
+                header.height
+            ),
+        ));
+    }
+    Ok((state, header.hash()))
+}
+
+/// M140: lowercase/uppercase hex → bytes; `None` on odd length or a non-hex char.
+fn hex_to_bytes(s: &str) -> Option<Vec<u8>> {
+    if s.len() % 2 != 0 {
+        return None;
+    }
+    let nib = |b: u8| match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        b'A'..=b'F' => Some(b - b'A' + 10),
+        _ => None,
+    };
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(s.len() / 2);
+    let mut i = 0;
+    while i < bytes.len() {
+        out.push((nib(bytes[i])? << 4) | nib(bytes[i + 1])?);
+        i += 2;
+    }
+    Some(out)
 }
 
 impl Node {
@@ -1569,6 +1643,9 @@ async fn run_actor(mut actor: Actor, mut rx: mpsc::UnboundedReceiver<Cmd>) {
             }
             Cmd::QueryBatch { items, reply } => {
                 let _ = reply.send(actor.node.batch(items));
+            }
+            Cmd::BaseHeight(reply) => {
+                let _ = reply.send(actor.node.base_height());
             }
             Cmd::Metrics(reply) => {
                 let _ = reply.send(Metrics {
@@ -4911,6 +4988,39 @@ fn not_found_body(fmt: RespFormat, msg: &str) -> String {
     error_body(fmt, "404 Not Found", msg)
 }
 
+/// M140: a `410 Gone` body for a request that is well-formed and points at a height this
+/// (snapshot-booted) node has **pruned** — distinct from `404 Not Found` (the height never
+/// existed / is past the tip). Same text/JSON shape as [`not_found_body`].
+fn gone_body(fmt: RespFormat, msg: &str) -> String {
+    error_body(fmt, "410 Gone", msg)
+}
+
+/// M140: pick `410 Gone` (pruned) over `404 Not Found` when a snapshot-booted node is asked
+/// for a height it no longer retains — i.e. `0 < height <= base_height`. `base_height == 0`
+/// (a genesis-start node) always yields `404`, so the base=0 path is byte-identical.
+fn height_miss_body(fmt: RespFormat, height: u64, base_height: u64, not_found_msg: &str) -> String {
+    if height > 0 && height <= base_height {
+        gone_body(
+            fmt,
+            &format!(
+                "pruned: this node adopted a snapshot at height {base_height} and does not retain pre-snapshot history"
+            ),
+        )
+    } else {
+        not_found_body(fmt, not_found_msg)
+    }
+}
+
+/// M140: read the node's `base_height` (0 unless snapshot-booted) via a cheap one-shot. On a
+/// send/recv failure returns 0 — degrading the 410-vs-404 choice to plain 404, never wrong.
+async fn query_base_height(cmd: &mpsc::UnboundedSender<Cmd>) -> u64 {
+    let (reply, rx) = oneshot::channel();
+    if cmd.send(Cmd::BaseHeight(reply)).is_err() {
+        return 0;
+    }
+    rx.await.unwrap_or(0)
+}
+
 async fn serve_rpc_conn(mut stream: TcpStream, cmd: mpsc::UnboundedSender<Cmd>) {
     // Accumulate bytes until we see the end-of-headers marker, keeping any body
     // bytes that arrived in the same read.
@@ -5127,7 +5237,14 @@ async fn serve_rpc_conn(mut stream: TcpStream, cmd: mpsc::UnboundedSender<Cmd>) 
                             &json_certified_header(&ch),
                         ),
                         Ok(None) => {
-                            not_found_body(fmt, &format!("no certified header at height {height}"))
+                            // M140: a pruned (≤ base_height) height is 410 Gone; past-the-tip is 404.
+                            let base = query_base_height(&cmd).await;
+                            height_miss_body(
+                                fmt,
+                                height,
+                                base,
+                                &format!("no certified header at height {height}"),
+                            )
                         }
                         Err(_) => http_response("503 Service Unavailable", "node stopped"),
                     }
@@ -5593,7 +5710,15 @@ async fn serve_rpc_conn(mut stream: TcpStream, cmd: mpsc::UnboundedSender<Cmd>) 
                         Ok(Some(b)) => {
                             ok_body(fmt, &format_block_summary(&b), &json_block_summary(&b))
                         }
-                        Ok(None) => http_response("404 Not Found", "block not found"),
+                        Ok(None) => {
+                            // M140: 410 Gone if the height is pruned (snapshot-boot), else 404.
+                            let base = query_base_height(&cmd).await;
+                            if height > 0 && height <= base {
+                                http_response("410 Gone", "pruned: this node adopted a snapshot and does not retain pre-snapshot history")
+                            } else {
+                                http_response("404 Not Found", "block not found")
+                            }
+                        }
                         Err(_) => http_response("503 Service Unavailable", "node stopped"),
                     }
                 }
@@ -5623,7 +5748,15 @@ async fn serve_rpc_conn(mut stream: TcpStream, cmd: mpsc::UnboundedSender<Cmd>) 
                                 &json_page(&json_block_tx_listing(page), total, next),
                             )
                         }
-                        Ok(None) => http_response("404 Not Found", "block not found"),
+                        Ok(None) => {
+                            // M140: 410 Gone if pruned, else 404.
+                            let base = query_base_height(&cmd).await;
+                            if height > 0 && height <= base {
+                                http_response("410 Gone", "pruned: this node adopted a snapshot and does not retain pre-snapshot history")
+                            } else {
+                                http_response("404 Not Found", "block not found")
+                            }
+                        }
                         Err(_) => http_response("503 Service Unavailable", "node stopped"),
                     }
                 }
@@ -6075,6 +6208,38 @@ impl Node {
         // logs + boot recovery
         let bpath = format!("{}/blocks.log", cfg.node.data_dir);
         let cpath = format!("{}/certs.log", cfg.node.data_dir);
+
+        // M140: snapshot-boot path. When configured, decode + verify the snapshot against the
+        // supplied cert-signed header (M135's cert-less check — the right strength at boot,
+        // before the operator has a known validator set), then truncate the on-disk log so
+        // the post-snapshot chain starts from `base_height = state.height` with `blocks`/`certs`
+        // empty. The default path (no `snapshot` config) is byte-identical to pre-M140.
+        let snapshot_boot: Option<(crate::ChainState, Hash)> = match cfg.snapshot.as_ref() {
+            Some(s) => {
+                let (state, head) = load_snapshot_boot(s)?;
+                // Operator-side contract: a non-empty log + a snapshot is contradictory
+                // (the snapshot represents the tip; the log would represent pre-snapshot
+                // history the snapshot explicitly prunes). Truncate with a clear message so a
+                // mistake is loud, not silent. `OpenOptions::create(true).append(true)` then
+                // re-creates an empty log on next `open_touch`.
+                if std::path::Path::new(&bpath).exists() {
+                    eprintln!(
+                        "snapshot-boot: truncating existing {} (a populated log is contradictory with a snapshot)",
+                        bpath
+                    );
+                    let _ = std::fs::remove_file(&bpath);
+                }
+                if std::path::Path::new(&cpath).exists() {
+                    eprintln!(
+                        "snapshot-boot: truncating existing {} (a populated log is contradictory with a snapshot)",
+                        cpath
+                    );
+                    let _ = std::fs::remove_file(&cpath);
+                }
+                Some((state, head))
+            }
+            None => None,
+        };
         let blog = BlockLog::open(&bpath)?;
         let clog = CertLog::open(&cpath)?;
         let blocks = blog.read_all()?;
@@ -6082,12 +6247,26 @@ impl Node {
 
         let peer_ids: Vec<u64> = cfg.peers.iter().map(|p| p.id).collect();
 
-        let mut node = GossipNode::new(
-            my_id,
-            genesis.clone(),
-            cfg.mempool.max_block_txs,
-            peer_ids.iter().copied(),
-        );
+        // M140: a snapshot-booted node starts with the post-snapshot state; a fresh node
+        // starts from genesis. The rest of `Node::start` (load_certified + tx_index seed)
+        // is naturally a no-op on snapshot-boot because `blocks`/`certs` are empty (the
+        // on-disk log was truncated above).
+        let mut node = match snapshot_boot.as_ref() {
+            Some((state, head)) => GossipNode::from_snapshot(
+                my_id,
+                genesis.clone(),
+                state.clone(),
+                *head,
+                cfg.mempool.max_block_txs,
+                peer_ids.iter().copied(),
+            ),
+            None => GossipNode::new(
+                my_id,
+                genesis.clone(),
+                cfg.mempool.max_block_txs,
+                peer_ids.iter().copied(),
+            ),
+        };
         // M54: bound the pending pool (DoS hardening). Default capacity is ample
         // (localnet never reaches it ⇒ head unchanged); operators tune `[mempool]`.
         node.set_mempool_capacity(cfg.mempool.capacity);
@@ -6181,6 +6360,13 @@ impl Node {
             tls,
             bind_channel: cfg.network.bind_channel,
         });
+
+        // M140: the first height to drive is the node's live height + 1 — which equals
+        // `appended + 1` for a genesis-started node (appended == height), but on a
+        // snapshot-booted node the on-disk log is empty (`appended == 0`) while the
+        // live height is the snapshot tip, so the two diverge. Capture it before `node`
+        // moves into the actor.
+        let boot_height = node.height();
 
         let actor = Actor {
             node,
@@ -6276,7 +6462,7 @@ impl Node {
         // decide→next-height and sync-reconcile chains keep it going thereafter.
         if is_validator {
             let cmd = cmd_tx.clone();
-            let next = appended as u64 + 1;
+            let next = boot_height + 1;
             let startup_ms = cfg.network.startup_delay_ms;
             tokio::spawn(async move {
                 tokio::time::sleep(Duration::from_millis(startup_ms)).await;
@@ -7032,6 +7218,7 @@ mod tests {
             rpc: None,
             logging: None,
             mempool: crate::config::MempoolConfig::default(),
+            snapshot: None,
         }
     }
 
@@ -13903,6 +14090,7 @@ vote_b.validator=5 vote_b.height=9 vote_b.round=2 vote_b.block_hash={b_h} vote_b
             rpc: None,
             logging: None,
             mempool: crate::config::MempoolConfig::default(),
+            snapshot: None,
         }
     }
 
@@ -15010,5 +15198,131 @@ vote_b.validator=5 vote_b.height=9 vote_b.round=2 vote_b.block_hash={b_h} vote_b
         let os = j.chars().filter(|&c| c == '[').count();
         let cs = j.chars().filter(|&c| c == ']').count();
         assert_eq!(os, cs, "unbalanced brackets: {j}");
+    }
+
+    #[tokio::test]
+    async fn snapshot_booted_node_starts_at_tip_and_serves_post_snapshot() {
+        // M140: full-node fast-sync boot — produce a 3-block chain offline, dump a
+        // M131-format snapshot + the cert-signed `BlockHeader` at the tip, then
+        // start a fresh daemon with `cfg.snapshot = Some(...)` and assert:
+        //   * the node adopted the snapshot (`Cmd::BaseHeight` returns 3);
+        //   * a pre-snapshot height serves as **HTTP 410 Gone** (pruned, not 404);
+        //   * a post-snapshot height (driven live by the node's own self-certifying
+        //     single-validator quorum) serves as 200 with `height=4`.
+        // The plan's HTTP safety proof: the snapshot-boot path serves forward but
+        // refuses backward.
+        use crate::config::SnapshotBootConfig;
+        use crate::driver::ChainDriver;
+
+        // 1. offline chain (single validator → node can self-certify post-boot).
+        let dir = tmp_dir("snap-boot");
+        let mut cfg = node_config(21, 21321, &[21], dir.clone());
+        let rpc_addr = "127.0.0.1:21331";
+        cfg.rpc = Some(crate::config::RpcConfig {
+            enabled: true,
+            listen: rpc_addr.into(),
+        });
+        let mut genesis = test_genesis();
+        genesis.validators = vec![(21, kp(21).public(), 1)];
+
+        // One tx per block (max_txs = 1); accounts 1/2/3 each author one (nonce 0).
+        let seeds: BTreeMap<u64, [u8; 32]> = [(21u64, seed(21))].into_iter().collect();
+        let mut d = ChainDriver::new(genesis.clone(), seeds, 1);
+        d.submit(test_tx(1, 1, 1)).expect("submit tx 1");
+        d.submit(test_tx(2, 2, 2)).expect("submit tx 2");
+        d.submit(test_tx(3, 3, 3)).expect("submit tx 3");
+        let produced = d.produce_until_drained(1.0, 8).expect("produce 3");
+        assert_eq!(produced, 3, "driver produced 3 heights");
+        let blocks = d.blocks().to_vec();
+        assert_eq!(blocks.len(), 3);
+        assert_eq!(blocks[2].height, 3, "tip at height 3");
+
+        // 2. snapshot bytes + cert-signed header (the on-wire form `load_snapshot_boot` parses).
+        let snap_bytes = crate::codec::encode_snapshot(&d.chain.state);
+        let header = crate::codec::BlockHeader::from_block(&blocks[2]);
+        let header_hex = crate::hash::hex(&crate::codec::encode_header(&header));
+
+        // 3. write the snapshot blob to disk; configure the boot.
+        std::fs::create_dir_all(&dir).expect("mkdir data dir");
+        let snap_path = std::path::Path::new(&dir).join("snapshot.bin");
+        std::fs::write(&snap_path, &snap_bytes).expect("write snapshot");
+        cfg.snapshot = Some(SnapshotBootConfig {
+            path: snap_path.to_string_lossy().into_owned(),
+            header_hex,
+        });
+
+        // 4. boot the node from the snapshot.
+        let node = Node::start(cfg, genesis.clone(), Some(kp(21)))
+            .await
+            .expect("snapshot boot");
+
+        // 5. `Cmd::BaseHeight` returns 3 — the snapshot was adopted (genesis-started
+        //    nodes would return 0 here, the M139 offset-awareness contract).
+        let (reply, rx) = oneshot::channel();
+        node.cmd
+            .send(Cmd::BaseHeight(reply))
+            .expect("send BaseHeight");
+        let base_height = tokio::time::timeout(Duration::from_secs(2), rx)
+            .await
+            .expect("base_height recv")
+            .expect("base_height value");
+        assert_eq!(base_height, 3, "snapshot adopted at height 3");
+
+        // 6. wait for the node to drive one more block (height 4) live. With a single
+        //    validator, the empty-block heartbeat self-certifies within one interval.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+        loop {
+            if node.status().await.map(|(h, _)| h >= 4).unwrap_or(false) {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "snapshot-booted node never produced height 4"
+            );
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+
+        async fn get(addr: &str, path: &str) -> String {
+            let req =
+                format!("GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
+            let mut s = TcpStream::connect(addr).await.expect("connect rpc");
+            s.write_all(req.as_bytes()).await.expect("send get");
+            let mut resp = Vec::new();
+            s.read_to_end(&mut resp).await.expect("read response");
+            String::from_utf8_lossy(&resp).into_owned()
+        }
+        fn body_of(resp: &str) -> &str {
+            resp.split_once("\r\n\r\n").map(|(_, b)| b).unwrap_or("")
+        }
+
+        // 7. `/block/1` (pruned, height ≤ base_height=3) → **410 Gone**, NOT 404.
+        let pruned = get(rpc_addr, "/block/1").await;
+        assert!(
+            pruned.starts_with("HTTP/1.1 410 Gone"),
+            "pre-snapshot /block/1 must be 410 Gone: {pruned}"
+        );
+        assert!(
+            body_of(&pruned).contains("pruned"),
+            "410 body must mention pruning: {pruned}"
+        );
+
+        // 8. `/block/4` (post-snapshot, driven live) → 200 with `height=4`.
+        let post = get(rpc_addr, "/block/4").await;
+        assert!(
+            post.starts_with("HTTP/1.1 200 OK"),
+            "post-snapshot /block/4 must be 200: {post}"
+        );
+        let body = body_of(&post);
+        assert!(
+            body.starts_with("height=4\n"),
+            "block 4 body should start with height=4: {body}"
+        );
+        assert!(body.contains("\nhash="), "block 4 has a hash: {body}");
+        assert!(
+            body.contains("proposer=21"),
+            "self-validator is the proposer: {body}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

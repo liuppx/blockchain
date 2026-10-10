@@ -301,7 +301,7 @@ fn main() {
         "batch" => cmd_batch(),
         "bridge" => cmd_bridge(),
         "redeem" => cmd_redeem(),
-        "run" => cmd_run(config_arg(&args)),
+        "run" => cmd_run(config_arg(&args), &args),
         "check-config" => cmd_check_config(config_arg(&args)),
         "genesis-hash" => cmd_genesis_hash(config_arg(&args)),
         "inspect-genesis" => cmd_inspect_genesis(config_arg(&args)),
@@ -399,6 +399,7 @@ fn usage() {
     eprintln!("  node bridge             trustless bridge: chain A locks to chain B, relayer ferries a cert-signed envelope, B's endpoint verifies + credits — no relayer trust");
     eprintln!("  node redeem             consensus-level redeem: B's producer follows A on-chain and mints from a source lock inside its state machine — the mint is BFT-enforced, not off-chain");
     eprintln!("  node run    --config F  run the networked BFT daemon (tokio TCP P2P): load config/genesis/validator key, gossip votes + sync/verify over sockets");
+    eprintln!("  node run    --config F --snapshot FILE --snapshot-header HEX  adopt a M131 snapshot at boot (M140 fast-sync); truncates the on-disk log, verifies the cert-signed header's three roots against the snapshot");
     eprintln!("  node check-config --config F  dry-run: load + validate config, its genesis, and validator key (if any) without starting the daemon; print a summary or the first error");
     eprintln!("  node genesis-hash --config F  print the chain identity derived from the config's genesis: genesis_hash + initial state_root + validator count (compare across operators before joining)");
     eprintln!("  node inspect-genesis --config F  dump the config's genesis contents: every account (id/balance/pubkey), reviewer, validator, plus params (the detail view to genesis-hash's identity)");
@@ -3718,13 +3719,29 @@ fn cmd_inspect_cert(args: &[String]) {
     }
 }
 
-fn cmd_run(config_path: String) {
+fn cmd_run(config_path: String, args: &[String]) {
     // M44: load the config first, then install the subscriber from its optional
     // `[logging]` section (absent ⇒ the M37 default). Config-load errors print via
     // `fail_msg`/eprintln — not tracing — so no log lines are lost by ordering the
     // load before the subscriber init.
-    let cfg =
+    let mut cfg =
         config::load_node_config(&config_path).unwrap_or_else(|e| fail_msg("load node config", &e));
+    // M140: optional snapshot-boot flags — `--snapshot FILE` + `--snapshot-header HEX`. The two
+    // flags are a coherent pair; if either is given we set `cfg.snapshot` so `Node::start`
+    // adopts the snapshot at boot (truncating the on-disk log + verifying the cert-signed
+    // header against the snapshot's three roots).
+    let snap_path = opt_arg(args, "--snapshot").map(str::to_string);
+    let snap_header = opt_arg(args, "--snapshot-header").map(str::to_string);
+    match (snap_path, snap_header) {
+        (Some(_), None) | (None, Some(_)) => fail_msg(
+            "node run",
+            &"--snapshot and --snapshot-header must be given together",
+        ),
+        (Some(path), Some(header_hex)) => {
+            cfg.snapshot = Some(config::SnapshotBootConfig { path, header_hex });
+        }
+        (None, None) => {}
+    }
     daemon::init_tracing_with(cfg.logging.as_ref());
     let gcfg = config::load_genesis(&cfg.genesis).unwrap_or_else(|e| fail_msg("load genesis", &e));
     let genesis = gcfg
@@ -4240,6 +4257,7 @@ fn cmd_localnet() {
             rpc: None,
             logging: None,
             mempool: crate::config::MempoolConfig::default(),
+            snapshot: None,
         }
     };
 
