@@ -582,6 +582,26 @@ const BLOCK_APPLY_BUCKET_MICROS: [u64; N_APPLY_BUCKETS] = [
 /// Number of finite histogram buckets (see [`BLOCK_APPLY_BUCKET_MICROS`]).
 const N_APPLY_BUCKETS: usize = 11;
 
+/// M138: upper bounds (in **microseconds**, for a uniform `_sum`/bucket comparison with the
+/// block-apply histogram) of the tx submit→commit latency histogram. The full path (M53 local
+/// submit → mempool → block candidate → BFT round → `apply_certified`) typically takes a few
+/// seconds; the buckets span 1 s … 30 min, denser at the low end. The actor task is the sole
+/// writer (no atomics).
+const TX_SUBMIT_BUCKET_MICROS: [u64; N_TX_BUCKETS] = [
+    1_000_000,
+    2_000_000,
+    5_000_000,
+    10_000_000,
+    20_000_000,
+    30_000_000,
+    60_000_000,
+    120_000_000,
+    300_000_000,
+    600_000_000,
+    1_800_000_000,
+];
+const N_TX_BUCKETS: usize = 11;
+
 /// M38: a read-only snapshot of the daemon's runtime state, rendered to the
 /// Prometheus text-exposition format by [`render_prometheus`]. Built inside the
 /// actor (the single owner of all this state) in response to [`Cmd::Metrics`].
@@ -641,6 +661,16 @@ pub struct Metrics {
     pub block_apply_buckets: [u64; N_APPLY_BUCKETS],
     pub block_apply_sum_micros: u64,
     pub block_apply_count: u64,
+    /// M138: tx submit→commit latency histogram (for this node's local M53 submits only,
+    /// since flood-arrival txs aren't timestamped at our boundary). Same shape as the
+    /// M125 block-apply histogram, but in seconds and over the multi-minute range
+    /// expected of a multi-step consensus round. `block_apply_buckets[i]` is the non-
+    /// cumulative count of submits whose latency ≤ `TX_SUBMIT_BUCKET_MICROS[i]` (above the
+    /// previous bound); submits past the last bound land only in the total count
+    /// (`zhixing_tx_submit_to_commit_seconds_count` ≡ `_bucket{le="+Inf"}`).
+    pub tx_submit_buckets: [u64; N_TX_BUCKETS],
+    pub tx_submit_sum_micros: u64,
+    pub tx_submit_count: u64,
 }
 
 /// A handle to a running node (for the in-process `localnet` demo and tests).
@@ -817,6 +847,15 @@ struct Actor {
     block_apply_buckets: [u64; N_APPLY_BUCKETS],
     block_apply_sum_micros: u64,
     block_apply_count: u64,
+    /// M138: tx submit→commit latency histogram accumulators (actor-owned). Observations are
+    /// recorded when a locally-submitted tx first appears in a block this node commits.
+    tx_submit_buckets: [u64; N_TX_BUCKETS],
+    tx_submit_sum_micros: u64,
+    tx_submit_count: u64,
+    /// M138: admission time of each locally-submitted, not-yet-committed tx (content hash →
+    /// `Instant`). Populated on `Cmd::SubmitTx` admission, drained when the tx commits; pruned
+    /// defensively so a never-committed submit can't grow it without bound.
+    tx_submit_times: HashMap<crate::Hash, std::time::Instant>,
     /// M54: per-peer gossip-tx token buckets (DoS hardening). Keyed by peer id;
     /// the actor task is the sole writer. Empty when rate limiting is disabled.
     peer_tx_buckets: HashMap<u64, TokenBucket>,
@@ -1126,11 +1165,22 @@ impl Actor {
         };
         // hash is unchanged by commit (block was sealed), so the certificate still
         // verifies against the active set inside apply_certified.
+        // M138: capture this block's tx hashes before the block is moved into apply, so a
+        // committed locally-submitted tx can be matched to its admission time.
+        let committed_tx_hashes: Vec<crate::Hash> = block.txs.iter().map(|t| t.hash()).collect();
         // M125: time the apply (consensus→committed state transition) for the latency histogram.
         let t0 = std::time::Instant::now();
         let applied = self.node.apply_certified(block, commit);
         if applied {
             self.record_block_apply(t0.elapsed().as_micros() as u64);
+            // M138: fold each locally-submitted tx's submit→commit latency into the histogram,
+            // then drop it from the pending map (committed ⇒ no longer awaiting).
+            let now = std::time::Instant::now();
+            for h in &committed_tx_hashes {
+                if let Some(started) = self.tx_submit_times.remove(h) {
+                    self.record_tx_submit(now.duration_since(started).as_micros() as u64);
+                }
+            }
             self.blocks_committed += 1; // M52
             self.persist();
             self.broadcast_status();
@@ -1148,6 +1198,17 @@ impl Actor {
         }
         self.block_apply_sum_micros = self.block_apply_sum_micros.saturating_add(micros);
         self.block_apply_count += 1;
+    }
+
+    /// M138: fold one tx submit→commit latency (microseconds) into the histogram — bump the
+    /// first finite bucket whose bound ≥ `micros` (slower submits land only in the total), and
+    /// the summed latency + observation count. Mirrors [`Self::record_block_apply`].
+    fn record_tx_submit(&mut self, micros: u64) {
+        if let Some(i) = TX_SUBMIT_BUCKET_MICROS.iter().position(|&b| micros <= b) {
+            self.tx_submit_buckets[i] += 1;
+        }
+        self.tx_submit_sum_micros = self.tx_submit_sum_micros.saturating_add(micros);
+        self.tx_submit_count += 1;
     }
 
     /// M33: sync always wins. Called after an inbound advanced our height: any
@@ -1232,6 +1293,12 @@ async fn run_actor(mut actor: Actor, mut rx: mpsc::UnboundedReceiver<Cmd>) {
                 actor.local_txs += 1;
                 match actor.node.submit_local_checked(*tx) {
                     Ok((h, out)) => {
+                        // M138: start the submit→commit clock for this hash (first admission
+                        // wins; a duplicate re-submit keeps the earlier, truthful start).
+                        actor
+                            .tx_submit_times
+                            .entry(h)
+                            .or_insert_with(std::time::Instant::now);
                         actor.route(out);
                         let _ = reply.send(Ok(h));
                     }
@@ -1526,6 +1593,9 @@ async fn run_actor(mut actor: Actor, mut rx: mpsc::UnboundedReceiver<Cmd>) {
                     block_apply_buckets: actor.block_apply_buckets,
                     block_apply_sum_micros: actor.block_apply_sum_micros,
                     block_apply_count: actor.block_apply_count,
+                    tx_submit_buckets: actor.tx_submit_buckets,
+                    tx_submit_sum_micros: actor.tx_submit_sum_micros,
+                    tx_submit_count: actor.tx_submit_count,
                 });
             }
         }
@@ -2168,6 +2238,33 @@ fn render_prometheus(m: &Metrics) -> String {
     s.push_str(&format!(
         "zhixing_block_apply_seconds_count {}\n",
         m.block_apply_count,
+    ));
+    // M138: tx submit→commit latency histogram (the `histogram` half of the
+    // Prometheus data model, this time for the multi-step M53 → mempool →
+    // consensus → apply path). Same `_bucket{le="…"}` per finite bound +
+    // `+Inf` (== _count) + `_sum` (seconds) + `_count` shape.
+    s.push_str("# HELP zhixing_tx_submit_to_commit_seconds Tx submit (M53) to commit latency, locally-submitted txs only.\n");
+    s.push_str("# TYPE zhixing_tx_submit_to_commit_seconds histogram\n");
+    let mut cumulative = 0u64;
+    for (i, &bound_micros) in TX_SUBMIT_BUCKET_MICROS.iter().enumerate() {
+        cumulative += m.tx_submit_buckets[i];
+        s.push_str(&format!(
+            "zhixing_tx_submit_to_commit_seconds_bucket{{le=\"{:.0}\"}} {}\n",
+            bound_micros as f64 / 1_000_000.0,
+            cumulative,
+        ));
+    }
+    s.push_str(&format!(
+        "zhixing_tx_submit_to_commit_seconds_bucket{{le=\"+Inf\"}} {}\n",
+        m.tx_submit_count,
+    ));
+    s.push_str(&format!(
+        "zhixing_tx_submit_to_commit_seconds_sum {:.6}\n",
+        m.tx_submit_sum_micros as f64 / 1_000_000.0,
+    ));
+    s.push_str(&format!(
+        "zhixing_tx_submit_to_commit_seconds_count {}\n",
+        m.tx_submit_count,
     ));
     s
 }
@@ -6107,6 +6204,10 @@ impl Node {
             block_apply_buckets: [0; N_APPLY_BUCKETS],
             block_apply_sum_micros: 0,
             block_apply_count: 0,
+            tx_submit_buckets: [0; N_TX_BUCKETS],
+            tx_submit_sum_micros: 0,
+            tx_submit_count: 0,
+            tx_submit_times: HashMap::new(),
             peer_tx_buckets: HashMap::new(),
             tx_rate: cfg.mempool.per_peer_tx_per_sec,
             tx_burst: cfg.mempool.per_peer_tx_burst,
@@ -7406,6 +7507,11 @@ mod tests {
             block_apply_buckets: [1, 2, 0, 3, 0, 0, 0, 0, 0, 0, 0],
             block_apply_sum_micros: 123_456,
             block_apply_count: 8,
+            // M138: a sample tx submit→commit histogram — finite buckets sum to 4, with one
+            // observation past the last bound (count 5 > finite total 4).
+            tx_submit_buckets: [0, 1, 2, 1, 0, 0, 0, 0, 0, 0, 0],
+            tx_submit_sum_micros: 7_500_000,
+            tx_submit_count: 5,
         }
     }
 

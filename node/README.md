@@ -1341,6 +1341,19 @@ M116 的 `node rpc` 只能 GET。M117 补上写侧，让它成为**全能** RPC 
 
 **已知边界（顺延至 M121+）**：身份读三类已齐（`/genesis` 链 / `/node` 节点 / `/info` 链尖）；读面两分（`/params`/`/config`）已齐；RPC 自带端点发现 + 全能客户端 + 完整链读/写面；内容协商三轴已齐（仅 `identity`，真压缩顺延）；离线工具篮子已补；运维篮子剩余：证书/密钥轮换与落盘、follower 认证、指标端 TLS、OTel/push exporter、每-sink 独立 rotation 覆盖、时延直方图；keygen 篮子剩余：助记词 / BIP-39、口令加密 keystore、密钥轮换；剩余：游标分页、未知方法 `405`；共识 / wire 篮子（破 head 不变量）：**货币费用** + 费用优先排序、nonce / 序列号反重放。
 
+## `zhixing_tx_submit_to_commit_seconds` 直方图 — tx 提交到落定的端到端时延（Milestone 138）
+
+补齐观测面三型的最后一种用法场景：M125 是 **块落定**时延（consensus→committed，μs-级），M138 是 **tx 提交→落定**时延（submit→commit，秒-级）——把"我提交的交易要等多久才被法定人数认证"这一**用户最关心的延迟**做成在线可观测的 Prometheus 直方图。
+
+- **设计**：`actor.tx_submit_times: HashMap<Hash, Instant>` 在 `Cmd::SubmitTx` 录取时记录（**首次** 录取获胜，重复提交保留更早的诚实时间戳）；`on_decided` 提交本节点产出的块时，对该块内每个有记录的 tx 求 `now - started` 并折入直方图，然后从 map 移除。**仅** 算本节点本地提交（gossip 入站 tx 不在我们边界上，无时间戳可记——若纳入会污染数据）。
+- **actor-owned、零原子**：与 M125 同样的模式——`Cmd::SubmitTx`、`on_decided`、Metrics 快照都跑在 actor task 同一线程内，plain `+= 1`/`+= micros` 即可，无需 `AtomicU64`/`Mutex`。
+- **桶**：以**微秒**为单位（与 M125 同坐标系、便于 `_sum` 互比），边界 1s/2s/5s/10s/20s/30s/1m/2m/5m/10m/30m（默认空块间隔 + BFT 一轮的端到端通常在数秒内）。
+- **render**：`# TYPE zhixing_tx_submit_to_commit_seconds histogram` + 累积 `_bucket{le="<秒>"}`（注意是整数秒）+ `+Inf`（== _count）+ `_sum`（秒）+ `_count`。
+- **不变量保持**：纯观测、无 wire/共识/状态/依赖改动、指标端默认关，故 `localnet` head 仍 wire v1 `a045426e…3b87bc`。
+- **测试**：纯 `Metrics` 算子 + 渲染已隐式覆盖（`sample_metrics` 文本/JSON 断言已扩展到 M138 字段 + `render_prometheus` 自然经过——对 `sample_metrics` 触发渲染路径即测）。
+
+**已知边界（顺延至 M139+）**：fast-sync 对轻客户端端到端已用（M131–M136）；read/审计/观测面已饱。剩余多需引依赖或属运维/大件（真压缩、keystore 加密、OTel/指标端 TLS、follower 认证、每-sink rotation、`daemon` offset-aware history 启动 fast-sync）。
+
 ## `/bonds` 与 `/unbonding` 暴露 Σ 总和（M137)
 
 承接 M130（`/supply` 加 `accounts_balance`/`unbonding`/`conserved` 让守恒可单端点审计）：`/bonds` 和 `/unbonding` 这两个列表端点**仍只列条目**——`Σ bonded` 与 `Σ unbonding` 只在 `/supply` 看，操作员要核对"列表总和 == 守恒等式中相应项"得**跨两个端点对账**。M137 把 Σ 直接补进 `/bonds`（`total_bonded`）与 `/unbonding`（`total_amount`），文本 + JSON 都加，lossless 引号 u64。
