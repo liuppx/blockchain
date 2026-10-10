@@ -1341,6 +1341,18 @@ M116 的 `node rpc` 只能 GET。M117 补上写侧，让它成为**全能** RPC 
 
 **已知边界（顺延至 M121+）**：身份读三类已齐（`/genesis` 链 / `/node` 节点 / `/info` 链尖）；读面两分（`/params`/`/config`）已齐；RPC 自带端点发现 + 全能客户端 + 完整链读/写面；内容协商三轴已齐（仅 `identity`，真压缩顺延）；离线工具篮子已补；运维篮子剩余：证书/密钥轮换与落盘、follower 认证、指标端 TLS、OTel/push exporter、每-sink 独立 rotation 覆盖、时延直方图；keygen 篮子剩余：助记词 / BIP-39、口令加密 keystore、密钥轮换；剩余：游标分页、未知方法 `405`；共识 / wire 篮子（破 head 不变量）：**货币费用** + 费用优先排序、nonce / 序列号反重放。
 
+## `node check-snapshot --snapshot F --header HEX` — 快照对头的离线交叉校验 CLI（Milestone 135 · 快速同步工具闭环)
+
+把 M134 的校验密码学包成**可直接跑的 CLI**：`node check-snapshot --snapshot FILE --header HEX` 解码 M131 快照 + 一个 cert-signed `BlockHeader`（`GET /header/{h}`/`/headers` 回的 on-wire hex 形），核对**高度 + 三个 cert-signed 根**（state_root/accounts_root/bridge_root）一致；任一不符即非零退出 + stderr。`--snapshot -` 读 stdin（配 `snapshot --out -` 可全管道）。
+
+- **运维闭环**：`node snapshot`（M132 导出）→ 传输 → `node inspect-snapshot`（M133 看）→ `curl …/header/{h}`（M126 取可信头）→ `node check-snapshot`（M135 判）。一条龙无需写代码。
+- **与 M134 的分工**：M134 的 `verify_snapshot_against_header` 是**含法定人数**的强校验（需 cert + 可信验证人集）；M135 CLI 做**无 cert 的根一致性**检查（高度 + 三根），足以抓出截断/错版本/错链的快照，且不需要调用方先持有验证人集——两者互补（强校验走库 API，快检走 CLI）。
+- **纯核心 + 薄壳**：`check_snapshot_against_header(bytes, header_hex) -> CheckOutcome{Ok|Mismatch}` 纯、可单测；新 `hex_decode`/`hex_nibble`（接受大小写、拒奇长/非 hex）。
+- **未引入新依赖**：复用 M131 codec + `decode_header`（M23）+ `hash::hex`。纯离线、不碰 head。
+- **测试（+2 → 557）**：`check_snapshot_matches_tip_header`（tip 快照对 tip 头 OK；+1 balance 的伪造快照→Mismatch）、`hex_decode_round_trips`（`hash::hex` 逆、拒坏输入）。
+
+**范围说明（未在本轮）**：真正的 **daemon live bootstrap**（`node run --snapshot`：启动时加载快照、验 M134、从该高度续 gossip）仍待做——它需要 `GossipNode` 的 `blocks`/`certs` 索引改成 **offset-aware**（当前 `self.blocks[h-1]` 硬假设 history 从高度 1 落盘，~10 处索引点 + Diff/replay 路径），是个独立大件（M136+ 候选）。M135 让**离线快照工具链完整可用**，daemon 集成不阻塞使用。
+
 ## `light::verify_snapshot_against_header` — 快照对 cert-signed header 的密码学校验（Milestone 134 · 快速同步第 4 步 · 收尾步核心)
 
 完成快速同步大件的**密码学核心**：让下载的 M131 快照**真正可信**。把 `light.rs` 的 M23 `verify_state_root_against_header`（仅把 cert 绑到 header）扩展为 `verify_snapshot_against_header`，多走两步：**(1) cert 绑定** + **(2) 快照高度** + **(3) 快照**重算**三根**（`state_root`/`accounts_root`/`bridge_root`）**等于 header 的 cert-signed 承诺**——匹配 `state_root` 本身就足以证明快照是该验证人集在该高度定稿的真状态（state_root 摘要**每个**共识字段）。

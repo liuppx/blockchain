@@ -316,6 +316,10 @@ fn main() {
         "verify" => cmd_verify(dir_arg(&args)),
         "snapshot" => cmd_snapshot(dir_arg(&args), req_arg(&args, "--out").to_string()),
         "inspect-snapshot" => cmd_inspect_snapshot(req_arg(&args, "--snapshot").to_string()),
+        "check-snapshot" => cmd_check_snapshot(
+            req_arg(&args, "--snapshot").to_string(),
+            req_arg(&args, "--header").to_string(),
+        ),
         "inspect-block" => cmd_inspect_block(&args),
         "inspect-cert" => cmd_inspect_cert(&args),
         "certs" => cmd_certs(dir_arg(&args)),
@@ -410,6 +414,7 @@ fn usage() {
     eprintln!("  node verify --dir DIR   replay blocks+certs logs through finality verification; non-zero exit on any integrity error (missing log, length mismatch, cert mismatch, < 2/3 quorum)");
     eprintln!("  node snapshot --dir DIR --out FILE  export the chain (replay-verified) as a M131 snapshot blob; --out - writes to stdout");
     eprintln!("  node inspect-snapshot --snapshot FILE  decode a M131 snapshot blob and print height/roots/supply_conserved; --snapshot - reads stdin");
+    eprintln!("  node check-snapshot --snapshot FILE --header HEX  cross-check a snapshot against a cert-signed BlockHeader hex (GET /header/{{h}}): height + 3 roots must match; non-zero exit on mismatch");
     eprintln!("  node inspect-block --dir DIR [--height N]  read the persisted block log and print a per-block summary, or (with --height) one block's header + contents + tx hashes");
     eprintln!("  node inspect-cert  --dir DIR [--height N]  read the persisted cert log and print a per-cert summary, or (with --height) one finality certificate's height/round/block_hash + precommit voters");
     eprintln!("  node certs  --dir DIR   persist a certified chain (blocks+certs) and re-verify finality on reload");
@@ -4524,6 +4529,135 @@ fn cmd_inspect_snapshot(path: String) {
     println!("{summary}", summary = inspect_snapshot(&state));
 }
 
+/// M135: outcome of a snapshot ↔ cert-signed header cross-check.
+enum CheckOutcome {
+    /// Height + three roots agree. The snapshot is the *same state* the header commits
+    /// to; with a trusted validator set the full M134 quorum check is also implied.
+    Ok { height: u64 },
+    /// Snapshot's height/roots disagree with the header.
+    Mismatch { height: u64, reason: &'static str },
+}
+
+/// M135: pure helper — decode a M131 snapshot + a `BlockHeader` (the on-wire hex form
+/// `GET /header/{h}` / `/headers?from=…` produces) and check height + the three cert-signed
+/// roots agree. With a trusted cert, this is the offline end-to-end fast-sync check
+/// (the cryptographically strong version lives in `light::verify_snapshot_against_header`,
+/// which requires the cert; M135's helper covers the cert-less case so an operator can
+/// spot a truncated/wrong-version snapshot with nothing but a header).
+fn check_snapshot_against_header(snapshot_bytes: &[u8], header_hex: &str) -> CheckOutcome {
+    let state = match zhixing_node::codec::decode_snapshot(snapshot_bytes) {
+        Ok(s) => s,
+        Err(_) => {
+            eprintln!("error: decode snapshot failed (corrupt/wrong-version blob)");
+            std::process::exit(1);
+        }
+    };
+    let header_bytes = match hex_decode(header_hex) {
+        Some(b) => b,
+        None => {
+            eprintln!("error: --header hex invalid");
+            std::process::exit(1);
+        }
+    };
+    let header = match zhixing_node::codec::decode_header(&header_bytes) {
+        Ok(h) => h,
+        Err(e) => {
+            eprintln!("error: decode header: {e:?}");
+            std::process::exit(1);
+        }
+    };
+    if state.height != header.height {
+        return CheckOutcome::Mismatch {
+            height: header.height,
+            reason: "snapshot.height != header.height",
+        };
+    }
+    if state.state_root() != header.state_root {
+        return CheckOutcome::Mismatch {
+            height: header.height,
+            reason: "state_root mismatch",
+        };
+    }
+    if state.merkle_root() != header.accounts_root {
+        return CheckOutcome::Mismatch {
+            height: header.height,
+            reason: "accounts_root mismatch",
+        };
+    }
+    if state.bridge_merkle_root() != header.bridge_root {
+        return CheckOutcome::Mismatch {
+            height: header.height,
+            reason: "bridge_root mismatch",
+        };
+    }
+    CheckOutcome::Ok {
+        height: header.height,
+    }
+}
+
+/// M135: `node check-snapshot --snapshot FILE --header HEX` — cross-check a M131 snapshot
+/// blob against a cert-signed `BlockHeader` (the on-wire hex form `GET /header/{h}` /
+/// `/headers?from=…` returns). Verifies height + the three cert-signed roots agree; non-zero
+/// exit + stderr on any mismatch. The cert-less part of fast-sync — for the quorum-bound
+/// check use M134's `light::verify_snapshot_against_header` programmatically.
+fn cmd_check_snapshot(snapshot_path: String, header_hex: String) {
+    let bytes = if snapshot_path == "-" {
+        let mut buf = Vec::new();
+        use std::io::Read;
+        if let Err(e) = std::io::stdin().read_to_end(&mut buf) {
+            eprintln!("error: read snapshot from stdin: {e}");
+            exit(1);
+        }
+        buf
+    } else {
+        match std::fs::read(&snapshot_path) {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!("error: read snapshot {snapshot_path}: {e}");
+                exit(1);
+            }
+        }
+    };
+    match check_snapshot_against_header(&bytes, &header_hex) {
+        CheckOutcome::Ok { height } => {
+            println!(
+                "ok  height {height}: height + state_root + accounts_root + bridge_root all match"
+            );
+        }
+        CheckOutcome::Mismatch { height, reason } => {
+            eprintln!("error: mismatch at height {height}: {reason}");
+            exit(1);
+        }
+    }
+}
+
+/// M135: decode a lowercase/uppercase hex string to bytes; `None` on a non-hex or odd-length
+/// input. (The RPC header reads emit lowercase hex; we accept either case.)
+fn hex_decode(s: &str) -> Option<Vec<u8>> {
+    if s.len() % 2 != 0 {
+        return None;
+    }
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(s.len() / 2);
+    let mut i = 0;
+    while i < bytes.len() {
+        let hi = hex_nibble(bytes[i])?;
+        let lo = hex_nibble(bytes[i + 1])?;
+        out.push((hi << 4) | lo);
+        i += 2;
+    }
+    Some(out)
+}
+
+fn hex_nibble(b: u8) -> Option<u8> {
+    match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        b'A'..=b'F' => Some(b - b'A' + 10),
+        _ => None,
+    }
+}
+
 /// Demonstrate certificate persistence and *replay-as-finality-verification*.
 /// First run: produce a BFT-certified chain and persist both `blocks.log` and
 /// `certs.log`. Every run: reload both logs and replay them re-verifying each
@@ -5051,6 +5185,49 @@ mod tests {
         bytes[0..4].copy_from_slice(&999u32.to_be_bytes()); // clobber the version
         assert!(zhixing_node::codec::decode_snapshot(&bytes).is_err());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn check_snapshot_matches_tip_header() {
+        // M135: a snapshot taken at the tip cross-checks OK against that tip block's
+        // cert-signed header (height + the three roots), and a tampered snapshot is rejected.
+        let dir = tmpdir("check-snapshot");
+        persist_demo_chain(&dir);
+        let chain = replay_for_snapshot(&dir.to_string_lossy()).expect("replay");
+        let bytes = zhixing_node::codec::encode_snapshot(&chain.state);
+        // The tip block's header, hex-encoded as `GET /header/{h}` would return it.
+        let blog = BlockLog::open(dir.join("blocks.log")).expect("reopen");
+        let blocks = blog.read_all().expect("read");
+        let tip = blocks.last().expect("one block");
+        let header = zhixing_node::codec::BlockHeader::from_block(tip);
+        let header_hex = hex(&zhixing_node::codec::encode_header(&header));
+
+        match check_snapshot_against_header(&bytes, &header_hex) {
+            CheckOutcome::Ok { height } => assert_eq!(height, chain.state.height),
+            CheckOutcome::Mismatch { reason, .. } => panic!("expected Ok, got mismatch: {reason}"),
+        }
+
+        // A snapshot from a *different* state (extra balance) breaks the root match.
+        let mut forged = chain.state.clone();
+        if let Some(a) = forged.accounts.get_mut(&1) {
+            a.balance += 1;
+        }
+        let forged_bytes = zhixing_node::codec::encode_snapshot(&forged);
+        match check_snapshot_against_header(&forged_bytes, &header_hex) {
+            CheckOutcome::Mismatch { .. } => {}
+            CheckOutcome::Ok { .. } => panic!("expected mismatch for a forged snapshot"),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn hex_decode_round_trips() {
+        // M135: the CLI's hex decoder is the inverse of `hash::hex` and rejects bad input.
+        let b = [0u8, 1, 15, 16, 255, 0xAB];
+        assert_eq!(hex_decode(&hex(&b)), Some(b.to_vec()));
+        assert_eq!(hex_decode("0A1b"), Some(vec![0x0A, 0x1B])); // mixed case
+        assert_eq!(hex_decode("abc"), None); // odd length
+        assert_eq!(hex_decode("zz"), None); // non-hex
     }
 
     #[test]
