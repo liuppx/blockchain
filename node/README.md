@@ -1341,6 +1341,21 @@ M116 的 `node rpc` 只能 GET。M117 补上写侧，让它成为**全能** RPC 
 
 **已知边界（顺延至 M121+）**：身份读三类已齐（`/genesis` 链 / `/node` 节点 / `/info` 链尖）；读面两分（`/params`/`/config`）已齐；RPC 自带端点发现 + 全能客户端 + 完整链读/写面；内容协商三轴已齐（仅 `identity`，真压缩顺延）；离线工具篮子已补；运维篮子剩余：证书/密钥轮换与落盘、follower 认证、指标端 TLS、OTel/push exporter、每-sink 独立 rotation 覆盖、时延直方图；keygen 篮子剩余：助记词 / BIP-39、口令加密 keystore、密钥轮换；剩余：游标分页、未知方法 `405`；共识 / wire 篮子（破 head 不变量）：**货币费用** + 费用优先排序、nonce / 序列号反重放。
 
+## 全状态快照 codec（Milestone 131 · 快速同步第 1 步）
+
+启动**快速同步**大件的第一步：一个把整个 `ChainState` 规范、可逆、确定性地序列化的 **snapshot codec**（`codec::encode_snapshot`/`decode_snapshot`）。有了它，后续里程碑可让新节点**从快照加载某高度的状态**而无需重放整条区块日志（尤其在日志被裁剪后）；快照本身也可被哈希、其 `state_root` 对**已被 cert 签名的 header** 交叉校验。
+
+- **格式**：前导 `u32` 版本（`SNAPSHOT_VERSION=1`）+ 全部状态字段，big-endian、确定性（同状态 ⇒ 同字节）。覆盖 `ChainState` 的每一字段：scalars（height/supply/treasury/bonded/bridge_locked/bridge_minted/next_lock_id/base_emission/slash_bps）、`DeltaKParams`、accounts、reviewers、cognitive graph nodes、bonds、unbonding 队列、active validator set、bridge_locks(+heights)、bridge_sources（含各自的 validator set + consumed 集）。
+- **关键决策**：`genesis_hash` 与 `now_days` 虽**不入 `state_root`**，仍写进快照——故 decode 复原**逐字节相同**的 `ChainState`（含链身份与 ΔK 新鲜度基准）。复用 `enc_bridge_lock`/`dec_bridge_lock`；validator set 经 `ValidatorSet::validators()`↔`::new()` 往返；长度用 `count()`（MAX_ITEMS 上限防 DoS）。
+- **放在 `codec.rs`**：与全部 `Enc`/`Dec` 机制 + 既有每实体编码器同处，`Dec` 私有故不可外置。
+- **正确性属性**：encode→decode→`state_root()`/`merkle_root()`/`bridge_merkle_root()` 全等 + **再编码逐字节一致**（确定性）+ 不入根的 `genesis_hash`/`now_days`/`next_lock_id`/`bridge_minted` 也复原；未知版本 → `BadEnum`、尾随字节 → `TrailingBytes`。
+- **不变量保持**：纯新增离线 codec，无 wire/共识/状态/依赖改动、不碰 head（快照格式独立于区块 wire v1）。
+- **测试（+2 → 548）**：`snapshot_round_trips_to_identical_state`（非平凡状态：genesis + bond + unbonding + bridge lock/height + bridge mint，全根相等 + 再编码稳定）、`snapshot_rejects_bad_version_and_trailing_bytes`。
+
+**后续步骤（快速同步路线）**：第 2 步 `node snapshot --dir D --out F` 导出 CLI（载链→写快照）；第 3 步 `node inspect-snapshot`/校验导入（解码→核对 `state_root` 对可信 header）；第 4 步 daemon 从快照 bootstrap（跳过全量重放）。各步仍"不破 head、零新依赖"。
+
+**已知边界（顺延至 M132+）**：snapshot codec 已就位；其余读/运维项多需引依赖或属运维篮子（见前）。
+
 ## `GET /supply` 暴露供应守恒验算 + 判词（Milestone 130)
 
 M104 的 `/supply` 回原始资金池（`supply`/`treasury`/`bonded`/`bridge_locked`/`bridge_minted`），但**没暴露守恒等式的两个关键项**（Σ账户余额、解绑中金额）**也没给判词**——客户端想核对 `Σ余额 + treasury + bonded + unbonding + bridge_locked == supply`（M78 `supply_conserved`）只能自己拉全账户求和。M130 把 `accounts_balance`、`unbonding`、`conserved:bool` 补进 `/supply`，让监控经一次 RPC 即审计这条核心不变量——**M128 离线 `verify` 的在线对应**。

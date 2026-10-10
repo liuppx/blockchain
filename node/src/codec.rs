@@ -7,12 +7,14 @@
 use crate::consensus::{Commit, Vote, VoteType};
 use crate::light::{ProofEntry, ProofKind};
 use crate::merkle::{Proof, Step};
+use crate::validator::ValidatorSet;
 use crate::validator::{Validator, ValidatorUpdate};
 use crate::{
-    Account, Block, BondKind, BridgeHeader, BridgeRedeem, Embedding, Review, Reviewer,
-    SlashEvidence, StakeOp, SubmissionTx,
+    Account, Block, BondKind, BridgeHeader, BridgeRedeem, BridgeSource, ChainState, Embedding,
+    Review, Reviewer, SlashEvidence, StakeOp, SubmissionTx, UnbondingEntry,
 };
 use zhixing_engine::DIM;
+use zhixing_engine::{CognitiveGraph, DeltaKParams, GraphNode};
 
 #[derive(Debug)]
 pub enum CodecError {
@@ -987,8 +989,306 @@ pub fn decode_account(buf: &[u8]) -> Result<Account, CodecError> {
     })
 }
 
-/// Canonical bytes of one [`Proof`]. Each step is one tag byte (0 = Left,
-/// 1 = Right) followed by 32 bytes of sibling hash.
+// --- M131: full-state snapshot codec -----------------------------------------
+//
+// A snapshot is a canonical, self-describing serialization of an entire
+// [`ChainState`] — the foundation of fast-sync: a joining node can load state at
+// a height without replaying the whole block log. The format is versioned
+// (leading `u32`) and byte-deterministic (same state ⇒ same bytes), so a snapshot
+// can itself be hashed and its `state_root` cross-checked against a cert-signed
+// header. `genesis_hash` and `now_days` are included even though `state_root`
+// excludes them, so decode reproduces a *byte-identical* `ChainState`.
+
+/// Current snapshot wire version. Bumped if the layout ever changes.
+pub const SNAPSHOT_VERSION: u32 = 1;
+
+/// Write the account's state fields into the shared stream (same layout as
+/// [`encode_account`], inlined so the snapshot controls framing).
+fn enc_account_fields(e: &mut Enc, a: &Account) {
+    e.raw(&a.pubkey);
+    e.u64(a.balance);
+    e.u64(a.staked_total);
+    e.u64(a.earned_total);
+    e.u64(a.slashed_total);
+    e.u64(a.submissions);
+    e.u64(a.accepted);
+    e.u64(a.nonce); // M122
+}
+
+/// Inverse of [`enc_account_fields`].
+fn dec_account_fields(d: &mut Dec) -> Result<Account, CodecError> {
+    let mut pubkey = [0u8; 32];
+    pubkey.copy_from_slice(d.take(32)?);
+    Ok(Account {
+        pubkey,
+        balance: d.u64()?,
+        staked_total: d.u64()?,
+        earned_total: d.u64()?,
+        slashed_total: d.u64()?,
+        submissions: d.u64()?,
+        accepted: d.u64()?,
+        nonce: d.u64()?,
+    })
+}
+
+/// Write a validator set as `count ‖ (id ‖ pubkey ‖ power)*`.
+fn enc_validator_set(e: &mut Enc, vs: &ValidatorSet) {
+    let vals = vs.validators();
+    e.u64(vals.len() as u64);
+    for v in vals {
+        e.u64(v.id);
+        e.raw(&v.pubkey);
+        e.u64(v.power);
+    }
+}
+
+/// Inverse of [`enc_validator_set`].
+fn dec_validator_set(d: &mut Dec) -> Result<ValidatorSet, CodecError> {
+    let n = d.count()?;
+    let mut vals = Vec::with_capacity(n as usize);
+    for _ in 0..n {
+        let id = d.u64()?;
+        let mut pubkey = [0u8; 32];
+        pubkey.copy_from_slice(d.take(32)?);
+        let power = d.u64()?;
+        vals.push(crate::validator::Validator { id, pubkey, power });
+    }
+    Ok(ValidatorSet::new(vals))
+}
+
+/// Serialize an entire [`ChainState`] to canonical, versioned bytes.
+pub fn encode_snapshot(s: &ChainState) -> Vec<u8> {
+    let mut e = Enc(Vec::new());
+    e.u32(SNAPSHOT_VERSION);
+    // scalar state
+    e.u64(s.height);
+    e.f32(s.now_days);
+    e.u64(s.supply);
+    e.u64(s.treasury);
+    e.u64(s.bonded);
+    e.u64(s.bridge_locked);
+    e.u64(s.bridge_minted);
+    e.u64(s.next_lock_id);
+    e.u64(s.base_emission_micro);
+    e.u32(s.slash_bps);
+    e.raw(&s.genesis_hash);
+    // ΔK params
+    let p = &s.params;
+    e.f32(p.tau_dup);
+    e.u64(p.n_review_min as u64);
+    e.f32(p.c_cap);
+    e.u64(p.n_min as u64);
+    e.f32(p.lam);
+    e.f32(p.bonus_max);
+    e.f32(p.decay);
+    e.f32(p.fresh_min);
+    e.f32(p.delta_k_min);
+    // accounts
+    e.u64(s.accounts.len() as u64);
+    for (id, a) in &s.accounts {
+        e.u64(*id);
+        enc_account_fields(&mut e, a);
+    }
+    // reviewers
+    e.u64(s.reviewers.len() as u64);
+    for (id, rep) in &s.reviewers {
+        e.u64(*id);
+        e.f32(*rep);
+    }
+    // cognitive graph nodes
+    e.u64(s.graph.nodes.len() as u64);
+    for n in &s.graph.nodes {
+        e.u64(n.node_id);
+        e.emb(&n.embedding);
+        e.u32(n.domain);
+    }
+    // bonds
+    e.u64(s.bonds.len() as u64);
+    for (id, amt) in &s.bonds {
+        e.u64(*id);
+        e.u64(*amt);
+    }
+    // unbonding queue
+    e.u64(s.unbonding.len() as u64);
+    for u in &s.unbonding {
+        e.u64(u.account);
+        e.u64(u.amount);
+        e.u64(u.mature_height);
+    }
+    // active validator set
+    enc_validator_set(&mut e, &s.validators);
+    // bridge locks
+    e.u64(s.bridge_locks.len() as u64);
+    for (id, lock) in &s.bridge_locks {
+        e.u64(*id);
+        enc_bridge_lock(&mut e, lock, true);
+    }
+    // bridge lock heights
+    e.u64(s.bridge_lock_heights.len() as u64);
+    for (id, h) in &s.bridge_lock_heights {
+        e.u64(*id);
+        e.u64(*h);
+    }
+    // bridge sources
+    e.u64(s.bridge_sources.len() as u64);
+    for (chain, src) in &s.bridge_sources {
+        e.raw(chain);
+        enc_validator_set(&mut e, &src.set);
+        e.raw(&src.head);
+        e.u64(src.height);
+        e.u64(src.consumed.len() as u64);
+        for c in &src.consumed {
+            e.u64(*c);
+        }
+    }
+    e.0
+}
+
+/// Inverse of [`encode_snapshot`]. Rejects an unknown version and any trailing
+/// bytes, so a corrupt or newer snapshot fails loudly rather than silently.
+pub fn decode_snapshot(buf: &[u8]) -> Result<ChainState, CodecError> {
+    let mut d = Dec { buf, pos: 0 };
+    let version = d.u32()?;
+    if version != SNAPSHOT_VERSION {
+        return Err(CodecError::BadEnum(version));
+    }
+    let height = d.u64()?;
+    let now_days = d.f32()?;
+    let supply = d.u64()?;
+    let treasury = d.u64()?;
+    let bonded = d.u64()?;
+    let bridge_locked = d.u64()?;
+    let bridge_minted = d.u64()?;
+    let next_lock_id = d.u64()?;
+    let base_emission_micro = d.u64()?;
+    let slash_bps = d.u32()?;
+    let mut genesis_hash = [0u8; 32];
+    genesis_hash.copy_from_slice(d.take(32)?);
+    let params = DeltaKParams {
+        tau_dup: d.f32()?,
+        n_review_min: d.u64()? as usize,
+        c_cap: d.f32()?,
+        n_min: d.u64()? as usize,
+        lam: d.f32()?,
+        bonus_max: d.f32()?,
+        decay: d.f32()?,
+        fresh_min: d.f32()?,
+        delta_k_min: d.f32()?,
+    };
+    // accounts
+    let n = d.count()?;
+    let mut accounts = std::collections::BTreeMap::new();
+    for _ in 0..n {
+        let id = d.u64()?;
+        accounts.insert(id, dec_account_fields(&mut d)?);
+    }
+    // reviewers
+    let n = d.count()?;
+    let mut reviewers = std::collections::BTreeMap::new();
+    for _ in 0..n {
+        let id = d.u64()?;
+        reviewers.insert(id, d.f32()?);
+    }
+    // graph nodes
+    let n = d.count()?;
+    let mut nodes = Vec::with_capacity(n as usize);
+    for _ in 0..n {
+        let node_id = d.u64()?;
+        let embedding = d.emb()?;
+        let domain = d.u32()?;
+        nodes.push(GraphNode {
+            node_id,
+            embedding,
+            domain,
+        });
+    }
+    let graph = CognitiveGraph { nodes };
+    // bonds
+    let n = d.count()?;
+    let mut bonds = std::collections::BTreeMap::new();
+    for _ in 0..n {
+        let id = d.u64()?;
+        bonds.insert(id, d.u64()?);
+    }
+    // unbonding
+    let n = d.count()?;
+    let mut unbonding = Vec::with_capacity(n as usize);
+    for _ in 0..n {
+        unbonding.push(UnbondingEntry {
+            account: d.u64()?,
+            amount: d.u64()?,
+            mature_height: d.u64()?,
+        });
+    }
+    // validators
+    let validators = dec_validator_set(&mut d)?;
+    // bridge locks
+    let n = d.count()?;
+    let mut bridge_locks = std::collections::BTreeMap::new();
+    for _ in 0..n {
+        let id = d.u64()?;
+        bridge_locks.insert(id, dec_bridge_lock(&mut d)?);
+    }
+    // bridge lock heights
+    let n = d.count()?;
+    let mut bridge_lock_heights = std::collections::BTreeMap::new();
+    for _ in 0..n {
+        let id = d.u64()?;
+        bridge_lock_heights.insert(id, d.u64()?);
+    }
+    // bridge sources
+    let n = d.count()?;
+    let mut bridge_sources = std::collections::BTreeMap::new();
+    for _ in 0..n {
+        let mut chain = [0u8; 32];
+        chain.copy_from_slice(d.take(32)?);
+        let set = dec_validator_set(&mut d)?;
+        let mut head = [0u8; 32];
+        head.copy_from_slice(d.take(32)?);
+        let src_height = d.u64()?;
+        let cn = d.count()?;
+        let mut consumed = std::collections::BTreeSet::new();
+        for _ in 0..cn {
+            consumed.insert(d.u64()?);
+        }
+        bridge_sources.insert(
+            chain,
+            BridgeSource {
+                set,
+                head,
+                height: src_height,
+                consumed,
+            },
+        );
+    }
+    if d.pos != d.buf.len() {
+        return Err(CodecError::TrailingBytes);
+    }
+    Ok(ChainState {
+        accounts,
+        reviewers,
+        graph,
+        params,
+        base_emission_micro,
+        slash_bps,
+        supply,
+        treasury,
+        bonded,
+        bonds,
+        unbonding,
+        height,
+        now_days,
+        validators,
+        bridge_locked,
+        bridge_locks,
+        bridge_lock_heights,
+        next_lock_id,
+        bridge_minted,
+        bridge_sources,
+        genesis_hash,
+    })
+}
+
 pub fn encode_proof(p: &Proof) -> Vec<u8> {
     let mut e = Enc(Vec::new());
     e.u64(p.steps.len() as u64);
@@ -2667,5 +2967,95 @@ mod tests {
             decode_block(&encode_block(&plain)).unwrap().hash(),
             b.hash()
         );
+    }
+
+    // --- M131: snapshot codec round-trip ------------------------------------
+
+    /// A non-trivial `ChainState`: genesis (accounts/reviewers/seed graph/validators)
+    /// plus a bond, an unbonding entry, a bridge lock + its height, and a bridge mint —
+    /// so the round-trip exercises every map/vec/nested field.
+    fn sample_state() -> ChainState {
+        let pk = |n: u8| crate::Keypair::from_seed([n; 32]).public();
+        let mut emb = [0.0f32; DIM];
+        emb[1] = 1.0;
+        let g = crate::Genesis {
+            accounts: vec![(1, 30 * MICRO, pk(1)), (2, 50 * MICRO, pk(2))],
+            reviewers: vec![(10, 1.0), (11, 0.5)],
+            seed_nodes: vec![(emb, 0)],
+            params: DeltaKParams::default(),
+            base_emission_micro: 8 * MICRO,
+            slash_bps: 10_000,
+            timestamp_days: 1.5,
+            validators: vec![(21, pk(21), 3), (22, pk(22), 1)],
+            bridge_sources: vec![],
+        };
+        let (mut s, _gh) = ChainState::genesis(g);
+        // Poke the stake + bridge fields so they are non-empty in the snapshot.
+        s.bonds.insert(21, 3 * MICRO);
+        s.bonded = 3 * MICRO;
+        s.unbonding.push(UnbondingEntry {
+            account: 2,
+            amount: MICRO,
+            mature_height: 9,
+        });
+        s.bridge_locks.insert(
+            0,
+            crate::BridgeLock {
+                account: 1,
+                amount: 5 * MICRO,
+                dest_chain: [7u8; 32],
+                dest_account: 2,
+                nonce: 0,
+                signature: [9u8; 64],
+            },
+        );
+        s.bridge_lock_heights.insert(0, 1);
+        s.next_lock_id = 1;
+        s.bridge_locked = 5 * MICRO;
+        s.bridge_minted = 2 * MICRO;
+        s
+    }
+
+    #[test]
+    fn snapshot_round_trips_to_identical_state() {
+        // M131: encode → decode reproduces a byte-identical state: same cert-signed roots,
+        // same scalar fields, and a byte-identical re-encode (determinism).
+        let s = sample_state();
+        let bytes = encode_snapshot(&s);
+        let back = decode_snapshot(&bytes).expect("decode snapshot");
+        // The cert-signed commitments are the strongest equality check (they digest the
+        // whole state); matching them means the decode reproduced the state faithfully.
+        assert_eq!(back.state_root(), s.state_root(), "state_root");
+        assert_eq!(back.merkle_root(), s.merkle_root(), "accounts_root");
+        assert_eq!(
+            back.bridge_merkle_root(),
+            s.bridge_merkle_root(),
+            "bridge_root"
+        );
+        // Fields excluded from state_root must still round-trip.
+        assert_eq!(back.genesis_hash, s.genesis_hash, "genesis_hash");
+        assert_eq!(back.now_days, s.now_days, "now_days");
+        assert_eq!(back.next_lock_id, s.next_lock_id, "next_lock_id");
+        assert_eq!(back.bridge_minted, s.bridge_minted, "bridge_minted");
+        // Re-encoding the decoded state is byte-identical (canonical, deterministic).
+        assert_eq!(encode_snapshot(&back), bytes, "re-encode stable");
+    }
+
+    #[test]
+    fn snapshot_rejects_bad_version_and_trailing_bytes() {
+        // M131: an unknown leading version ⇒ BadEnum; extra trailing bytes ⇒ TrailingBytes.
+        let bytes = encode_snapshot(&sample_state());
+        let mut wrong = bytes.clone();
+        wrong[0..4].copy_from_slice(&999u32.to_be_bytes());
+        assert!(matches!(
+            decode_snapshot(&wrong),
+            Err(CodecError::BadEnum(999))
+        ));
+        let mut extra = bytes.clone();
+        extra.push(0);
+        assert!(matches!(
+            decode_snapshot(&extra),
+            Err(CodecError::TrailingBytes)
+        ));
     }
 }
