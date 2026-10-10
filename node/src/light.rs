@@ -378,6 +378,10 @@ pub enum LightError {
     /// A validator-membership Merkle proof did not verify against a certified
     /// block's `next_validators_root`.
     MembershipProofInvalid { height: u64 },
+    /// M134: a snapshot's recomputed roots (`state_root`/`accounts_root`/`bridge_root`) or its
+    /// height do not match the cert-signed header it is verified against — the snapshot is not
+    /// the state the validator set finalized at that height (stale, truncated, or forged).
+    SnapshotMismatch { height: u64 },
     /// M26: the kNN claim's neighbour set was empty (`k == 0` or the
     /// certified graph is empty for this query). Returned instead of
     /// returning `Ok(())` so the wallet can distinguish "no answer" from
@@ -460,6 +464,12 @@ impl std::fmt::Display for LightError {
                 write!(
                     f,
                     "light: validator membership proof invalid against block {height}"
+                )
+            }
+            LightError::SnapshotMismatch { height } => {
+                write!(
+                    f,
+                    "light: snapshot does not match the cert-signed header at height {height}"
                 )
             }
             LightError::EmptyKnnQuery { height } => {
@@ -834,7 +844,42 @@ impl ValidatorTracker {
         Ok(())
     }
 
-    // ----- M26: cert-signed kNN over the cognitive graph -----
+    /// M134: verify a **full-state snapshot** against a cert-signed header — the cryptographic
+    /// core of trustworthy fast-sync. A joining node downloads a [`ChainState`] snapshot (M131
+    /// codec) from an untrusted peer; this proves the snapshot really is the state the validator
+    /// set finalized at `header.height`, so the node can adopt it instead of replaying every
+    /// block. Three independent checks:
+    ///   1. the cert binds this header and is a real > 2/3 quorum of `tracked_set`
+    ///      (via [`Self::verify_state_root_against_header`]);
+    ///   2. the snapshot is at the header's height;
+    ///   3. the snapshot's *recomputed* roots equal the header's cert-signed commitments —
+    ///      `state_root` (the whole-state digest) plus `accounts_root` and `bridge_root` for
+    ///      clearer failure localization. Matching `state_root` alone already implies the
+    ///      snapshot is faithful, since it digests every consensus field.
+    ///
+    /// `tracked_set` is the validator set active at `header.height` (what the caller trusts:
+    /// the genesis set for a young chain, or a set tracked forward via `/headers`). Returns
+    /// `Ok(())` only when the snapshot is provably authentic.
+    pub fn verify_snapshot_against_header(
+        state: &crate::ChainState,
+        header: &crate::codec::BlockHeader,
+        cert: &Commit,
+        tracked_set: &ValidatorSet,
+    ) -> Result<(), LightError> {
+        // 1. the cert binds this header and is a quorum of the trusted set.
+        Self::verify_state_root_against_header(header, cert, tracked_set)?;
+        // 2. + 3. the snapshot must be at the header's height and recompute to its commitments.
+        if state.height != header.height
+            || state.state_root() != header.state_root
+            || state.merkle_root() != header.accounts_root
+            || state.bridge_merkle_root() != header.bridge_root
+        {
+            return Err(LightError::SnapshotMismatch {
+                height: header.height,
+            });
+        }
+        Ok(())
+    }
 
     // See also `engine::CognitiveGraph::k_nearest_with_ties`. The wallet-side
     // ranking here MUST match the engine's ranking byte-for-byte given the
@@ -3312,5 +3357,86 @@ mod tests {
             &response,
         )
         .expect("M29: skipping a None inclusion slot leaves the rest verifiable");
+    }
+
+    /// A different genesis that produces a validator set the cert at height 1 was NOT signed
+    /// by (different ids), so `verify_snapshot_against_header` can fail on the cert step.
+    fn alt_genesis() -> Genesis {
+        use crate::validator::Validator;
+        let mut g = base_genesis();
+        g.validators = vec![(99, kp(99).public(), 1)];
+        g.accounts = vec![(99, 30 * crate::MICRO, kp(99).public())];
+        g
+    }
+
+    #[test]
+    fn verify_snapshot_accepts_an_authentic_snapshot() {
+        // M134: the state behind a cert-signed header, carried through the M131 snapshot codec,
+        // verifies against that header + the genesis (height-1) validator set.
+        let mut d = driver(base_genesis());
+        d.submit(novel_tx(1, 1, 1, 1.0)).unwrap();
+        d.produce(1.0, &no_silence()).unwrap().expect("block");
+        let block = d.blocks()[0].clone();
+        let cert = d.certificates()[0].clone();
+        let header = crate::codec::BlockHeader::from_block(&block);
+        let tracked = ValidatorTracker::from_genesis(&base_genesis())
+            .validators()
+            .clone();
+        // Round-trip the live state through the snapshot codec (M131), as a joining node would
+        // after downloading the blob — then verify the *decoded* state against the header.
+        let bytes = crate::codec::encode_snapshot(&d.chain.state);
+        let snapshot = crate::codec::decode_snapshot(&bytes).expect("decode snapshot");
+        ValidatorTracker::verify_snapshot_against_header(&snapshot, &header, &cert, &tracked)
+            .expect("authentic snapshot verifies");
+    }
+
+    #[test]
+    fn verify_snapshot_rejects_a_tampered_snapshot() {
+        // M134: inflating a balance in the snapshot breaks its recomputed state_root/accounts_root,
+        // so it no longer matches the cert-signed header — rejected as SnapshotMismatch.
+        let mut d = driver(base_genesis());
+        d.submit(novel_tx(1, 1, 1, 1.0)).unwrap();
+        d.produce(1.0, &no_silence()).unwrap().expect("block");
+        let block = d.blocks()[0].clone();
+        let cert = d.certificates()[0].clone();
+        let header = crate::codec::BlockHeader::from_block(&block);
+        let tracked = ValidatorTracker::from_genesis(&base_genesis())
+            .validators()
+            .clone();
+        let mut snapshot = d.chain.state.clone();
+        if let Some(acct) = snapshot.accounts.get_mut(&1) {
+            acct.balance += 1; // forge extra money
+        }
+        let err =
+            ValidatorTracker::verify_snapshot_against_header(&snapshot, &header, &cert, &tracked)
+                .unwrap_err();
+        assert!(
+            matches!(err, LightError::SnapshotMismatch { .. }),
+            "got {err}"
+        );
+    }
+
+    #[test]
+    fn verify_snapshot_rejects_a_forged_cert() {
+        // M134: an authentic snapshot but a cert that is not a quorum of the trusted set is
+        // rejected at the cert step (before the root comparison).
+        let mut d = driver(base_genesis());
+        d.submit(novel_tx(1, 1, 1, 1.0)).unwrap();
+        d.produce(1.0, &no_silence()).unwrap().expect("block");
+        let block = d.blocks()[0].clone();
+        let cert = d.certificates()[0].clone();
+        let header = crate::codec::BlockHeader::from_block(&block);
+        // A different (wrong) validator set the cert was not signed by.
+        let wrong = ValidatorTracker::from_genesis(&alt_genesis())
+            .validators()
+            .clone();
+        let err = ValidatorTracker::verify_snapshot_against_header(
+            &d.chain.state,
+            &header,
+            &cert,
+            &wrong,
+        )
+        .unwrap_err();
+        assert!(matches!(err, LightError::Consensus(_)), "got {err}");
     }
 }

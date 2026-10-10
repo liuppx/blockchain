@@ -1341,6 +1341,20 @@ M116 的 `node rpc` 只能 GET。M117 补上写侧，让它成为**全能** RPC 
 
 **已知边界（顺延至 M121+）**：身份读三类已齐（`/genesis` 链 / `/node` 节点 / `/info` 链尖）；读面两分（`/params`/`/config`）已齐；RPC 自带端点发现 + 全能客户端 + 完整链读/写面；内容协商三轴已齐（仅 `identity`，真压缩顺延）；离线工具篮子已补；运维篮子剩余：证书/密钥轮换与落盘、follower 认证、指标端 TLS、OTel/push exporter、每-sink 独立 rotation 覆盖、时延直方图；keygen 篮子剩余：助记词 / BIP-39、口令加密 keystore、密钥轮换；剩余：游标分页、未知方法 `405`；共识 / wire 篮子（破 head 不变量）：**货币费用** + 费用优先排序、nonce / 序列号反重放。
 
+## `light::verify_snapshot_against_header` — 快照对 cert-signed header 的密码学校验（Milestone 134 · 快速同步第 4 步 · 收尾步核心)
+
+完成快速同步大件的**密码学核心**：让下载的 M131 快照**真正可信**。把 `light.rs` 的 M23 `verify_state_root_against_header`（仅把 cert 绑到 header）扩展为 `verify_snapshot_against_header`，多走两步：**(1) cert 绑定** + **(2) 快照高度** + **(3) 快照**重算**三根**（`state_root`/`accounts_root`/`bridge_root`）**等于 header 的 cert-signed 承诺**——匹配 `state_root` 本身就足以证明快照是该验证人集在该高度定稿的真状态（state_root 摘要**每个**共识字段）。
+
+- **新 `LightError::SnapshotMismatch { height }`**（+ Display 臂）：快照的根对不上该高度的 header 时返回——可定位为"陈旧/被截断/伪造"，区别于 cert 自身不合格（`Consensus(_)`）。
+- **位置**：放 `light.rs` 紧邻 `verify_state_root_against_header`；`tracked_set` 是调用方在 header 高度信任的验证人集（创世集、向前跟踪的 `ValidatorTracker`、或 M134+ 的离线跟踪结果）。
+- **为什么这一步是收尾核心**：有了 `verify_snapshot_against_header`，**任何**"下载快照"流程的**信任根**就位了——后续可以造 `daemon` bootstrap（启动时加载快照 + 验 M134 + 跳全量重放），无需等它就先把校验密码学做对。
+- **范围说明**（不在本轮）：把 `Node::start` 改成"先从快照加载、验 M134、再续 gossip"是另一工程——daemon 的 `blocks`/`certs` 索引假设 history 已落盘，从快照起步需要 offset-aware history（`M135+` 候选）。本轮只交付**可复用的密码学原语** + 测试。
+- **未引入新依赖**：纯库函数、零 I/O。
+- **不变量保持**：纯只读、不碰 head。
+- **测试（+3 → 555）**：`verify_snapshot_accepts_an_authentic_snapshot`（`driver`→M131 codec round-trip→验过）、`verify_snapshot_rejects_a_tampered_snapshot`（+1 balance → `SnapshotMismatch`）、`verify_snapshot_rejects_a_forged_cert`（异 genesis 集 → `Consensus(_)`，cert 步先拒）。
+
+**已知边界（顺延至 M135+）**：M134 给出快照**校验密码学**；**快照加载到 daemon**（M135 候选）需 offset-aware history（让 `GossipNode` 接受"从某高度起算的 blocks/certs"），是个独立大件。其余运维/读/依赖项不变。
+
 ## `node inspect-snapshot --snapshot F` — 快照检视 CLI（Milestone 133 · 快速同步第 3 步)
 
 承接 M132 的导出：M133 加 `node inspect-snapshot --snapshot FILE`——解码 M131 blob 并打印一行健康报告：`height`/`genesis_hash`/三个 cert-signed state 根（state_root/accounts_root/bridge_root）/`supply`/账户数/`supply_conserved`。`--snapshot -` 读 stdin（配 `snapshot --out -` 可管道：`node snapshot … --out - | node inspect-snapshot --snapshot -`）。
