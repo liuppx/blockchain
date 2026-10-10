@@ -4173,6 +4173,42 @@ fn json_page(items: &str, total: usize, next: Option<usize>) -> String {
     )
 }
 
+/// M137: `/bonds` page with the whole-map bonded Σ (`total_bonded`, lossless quoted-u64)
+/// alongside the standard page envelope — lets a JSON client audit `Σ bonded == state.bonded`.
+fn json_bond_page(items: &str, total: usize, next: Option<usize>, total_bonded: u64) -> String {
+    let next = match next {
+        Some(n) => json_u64(n as u64),
+        None => "null".to_string(),
+    };
+    format!(
+        "{{\"total\":{},\"next\":{},\"total_bonded\":{},\"items\":{}}}",
+        json_u64(total as u64),
+        next,
+        json_u64(total_bonded),
+        items
+    )
+}
+
+/// M137: `/unbonding` page with the whole-queue amount Σ (`total_amount`, lossless quoted-u64).
+fn json_unbonding_page(
+    items: &str,
+    total: usize,
+    next: Option<usize>,
+    total_amount: u64,
+) -> String {
+    let next = match next {
+        Some(n) => json_u64(n as u64),
+        None => "null".to_string(),
+    };
+    format!(
+        "{{\"total\":{},\"next\":{},\"total_amount\":{},\"items\":{}}}",
+        json_u64(total as u64),
+        next,
+        json_u64(total_amount),
+        items
+    )
+}
+
 // ---- M67/M74/M75/M76/M77/M78: JSON renderers for the proof / batch / lock reads. -----
 // M67 serialized every proof envelope to one opaque `hex(encode_*)` blob dropped into
 // a named JSON field — self-verifying, but useless to a JSON client that only wants a
@@ -5244,13 +5280,17 @@ async fn serve_rpc_conn(mut stream: TcpStream, cmd: mpsc::UnboundedSender<Cmd>) 
                 // M87: per-validator bonded-stake directory — always a (possibly empty)
                 // `200`. Sixth consumer of the pagination stack (after `/bridge/locks`,
                 // `/validators`, `/accounts`, `/reviewers`, `/graph`), reusing
-                // `format_bond`/`json_bond` per item.
+                // `format_bond`/`json_bond` per item. M137: the listing also reports the
+                // micro-$COG Σ of the *whole* bonds map (the value folded into `state.bonded`
+                // and visible at `/supply` as `bonded=`) so an operator can audit a single
+                // invariant (`Σ bonded == state.bonded`) without joining two endpoints.
                 let (reply, rx) = oneshot::channel();
                 if cmd.send(Cmd::QueryBonds { reply }).is_err() {
                     http_response("503 Service Unavailable", "node stopped")
                 } else {
                     match rx.await {
                         Ok(listing) => {
+                            let total_bonded: u64 = listing.iter().map(|&(_, b)| b).sum();
                             let offset = usize_param(query, "offset").unwrap_or(0);
                             let limit = Some(effective_limit(usize_param(query, "limit")));
                             let total = listing.len();
@@ -5261,10 +5301,17 @@ async fn serve_rpc_conn(mut stream: TcpStream, cmd: mpsc::UnboundedSender<Cmd>) 
                             } else {
                                 None
                             };
+                            let summary = format!("total_bonded={total_bonded}");
+                            let items = format!("{summary}\n{}", format_bond_listing(page));
                             ok_body(
                                 fmt,
-                                &format_page(&format_bond_listing(page), total, next),
-                                &json_page(&json_bond_listing(page), total, next),
+                                &format_page(&items, total, next),
+                                &json_bond_page(
+                                    &json_bond_listing(page),
+                                    total,
+                                    next,
+                                    total_bonded,
+                                ),
                             )
                         }
                         Err(_) => http_response("503 Service Unavailable", "node stopped"),
@@ -5275,13 +5322,17 @@ async fn serve_rpc_conn(mut stream: TcpStream, cmd: mpsc::UnboundedSender<Cmd>) 
                 // M88: unbonding-delay queue — always a (possibly empty) `200`. Seventh
                 // consumer of the pagination stack (after `/bridge/locks`, `/validators`,
                 // `/accounts`, `/reviewers`, `/graph`, `/bonds`), reusing
-                // `format_unbonding`/`json_unbonding` per item.
+                // `format_unbonding`/`json_unbonding` per item. M137: also reports the
+                // micro-$COG Σ of the *whole* queue (the value folded into `state.unbonding`
+                // and visible at `/supply`) so the operator can verify the queue's total in
+                // one place.
                 let (reply, rx) = oneshot::channel();
                 if cmd.send(Cmd::QueryUnbonding { reply }).is_err() {
                     http_response("503 Service Unavailable", "node stopped")
                 } else {
                     match rx.await {
                         Ok(listing) => {
+                            let total_amount: u64 = listing.iter().map(|u| u.amount).sum();
                             let offset = usize_param(query, "offset").unwrap_or(0);
                             let limit = Some(effective_limit(usize_param(query, "limit")));
                             let total = listing.len();
@@ -5292,10 +5343,17 @@ async fn serve_rpc_conn(mut stream: TcpStream, cmd: mpsc::UnboundedSender<Cmd>) 
                             } else {
                                 None
                             };
+                            let summary = format!("total_amount={total_amount}");
+                            let items = format!("{summary}\n{}", format_unbonding_listing(page));
                             ok_body(
                                 fmt,
-                                &format_page(&format_unbonding_listing(page), total, next),
-                                &json_page(&json_unbonding_listing(page), total, next),
+                                &format_page(&items, total, next),
+                                &json_unbonding_page(
+                                    &json_unbonding_listing(page),
+                                    total,
+                                    next,
+                                    total_amount,
+                                ),
                             )
                         }
                         Err(_) => http_response("503 Service Unavailable", "node stopped"),
@@ -8851,16 +8909,18 @@ mod tests {
             resp.split_once("\r\n\r\n").map(|(_, b)| b).unwrap_or("")
         }
 
-        // Plain directory → 200 with an empty page (no bonds at genesis, only the `total` head).
+        // Plain directory → 200 with an empty page; M137 adds the `total_bonded` Σ line
+        // (0 at genesis — bonds only grow via on-chain StakeOps). `format_page` always
+        // terminates the body with a newline, so the text envelope ends in `\n`.
         let resp = get(rpc_addr, "/bonds").await;
         assert!(resp.starts_with("HTTP/1.1 200 OK"), "bonds status: {resp}");
         assert_eq!(
             body_of(&resp),
-            "total=0",
-            "bonds text envelope (empty directory)"
+            "total=0\ntotal_bonded=0\n",
+            "bonds text envelope (empty directory, with M137 Σ)"
         );
 
-        // JSON representation → the `total`/`next`/`items` envelope with an empty array.
+        // JSON representation → the `total`/`next`/`total_bonded`/`items` envelope (empty array).
         let as_json = get(rpc_addr, "/bonds?format=json").await;
         assert!(
             as_json.starts_with("HTTP/1.1 200 OK"),
@@ -8872,8 +8932,8 @@ mod tests {
         );
         assert_eq!(
             body_of(&as_json),
-            "{\"total\":\"0\",\"next\":null,\"items\":[]}",
-            "bonds JSON envelope (empty directory)"
+            "{\"total\":\"0\",\"next\":null,\"total_bonded\":\"0\",\"items\":[]}",
+            "bonds JSON envelope (empty directory, with M137 Σ)"
         );
 
         let _ = std::fs::remove_dir_all(&dir);
@@ -8924,7 +8984,9 @@ mod tests {
             resp.split_once("\r\n\r\n").map(|(_, b)| b).unwrap_or("")
         }
 
-        // Plain directory → 200 with an empty page (no queued withdrawals at genesis).
+        // Plain directory → 200 with an empty page; M137 adds the `total_amount` Σ line
+        // (0 at genesis — the queue only fills via Unbond StakeOps). Trailing newline per
+        // `format_page`.
         let resp = get(rpc_addr, "/unbonding").await;
         assert!(
             resp.starts_with("HTTP/1.1 200 OK"),
@@ -8932,11 +8994,11 @@ mod tests {
         );
         assert_eq!(
             body_of(&resp),
-            "total=0",
-            "unbonding text envelope (empty queue)"
+            "total=0\ntotal_amount=0\n",
+            "unbonding text envelope (empty queue, with M137 Σ)"
         );
 
-        // JSON representation → the `total`/`next`/`items` envelope with an empty array.
+        // JSON representation → the `total`/`next`/`total_amount`/`items` envelope (empty array).
         let as_json = get(rpc_addr, "/unbonding?format=json").await;
         assert!(
             as_json.starts_with("HTTP/1.1 200 OK"),
@@ -8948,8 +9010,8 @@ mod tests {
         );
         assert_eq!(
             body_of(&as_json),
-            "{\"total\":\"0\",\"next\":null,\"items\":[]}",
-            "unbonding JSON envelope (empty queue)"
+            "{\"total\":\"0\",\"next\":null,\"total_amount\":\"0\",\"items\":[]}",
+            "unbonding JSON envelope (empty queue, with M137 Σ)"
         );
 
         let _ = std::fs::remove_dir_all(&dir);

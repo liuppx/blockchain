@@ -1341,6 +1341,17 @@ M116 的 `node rpc` 只能 GET。M117 补上写侧，让它成为**全能** RPC 
 
 **已知边界（顺延至 M121+）**：身份读三类已齐（`/genesis` 链 / `/node` 节点 / `/info` 链尖）；读面两分（`/params`/`/config`）已齐；RPC 自带端点发现 + 全能客户端 + 完整链读/写面；内容协商三轴已齐（仅 `identity`，真压缩顺延）；离线工具篮子已补；运维篮子剩余：证书/密钥轮换与落盘、follower 认证、指标端 TLS、OTel/push exporter、每-sink 独立 rotation 覆盖、时延直方图；keygen 篮子剩余：助记词 / BIP-39、口令加密 keystore、密钥轮换；剩余：游标分页、未知方法 `405`；共识 / wire 篮子（破 head 不变量）：**货币费用** + 费用优先排序、nonce / 序列号反重放。
 
+## `/bonds` 与 `/unbonding` 暴露 Σ 总和（M137)
+
+承接 M130（`/supply` 加 `accounts_balance`/`unbonding`/`conserved` 让守恒可单端点审计）：`/bonds` 和 `/unbonding` 这两个列表端点**仍只列条目**——`Σ bonded` 与 `Σ unbonding` 只在 `/supply` 看，操作员要核对"列表总和 == 守恒等式中相应项"得**跨两个端点对账**。M137 把 Σ 直接补进 `/bonds`（`total_bonded`）与 `/unbonding`（`total_amount`），文本 + JSON 都加，lossless 引号 u64。
+
+- **改动**：两 handler 各自 `Σ` 一次后入 page body（文本 `key=value` 单独一行、JSON 新增一个顶层键）；新 `json_bond_page`/`json_unbonding_page` 两个并行 helper，与既有 `json_page` 同形（不破其它端点）。
+- **价值**：操作员现在能在一处直接读"列表的 Σ == `/supply` 上的同名项"——单端点闭环。
+- **不变量保持**：纯展示增量、不动账本结构、无 wire/共识/状态/依赖改动、RPC 默认关，故 `localnet` head 仍 wire v1 `a045426e…3b87bc`。
+- **测试（强化既有 → 559）**：TCP `rpc_bonds_list_over_tcp`/`rpc_unbonding_list_over_tcp` 更新期望断言新增字段。
+
+**已知边界（顺延至 M138+）**：轻客户端 fast-sync 端到端已就绪（M131–M136）；full-node daemon 快照启动仍待 offset-aware history（M137+ 候选的大件）；其余多需引依赖（真压缩、keystore 加密、OTel/指标端 TLS、follower 认证）或属运维篮子。
+
 ## `ValidatorTracker::from_snapshot` — 轻客户端从快照 live 引导（Milestone 136 · 快速同步 live 消费者)
 
 把快照工具链接到一个**真正 live 的消费者**：轻客户端。`ValidatorTracker::from_snapshot(&ChainState, head_hash)` 让轻客户端**跳过从创世逐块跟踪**，直接在某高度 H 采纳快照——重建 `set`（= `state.validators`，即认证 H+1 的集合）/`bonds`/`pubkeys`/`head`/`height`，使之与"从创世跟踪到 H"的 tracker **逐字段等价**，之后照常 `follow(H+1…)` 续跟。
