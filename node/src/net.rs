@@ -315,8 +315,23 @@ pub struct GossipNode {
     /// built the peer; caching it here makes `serve_diff` self-contained.
     pub genesis: Genesis,
     pub mempool: Mempool,
-    /// Retained certified chain, height order; `blocks[i]`/`certs[i]` is height
-    /// `i+1`. Kept so this node can answer a peer's `GetBlocks`.
+    /// M139: `(height of block at index 0) - 1` — i.e. the highest height that has
+    /// been **pruned**. Always 0 for a fresh-from-genesis node (today's contract);
+    /// set to the snapshot's tip height by [`Self::from_snapshot`]. `blocks[i]`
+    /// therefore means height `base_height + 1 + i` (and `blocks[0]` is the block at
+    /// `base_height + 1`).
+    base_height: u64,
+    /// M139: the post-`base_height` state used as the replay anchor for
+    /// `serve_diff`/`serve_lock` (which need to rebuild a per-height state
+    /// snapshot). `None` for a genesis-start node (replays from `Self::genesis` via
+    /// [`Chain::replay`]); `Some((state, base_head))` for a snapshot-boot (replays
+    /// from this via [`Chain::replay_from`]). The first variant is a heap
+    /// allocation-free `None`; the second is a single `ChainState` clone (one extra
+    /// state snapshot per node).
+    base: Option<Box<(crate::ChainState, crate::Hash)>>,
+    /// M139: retained post-`base_height` chain; `blocks[i]` is height `base_height+1+i`.
+    /// Pre-snapshot heights are NOT retained — a snapshot-booted node returns `None`
+    /// (and the HTTP layer turns that into `410 Gone`) for any height ≤ `base_height`.
     blocks: Vec<Block>,
     certs: Vec<Commit>,
     /// Content hashes of transactions already seen — makes gossip flooding
@@ -348,6 +363,9 @@ impl GossipNode {
             chain: Chain::new(genesis.clone()),
             genesis,
             mempool: Mempool::new(max_txs),
+            // M139: base=0 = genesis-start contract (byte-identical to pre-M139).
+            base_height: 0,
+            base: None,
             blocks: Vec::new(),
             certs: Vec::new(),
             seen_tx: SeenSet::new(),
@@ -357,6 +375,81 @@ impl GossipNode {
             pending_stake_ops: Vec::new(),
             peers: peers.into_iter().filter(|&p| p != id).collect(),
         }
+    }
+
+    /// M139: adopt a snapshot as the starting point. The caller MUST have verified
+    /// `snapshot` against a cert-signed header (see
+    /// [`crate::light::verify_snapshot_against_header`]) — this constructor is
+    /// infallible plumbing. `head` is the hash of the block at `snapshot.height`
+    /// (the provider attaches it; it can't be reconstructed from the state alone).
+    /// The retained `blocks`/`certs` vecs start empty; the first `apply_certified` must
+    /// be height `snapshot.height + 1`. `genesis` is still required because the chain's
+    /// identity (genesis hash) is the trust anchor for the rest of the runtime, even
+    /// though no pre-snapshot history is replayed.
+    pub fn from_snapshot(
+        id: u64,
+        genesis: Genesis,
+        snapshot: crate::ChainState,
+        head: Hash,
+        max_txs: usize,
+        peers: impl IntoIterator<Item = u64>,
+    ) -> Self {
+        let base_height = snapshot.height;
+        GossipNode {
+            id,
+            chain: Chain::from_snapshot(snapshot.clone(), head),
+            genesis,
+            mempool: Mempool::new(max_txs),
+            base_height,
+            // Clone the base state once so `serve_diff`/`serve_lock` can replay a tail
+            // onto it without re-applying the snapshot's pre-tx state themselves.
+            base: Some(Box::new((snapshot, head))),
+            blocks: Vec::new(),
+            certs: Vec::new(),
+            seen_tx: SeenSet::new(),
+            seen_evidence: SeenSet::new(),
+            seen_stake_op: SeenSet::new(),
+            pending_evidence: Vec::new(),
+            pending_stake_ops: Vec::new(),
+            peers: peers.into_iter().filter(|&p| p != id).collect(),
+        }
+    }
+
+    /// M139: vec index for committed `height` — `None` when `height ≤ base_height`
+    /// (pruned) or when `height` is past the tip. The base=0 case is byte-identical
+    /// to the prior `(height - 1) as usize` index (the existing `&`/`.get` already
+    /// filtered pre-tip / pre-base entries).
+    fn vec_idx(&self, height: u64) -> Option<usize> {
+        if height <= self.base_height {
+            return None;
+        }
+        let i = (height - 1 - self.base_height) as usize;
+        if i >= self.blocks.len() {
+            return None;
+        }
+        Some(i)
+    }
+
+    /// M139: the post-apply [`ChainState`] **at** a committed `height` (i.e. after applying
+    /// the block at `height`) — the replay anchor for `serve_diff` / `serve_lock`. For a
+    /// genesis-start node (`base == None`) this is `Chain::replay(genesis, &blocks[..height])`,
+    /// byte-identical to the pre-M139 code. For a snapshot-booted node it replays the retained
+    /// tail `&blocks[.. height - base_height]` on top of the snapshot base state via
+    /// [`Chain::replay_from`]. `None` when `height` is pruned (≤ `base_height`) or past the tip.
+    fn replay_to_state_at(&self, height: u64) -> Option<crate::ChainState> {
+        if height <= self.base_height {
+            return None;
+        }
+        let tail_len = (height - self.base_height) as usize;
+        if tail_len > self.blocks.len() {
+            return None;
+        }
+        let tail = &self.blocks[..tail_len];
+        let chain = match self.base.as_deref() {
+            None => crate::Chain::replay(self.genesis.clone(), tail).ok()?,
+            Some((state, head)) => crate::Chain::replay_from(state.clone(), *head, tail).ok()?,
+        };
+        Some(chain.state)
     }
 
     pub fn height(&self) -> u64 {
@@ -554,13 +647,13 @@ impl GossipNode {
 
     /// M126: the cert-signed [`CertifiedHeader`] (header + its finality `Commit`) at a committed
     /// `height` — the standalone unit a light client verifies against, decoupled from any account
-    /// proof. `blocks[i]`/`certs[i]` is height `i+1`; genesis (height 0, no log block/cert) and a
-    /// height past the tip ⇒ `None`.
+    /// proof. `blocks[i]`/`certs[i]` is height `base_height+1+i` (M139). Genesis (height 0, no
+    /// log block/cert), a pruned height (≤ `base_height`), and a height past the tip ⇒ `None`.
     pub fn certified_header(&self, height: u64) -> Option<CertifiedHeader> {
         if height == 0 {
             return None;
         }
-        let i = (height - 1) as usize;
+        let i = self.vec_idx(height)?;
         let block = self.blocks.get(i)?;
         let cert = self.certs.get(i)?;
         Some(CertifiedHeader::from_certified(block, cert))
@@ -568,13 +661,16 @@ impl GossipNode {
 
     /// M127: a contiguous range of certified headers for heights `[from, from+limit)` that are
     /// committed — the RPC analog of gossip header-sync, so a light client can bootstrap its
-    /// header chain over plain HTTP. `from == 0` (genesis has no log header) yields an empty
-    /// range; the result stops at the tip.
+    /// header chain over plain HTTP. `from == 0` (genesis has no log header) or `from ≤
+    /// base_height` (pruned) yields an empty range; the result stops at the tip.
     pub fn headers_range(&self, from: u64, limit: usize) -> Vec<CertifiedHeader> {
         if from == 0 {
             return Vec::new();
         }
-        let start = (from - 1) as usize;
+        if from <= self.base_height {
+            return Vec::new();
+        }
+        let start = (from - 1 - self.base_height) as usize;
         (start..self.blocks.len().min(start.saturating_add(limit)))
             .map(|i| CertifiedHeader::from_certified(&self.blocks[i], &self.certs[i]))
             .collect()
@@ -622,19 +718,17 @@ impl GossipNode {
                     // both headers from its own `self.blocks[..]` (the
                     // wallet supplied the heights; the headers are
                     // already content-addressed by the block hash the
-                    // wallet will cross-check against its M22 header
-                    // cache). This matches M28's `serve_diff`
-                    // contract: producer-side `state_at_h1` /
-                    // `state_at_h2` come from `Chain::replay` over
-                    // `self.blocks[..]`, not from the request.
-                    // `serve_diff` rejects h1 == 0 internally; we mirror
-                    // the same guard here so the `usize - 1` below can't
-                    // underflow.
-                    if h1 == 0 || h1 >= h2 || h2 > self.height() {
+                    // M139: pre-snapshot (≤ `base_height`) heights are pruned on a
+                    // snapshot-booted node; reject at the producer side so the
+                    // batch arm honestly returns `None` rather than serving
+                    // a half-replayed diff.
+                    if h1 == 0 || h1 >= h2 || h2 > self.height() || h1 <= self.base_height {
                         return None;
                     }
-                    let block_h1 = &self.blocks[h1 as usize - 1];
-                    let block_h2 = &self.blocks[h2 as usize - 1];
+                    let idx_h1 = self.vec_idx(h1)?;
+                    let idx_h2 = self.vec_idx(h2)?;
+                    let block_h1 = &self.blocks[idx_h1];
+                    let block_h2 = &self.blocks[idx_h2];
                     let header_h1 = crate::codec::BlockHeader::from_block(block_h1);
                     let header_h2 = crate::codec::BlockHeader::from_block(block_h2);
                     let env = self.serve_diff(h1, h2, &header_h1, &header_h2)?;
@@ -810,21 +904,16 @@ impl GossipNode {
         if header_h1.height != h1 || header_h2.height != h2 {
             return None;
         }
-        // The genesis is cached on the peer so we can replay from
-        // genesis to derive `state_at_h1` (the state AT height h₁ — after
-        // applying block h₁). `graph_diff` takes the h₁ side as the
-        // "previous" state, so for h₁ = 1 we replay blocks `[0..1]` (just
-        // block 1). For h₁ > 1 we replay `[0..h1]` (blocks 1..h₁). The
-        // prefix length is exactly `h1` (not `h1 - 1`) so we capture the
-        // post-block-h₁ state, not the pre-block-h₁ state.
-        let state_h1 = {
-            let prefix: Vec<crate::Block> = self.blocks[..h1 as usize].to_vec();
-            crate::Chain::replay(self.genesis.clone(), &prefix)
-                .ok()?
-                .state
-        };
-        let cert_h1 = self.certs.get((h1 - 1) as usize)?.clone();
-        let cert_h2 = self.certs.get((h2 - 1) as usize)?.clone();
+        // M139: pre-snapshot heights (h1 ≤ `base_height`) are pruned on a
+        // snapshot-booted node; we don't have the pre-snapshot history to
+        // replay. For `h1 > base_height`, replay the **tail** onto the
+        // snapshot's base state (or genesis state, when `base == None`).
+        if h1 <= self.base_height {
+            return None;
+        }
+        let state_h1 = self.replay_to_state_at(h1)?;
+        let cert_h1 = self.certs.get(self.vec_idx(h1)?)?.clone();
+        let cert_h2 = self.certs.get(self.vec_idx(h2)?)?.clone();
         let diff = self.chain.state.graph_diff(&state_h1);
         // Per-side tracked sets come from the wallet's POV: after
         // applying block `h` the set that certifies `h+1` is
@@ -832,16 +921,8 @@ impl GossipNode {
         // via `ValidatorTracker::follow`, but for the producer we
         // surface the sets as-is — the wallet re-derives them anyway
         // from its header cache.
-        let tracked_h1 = {
-            let replay =
-                crate::Chain::replay(self.genesis.clone(), &self.blocks[..h1 as usize]).ok()?;
-            replay.state.validators.clone()
-        };
-        let tracked_h2 = {
-            let replay =
-                crate::Chain::replay(self.genesis.clone(), &self.blocks[..h2 as usize]).ok()?;
-            replay.state.validators.clone()
-        };
+        let tracked_h1 = self.replay_to_state_at(h1)?.validators.clone();
+        let tracked_h2 = self.replay_to_state_at(h2)?.validators.clone();
         Some(crate::light::DiffEnvelope {
             header_prev: header_h1.clone(),
             cert_prev: cert_h1,
@@ -866,21 +947,17 @@ impl GossipNode {
         let lock = self.chain.state.bridge_locks.get(&lock_id)?.clone();
         let proof = self.chain.state.bridge_lock_proof(lock_id)?;
         let height = *self.chain.state.bridge_lock_heights.get(&lock_id)?;
-        // Heights are 1-indexed: `blocks[i]` corresponds to height `i+1`.
-        let idx = (height - 1) as usize;
+        // M139: the carrying block's header+cert. `vec_idx` returns `None` for a pruned
+        // (≤ base_height) height, so a snapshot-booted node honestly can't serve a lock
+        // whose block it no longer retains.
+        let idx = self.vec_idx(height)?;
         let block = self.blocks.get(idx)?;
         let cert = self.certs.get(idx)?;
         let header = block.header();
-        // Active set that certifies this header (the set the endpoint's
-        // tracker must follow to know the cert). Replay from genesis so we
-        // get the post-apply state for this height, the same way
-        // `serve_diff` builds per-side tracked sets.
-        let tracked_set =
-            crate::Chain::replay(self.genesis.clone(), &self.blocks[..height as usize])
-                .ok()?
-                .state
-                .validators
-                .clone();
+        // Active set that certifies this header (the set the endpoint's tracker must follow
+        // to know the cert) — the post-apply state at this height, from the same
+        // replay-from-base path `serve_diff` uses.
+        let tracked_set = self.replay_to_state_at(height)?.validators.clone();
         Some(crate::bridge::LockEnvelope {
             source_header: header,
             source_cert: cert.clone(),
@@ -914,12 +991,14 @@ impl GossipNode {
     }
 
     /// The certified blocks from `height` onward (inclusive), capped at
-    /// [`MAX_BATCH`] — the payload for a peer's `GetBlocks`.
+    /// [`MAX_BATCH`] — the payload for a peer's `GetBlocks`. M139: a snapshot-booted node
+    /// can only serve `height > base_height`; a request for a pruned height returns empty
+    /// (the requester must find a full-history peer or snapshot-sync itself).
     fn batch_from(&self, height: u64) -> Vec<(Block, Commit)> {
-        if height == 0 {
+        if height == 0 || height <= self.base_height {
             return Vec::new();
         }
-        let start = (height - 1) as usize;
+        let start = (height - 1 - self.base_height) as usize;
         (start..self.blocks.len().min(start + MAX_BATCH))
             .map(|i| (self.blocks[i].clone(), self.certs[i].clone()))
             .collect()
@@ -932,7 +1011,14 @@ impl GossipNode {
     /// Diff verifier replays the whole prefix, so a short cap would make a
     /// long-chain Diff unverifiable. `up_to == 0` ⇒ empty (a batch with no Diff
     /// item needs no range); `up_to` beyond the tip clamps to the stored tip.
+    /// M139: a snapshot-booted node (`base_height > 0`) does NOT hold the
+    /// genesis-anchored prefix `[1..=base_height]`, so it cannot serve this
+    /// full-prefix payload at all — it returns empty. A Diff verifier must pull
+    /// the prefix from a full-history peer.
     fn blocks_through(&self, up_to: u64) -> Vec<(Block, Commit)> {
+        if self.base_height > 0 {
+            return Vec::new();
+        }
         let end = (up_to as usize).min(self.blocks.len());
         (0..end)
             .map(|i| (self.blocks[i].clone(), self.certs[i].clone()))
@@ -942,19 +1028,22 @@ impl GossipNode {
     /// The cert-signed headers from `height` onward (inclusive), capped at
     /// [`MAX_BATCH`] — the payload for a peer's `GetHeaders` (M22). Drops
     /// transaction bodies, stake ops, and slashing evidence; what remains is
-    /// exactly the cert-signed prefix.
+    /// exactly the cert-signed prefix. M139: a request for a pruned height
+    /// (≤ `base_height`) returns empty.
     pub fn headers_from(&self, height: u64) -> Vec<CertifiedHeader> {
-        if height == 0 {
+        if height == 0 || height <= self.base_height {
             return Vec::new();
         }
-        let start = (height - 1) as usize;
+        let start = (height - 1 - self.base_height) as usize;
         (start..self.blocks.len().min(start + MAX_BATCH))
             .map(|i| CertifiedHeader::from_certified(&self.blocks[i], &self.certs[i]))
             .collect()
     }
 
-    /// Every retained certified header (snapshot — the cert-signed projection
-    /// of the full-node's certified chain). The light client uses this with
+    /// Every **retained** certified header (snapshot — the cert-signed projection
+    /// of the full-node's certified chain). M139: for a snapshot-booted node this is
+    /// the post-`base_height` headers only; pre-snapshot history is pruned. The light
+    /// client uses this with
     /// [`crate::light::ValidatorTracker::follow_committed`] to advance without
     /// pulling bodies.
     pub fn certified_headers(&self) -> Vec<CertifiedHeader> {
@@ -4437,5 +4526,111 @@ mod tests {
             full.serve_diff(1, 2, &header_h1, &header_h1).is_none(),
             "header_h2.height != h2"
         );
+    }
+
+    // ---- M139: snapshot offset-awareness ----
+
+    #[test]
+    fn chain_from_snapshot_and_replay_from_match_full_replay() {
+        // M139: `Chain::from_snapshot` reproduces the tip state/head of a fully-replayed
+        // chain, and `Chain::replay_from(genesis_state, genesis_hash, blocks)` is byte-
+        // identical to `Chain::replay(genesis, blocks)` (the single-replay-path guarantee).
+        let (blocks, certs) = certified_chain(3);
+        let _ = &certs;
+        let full = crate::Chain::replay(genesis(), &blocks).expect("full replay");
+
+        // from_snapshot: adopt the tip state + head, assert identical commitments.
+        let rebuilt = crate::Chain::from_snapshot(full.state.clone(), full.head);
+        assert_eq!(
+            rebuilt.state.state_root(),
+            full.state.state_root(),
+            "state_root"
+        );
+        assert_eq!(
+            rebuilt.state.merkle_root(),
+            full.state.merkle_root(),
+            "accounts_root"
+        );
+        assert_eq!(rebuilt.head, full.head, "head");
+        assert_eq!(rebuilt.state.height, full.state.height, "height");
+
+        // replay_from genesis state ≡ replay from genesis.
+        let (genesis_state, genesis_hash) = crate::ChainState::genesis(genesis());
+        let via_from =
+            crate::Chain::replay_from(genesis_state, genesis_hash, &blocks).expect("replay_from");
+        assert_eq!(via_from.state.state_root(), full.state.state_root());
+        assert_eq!(via_from.head, full.head);
+    }
+
+    #[test]
+    fn gossipnode_from_snapshot_applies_next_height() {
+        // M139: a node adopting a snapshot at height H has empty retained history, reports
+        // height H, serves no pre-H header (pruned), and accepts block H+1 forward.
+        let (blocks, certs) = certified_chain(3); // heights 1,2,3
+                                                  // State AT height 1 (the snapshot point) — the provider's `snapshot` + `head`.
+        let at_1 = crate::Chain::replay(genesis(), &blocks[..1]).expect("replay to 1");
+        let mut snap =
+            GossipNode::from_snapshot(1, genesis(), at_1.state.clone(), at_1.head, 8, []);
+        assert_eq!(snap.height(), 1, "adopted height");
+        assert!(snap.blocks().is_empty(), "no pre-snapshot history retained");
+        // Pruned: the snapshot node cannot serve the header at height 1 (or below).
+        assert!(snap.certified_header(1).is_none(), "height 1 is pruned");
+
+        // Apply block 2 (prev_hash == head@1, height == 2) — must succeed and append.
+        assert!(
+            snap.apply_certified(blocks[1].clone(), certs[1].clone()),
+            "block 2 applies on top of the snapshot"
+        );
+        assert_eq!(snap.height(), 2);
+        // Now the post-snapshot header is served; the pruned one still isn't.
+        let h2 = snap.certified_header(2).expect("height 2 served");
+        assert_eq!(h2.header.height, 2);
+        assert!(snap.certified_header(1).is_none(), "height 1 still pruned");
+        // blocks[0] of the snapshot node is height 2 (offset-aware indexing).
+        assert_eq!(snap.blocks().len(), 1);
+        assert_eq!(snap.blocks()[0].height, 2);
+    }
+
+    #[test]
+    fn pruned_node_serves_post_snapshot_diff_and_gones_pre_snapshot() {
+        // M139: a snapshot-booted node (base_height = 1) serves a Diff over post-snapshot
+        // heights [2,3] (replay-from-base), and returns None for any range touching the
+        // pruned height 1 (the HTTP layer turns that into 410 Gone in M140).
+        let (blocks, certs) = certified_chain(3); // heights 1,2,3
+        let at_1 = crate::Chain::replay(genesis(), &blocks[..1]).expect("replay to 1");
+        let mut snap =
+            GossipNode::from_snapshot(1, genesis(), at_1.state.clone(), at_1.head, 8, []);
+        // Feed heights 2 and 3 forward.
+        assert!(snap.apply_certified(blocks[1].clone(), certs[1].clone()));
+        assert!(snap.apply_certified(blocks[2].clone(), certs[2].clone()));
+        assert_eq!(snap.height(), 3);
+
+        // Post-snapshot Diff [2,3] serves (headers from the retained tail).
+        let header_h2 = crate::codec::BlockHeader::from_block(&blocks[1]);
+        let header_h3 = crate::codec::BlockHeader::from_block(&blocks[2]);
+        let env = snap
+            .serve_diff(2, 3, &header_h2, &header_h3)
+            .expect("pruned node serves a post-snapshot diff");
+        assert_eq!(env.header_prev.height, 2);
+        assert_eq!(env.header_new.height, 3);
+
+        // A Diff touching the pruned height 1 is refused (can't replay pre-snapshot state).
+        let header_h1 = crate::codec::BlockHeader::from_block(&blocks[0]);
+        assert!(
+            snap.serve_diff(1, 3, &header_h1, &header_h3).is_none(),
+            "pre-snapshot h1=1 is pruned"
+        );
+        // Likewise serve_lock / headers_from / headers_range refuse pruned heights.
+        assert!(snap.headers_from(1).is_empty(), "headers_from(1) pruned");
+        assert_eq!(
+            snap.headers_from(2).len(),
+            2,
+            "headers_from(2) returns heights 2,3"
+        );
+        assert!(
+            snap.headers_range(1, 10).is_empty(),
+            "headers_range from pruned height is empty"
+        );
+        assert_eq!(snap.headers_range(2, 10).len(), 2);
     }
 }

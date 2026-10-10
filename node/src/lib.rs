@@ -2242,6 +2242,41 @@ impl Chain {
         }
     }
 
+    /// M139: adopt a [`ChainState`] snapshot as the starting point of a [`Chain`] — the
+    /// foundation of full-node fast-sync (M140 wires the boot). The caller MUST have
+    /// verified the snapshot against a cert-signed header (see
+    /// [`crate::light::verify_snapshot_against_header`]); this constructor is infallible
+    /// because it's just plumbing. `state.genesis_hash` and `head` together identify
+    /// "this snapshot, at this tip"; `block_hashes[1] = head` so `Chain::commit` can
+    /// continue cleanly from height `state.height + 1`.
+    pub fn from_snapshot(state: ChainState, head: Hash) -> Self {
+        let genesis_hash = state.genesis_hash;
+        Chain {
+            state,
+            head,
+            genesis_hash,
+            block_hashes: vec![genesis_hash, head],
+        }
+    }
+
+    /// M139: replay `blocks` on top of a pre-built `base` state (e.g. a snapshot). The
+    /// base must already be at height `0`; `blocks[0]` is the block at height 1 on top of
+    /// it. Distinct from [`Self::replay`] (which always starts from genesis) so a
+    /// snapshot-booted node can produce per-side `tracked_set` for a post-snapshot Diff
+    /// without needing the pre-snapshot history.
+    pub fn replay_from(
+        base: ChainState,
+        base_head: Hash,
+        blocks: &[Block],
+    ) -> Result<Self, ChainError> {
+        let mut chain = Self::from_snapshot(base, base_head);
+        for b in blocks {
+            let mut b = b.clone();
+            chain.commit(&mut b)?;
+        }
+        Ok(chain)
+    }
+
     /// The validator-set Merkle root this block would hand off to (the set that
     /// certifies the next height), computed by trial-applying the block on a
     /// clone with the commitment check disabled. The producer uses this to

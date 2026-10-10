@@ -1341,6 +1341,23 @@ M116 的 `node rpc` 只能 GET。M117 补上写侧，让它成为**全能** RPC 
 
 **已知边界（顺延至 M121+）**：身份读三类已齐（`/genesis` 链 / `/node` 节点 / `/info` 链尖）；读面两分（`/params`/`/config`）已齐；RPC 自带端点发现 + 全能客户端 + 完整链读/写面；内容协商三轴已齐（仅 `identity`，真压缩顺延）；离线工具篮子已补；运维篮子剩余：证书/密钥轮换与落盘、follower 认证、指标端 TLS、OTel/push exporter、每-sink 独立 rotation 覆盖、时延直方图；keygen 篮子剩余：助记词 / BIP-39、口令加密 keystore、密钥轮换；剩余：游标分页、未知方法 `405`；共识 / wire 篮子（破 head 不变量）：**货币费用** + 费用优先排序、nonce / 序列号反重放。
 
+## `GossipNode` 偏移感知 + 快照构造函数（Milestone 139 · 快速同步 full-node 基础）
+
+承接 M136 的轻客户端 fast-sync：full-node 端 `node run --snapshot` 仍待做，但**最深的依赖**——让 `GossipNode` 能从任意高度起算（而非硬假设 `blocks[0]` = 高度 1）——本轮做成。M139 是**仅做 `GossipNode` 改造**（+ `Chain::from_snapshot`/`replay_from` 两个新构造函数），daemon wiring + log 截断 + E2E 留给 M140。
+
+- **设计核心**：加 `base_height: u64`（默认 0 = 创世起算的现契约）+ `base: Option<Box<(ChainState, Hash)>>`（None = 现行为、`Some(_)` = 快照起算）。引入**一个** 私有 helper `vec_idx(height) -> Option<usize>`（高度 ≤ `base_height` → `None` 视为**已裁剪**）与 `replay_to_state_at(height) -> Option<ChainState>`（按 `base` 是否为 None 走 `Chain::replay` 或 `Chain::replay_from`）——所有 ~9 个索引点统一通过这两 helper。
+- **base=0 路径逐字节保持**：helper 在 `base == None` 时走 `Chain::replay(genesis, &self.blocks[..h])` 与 `Chain::replay_from(genesis_state, genesis_hash, blocks)` 等价——**`Chain::replay` 被重新实现为 `replay_from(genesis_state, genesis_hash, blocks)` 的一层薄壳**（单条 replay 代码路径），既有 559 测全绿即是**等价性证明**。
+- **pruned-serve 行为**：高度 ≤ `base_height` 的读请求（`certified_header`/`headers_range`/`headers_from`/`batch_from`/`serve_lock`/`serve_batch` Diff 臂）返 `None`（daemon HTTP 层在 M140 翻译为 **410 Gone**——区别于"未找到" `404`，是规范准确的"被裁剪"语义）。`serve_diff` 的全套 prefix replay（`Chain::replay(genesis, &self.blocks[..h1..h2])`）改走 `replay_to_state_at(h?)`——在 base=0 时与原行为一致，在 base>0 时从快照基态回放尾部。
+- **新 `Chain` API**（`src/lib.rs`）：`Chain::from_snapshot(state, head) -> Self` 不可错构造（`state.genesis_hash` + `head` 一起是"在某尖端的这份状态"），`Chain::replay_from(base_state, base_head, blocks) -> Result<Self, _>` 与 `Chain::replay` 等价（base=0 路径）。
+- **新 `GossipNode` API**（`src/net.rs`）：`GossipNode::from_snapshot(id, genesis, snapshot: ChainState, head, max_txs, peers) -> Self`——返回带 `base_height = snapshot.height`、`base = Some(_)`、空 `blocks`/`certs` 的节点；`apply_certified` 自然接受 H+1 起的块（高度用 `self.height()` 不受 offset 影响）。
+- **零内存开销在默认情况**：`Option<Box<_>>` 的 `None` 不分配；快照路径只多一个 `ChainState` 克隆。
+- **不变量保持**：`load_certified` / `apply_certified` 的 height/prev_hash 校验用 `self.height()`（`chain.state.height`）——已是 offset-safe。`diff`/`batch`/`proof` 路径中只有 replay-from-slice 受影响（已改走新 helper）。`localnet` 头仍 wire v1 `a045426e…3b87bc`（默认配置永不构造快照节点）。
+- **测试（+3 → 562）**：`chain_from_snapshot_and_replay_from_match_full_replay`（`from_snapshot` 状态三根相等 + `replay_from` ≡ `replay`）、`gossipnode_from_snapshot_applies_next_height`（采纳 H=1 后 `height()=1`、H+1=2 成功 commit、`blocks[0].height=2`、`certified_header(1)`=None 裁剪）、`pruned_node_serves_post_snapshot_diff_and_gones_pre_snapshot`（[2,3] 差分成功 + 触碰 1 的请求一律 None）。
+
+**后续步骤（顺延至 M140）**：daemon `Node::start` 接受 `--snapshot FILE --snapshot-header HEX`——读+`light::verify_snapshot_against_header` 验证后构造 `GossipNode::from_snapshot`、截断 `blocks.log`/`certs.log`、`Actor::appended=0`、跳过 pre-seed `tx_index`。新 `[run] snapshot` / `[run] snapshot_header` 配置项。E2E 测：driver 链→`node snapshot`→`node run --snapshot`→新节点 height H、empty `self.blocks()`、从 H+1 续 gossip。
+
+**已知边界（顺延至 M141+）**：其余运维/读/依赖项不变；full-node 快照启动（M140）+ light 端 `LightGossipNode` 快照种子（M141 候选）均依赖 M139 这条基础。
+
 ## `zhixing_tx_submit_to_commit_seconds` 直方图 — tx 提交到落定的端到端时延（Milestone 138）
 
 补齐观测面三型的最后一种用法场景：M125 是 **块落定**时延（consensus→committed，μs-级），M138 是 **tx 提交→落定**时延（submit→commit，秒-级）——把"我提交的交易要等多久才被法定人数认证"这一**用户最关心的延迟**做成在线可观测的 Prometheus 直方图。
