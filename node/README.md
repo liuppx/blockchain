@@ -1341,6 +1341,17 @@ M116 的 `node rpc` 只能 GET。M117 补上写侧，让它成为**全能** RPC 
 
 **已知边界（顺延至 M121+）**：身份读三类已齐（`/genesis` 链 / `/node` 节点 / `/info` 链尖）；读面两分（`/params`/`/config`）已齐；RPC 自带端点发现 + 全能客户端 + 完整链读/写面；内容协商三轴已齐（仅 `identity`，真压缩顺延）；离线工具篮子已补；运维篮子剩余：证书/密钥轮换与落盘、follower 认证、指标端 TLS、OTel/push exporter、每-sink 独立 rotation 覆盖、时延直方图；keygen 篮子剩余：助记词 / BIP-39、口令加密 keystore、密钥轮换；剩余：游标分页、未知方法 `405`；共识 / wire 篮子（破 head 不变量）：**货币费用** + 费用优先排序、nonce / 序列号反重放。
 
+## `GET /supply` 暴露供应守恒验算 + 判词（Milestone 130)
+
+M104 的 `/supply` 回原始资金池（`supply`/`treasury`/`bonded`/`bridge_locked`/`bridge_minted`），但**没暴露守恒等式的两个关键项**（Σ账户余额、解绑中金额）**也没给判词**——客户端想核对 `Σ余额 + treasury + bonded + unbonding + bridge_locked == supply`（M78 `supply_conserved`）只能自己拉全账户求和。M130 把 `accounts_balance`、`unbonding`、`conserved:bool` 补进 `/supply`，让监控经一次 RPC 即审计这条核心不变量——**M128 离线 `verify` 的在线对应**。
+
+- **改动**：`SupplyView` +`accounts_balance`/`unbonding`/`conserved`；`Cmd::QuerySupply` 用与 `supply_conserved` 相同的 u128 加宽算 Σ余额与 unbonding、并带回 `s.supply_conserved()` 判词；`format_supply`/`json_supply` 加对应字段（`conserved` 为**裸 JSON bool**，非引号串）。
+- **价值**：供应守恒是本链最强的经济不变量（30+ 处测试守护）；现经 `/supply` 即可被 scraper/告警直接消费（`conserved=false` 即红线），无需重算。
+- **不变量保持**：纯读、无 wire/共识/状态/依赖改动、RPC 默认关，故 `localnet` head 仍 wire v1 `a045426e…3b87bc`。
+- **测试（强化既有 → 546）**：`supply_renders_text_and_json`（守恒一致样本 947700+2000+50000+0+300==1000000、新字段齐、`conserved=true`/裸 bool）；TCP `rpc_supply_over_tcp`（新字段顺序 + `conserved=true` 文本/JSON）。
+
+**已知边界（顺延至 M131+）**：读/审计面已把核心不变量做成在线可验；剩余多需引依赖（`Accept-Encoding` 真压缩、keystore 口令加密、OTel/push exporter、指标端 TLS）或属运维篮子（证书/密钥轮换与落盘、follower 认证、每-sink rotation、RPC 时延直方图——需跨任务原子）；生产路线大件：状态裁剪/快照/快速同步（零依赖但工作量大，需全状态 codec）。均在"不破 head"（wire v1 已冻结）前提下推进。
+
 ## `GET /block/{height}` 暴露 wire-v1 proposer + 费用（Milestone 129）
 
 M113 的 `/block/{height}` 读回块头摘要（高度/哈希/`state_root`/`accounts_root` + 各体计数），但**没暴露 M122 wire-v1 新增的 `proposer`**——出块验证人（即本块 tx 费用的受益人）经 RPC **不可见**。M129 把 `proposer` 与 `fees`（本块 `tx.fee` 之和，即 proposer 实得 micro-$COG）补进 `BlockSummary`。

@@ -1433,12 +1433,19 @@ async fn run_actor(mut actor: Actor, mut rx: mpsc::UnboundedReceiver<Cmd>) {
             Cmd::QuerySupply { reply } => {
                 // M104: snapshot the supply-conservation totals from committed state.
                 let s = &actor.node.chain.state;
+                // M130: the two derived terms + the conservation verdict, computed under the
+                // same u128 widening as `supply_conserved` so they add up exactly.
+                let accounts_balance: u128 = s.accounts.values().map(|a| a.balance as u128).sum();
+                let unbonding: u128 = s.unbonding.iter().map(|u| u.amount as u128).sum();
                 let _ = reply.send(SupplyView {
                     supply: s.supply,
                     treasury: s.treasury,
                     bonded: s.bonded,
                     bridge_locked: s.bridge_locked,
                     bridge_minted: s.bridge_minted,
+                    accounts_balance: accounts_balance.min(u64::MAX as u128) as u64,
+                    unbonding: unbonding.min(u64::MAX as u128) as u64,
+                    conserved: s.supply_conserved(),
                 });
             }
             Cmd::QueryParams { reply } => {
@@ -3964,13 +3971,29 @@ struct SupplyView {
     bonded: u64,
     bridge_locked: u64,
     bridge_minted: u64,
+    /// M130: Σ of all account balances — the largest conservation term, so a client can audit
+    /// `accounts_balance + treasury + bonded + bridge_locked + unbonding == supply` itself.
+    accounts_balance: u64,
+    /// M130: Σ of micro-$COG in the unbonding-delay queue (held out of balances, still in supply).
+    unbonding: u64,
+    /// M130: the node's own verdict on the supply-conservation invariant (`supply_conserved`),
+    /// so a monitor can alert on a breach without re-summing — the on-wire analog of M128's
+    /// offline `verify`.
+    conserved: bool,
 }
 
 /// M104: render the supply snapshot as a grep-friendly `key=value` line. Pure for testing.
 fn format_supply(s: &SupplyView) -> String {
     format!(
-        "supply={} treasury={} bonded={} bridge_locked={} bridge_minted={}",
-        s.supply, s.treasury, s.bonded, s.bridge_locked, s.bridge_minted,
+        "supply={} accounts_balance={} treasury={} bonded={} unbonding={} bridge_locked={} bridge_minted={} conserved={}",
+        s.supply,
+        s.accounts_balance,
+        s.treasury,
+        s.bonded,
+        s.unbonding,
+        s.bridge_locked,
+        s.bridge_minted,
+        s.conserved,
     )
 }
 
@@ -3978,12 +4001,15 @@ fn format_supply(s: &SupplyView) -> String {
 /// quoted-u64 scalars (matching the convention of the other reads).
 fn json_supply(s: &SupplyView) -> String {
     format!(
-        "{{\"supply\":{},\"treasury\":{},\"bonded\":{},\"bridge_locked\":{},\"bridge_minted\":{}}}",
+        "{{\"supply\":{},\"accounts_balance\":{},\"treasury\":{},\"bonded\":{},\"unbonding\":{},\"bridge_locked\":{},\"bridge_minted\":{},\"conserved\":{}}}",
         json_u64(s.supply),
+        json_u64(s.accounts_balance),
         json_u64(s.treasury),
         json_u64(s.bonded),
+        json_u64(s.unbonding),
         json_u64(s.bridge_locked),
         json_u64(s.bridge_minted),
+        s.conserved,
     )
 }
 
@@ -9743,8 +9769,14 @@ mod tests {
         // A fresh chain: zero slashed treasury, zero bonded/bridge pools; a nonzero supply.
         assert!(body.starts_with("supply="), "supply text: {body}");
         assert!(
-            body.contains("treasury=0 bonded=0 bridge_locked=0 bridge_minted=0"),
+            body.contains("treasury=0 bonded=0 unbonding=0 bridge_locked=0 bridge_minted=0"),
             "fresh pools: {body}"
+        );
+        // M130: the node reports the conservation invariant holds, and the Σ-balance term shows.
+        assert!(body.contains("conserved=true"), "conserved: {body}");
+        assert!(
+            body.contains("accounts_balance="),
+            "accounts_balance: {body}"
         );
 
         // JSON representation carries the same values as a quoted-u64 object.
@@ -9755,7 +9787,12 @@ mod tests {
         );
         let jbody = body_of(&as_json);
         assert!(jbody.starts_with("{\"supply\":\""), "supply json: {jbody}");
-        assert!(jbody.contains("\"treasury\":\"0\",\"bonded\":\"0\",\"bridge_locked\":\"0\",\"bridge_minted\":\"0\""), "json pools: {jbody}");
+        assert!(jbody.contains("\"treasury\":\"0\",\"bonded\":\"0\",\"unbonding\":\"0\",\"bridge_locked\":\"0\",\"bridge_minted\":\"0\""), "json pools: {jbody}");
+        // M130: `conserved` is a bare JSON bool (not a quoted string).
+        assert!(
+            jbody.contains("\"conserved\":true"),
+            "json conserved: {jbody}"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -11962,21 +11999,26 @@ vote_b.validator=5 vote_b.height=9 vote_b.round=2 vote_b.block_hash={b_h} vote_b
 
     #[test]
     fn supply_renders_text_and_json() {
-        // M104: the snapshot renders a grep line and a quoted-u64 JSON object.
+        // M104/M130: the snapshot renders a grep line and a quoted-u64 JSON object, now including
+        // the Σ-balance / unbonding terms and the `conserved` verdict (a bare JSON bool).
+        // The example is conservation-consistent: 947700 + 2000 + 50000 + 0 + 300 == 1000000.
         let s = SupplyView {
             supply: 1_000_000,
             treasury: 2_000,
             bonded: 50_000,
             bridge_locked: 300,
             bridge_minted: 42,
+            accounts_balance: 947_700,
+            unbonding: 0,
+            conserved: true,
         };
         assert_eq!(
             format_supply(&s),
-            "supply=1000000 treasury=2000 bonded=50000 bridge_locked=300 bridge_minted=42"
+            "supply=1000000 accounts_balance=947700 treasury=2000 bonded=50000 unbonding=0 bridge_locked=300 bridge_minted=42 conserved=true"
         );
         assert_eq!(
             json_supply(&s),
-            "{\"supply\":\"1000000\",\"treasury\":\"2000\",\"bonded\":\"50000\",\"bridge_locked\":\"300\",\"bridge_minted\":\"42\"}"
+            "{\"supply\":\"1000000\",\"accounts_balance\":\"947700\",\"treasury\":\"2000\",\"bonded\":\"50000\",\"unbonding\":\"0\",\"bridge_locked\":\"300\",\"bridge_minted\":\"42\",\"conserved\":true}"
         );
     }
 
