@@ -581,12 +581,49 @@ impl ValidatorTracker {
         }
     }
 
+    /// M136: adopt a [`ChainState`](crate::ChainState) snapshot as the tracker's starting
+    /// point — fast-sync primitive for a light client. After this call, the tracker is
+    /// indistinguishable from one that had followed every block up to `state.height`
+    /// (its `set`/`bonds`/`head` all match the live chain's); the very next
+    /// [`Self::follow`] expects block `state.height + 1`. The `pubkeys` table is seeded
+    /// from `state.accounts`. The `head_hash` is the hash of the block at the snapshot's
+    /// tip — the provider MUST attach it (a snapshot alone can't reconstruct it, since the
+    /// block's bytes are not part of the state). This is the canonical way a light client
+    /// fast-syncs: download snapshot + head hash + next cert, then resume [`Self::follow`].
+    pub fn from_snapshot(state: &crate::ChainState, head_hash: Hash) -> Self {
+        use crate::validator::Validator;
+        let set = ValidatorSet::new(
+            state
+                .validators
+                .validators()
+                .iter()
+                .map(|v| Validator {
+                    id: v.id,
+                    pubkey: v.pubkey,
+                    power: v.power,
+                })
+                .collect(),
+        );
+        let bonds = state.bonds.clone();
+        let pubkeys: BTreeMap<u64, PubKey> = state
+            .accounts
+            .iter()
+            .map(|(&id, a)| (id, a.pubkey))
+            .collect();
+        ValidatorTracker {
+            set,
+            bonds,
+            pubkeys,
+            head: head_hash,
+            height: state.height,
+        }
+    }
+
     /// The validator set active for the *next* height (the set that certifies
     /// it). After following height H this is the set that certifies H+1.
     pub fn validators(&self) -> &ValidatorSet {
         &self.set
     }
-
     /// Height of the last followed block (0 = only genesis so far).
     pub fn height(&self) -> u64 {
         self.height
@@ -3438,5 +3475,74 @@ mod tests {
         )
         .unwrap_err();
         assert!(matches!(err, LightError::Consensus(_)), "got {err}");
+    }
+
+    #[test]
+    fn from_snapshot_tracker_matches_full_tracker_and_resumes() {
+        // M136: a light client that adopts a snapshot at height H is indistinguishable from one
+        // that followed every block to H — same height/head/validator set — AND can resume
+        // following H+1 forward. Uses a validator update so the set at H differs from genesis,
+        // which makes the set-reconstruction non-trivial.
+        let mut d = driver(base_genesis());
+        // h1: add validator 24 (power 5); h2: a plain tx height.
+        d.stage_validator_update(ValidatorUpdate {
+            id: 24,
+            pubkey: kp(24).public(),
+            power: 5,
+        });
+        d.produce(1.0, &no_silence()).unwrap().expect("block 1");
+        d.submit(novel_tx_nonce(1, 7, 2, 2.0, 0)).unwrap();
+        d.produce(2.0, &no_silence()).unwrap().expect("block 2");
+
+        // A from-genesis tracker that followed both blocks — the ground truth.
+        let mut full = ValidatorTracker::from_genesis(&base_genesis());
+        full.follow_all(d.blocks(), d.certificates())
+            .expect("follow all");
+
+        // Capture the snapshot (state @ height 2) + the head hash the provider would attach.
+        let snapshot = d.chain.state.clone();
+        let head_at_2 = d.chain.head;
+
+        // Adopt the snapshot — must reproduce the full tracker's view exactly.
+        let mut snap = ValidatorTracker::from_snapshot(&snapshot, head_at_2);
+        assert_eq!(snap.height(), full.height(), "height");
+        assert_eq!(snap.head(), full.head(), "head");
+        assert_eq!(
+            ids_powers(snap.validators()),
+            ids_powers(full.validators()),
+            "validator set (incl. the added validator 24)"
+        );
+
+        // Now produce height 3 and show BOTH trackers follow it identically — the snapshot
+        // tracker resumes from H+1 without ever having seen heights 1..=2.
+        d.submit(novel_tx_nonce(1, 8, 3, 3.0, 1)).unwrap();
+        d.produce(3.0, &no_silence()).unwrap().expect("block 3");
+        let b3 = d.blocks()[2].clone();
+        let c3 = d.certificates()[2].clone();
+        full.follow(&b3, &c3).expect("full follows 3");
+        snap.follow(&b3, &c3)
+            .expect("snapshot tracker resumes at 3");
+        assert_eq!(snap.height(), 3);
+        assert_eq!(snap.head(), full.head(), "heads agree after resume");
+        assert_eq!(snap.head(), d.chain.head, "head matches the live chain");
+    }
+
+    #[test]
+    fn from_snapshot_rejects_a_forked_next_block() {
+        // M136: a snapshot tracker starting at H chains strictly — a block whose prev_hash
+        // isn't the snapshot's head is a fork/splice and rejected (same guard as a
+        // from-genesis tracker), so fast-sync can't be tricked into a wrong branch.
+        let mut d = driver(base_genesis());
+        d.submit(novel_tx(1, 1, 1, 1.0)).unwrap();
+        d.produce(1.0, &no_silence()).unwrap().expect("block 1");
+        // Adopt the snapshot at height 1 with a WRONG head hash.
+        let mut snap = ValidatorTracker::from_snapshot(&d.chain.state, [0xABu8; 32]);
+        // Produce height 2 on the real chain; its prev_hash is the real head, not [0xAB;32].
+        d.submit(novel_tx_nonce(1, 2, 2, 2.0, 1)).unwrap();
+        d.produce(2.0, &no_silence()).unwrap().expect("block 2");
+        let b2 = d.blocks()[1].clone();
+        let c2 = d.certificates()[1].clone();
+        let err = snap.follow(&b2, &c2).unwrap_err();
+        assert!(matches!(err, LightError::ForkDetected { .. }), "got {err}");
     }
 }

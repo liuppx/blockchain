@@ -1341,6 +1341,17 @@ M116 的 `node rpc` 只能 GET。M117 补上写侧，让它成为**全能** RPC 
 
 **已知边界（顺延至 M121+）**：身份读三类已齐（`/genesis` 链 / `/node` 节点 / `/info` 链尖）；读面两分（`/params`/`/config`）已齐；RPC 自带端点发现 + 全能客户端 + 完整链读/写面；内容协商三轴已齐（仅 `identity`，真压缩顺延）；离线工具篮子已补；运维篮子剩余：证书/密钥轮换与落盘、follower 认证、指标端 TLS、OTel/push exporter、每-sink 独立 rotation 覆盖、时延直方图；keygen 篮子剩余：助记词 / BIP-39、口令加密 keystore、密钥轮换；剩余：游标分页、未知方法 `405`；共识 / wire 篮子（破 head 不变量）：**货币费用** + 费用优先排序、nonce / 序列号反重放。
 
+## `ValidatorTracker::from_snapshot` — 轻客户端从快照 live 引导（Milestone 136 · 快速同步 live 消费者)
+
+把快照工具链接到一个**真正 live 的消费者**：轻客户端。`ValidatorTracker::from_snapshot(&ChainState, head_hash)` 让轻客户端**跳过从创世逐块跟踪**，直接在某高度 H 采纳快照——重建 `set`（= `state.validators`，即认证 H+1 的集合）/`bonds`/`pubkeys`/`head`/`height`，使之与"从创世跟踪到 H"的 tracker **逐字段等价**，之后照常 `follow(H+1…)` 续跟。
+
+- **为什么选轻客户端而非 full daemon**：`ValidatorTracker` 只按 header 跟踪验证人集、不存全块历史，天然适配"从检查点起步"；full `GossipNode` 的 `blocks`/`certs` 索引硬假设 history 从高度 1 落盘（`self.blocks[h-1]`，~10 处 + Diff/replay），改成 offset-aware 是独立大件（见下），不该塞进本轮。
+- **信任模型**：快照的真实性由 M134 `verify_snapshot_against_header` 在采纳**前**保证（对调用方信任的"H 高度验证人集"验 cert——弱主观性检查点）；`head_hash` 由快照提供方随附（状态本身无法重算出 tip 块哈希，因块字节不在状态里）。采纳后 tracker 严格链式跟进：下一块 `prev_hash` 必须等于 `head_hash`，否则 `ForkDetected`——fast-sync 无法被骗到错误分支。
+- **纯库原语**：零 I/O、不碰 head。
+- **测试（+2 → 559）**：`from_snapshot_tracker_matches_full_tracker_and_resumes`（含一个验证人更新使 set≠创世：采纳快照后 height/head/验证人集与 full tracker 逐一相等，且能续跟 H+1 到相同 head）、`from_snapshot_rejects_a_forked_next_block`（错 head_hash 起步 → 下一块 `ForkDetected`）。
+
+**快速同步大件收官**：离线工具链（M131 codec→M132 导出→M133 检视→M134 密码学校验→M135 CLI 闭环）+ 本轮 M136 的**轻客户端 live 引导**，整套 fast-sync 对**轻客户端**已端到端可用（下载快照+头+cert → 验 M134 → `from_snapshot` → 续 `follow`）。**仍待做**：full-node daemon 的快照启动（`node run --snapshot`）需 `GossipNode`/`LightGossipNode` 的 blocks/certs 索引全面 offset-aware——一个独立大件（M137+ 候选），不阻塞轻客户端 fast-sync。
+
 ## `node check-snapshot --snapshot F --header HEX` — 快照对头的离线交叉校验 CLI（Milestone 135 · 快速同步工具闭环)
 
 把 M134 的校验密码学包成**可直接跑的 CLI**：`node check-snapshot --snapshot FILE --header HEX` 解码 M131 快照 + 一个 cert-signed `BlockHeader`（`GET /header/{h}`/`/headers` 回的 on-wire hex 形），核对**高度 + 三个 cert-signed 根**（state_root/accounts_root/bridge_root）一致；任一不符即非零退出 + stderr。`--snapshot -` 读 stdin（配 `snapshot --out -` 可全管道）。
