@@ -314,6 +314,7 @@ fn main() {
         "localnet" => cmd_localnet(),
         "status" => cmd_status(dir_arg(&args)),
         "verify" => cmd_verify(dir_arg(&args)),
+        "snapshot" => cmd_snapshot(dir_arg(&args), req_arg(&args, "--out").to_string()),
         "inspect-block" => cmd_inspect_block(&args),
         "inspect-cert" => cmd_inspect_cert(&args),
         "certs" => cmd_certs(dir_arg(&args)),
@@ -406,6 +407,7 @@ fn usage() {
     eprintln!("  node localnet           spin up an in-process tokio testnet (4 validators, no sequencer) and show all nodes converge via distributed BFT voting over real sockets");
     eprintln!("  node status --dir DIR   replay the block log and print state");
     eprintln!("  node verify --dir DIR   replay blocks+certs logs through finality verification; non-zero exit on any integrity error (missing log, length mismatch, cert mismatch, < 2/3 quorum)");
+    eprintln!("  node snapshot --dir DIR --out FILE  export the chain (replay-verified) as a M131 snapshot blob; --out - writes to stdout");
     eprintln!("  node inspect-block --dir DIR [--height N]  read the persisted block log and print a per-block summary, or (with --height) one block's header + contents + tx hashes");
     eprintln!("  node inspect-cert  --dir DIR [--height N]  read the persisted cert log and print a per-cert summary, or (with --height) one finality certificate's height/round/block_hash + precommit voters");
     eprintln!("  node certs  --dir DIR   persist a certified chain (blocks+certs) and re-verify finality on reload");
@@ -4356,6 +4358,53 @@ fn verify_logs(dir: &str) -> VerifyOutcome {
     }
 }
 
+/// M132: load the on-disk chain (replay-verified) and hand the caller the reconstructed
+/// `Chain` so a snapshot can be exported. I/O and finality-replay errors surface as
+/// `SnapshotReplayError` variants that the CLI maps to a non-zero exit + stderr.
+enum SnapshotReplayError {
+    Io {
+        what: &'static str,
+        path: String,
+        err: std::io::Error,
+    },
+    Replay(zhixing_node::ReplayError),
+}
+
+impl std::fmt::Display for SnapshotReplayError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Io { what, path, err } => write!(f, "{what} ({path}): {err}"),
+            Self::Replay(e) => write!(f, "replay_verified: {e}"),
+        }
+    }
+}
+
+impl std::fmt::Debug for SnapshotReplayError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{self}")
+    }
+}
+
+fn replay_for_snapshot(dir: &str) -> Result<Chain, SnapshotReplayError> {
+    let bpath = format!("{dir}/blocks.log");
+    let cpath = format!("{dir}/certs.log");
+    let blocks = BlockLog::open(&bpath)
+        .and_then(|l| l.read_all())
+        .map_err(|e| SnapshotReplayError::Io {
+            what: "open/read blocks.log",
+            path: bpath,
+            err: e,
+        })?;
+    let certs = CertLog::open(&cpath)
+        .and_then(|l| l.read_all())
+        .map_err(|e| SnapshotReplayError::Io {
+            what: "open/read certs.log",
+            path: cpath,
+            err: e,
+        })?;
+    Chain::replay_verified(demo_genesis(), &blocks, &certs).map_err(SnapshotReplayError::Replay)
+}
+
 /// M128: `node verify --dir DIR` — the operator's finality audit. Replays `blocks.log` against
 /// `certs.log` and prints a one-line verdict. Exits **non-zero** on any integrity error
 /// (missing log, length mismatch, cert doesn't bind its block, < 2/3 quorum, …) so a
@@ -4381,6 +4430,47 @@ fn cmd_verify(dir: String) {
             exit(1);
         }
     }
+}
+
+/// M132: `node snapshot --dir DIR --out FILE` — export the on-disk chain (after finality
+/// replay) as a M131 snapshot blob. `--out -` writes to stdout for piping (e.g. to
+/// `gzip` or a network); otherwise the snapshot is written to `FILE`. Errors map to
+/// non-zero exit + stderr.
+fn cmd_snapshot(dir: String, out: String) {
+    let chain = match replay_for_snapshot(&dir) {
+        Ok(c) => c,
+        Err(SnapshotReplayError::Io { what, path, err }) => {
+            eprintln!("error: {what} ({path}): {err}");
+            exit(1);
+        }
+        Err(SnapshotReplayError::Replay(e)) => {
+            eprintln!("error: replay_verified: {e}");
+            exit(1);
+        }
+    };
+    let bytes = zhixing_node::codec::encode_snapshot(&chain.state);
+    if out == "-" {
+        use std::io::Write;
+        let stdout = std::io::stdout();
+        let mut h = stdout.lock();
+        if let Err(e) = h.write_all(&bytes) {
+            eprintln!("error: write snapshot to stdout: {e}");
+            exit(1);
+        }
+    } else {
+        if let Err(e) = std::fs::write(&out, &bytes) {
+            eprintln!("error: write snapshot to {out}: {e}");
+            exit(1);
+        }
+    }
+    eprintln!(
+        "wrote {} byte(s) to {}; height {}; head {}; state_root {}",
+        bytes.len(),
+        if out == "-" { "<stdout>" } else { &out },
+        chain.state.height,
+        short(&chain.head),
+        short(&chain.state.state_root()),
+    );
 }
 
 /// Demonstrate certificate persistence and *replay-as-finality-verification*.
@@ -4834,6 +4924,58 @@ mod tests {
                 assert_eq!(certs, 1);
             }
             other => panic!("expected CountMismatch, got {other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn snapshot_export_round_trips_through_decode() {
+        // M132: a persisted demo chain survives replay, the exported snapshot blob decodes
+        // back, and the three cert-signed state roots agree (proves the snapshot is the
+        // post-finality state, not a partial re-apply).
+        let dir = tmpdir("snapshot-export");
+        persist_demo_chain(&dir);
+        let chain = replay_for_snapshot(&dir.to_string_lossy()).expect("replay for snapshot");
+        let bytes = zhixing_node::codec::encode_snapshot(&chain.state);
+        let back = zhixing_node::codec::decode_snapshot(&bytes).expect("decode snapshot");
+        assert_eq!(back.state_root(), chain.state.state_root(), "state_root");
+        assert_eq!(
+            back.merkle_root(),
+            chain.state.merkle_root(),
+            "accounts_root"
+        );
+        assert_eq!(
+            back.bridge_merkle_root(),
+            chain.state.bridge_merkle_root(),
+            "bridge_root"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn snapshot_export_propagates_replay_mismatch() {
+        // M132: a length mismatch (more blocks than certs) surfaces as `SnapshotReplayError::Replay`
+        // (the CLI turns this into a non-zero exit + stderr). The `BlockLog::open` helper
+        // auto-creates an empty log, so a "missing" directory replay-verifies vacuously
+        // (covered by M128's vacuous-Ok test) — a mismatch is the right error surface.
+        let dir = tmpdir("snapshot-mismatch");
+        persist_demo_chain(&dir);
+        // Append a second block (a duplicate of the one already on disk) with no matching cert
+        // ⇒ the two logs' lengths differ by one.
+        let blog = BlockLog::open(dir.join("blocks.log")).expect("reopen blocks.log");
+        let existing = blog.read_all().expect("read blocks");
+        let extra = existing.first().expect("one demo block").clone();
+        blog.append(&extra).expect("append extra");
+        match replay_for_snapshot(&dir.to_string_lossy()) {
+            Err(SnapshotReplayError::Replay(zhixing_node::ReplayError::CountMismatch {
+                blocks,
+                certs,
+            })) => {
+                assert_eq!(blocks, 2);
+                assert_eq!(certs, 1);
+            }
+            Err(e) => panic!("expected Replay CountMismatch, got: {e}"),
+            Ok(_) => panic!("expected Replay error, got Ok"),
         }
         let _ = std::fs::remove_dir_all(&dir);
     }

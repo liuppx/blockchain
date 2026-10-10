@@ -1341,6 +1341,20 @@ M116 的 `node rpc` 只能 GET。M117 补上写侧，让它成为**全能** RPC 
 
 **已知边界（顺延至 M121+）**：身份读三类已齐（`/genesis` 链 / `/node` 节点 / `/info` 链尖）；读面两分（`/params`/`/config`）已齐；RPC 自带端点发现 + 全能客户端 + 完整链读/写面；内容协商三轴已齐（仅 `identity`，真压缩顺延）；离线工具篮子已补；运维篮子剩余：证书/密钥轮换与落盘、follower 认证、指标端 TLS、OTel/push exporter、每-sink 独立 rotation 覆盖、时延直方图；keygen 篮子剩余：助记词 / BIP-39、口令加密 keystore、密钥轮换；剩余：游标分页、未知方法 `405`；共识 / wire 篮子（破 head 不变量）：**货币费用** + 费用优先排序、nonce / 序列号反重放。
 
+## `node snapshot --dir D --out F` — 快照导出 CLI（Milestone 132 · 快速同步第 2 步)
+
+承接 M131 的 codec：M132 加 `node snapshot --dir DIR --out FILE`——经 `replay_verified` 加载磁盘链（与 M128 `verify` 同源，确保**只导出经证书验证的最终性状态**），再经 `codec::encode_snapshot` 写出 M131 blob。`--out -` 写 stdout（便于管道）。错误映射非零退出 + stderr。
+
+- **路径复用**：与 `verify` 共用磁盘加载逻辑（M128 已抽象为 `replay_logs` 链+cert 读）；本轮抽出 `replay_for_snapshot(dir) -> Result<Chain, SnapshotReplayError>`，IO/最终性错误分别归类为 `Io`/`Replay`，CLI 据此分两条 stderr。
+- **为什么先 replay 后 encode**：快照只应在"链确实被法定人数认证过"之后导出——`replay_verified` 是 M18 最终性复验内核，比 `Chain::replay` 强（cert 绑定 + > 2/3 法定人数）。这让 M131 的 snapshot 本身**就是 cert-signed state 的可移植表示**。
+- **未引入新依赖**：纯 stdout/文件 I/O、复用 M131 codec。
+- **不变量保持**：纯离线、不碰 head。
+- **测试（+2 → 550）**：`snapshot_export_round_trips_through_decode`（导出→`decode_snapshot`→三根相等）、`snapshot_export_propagates_replay_mismatch`（长度不匹配→`ReplayError::CountMismatch{2,1}` 透传）。
+
+**后续步骤**：第 3 步 `node inspect-snapshot F`（解码→打印 height/state_root）、第 4 步 daemon bootstrap（启动时从快照加载，跳过全量重放）。
+
+**已知边界（顺延至 M133+）**：其余运维/读/依赖项不变。
+
 ## 全状态快照 codec（Milestone 131 · 快速同步第 1 步）
 
 启动**快速同步**大件的第一步：一个把整个 `ChainState` 规范、可逆、确定性地序列化的 **snapshot codec**（`codec::encode_snapshot`/`decode_snapshot`）。有了它，后续里程碑可让新节点**从快照加载某高度的状态**而无需重放整条区块日志（尤其在日志被裁剪后）；快照本身也可被哈希、其 `state_root` 对**已被 cert 签名的 header** 交叉校验。
