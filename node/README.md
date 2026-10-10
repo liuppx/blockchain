@@ -1341,6 +1341,17 @@ M116 的 `node rpc` 只能 GET。M117 补上写侧，让它成为**全能** RPC 
 
 **已知边界（顺延至 M121+）**：身份读三类已齐（`/genesis` 链 / `/node` 节点 / `/info` 链尖）；读面两分（`/params`/`/config`）已齐；RPC 自带端点发现 + 全能客户端 + 完整链读/写面；内容协商三轴已齐（仅 `identity`，真压缩顺延）；离线工具篮子已补；运维篮子剩余：证书/密钥轮换与落盘、follower 认证、指标端 TLS、OTel/push exporter、每-sink 独立 rotation 覆盖、时延直方图；keygen 篮子剩余：助记词 / BIP-39、口令加密 keystore、密钥轮换；剩余：游标分页、未知方法 `405`；共识 / wire 篮子（破 head 不变量）：**货币费用** + 费用优先排序、nonce / 序列号反重放。
 
+## `GET /block/{height}` 暴露 wire-v1 proposer + 费用（Milestone 129）
+
+M113 的 `/block/{height}` 读回块头摘要（高度/哈希/`state_root`/`accounts_root` + 各体计数），但**没暴露 M122 wire-v1 新增的 `proposer`**——出块验证人（即本块 tx 费用的受益人）经 RPC **不可见**。M129 把 `proposer` 与 `fees`（本块 `tx.fee` 之和，即 proposer 实得 micro-$COG）补进 `BlockSummary`。
+
+- **改动**：`BlockSummary` +`proposer:u64` +`fees:u64`；`Cmd::QueryBlock` 构造时填 `b.proposer` 与 `b.txs.iter().map(|t| t.fee).sum()`；`format_block_summary`（文本加 `proposer=`/`fees=` 行）、`json_block_summary`（加 lossless 引号 u64 `"proposer"`/`"fees"`）同步。
+- **为什么有价值**：把 M122 的费用经济学变成**可观测**——客户端一次 `/block/{h}` 即知"谁出的块、赚了多少费"，无需拉全块体自己求和。
+- **不变量保持**：纯读、无 wire/共识/状态/依赖改动、RPC 默认关，故 `localnet` head 仍 wire v1 `a045426e…3b87bc`。
+- **测试（强化既有 → 546）**：`format_block_summary` 测新增断言 `proposer=21`/`fees=7*MICRO`（文本）与 `"proposer":"21"`/`"fees":"7000000"`（JSON）。
+
+**已知边界（顺延至 M130+）**：读面已把 wire v1 的新字段补全可见；剩余多需引依赖（`Accept-Encoding` 真压缩、keystore 口令加密、OTel/push exporter、指标端 TLS）或属运维篮子（证书/密钥轮换与落盘、follower 认证、每-sink rotation、RPC 时延直方图——需跨任务原子）；生产路线大件：状态裁剪/快照/快速同步。均在"不破 head"（wire v1 已冻结）前提下推进。
+
 ## `node verify --dir` — 链上最终性审计 CLI（Milestone 128）
 
 `node status` 只做**纯状态重放**（`Chain::replay`），从不验证最终性证书——无法回答"这份数据目录是否被 >2/3 法定人数真正认证过"。M128 加 `node verify --dir DIR`：载入 `blocks.log` + `certs.log`，经 `Chain::replay_verified` 把**每个已提交块对其最终性证书**逐一核对（高度 + 块哈希绑定 + 该高度生效验证人集下真正的 > 2/3 法定人数），**任一完整性错误即非零退出**，供监控/CI 钩子用退出码判健康。

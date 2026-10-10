@@ -1409,9 +1409,11 @@ async fn run_actor(mut actor: Actor, mut rx: mpsc::UnboundedReceiver<Cmd>) {
                         hash: b.hash(),
                         prev_hash: b.prev_hash,
                         timestamp_days: b.timestamp_days,
+                        proposer: b.proposer,
                         state_root: b.state_root,
                         accounts_root: b.accounts_root,
                         n_txs: b.txs.len(),
+                        fees: b.txs.iter().map(|t| t.fee).sum(),
                         n_stake_ops: b.stake_ops.len(),
                         n_evidence: b.slashing_evidence.len(),
                         n_validator_updates: b.validator_updates.len(),
@@ -3268,9 +3270,13 @@ struct BlockSummary {
     hash: crate::Hash,
     prev_hash: crate::Hash,
     timestamp_days: f32,
+    /// M129: the wire-v1 block producer (the validator credited with this block's tx fees).
+    proposer: u64,
     state_root: crate::Hash,
     accounts_root: crate::Hash,
     n_txs: usize,
+    /// M129: sum of `tx.fee` across this block's txs — the micro-$COG the proposer earned.
+    fees: u64,
     n_stake_ops: usize,
     n_evidence: usize,
     n_validator_updates: usize,
@@ -3280,15 +3286,17 @@ struct BlockSummary {
 /// lossless). Pure for direct unit testing.
 fn format_block_summary(b: &BlockSummary) -> String {
     format!(
-        "height={}\nhash={}\nprev_hash={}\ntimestamp_days={}\nstate_root={}\naccounts_root={}\n\
-txs={}\nstake_ops={}\nevidence={}\nvalidator_updates={}",
+        "height={}\nhash={}\nprev_hash={}\ntimestamp_days={}\nproposer={}\nstate_root={}\naccounts_root={}\n\
+txs={}\nfees={}\nstake_ops={}\nevidence={}\nvalidator_updates={}",
         b.height,
         crate::hash::hex(&b.hash),
         crate::hash::hex(&b.prev_hash),
         json_f32(b.timestamp_days),
+        b.proposer,
         crate::hash::hex(&b.state_root),
         crate::hash::hex(&b.accounts_root),
         b.n_txs,
+        b.fees,
         b.n_stake_ops,
         b.n_evidence,
         b.n_validator_updates,
@@ -3299,15 +3307,17 @@ txs={}\nstake_ops={}\nevidence={}\nvalidator_updates={}",
 /// lossless quoted-u64, hashes as quoted hex).
 fn json_block_summary(b: &BlockSummary) -> String {
     format!(
-        "{{\"height\":{},\"hash\":{},\"prev_hash\":{},\"timestamp_days\":{},\"state_root\":{},\"accounts_root\":{},\
-\"txs\":{},\"stake_ops\":{},\"evidence\":{},\"validator_updates\":{}}}",
+        "{{\"height\":{},\"hash\":{},\"prev_hash\":{},\"timestamp_days\":{},\"proposer\":{},\"state_root\":{},\"accounts_root\":{},\
+\"txs\":{},\"fees\":{},\"stake_ops\":{},\"evidence\":{},\"validator_updates\":{}}}",
         json_u64(b.height),
         json_str(&crate::hash::hex(&b.hash)),
         json_str(&crate::hash::hex(&b.prev_hash)),
         json_f32(b.timestamp_days),
+        json_u64(b.proposer),
         json_str(&crate::hash::hex(&b.state_root)),
         json_str(&crate::hash::hex(&b.accounts_root)),
         json_u64(b.n_txs as u64),
+        json_u64(b.fees),
         json_u64(b.n_stake_ops as u64),
         json_u64(b.n_evidence as u64),
         json_u64(b.n_validator_updates as u64),
@@ -11844,9 +11854,11 @@ vote_b.validator=5 vote_b.height=9 vote_b.round=2 vote_b.block_hash={b_h} vote_b
             hash: [0x11u8; 32],
             prev_hash: [0x22u8; 32],
             timestamp_days: 0.0,
+            proposer: 21, // M129: the validator who earned this block's fees
             state_root: [0x33u8; 32],
             accounts_root: [0x44u8; 32],
             n_txs: 2,
+            fees: 7 * MICRO, // M129: sum of tx.fee across the block
             n_stake_ops: 1,
             n_evidence: 0,
             n_validator_updates: 0,
@@ -11856,6 +11868,9 @@ vote_b.validator=5 vote_b.height=9 vote_b.round=2 vote_b.block_hash={b_h} vote_b
         assert!(text.starts_with("height=3\n"), "{text}");
         assert!(text.contains(&format!("hash={hh}\n")), "{text}");
         assert!(text.contains("txs=2\n"), "{text}");
+        // M129: the wire-v1 producer and its earned fees surface in the summary.
+        assert!(text.contains("proposer=21\n"), "{text}");
+        assert!(text.contains(&format!("fees={}\n", 7 * MICRO)), "{text}");
         assert!(text.ends_with("validator_updates=0"), "{text}");
 
         let json = json_block_summary(&b);
@@ -11863,6 +11878,12 @@ vote_b.validator=5 vote_b.height=9 vote_b.round=2 vote_b.block_hash={b_h} vote_b
         assert!(json.contains(&format!("\"hash\":\"{hh}\"")), "{json}");
         assert!(json.contains("\"txs\":\"2\""), "{json}");
         assert!(json.contains("\"stake_ops\":\"1\""), "{json}");
+        // M129: proposer + fees as lossless quoted-u64.
+        assert!(json.contains("\"proposer\":\"21\""), "{json}");
+        assert!(
+            json.contains(&format!("\"fees\":\"{}\"", 7 * MICRO)),
+            "{json}"
+        );
     }
 
     #[test]
