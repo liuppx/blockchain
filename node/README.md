@@ -1341,6 +1341,20 @@ M116 的 `node rpc` 只能 GET。M117 补上写侧，让它成为**全能** RPC 
 
 **已知边界（顺延至 M121+）**：身份读三类已齐（`/genesis` 链 / `/node` 节点 / `/info` 链尖）；读面两分（`/params`/`/config`）已齐；RPC 自带端点发现 + 全能客户端 + 完整链读/写面；内容协商三轴已齐（仅 `identity`，真压缩顺延）；离线工具篮子已补；运维篮子剩余：证书/密钥轮换与落盘、follower 认证、指标端 TLS、OTel/push exporter、每-sink 独立 rotation 覆盖、时延直方图；keygen 篮子剩余：助记词 / BIP-39、口令加密 keystore、密钥轮换；剩余：游标分页、未知方法 `405`；共识 / wire 篮子（破 head 不变量）：**货币费用** + 费用优先排序、nonce / 序列号反重放。
 
+## `node light-run` — 生产级轻客户端守护进程（Milestone 148 · light daemon Phase 2）
+
+M131–M147 把 fast-sync 的协议与库件做齐，但轻客户端至今只有 demo/测试用的进程内 `LightNetwork`，没有真正长跑的守护进程。M148 建 **`node light-run --config F`**：长跑轻节点 over TCP 连全节点 peer、拉 `GetHeadersWithSets`（M147）、用 `LightGossipNode` 跟踪验证人集。**headers-only——无块体、无共识、无 mempool、无 ChainState 执行、无落盘。**
+
+- **传输层泛型化**（`daemon.rs`，最小 seam）：`handle_conn` 对 `Cmd` 的耦合只在 3 个构造点（register/inbound/unregister）。引入 `trait TransportCmd { register/inbound/unregister }`，`handle_conn`/`run_listener`/`run_connector` 泛型化，`impl TransportCmd for Cmd`——auth/TLS/握手/framing 分支**一字不改**，全节点 607 测守护等价。首选此而非复制 ~60 行安全敏感握手码。
+- **轻 actor**（`daemon.rs`）：`LightCmd`（register/inbound/unregister/announce/status 五变体）+ `LightActor { node: LightGossipNode, outbound }` + `run_light_actor`——`Register` 回 Status、`Inbound` 走 `node.on_message`+route、`Announce` 走 `node.announce()`、`Status` 回 `(height, head)`。无 persist/broadcast/reconcile。
+- **`LightNode::start` + `daemon::light_run`**（`daemon.rs`）：复用 `AuthContext` build（`kp: None`、`enable_tls` 加密模式）、`run_listener::<LightCmd>`/`run_connector::<LightCmd>`（拨 `id > my_id`）、announce 心跳。fail-fast：`require_peer_auth`/`require_peer_certs` 开启则报错（轻节点无 key）。`LightNode` 句柄带 `status() -> (height, head)`。
+- **CLI**（`main.rs`）：`node light-run --config F`（镜像 `cmd_run`，不解析 validator key），dispatch + help。
+- **复用边界**：`read_frame`/`write_frame`/`auth_handshake`/TLS/`AuthContext`/`run_listener`/`run_connector`/`LightGossipNode` 全复用；全节点已 serve `GetHeadersWithSets`（M147），故轻守护进程能连**未改动的**全节点 peer。
+- **不碰** `net.rs`/`config.rs`（`NodeConfig` 原样复用——轻节点只是不读 `[validator]`/`[consensus]`/`[mempool]`）/共识/codec/块 wire；`localnet` 头仍 wire v1 `a045426e…3b87bc`。
+- **测试（+2 → 609）**：`light_run_syncs_headers_from_a_full_node_over_tcp`（核心：单验证人全节点 + 轻节点 over loopback TCP，轻节点同步到高度≥3、head == 全节点同高 header hash）、`light_start_rejects_require_peer_auth_without_key`。
+
+**范围 = MVP（连接 + headers-with-sets 同步）**。快照种子（`from_verified_snapshot` 经 `[snapshot]` cert+trusted_validators）与下列顺延 Phase 3：轻 RPC/metrics 读面、peer discovery、headers 持久化、弱主观性引导。
+
 ## 下一验证人集随头同步上线（Milestone 147 · light fast-sync 协议前置）
 
 目标是生产级轻客户端守护进程（`node light-run`）让 M142 的 `from_verified_snapshot` 真正可用。探查发现它是**三阶段**工程，有一个硬协议前置缺口：**轻节点今天无法仅凭 wire 跨验证人集变更同步**——`GossipMsg::Headers`/`CertifiedHeader` 只带 `next_validators_root`（32B 承诺），不带集合内容，而 `follow_header` 要求调用方传完整 `ValidatorSet`；今天这份集由 `LightNetwork::run` 的**进程内 oracle** `next_set_for` 伪造。M147 关这个缺口（守护进程本身留后续 Phase）。

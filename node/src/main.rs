@@ -302,6 +302,7 @@ fn main() {
         "bridge" => cmd_bridge(),
         "redeem" => cmd_redeem(),
         "run" => cmd_run(config_arg(&args), &args),
+        "light-run" => cmd_light_run(config_arg(&args), &args),
         "check-config" => cmd_check_config(config_arg(&args)),
         "genesis-hash" => cmd_genesis_hash(config_arg(&args)),
         "inspect-genesis" => cmd_inspect_genesis(config_arg(&args)),
@@ -400,6 +401,7 @@ fn usage() {
     eprintln!("  node redeem             consensus-level redeem: B's producer follows A on-chain and mints from a source lock inside its state machine — the mint is BFT-enforced, not off-chain");
     eprintln!("  node run    --config F  run the networked BFT daemon (tokio TCP P2P): load config/genesis/validator key, gossip votes + sync/verify over sockets");
     eprintln!("  node run    --config F --snapshot FILE --snapshot-header HEX [--snapshot-cert HEX --snapshot-validators FILE]  adopt a M131 snapshot at boot (fast-sync): verify the header's three roots against the snapshot (M135) and, when a cert + trusted set are given, additionally require the cert to reach >2/3 of that pinned set (M141); restart resumes the post-snapshot tail without re-syncing");
+    eprintln!("  node light-run --config F  run a light-client daemon (M148): connect to full-node peers over TCP, pull headers-with-sets (M147), track the validator set; headers-only — no block bodies, consensus, mempool, or on-disk state");
     eprintln!("  node check-config --config F  dry-run: load + validate config, its genesis, and validator key (if any) without starting the daemon; print a summary or the first error");
     eprintln!("  node genesis-hash --config F  print the chain identity derived from the config's genesis: genesis_hash + initial state_root + validator count (compare across operators before joining)");
     eprintln!("  node inspect-genesis --config F  dump the config's genesis contents: every account (id/balance/pubkey), reviewer, validator, plus params (the detail view to genesis-hash's identity)");
@@ -3780,6 +3782,27 @@ fn cmd_run(config_path: String, args: &[String]) {
     rt.block_on(async move {
         if let Err(e) = daemon::run(cfg, genesis, validator_key).await {
             fail("daemon", e);
+        }
+    });
+}
+
+/// M148: run a light-client daemon — connect to the configured full-node peers over
+/// TCP, pull `GetHeadersWithSets` (M147), and track the validator set with a
+/// `LightGossipNode`. Headers-only: no block bodies, consensus, mempool, or on-disk
+/// state. Mirrors `cmd_run` but never resolves a validator key.
+fn cmd_light_run(config_path: String, _args: &[String]) {
+    let cfg =
+        config::load_node_config(&config_path).unwrap_or_else(|e| fail_msg("load node config", &e));
+    daemon::init_tracing_with(cfg.logging.as_ref());
+    let gcfg = config::load_genesis(&cfg.genesis).unwrap_or_else(|e| fail_msg("load genesis", &e));
+    let genesis = gcfg
+        .to_genesis()
+        .unwrap_or_else(|e| fail_msg("build genesis", &e));
+
+    let rt = tokio::runtime::Runtime::new().unwrap_or_else(|e| fail("tokio runtime", e));
+    rt.block_on(async move {
+        if let Err(e) = daemon::light_run(cfg, genesis).await {
+            fail("light daemon", e);
         }
     });
 }

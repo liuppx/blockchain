@@ -577,6 +577,18 @@ enum Cmd {
     BaseHeight(oneshot::Sender<u64>),
 }
 
+impl TransportCmd for Cmd {
+    fn register(id: u64, tx: mpsc::UnboundedSender<GossipMsg>) -> Self {
+        Cmd::Register { id, tx }
+    }
+    fn inbound(from: u64, msg: Box<GossipMsg>) -> Self {
+        Cmd::Inbound { from, msg }
+    }
+    fn unregister(id: u64) -> Self {
+        Cmd::Unregister { id }
+    }
+}
+
 /// M125: upper bounds (in microseconds) of the finite block-apply latency histogram buckets,
 /// ascending. Block apply is a fast in-memory state transition (typically sub-millisecond), so
 /// the buckets are dense at the low end. An observation above the last bound only increments the
@@ -1800,11 +1812,22 @@ async fn run_actor(mut actor: Actor, mut rx: mpsc::UnboundedReceiver<Cmd>) {
 /// M42: `binding` carries this connection's TLS keying-material exporter (`Some`
 /// only when TLS is on and `[network] bind_channel` is set); it is folded into the
 /// authenticated handshake to defeat a MITM relay.
-async fn handle_conn(
+/// M148: the transport layer (`handle_conn`/`run_listener`/`run_connector`) is
+/// generic over the actor command type so both the full-node `Cmd` and the light
+/// daemon's `LightCmd` share one audited handshake/framing path. The transport only
+/// ever constructs three command shapes — register a peer's outbound sender, forward
+/// an inbound message, and unregister on disconnect.
+pub(crate) trait TransportCmd {
+    fn register(id: u64, tx: mpsc::UnboundedSender<GossipMsg>) -> Self;
+    fn inbound(from: u64, msg: Box<GossipMsg>) -> Self;
+    fn unregister(id: u64) -> Self;
+}
+
+async fn handle_conn<C: TransportCmd>(
     stream: Box<dyn PeerStream>,
     binding: Option<[u8; 32]>,
     ctx: Arc<AuthContext>,
-    cmd: mpsc::UnboundedSender<Cmd>,
+    cmd: mpsc::UnboundedSender<C>,
 ) {
     let my_id = ctx.my_id;
     let (mut rd, mut wr) = tokio::io::split(stream);
@@ -1829,13 +1852,7 @@ async fn handle_conn(
     info!(node = my_id, peer = peer_id, "peer connected");
 
     let (out_tx, mut out_rx) = mpsc::unbounded_channel::<GossipMsg>();
-    if cmd
-        .send(Cmd::Register {
-            id: peer_id,
-            tx: out_tx,
-        })
-        .is_err()
-    {
+    if cmd.send(C::register(peer_id, out_tx)).is_err() {
         return;
     }
 
@@ -1848,26 +1865,20 @@ async fn handle_conn(
     });
 
     while let Ok(msg) = read_frame(&mut rd).await {
-        if cmd
-            .send(Cmd::Inbound {
-                from: peer_id,
-                msg: Box::new(msg),
-            })
-            .is_err()
-        {
+        if cmd.send(C::inbound(peer_id, Box::new(msg))).is_err() {
             break;
         }
     }
 
-    let _ = cmd.send(Cmd::Unregister { id: peer_id });
+    let _ = cmd.send(C::unregister(peer_id));
     info!(node = my_id, peer = peer_id, "peer disconnected");
     writer.abort();
 }
 
-async fn run_listener(
+async fn run_listener<C: TransportCmd + Send + 'static>(
     listener: TcpListener,
     ctx: Arc<AuthContext>,
-    cmd: mpsc::UnboundedSender<Cmd>,
+    cmd: mpsc::UnboundedSender<C>,
 ) {
     let my_id = ctx.my_id;
     loop {
@@ -1891,7 +1902,11 @@ async fn run_listener(
 }
 
 /// Dial a higher-id peer, reconnecting with capped backoff after any drop.
-async fn run_connector(addr: SocketAddr, ctx: Arc<AuthContext>, cmd: mpsc::UnboundedSender<Cmd>) {
+async fn run_connector<C: TransportCmd + Send + 'static>(
+    addr: SocketAddr,
+    ctx: Arc<AuthContext>,
+    cmd: mpsc::UnboundedSender<C>,
+) {
     let mut backoff = Duration::from_millis(500);
     loop {
         if let Ok(stream) = TcpStream::connect(addr).await {
@@ -6622,6 +6637,195 @@ pub async fn run(
     let _node = Node::start(cfg, genesis, validator_key).await?;
     tokio::signal::ctrl_c().await?;
     info!("shutdown requested — exiting (logs are fsync'd per append)");
+    Ok(())
+}
+
+// ----------------------------------------------------------------------------
+// M148: light-client daemon (`node light-run`) — a long-running light node.
+// ----------------------------------------------------------------------------
+
+/// M148: the light daemon actor's command set — the light analogue of [`Cmd`], with
+/// only the four transport shapes plus a status query for the [`LightNode`] handle.
+/// No consensus, mempool, persistence, or read-RPC variants (a light node has none).
+enum LightCmd {
+    Inbound {
+        from: u64,
+        msg: Box<GossipMsg>,
+    },
+    Register {
+        id: u64,
+        tx: mpsc::UnboundedSender<GossipMsg>,
+    },
+    Unregister {
+        id: u64,
+    },
+    /// Periodic anti-entropy heartbeat (`net.announce_interval_ms`).
+    Announce,
+    /// Handle query: current `(tracker height, head)`.
+    Status(oneshot::Sender<(u64, Hash)>),
+}
+
+impl TransportCmd for LightCmd {
+    fn register(id: u64, tx: mpsc::UnboundedSender<GossipMsg>) -> Self {
+        LightCmd::Register { id, tx }
+    }
+    fn inbound(from: u64, msg: Box<GossipMsg>) -> Self {
+        LightCmd::Inbound { from, msg }
+    }
+    fn unregister(id: u64) -> Self {
+        LightCmd::Unregister { id }
+    }
+}
+
+/// M148: the light daemon's actor — owns the [`crate::net::LightGossipNode`] and the
+/// per-peer outbound queues. No logs, no chain, no consensus.
+struct LightActor {
+    node: crate::net::LightGossipNode,
+    outbound: HashMap<u64, mpsc::UnboundedSender<GossipMsg>>,
+}
+
+impl LightActor {
+    fn route(&self, out: Vec<(u64, GossipMsg)>) {
+        for (dst, msg) in out {
+            if let Some(tx) = self.outbound.get(&dst) {
+                let _ = tx.send(msg);
+            }
+        }
+    }
+}
+
+async fn run_light_actor(mut actor: LightActor, mut rx: mpsc::UnboundedReceiver<LightCmd>) {
+    while let Some(cmd) = rx.recv().await {
+        match cmd {
+            LightCmd::Register { id, tx } => {
+                // Announce our height so the peer starts pushing; the peer's reply
+                // `Status` triggers our `GetHeadersWithSets` (see LightGossipNode).
+                let _ = tx.send(GossipMsg::Status {
+                    height: actor.node.tracker().height(),
+                });
+                actor.outbound.insert(id, tx);
+            }
+            LightCmd::Unregister { id } => {
+                actor.outbound.remove(&id);
+            }
+            LightCmd::Inbound { from, msg } => {
+                let out = actor.node.on_message(from, *msg);
+                actor.route(out);
+            }
+            LightCmd::Announce => {
+                let out = actor.node.announce();
+                actor.route(out);
+            }
+            LightCmd::Status(reply) => {
+                let _ = reply.send((actor.node.tracker().height(), actor.node.tracker().head()));
+            }
+        }
+    }
+}
+
+/// M148: a handle to a running light daemon.
+pub struct LightNode {
+    cmd: mpsc::UnboundedSender<LightCmd>,
+}
+
+impl LightNode {
+    /// M148: boot a light-client daemon from `cfg` + `genesis`: build a
+    /// [`crate::net::LightGossipNode`], reuse the full-node transport layer
+    /// ([`handle_conn`]/[`run_listener`]/[`run_connector`] over [`LightCmd`]) to connect
+    /// to the configured peers, and sync headers-with-sets (M147). Headers-only — no
+    /// block bodies, consensus, mempool, persistence, or chain execution.
+    ///
+    /// A light node has no validator key, so `require_peer_auth`/`require_peer_certs`
+    /// (which need one) must be off; `enable_tls` alone (encryption-only) is fine.
+    pub async fn start(cfg: NodeConfig, genesis: Genesis) -> io::Result<LightNode> {
+        let my_id = cfg.node.id;
+        let listen = cfg.listen_addr().map_err(cfg_io)?;
+
+        if cfg.network.require_peer_auth || cfg.network.require_peer_certs {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "light node {my_id} cannot set require_peer_auth/require_peer_certs \
+                     (a light node has no validator signing key)"
+                ),
+            ));
+        }
+
+        let peer_ids: Vec<u64> = cfg.peers.iter().map(|p| p.id).collect();
+        let node = crate::net::LightGossipNode::new(my_id, &genesis, peer_ids.iter().copied());
+
+        // Reuse the full-node AuthContext build with no key. Encryption-only TLS
+        // (`enable_tls` without `require_peer_certs`) needs no credential.
+        let validators: HashMap<u64, PubKey> = genesis
+            .validators
+            .iter()
+            .map(|(id, pk, _)| (*id, *pk))
+            .collect();
+        let tls = if cfg.network.enable_tls {
+            Some(build_tls_setup(None)?)
+        } else {
+            None
+        };
+        let auth = Arc::new(AuthContext {
+            my_id,
+            kp: None,
+            validators,
+            require: cfg.network.require_peer_auth, // false (guarded above)
+            tls,
+            bind_channel: cfg.network.bind_channel,
+        });
+
+        let (cmd_tx, cmd_rx) = mpsc::unbounded_channel::<LightCmd>();
+        let actor = LightActor {
+            node,
+            outbound: HashMap::new(),
+        };
+        tokio::spawn(run_light_actor(actor, cmd_rx));
+
+        let listener = TcpListener::bind(listen).await?;
+        info!(node = my_id, addr = %listener.local_addr()?, peers = peer_ids.len(), role = "light", "listening");
+        tokio::spawn(run_listener(listener, auth.clone(), cmd_tx.clone()));
+
+        // dial higher ids only → one link per pair (same rule as the full node)
+        for p in &cfg.peers {
+            if p.id > my_id {
+                let addr = p.socket_addr().map_err(cfg_io)?;
+                tokio::spawn(run_connector(addr, auth.clone(), cmd_tx.clone()));
+            }
+        }
+
+        // periodic anti-entropy heartbeat
+        {
+            let cmd = cmd_tx.clone();
+            let announce_ms = cfg.network.announce_interval_ms;
+            tokio::spawn(async move {
+                let mut tick = tokio::time::interval(Duration::from_millis(announce_ms));
+                loop {
+                    tick.tick().await;
+                    if cmd.send(LightCmd::Announce).is_err() {
+                        break;
+                    }
+                }
+            });
+        }
+
+        Ok(LightNode { cmd: cmd_tx })
+    }
+
+    /// Current `(tracker height, head)` of the light node, or `None` if the actor
+    /// has stopped.
+    pub async fn status(&self) -> Option<(u64, Hash)> {
+        let (tx, rx) = oneshot::channel();
+        self.cmd.send(LightCmd::Status(tx)).ok()?;
+        rx.await.ok()
+    }
+}
+
+/// CLI entry point for `node light-run`: start the light daemon and block until Ctrl-C.
+pub async fn light_run(cfg: NodeConfig, genesis: Genesis) -> io::Result<()> {
+    let _node = LightNode::start(cfg, genesis).await?;
+    tokio::signal::ctrl_c().await?;
+    info!("shutdown requested — exiting (light node holds no on-disk state)");
     Ok(())
 }
 
@@ -15852,6 +16056,78 @@ vote_b.validator=5 vote_b.height=9 vote_b.round=2 vote_b.block_hash={b_h} vote_b
             "genesis-era blocks were removed; any remaining block is post-snapshot"
         );
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // --- M148: light-client daemon (node light-run) ------------------------------
+
+    #[tokio::test]
+    async fn light_run_syncs_headers_from_a_full_node_over_tcp() {
+        // M148: a long-running light daemon connects to a full node over TCP, pulls
+        // headers-with-sets (M147), and tracks the chain to the full node's height —
+        // headers-only, no block bodies or chain execution.
+        let dir = tmp_dir("light-full");
+        let mut genesis = test_genesis();
+        genesis.validators = vec![(21, kp(21).public(), 1)]; // single validator self-produces
+
+        // Full validator node (id 21) — binds port_base+0, dials peer 22 (the light node).
+        let full_cfg = node_config(21, 20620, &[21, 22], format!("{dir}/full"));
+        let full = Node::start(full_cfg, genesis.clone(), Some(kp(21)))
+            .await
+            .expect("start full node");
+
+        // Light node (id 22) — dials nobody (>22 none); the full node dials it. It syncs
+        // via the Status→GetHeadersWithSets exchange regardless of dial direction.
+        let light_cfg = node_config(22, 20620, &[21, 22], format!("{dir}/light"));
+        let light = LightNode::start(light_cfg, genesis.clone())
+            .await
+            .expect("start light node");
+
+        // Wait for the light node to reach height >= 3.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+        loop {
+            if light.status().await.map(|(h, _)| h >= 3).unwrap_or(false) {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "light node never synced to height 3"
+            );
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+
+        // The light node's head matches the full node's at the same height.
+        let (lh, lhead) = light.status().await.expect("light status");
+        let (fh, fhead) = full.status().await.expect("full status");
+        assert!(fh >= lh, "full node is at least as tall as the light node");
+        // Compare at the light node's height: pull the full node's header there.
+        let (reply, rx) = oneshot::channel();
+        full.cmd
+            .send(Cmd::QueryHeader { height: lh, reply })
+            .unwrap();
+        let ch = rx.await.unwrap().expect("full node has the header");
+        assert_eq!(
+            ch.header.hash(),
+            lhead,
+            "light-tracked head equals the full node's header hash at height {lh}"
+        );
+        let _ = (fhead,);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn light_start_rejects_require_peer_auth_without_key() {
+        // M148: a light node has no validator key, so an auth/cert-pinned network policy
+        // is refused at boot rather than failing every dial silently.
+        let dir = tmp_dir("light-auth");
+        let mut cfg = node_config(22, 20640, &[21, 22], dir.clone());
+        cfg.network.require_peer_auth = true;
+        let genesis = test_genesis();
+        match LightNode::start(cfg, genesis).await {
+            Err(e) => assert_eq!(e.kind(), io::ErrorKind::InvalidInput),
+            Ok(_) => panic!("require_peer_auth without a key must be rejected"),
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
