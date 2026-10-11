@@ -492,6 +492,10 @@ pub struct MempoolConfig {
     /// order. `0` ⇒ strict one-pending-tx-per-account (the behavior-preserving
     /// default; byte-identical to pre-M143).
     pub nonce_lookahead: usize,
+    /// M144: when `true`, a tx at a `(author, nonce)` already held is admitted by
+    /// *replacing* the incumbent iff it bids a strictly higher fee. `false` (the
+    /// behavior-preserving default) keeps same-slot competitors coexisting.
+    pub replace_by_fee: bool,
 }
 
 impl Default for MempoolConfig {
@@ -506,6 +510,7 @@ impl Default for MempoolConfig {
             seen_cache: 0,
             per_account_limit: 0,
             nonce_lookahead: 0,
+            replace_by_fee: false,
         }
     }
 }
@@ -2171,6 +2176,25 @@ mod tests {
         assert_eq!(cfg.mempool.capacity, 100);
         assert_eq!(cfg.mempool.nonce_lookahead, 0);
         assert_eq!(MempoolConfig::default().nonce_lookahead, 0);
+    }
+
+    #[test]
+    fn mempool_config_replace_by_fee_defaults_false() {
+        // M144: a `[mempool]` without `replace_by_fee` defaults to false (off).
+        let toml = r#"
+            genesis = "genesis.toml"
+
+            [node]
+            id = 21
+            listen = "127.0.0.1:9021"
+            data_dir = "/tmp/x"
+
+            [mempool]
+            capacity = 100
+        "#;
+        let cfg: NodeConfig = toml::from_str(toml).expect("parse mempool config");
+        assert!(!cfg.mempool.replace_by_fee);
+        assert!(!MempoolConfig::default().replace_by_fee);
     }
 
     #[test]

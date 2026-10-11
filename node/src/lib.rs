@@ -715,6 +715,15 @@ pub enum ChainError {
         got: u64,
         limit: u64,
     },
+    /// M144: a replace-by-fee admission was rejected because the incoming tx did not
+    /// bid a strictly higher fee than the pending tx at the same `(author, nonce)`.
+    /// A mempool-admission policy, not a consensus rule.
+    FeeTooLowToReplace {
+        author: u64,
+        nonce: u64,
+        existing_fee: u64,
+        got_fee: u64,
+    },
     BadScore {
         reviewer: u64,
         score: f32,
@@ -873,6 +882,10 @@ impl std::fmt::Display for ChainError {
             ChainError::NonceTooFarAhead { account, got, limit } => write!(
                 f,
                 "account {account} nonce {got} exceeds the mempool pipelining window (max {limit})"
+            ),
+            ChainError::FeeTooLowToReplace { author, nonce, existing_fee, got_fee } => write!(
+                f,
+                "account {author} nonce {nonce}: replacement fee {got_fee} not higher than pending {existing_fee}"
             ),
             ChainError::BadScore { reviewer, score } => {
                 write!(f, "reviewer {reviewer} score {score} out of [0,1]")
@@ -4436,6 +4449,21 @@ mod tests {
         let s = e.to_string();
         assert!(
             s.contains("account 7") && s.contains("10") && s.contains("3"),
+            "{s}"
+        );
+    }
+
+    #[test]
+    fn fee_too_low_to_replace_error_display() {
+        let e = ChainError::FeeTooLowToReplace {
+            author: 4,
+            nonce: 2,
+            existing_fee: 9,
+            got_fee: 5,
+        };
+        let s = e.to_string();
+        assert!(
+            s.contains("account 4") && s.contains("nonce 2") && s.contains('9') && s.contains('5'),
             "{s}"
         );
     }

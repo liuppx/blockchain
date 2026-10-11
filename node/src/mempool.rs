@@ -44,6 +44,11 @@ pub struct Mempool {
     /// account may hold txs with `acct.nonce <= tx.nonce <= acct.nonce + N`, which the
     /// builder then lays into one block in nonce order.
     nonce_lookahead: usize,
+    /// M144: when `true`, admitting a tx at a `(author, nonce)` already held by a
+    /// pending tx *replaces* it iff the newcomer bids a strictly higher fee (else the
+    /// newcomer is rejected). `false` (default) keeps the pre-M144 behavior — same-slot
+    /// competitors coexist and the builder picks the highest fee at build time.
+    replace_by_fee: bool,
 }
 
 impl Mempool {
@@ -56,6 +61,7 @@ impl Mempool {
             per_account_limit: usize::MAX,
             rejected_quota: 0,
             nonce_lookahead: 0,
+            replace_by_fee: false,
         }
     }
 
@@ -98,6 +104,18 @@ impl Mempool {
     /// M143: the configured nonce pipelining window (`0` ⇒ strict / off).
     pub fn nonce_lookahead(&self) -> usize {
         self.nonce_lookahead
+    }
+
+    /// M144: enable/disable replace-by-fee admission. When on, a new tx at a
+    /// `(author, nonce)` already held replaces the incumbent iff it bids a strictly
+    /// higher fee. `false` (default) keeps the pre-M144 coexist-and-pick-at-build rule.
+    pub fn set_replace_by_fee(&mut self, enabled: bool) {
+        self.replace_by_fee = enabled;
+    }
+
+    /// M144: whether replace-by-fee admission is enabled.
+    pub fn replace_by_fee(&self) -> bool {
+        self.replace_by_fee
     }
 
     pub fn len(&self) -> usize {
@@ -164,6 +182,38 @@ impl Mempool {
             });
         }
         let h = tx.hash();
+        // M144: replace-by-fee. If an incumbent (different content) holds this
+        // `(author, nonce)` slot, replace it only when the newcomer bids a strictly
+        // higher fee; otherwise reject. A same-hash re-insert is not a replacement — it
+        // falls through to the idempotent path below. Collect the incumbent as owned
+        // values first so the immutable borrow ends before we mutate the pool.
+        if self.replace_by_fee {
+            let incumbent = self
+                .pending
+                .iter()
+                .find(|(ih, t)| t.author == tx.author && t.nonce == tx.nonce && **ih != h)
+                .map(|(ih, t)| (*ih, t.fee));
+            if let Some((inc_hash, inc_fee)) = incumbent {
+                if tx.fee > inc_fee {
+                    // Drop the incumbent first so the capacity/quota gates below see the
+                    // freed slot — a replacement keeps the pool and quota size unchanged.
+                    self.pending.remove(&inc_hash);
+                    if let Some(count) = self.per_author.get_mut(&tx.author) {
+                        *count -= 1;
+                        if *count == 0 {
+                            self.per_author.remove(&tx.author);
+                        }
+                    }
+                } else {
+                    return Err(ChainError::FeeTooLowToReplace {
+                        author: tx.author,
+                        nonce: tx.nonce,
+                        existing_fee: inc_fee,
+                        got_fee: tx.fee,
+                    });
+                }
+            }
+        }
         let is_new = !self.pending.contains_key(&h);
         if is_new {
             if self.pending.len() >= self.capacity {
@@ -755,5 +805,96 @@ mod tests {
         assert_eq!(mp.len(), 0, "stale duplicate pruned");
         // quota freed: account 1 can be admitted again at the new nonce.
         assert!(mp.insert(&c, tx_nonce(1, 3, 3, 2 * MICRO, 1)).is_ok());
+    }
+
+    // --- M144: replace-by-fee --------------------------------------------------
+
+    #[test]
+    fn rbf_replaces_lower_fee_at_same_slot() {
+        let chain = Chain::new(genesis());
+        let mut mp = Mempool::new(16);
+        mp.set_replace_by_fee(true);
+        mp.insert(&chain, tx_fee(1, 1, 1, 2 * MICRO, 1, 0)).unwrap();
+        let hi = mp.insert(&chain, tx_fee(1, 2, 2, 2 * MICRO, 5, 0)).unwrap();
+        assert_eq!(mp.len(), 1, "same slot holds exactly one tx");
+        assert!(mp.contains(&hi), "the higher-fee tx is the one retained");
+    }
+
+    #[test]
+    fn rbf_rejects_not_higher_fee() {
+        let chain = Chain::new(genesis());
+        let mut mp = Mempool::new(16);
+        mp.set_replace_by_fee(true);
+        mp.insert(&chain, tx_fee(1, 1, 1, 2 * MICRO, 5, 0)).unwrap();
+        // equal fee → rejected.
+        assert!(matches!(
+            mp.insert(&chain, tx_fee(1, 2, 2, 2 * MICRO, 5, 0)),
+            Err(ChainError::FeeTooLowToReplace {
+                author: 1,
+                nonce: 0,
+                existing_fee: 5,
+                got_fee: 5
+            })
+        ));
+        // lower fee → rejected.
+        assert!(matches!(
+            mp.insert(&chain, tx_fee(1, 3, 3, 2 * MICRO, 3, 0)),
+            Err(ChainError::FeeTooLowToReplace {
+                existing_fee: 5,
+                got_fee: 3,
+                ..
+            })
+        ));
+        assert_eq!(mp.len(), 1, "incumbent (fee 5) stays");
+    }
+
+    #[test]
+    fn rbf_idempotent_same_tx() {
+        let chain = Chain::new(genesis());
+        let mut mp = Mempool::new(16);
+        mp.set_replace_by_fee(true);
+        let t = tx_fee(1, 1, 1, 2 * MICRO, 5, 0);
+        let h = mp.insert(&chain, t.clone()).unwrap();
+        assert_eq!(mp.insert(&chain, t).unwrap(), h, "re-insert is idempotent");
+        assert_eq!(mp.len(), 1);
+    }
+
+    #[test]
+    fn rbf_different_nonces_coexist() {
+        let chain = Chain::new(genesis());
+        let mut mp = Mempool::new(16);
+        mp.set_replace_by_fee(true);
+        mp.set_nonce_lookahead(4);
+        mp.insert(&chain, tx_fee(1, 1, 1, 2 * MICRO, 1, 0)).unwrap();
+        mp.insert(&chain, tx_fee(1, 2, 2, 2 * MICRO, 1, 1)).unwrap();
+        assert_eq!(
+            mp.len(),
+            2,
+            "different (author,nonce) slots are not replaced"
+        );
+    }
+
+    #[test]
+    fn rbf_replacement_preserves_quota() {
+        let chain = Chain::new(genesis());
+        let mut mp = Mempool::new(16);
+        mp.set_replace_by_fee(true);
+        mp.set_per_account_limit(1);
+        mp.insert(&chain, tx_fee(1, 1, 1, 2 * MICRO, 1, 0)).unwrap(); // fills the quota
+                                                                      // replacement at the same slot does not exceed the quota.
+        let hi = mp.insert(&chain, tx_fee(1, 2, 2, 2 * MICRO, 5, 0)).unwrap();
+        assert_eq!(mp.len(), 1);
+        assert!(mp.contains(&hi));
+    }
+
+    #[test]
+    fn rbf_off_by_default_keeps_same_slot_duplicates() {
+        // Default (off): two same-(author,nonce) competitors coexist (pre-M144 behavior).
+        let chain = Chain::new(genesis());
+        let mut mp = Mempool::new(16);
+        assert!(!mp.replace_by_fee());
+        mp.insert(&chain, tx_fee(1, 1, 1, 2 * MICRO, 1, 0)).unwrap();
+        mp.insert(&chain, tx_fee(1, 2, 2, 2 * MICRO, 5, 0)).unwrap();
+        assert_eq!(mp.len(), 2);
     }
 }

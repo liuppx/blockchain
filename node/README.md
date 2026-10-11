@@ -1341,6 +1341,18 @@ M116 的 `node rpc` 只能 GET。M117 补上写侧，让它成为**全能** RPC 
 
 **已知边界（顺延至 M121+）**：身份读三类已齐（`/genesis` 链 / `/node` 节点 / `/info` 链尖）；读面两分（`/params`/`/config`）已齐；RPC 自带端点发现 + 全能客户端 + 完整链读/写面；内容协商三轴已齐（仅 `identity`，真压缩顺延）；离线工具篮子已补；运维篮子剩余：证书/密钥轮换与落盘、follower 认证、指标端 TLS、OTel/push exporter、每-sink 独立 rotation 覆盖、时延直方图；keygen 篮子剩余：助记词 / BIP-39、口令加密 keystore、密钥轮换；剩余：游标分页、未知方法 `405`；共识 / wire 篮子（破 head 不变量）：**货币费用** + 费用优先排序、nonce / 序列号反重放。
 
+## 显式 replace-by-fee（Milestone 144 · mempool RBF）
+
+M143 让 mempool 可按 (account, nonce) 流水线缓冲多笔 tx，但同一 (author, nonce) 的竞争 tx（同槽不同内容/fee）今天会**同时**驻留（`pending` 按 content-hash 键），出块隐式取 fee 最优、落败者滞留到 `prune_stale`——浪费池容量 + quota，替换语义隐式。M144 加**显式 replace-by-fee**：准入时若新 tx 与某在池 tx 同 (author, nonce)，仅当新 fee **严格更高**才替换旧的，否则拒绝新的，使每槽位至多一笔 pending。
+
+- **opt-in，默认关**（`replace_by_fee = false`）→ 现行为（同槽多笔共存 + 出块隐式选优 + prune）逐字节保留，既有 591 测 + localnet head 不变。**链上不涉及**（纯 mempool 准入策略）。
+- **`insert` RBF 分支**（`mempool.rs`）：在 `validate_tx_ignoring_nonce` + nonce 窗口检查后、capacity/quota 前——RBF 开启时扫描 `pending` 找同 `(author, nonce)` incumbent（不同 hash）：`tx.fee > incumbent.fee` → 先移除 incumbent（quota 递减）再走正常纳入（capacity 见释放槽不误拒、quota 净不变），否则 `ChainError::FeeTooLowToReplace { author, nonce, existing_fee, got_fee }`。同 hash 重插仍幂等（落到原路径）。扫描 O(n) 仅 RBF 开启时、池受 capacity 约束，故不引索引（避免与 `pending` 失同步的不变量）。
+- **新字段** `replace_by_fee: bool` + `set_replace_by_fee`/getter；`MempoolConfig.replace_by_fee`（`#[serde(default)]`=false）；`GossipNode::set_mempool_replace_by_fee` 代理；`Node::start` 按 `cfg.mempool.replace_by_fee` 布线（false→不调用→不变）。
+- **不碰** `build_block`（RBF 开启时每槽 ≤1 笔，M143 多趟算法天然适配）、`prune_stale`、`apply_tx`/`validate_tx`/codec/wire/`driver.rs`/`light.rs`；`localnet` 头仍 wire v1 `a045426e…3b87bc`。
+- **测试（+8 → 599）**：mempool `rbf_replaces_lower_fee_at_same_slot`、`rbf_rejects_not_higher_fee`（等/低 fee 均 `FeeTooLowToReplace`、incumbent 留存）、`rbf_idempotent_same_tx`、`rbf_different_nonces_coexist`（不同槽不替换）、`rbf_replacement_preserves_quota`（per_account_limit 1 下替换不超额）、`rbf_off_by_default_keeps_same_slot_duplicates`；lib `fee_too_low_to_replace_error_display`；config `mempool_config_replace_by_fee_defaults_false`。
+
+**已知边界（顺延）**：最小 fee 加价阈值（`new.fee >= old.fee + min_bump` 防抖动替换，本轮为「严格更高即可」）；光守护进程；`Cmd::QueryBlock` 线性 find 改索引。
+
 ## nonce 流水线：每账户多笔待打包 tx（Milestone 143 · mempool pipelining）
 
 M122（wire v1）已完整实现 nonce 反重放，但 `validate_tx` 的严格 `tx.nonce == acct.nonce` 在 **mempool 准入**（`Mempool::insert`）也生效，导致**一个账户同时只能有一笔待打包 tx**——下一笔（nonce+1）须等前一笔提交才能准入。M143 加 **nonce 流水线**：允许账户缓冲一个有界窗口内的未来 nonce，出块时按**账户内 nonce 顺序 + 跨账户 fee 优先**确定性打包，使 nonce N、N+1 进同一个块。

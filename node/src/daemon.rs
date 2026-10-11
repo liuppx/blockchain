@@ -6405,6 +6405,11 @@ impl Node {
         if cfg.mempool.nonce_lookahead > 0 {
             node.set_mempool_nonce_lookahead(cfg.mempool.nonce_lookahead);
         }
+        // M144: replace-by-fee admission. `false` (the default) ⇒ setter not called ⇒
+        // behavior byte-identical.
+        if cfg.mempool.replace_by_fee {
+            node.set_mempool_replace_by_fee(true);
+        }
         // M141: a validator that snapshot-boots into a set it is not a member of will
         // follow + serve but never propose (its `start_height` membership guard never
         // opens). Surface that loudly rather than letting the node idle silently.

@@ -1185,6 +1185,13 @@ impl GossipNode {
         self.mempool.set_nonce_lookahead(lookahead);
     }
 
+    /// M144: enable replace-by-fee mempool admission — a tx at a `(author, nonce)`
+    /// already held replaces the incumbent iff it bids a strictly higher fee.
+    /// `false` (the default) keeps same-slot competitors coexisting.
+    pub fn set_mempool_replace_by_fee(&mut self, enabled: bool) {
+        self.mempool.set_replace_by_fee(enabled);
+    }
+
     /// M55: bound each gossip dedup set (`seen_tx`/`seen_evidence`/`seen_stake_op`)
     /// to `capacity` most-recent entries (FIFO eviction). `usize::MAX` ⇒ unbounded
     /// (the default). The three sets are bounded independently to the same value.
