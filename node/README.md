@@ -1341,6 +1341,22 @@ M116 的 `node rpc` 只能 GET。M117 补上写侧，让它成为**全能** RPC 
 
 **已知边界（顺延至 M121+）**：身份读三类已齐（`/genesis` 链 / `/node` 节点 / `/info` 链尖）；读面两分（`/params`/`/config`）已齐；RPC 自带端点发现 + 全能客户端 + 完整链读/写面；内容协商三轴已齐（仅 `identity`，真压缩顺延）；离线工具篮子已补；运维篮子剩余：证书/密钥轮换与落盘、follower 认证、指标端 TLS、OTel/push exporter、每-sink 独立 rotation 覆盖、时延直方图；keygen 篮子剩余：助记词 / BIP-39、口令加密 keystore、密钥轮换；剩余：游标分页、未知方法 `405`；共识 / wire 篮子（破 head 不变量）：**货币费用** + 费用优先排序、nonce / 序列号反重放。
 
+## 下一验证人集随头同步上线（Milestone 147 · light fast-sync 协议前置）
+
+目标是生产级轻客户端守护进程（`node light-run`）让 M142 的 `from_verified_snapshot` 真正可用。探查发现它是**三阶段**工程，有一个硬协议前置缺口：**轻节点今天无法仅凭 wire 跨验证人集变更同步**——`GossipMsg::Headers`/`CertifiedHeader` 只带 `next_validators_root`（32B 承诺），不带集合内容，而 `follow_header` 要求调用方传完整 `ValidatorSet`；今天这份集由 `LightNetwork::run` 的**进程内 oracle** `next_set_for` 伪造。M147 关这个缺口（守护进程本身留后续 Phase）。
+
+- **head 安全**：GossipMsg 是 P2P 信封，不折入任何 cert-signed 哈希（`encode_gossip` 独立于 `encode_block`/`encode_tx`）。纯新增 wire 变体 + 新 codec → `localnet` 头仍 wire v1 `a045426e…3b87bc`，全节点 BFT 收敛不受影响。
+- **`ValidatorSet` wire codec**（`codec.rs`）：`encode_validator_set`/`decode_validator_set`——长度前缀的 `(u64 id, 32B pubkey, u64 power)` 列表，确定性（id 排序）、拒尾字节。
+- **两新 GossipMsg**（`net.rs`，tag 18/19）：`GetHeadersWithSets { from }` + `HeadersWithSets(Vec<(CertifiedHeader, ValidatorSet)>)`——条目 `i` = `(高度 from+i 的头, 认证 from+i+1 的验证人集)`（= 应用块 from+i 后状态的 validators，其 `merkle_root == header.next_validators_root`）。
+- **全节点 serve**（`net.rs`）：`headers_with_sets_from(from)` 单趟重放（从 base 种子逐块 commit，对 `[start..end]` 每块快照 `state.validators` 与头配对），`on_message` 加 `GetHeadersWithSets` serve 臂。
+- **轻节点 consume**（`net.rs`）：同步请求从 `GetHeaders` 改 `GetHeadersWithSets`；新 `on_headers_with_sets` 对每个 `(header, next_set)` 调 `apply_header`（`follow_header` 对当前 set 验 cert、对 `next_validators_root` 验 next_set、推进）——**无状态、仅凭 wire**，替代 oracle。旧 `Headers`/`on_headers`（dedup-only）保留。
+- **`LightNetwork` 改 oracle-free**：`run()` 去掉 `next_set_for` 参数，新消息经正常 `on_message` 路径推进；更新 3 个 demo + 既有 light 测的调用（断言在真实 wire 路径下更强）。
+- **测试（+4 → 607）**：`validator_set_wire_round_trips`（codec）；`headers_with_sets_serve_pairs_each_header_with_its_next_set`（每条 `set.merkle_root == header.next_validators_root`，覆盖验证人变更）；**`light_syncs_across_validator_set_change_over_wire`（核心 soundness：轻节点仅凭 wire 跨「高度 1 加验证人 25」的集合变更同步到尖端 + 权威集，学到 25）**；`gossip_wire_round_trips_headers_with_sets`；既有 light 总线测迁移到 oracle-free 后仍绿（现经真实 wire）。
+
+**light 守护进程分阶段（M147 为 Phase 1 协议前置）**：
+- **Phase 2**：light 专属 actor + `node light-run` + `[light]` config，复用全部传输层（`handle_conn`/`run_listener`/`run_connector`/`AuthContext`/TLS），snapshot-seed via `from_verified_snapshot`。
+- **Phase 3**：弱主观性 trusted-set 引导、metrics/RPC、proof 透传；`HeadersWithSets` 的「仅变更附集」压缩。
+
 ## `/block/{h}` O(1) 按高度索引（Milestone 146 · 读路径 perf）
 
 `Cmd::QueryBlock` / `Cmd::QueryBlockTxs`（服务 `/block/{h}` 与 `/block/{h}/txs`）此前对 `node.blocks()` 做**线性 `find`**（O(n)）。但节点自 M139 起已偏移感知（`base_height` + `vec_idx`），高度→索引本是纯算术。M146 加 `GossipNode::block_at(height)` 复用 `vec_idx` 做 O(1) 查，两个 handler 改用它。

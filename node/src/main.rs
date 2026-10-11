@@ -1782,10 +1782,10 @@ fn cmd_lsync() {
     );
     let mut net = LightNetwork::new(vec![full], vec![light]);
 
-    // Per-height authoritative next sets, computed once from a full replay.
-    // The light peer is told "block i+1 was certified by this set, and it
-    // commits to this next set in its `next_validators_root`" — exactly the
-    // side-information `follow_committed`/`follow_header` need.
+    // M147: the light peer syncs headers-with-sets over the wire — the full peer
+    // ships each header paired with the next validator set, so no out-of-band
+    // `next_set` oracle is needed anymore. (The `committed_sets` replay below is kept
+    // only for the membership-proof illustration further down, not for sync.)
     let mut committed_sets: Vec<ValidatorSet> = Vec::new();
     let mut replay = Chain::new(demo_genesis());
     for b in d.blocks() {
@@ -1795,16 +1795,17 @@ fn cmd_lsync() {
             .unwrap_or_else(|e| fail_msg("replay commit", &e));
         committed_sets.push(replay.state.validators.clone());
     }
-    let next_set_for = |h: u64| committed_sets.get((h - 1) as usize).cloned();
 
     net.announce_all();
     for round in 0..10 {
-        let n = net.run(1, light_id, &next_set_for);
+        let n = net.run();
         if n == 0 {
             break;
         }
         if round == 0 {
-            println!("  round 1: light Status{{height=0}} -> full replies Headers{{from=1}}");
+            println!(
+                "  round 1: light Status{{height=0}} -> full replies HeadersWithSets{{from=1}}"
+            );
         }
     }
 
@@ -1933,16 +1934,11 @@ fn cmd_account() {
     let light = LightGossipNode::new(light_id, &demo_genesis(), [1, 2]);
     let mut net = LightNetwork::new(vec![full], vec![light]);
 
-    // 3. Authoritative per-height next sets from a full replay; needed to
-    //    side-channel the headers from full -> light through
-    //    LightGossipNode::apply_header (the bus drops them otherwise).
-    let sets = committed_sets(&demo_genesis(), &blocks);
-    let next_set_for = |h: u64| sets.get((h - 1) as usize).cloned();
-
-    // 4. Run the M22 sync to header height 2.
+    // 3. M147: headers-with-sets sync — the full peer ships each header's next set
+    //    over the wire, so the light peer advances with no out-of-band oracle.
     net.announce_all();
     for _ in 0..20 {
-        let n = net.run(1, light_id, &next_set_for);
+        let n = net.run();
         if n == 0 && net.light_node(light_id).tracker().height() == 2 {
             break;
         }
@@ -3238,13 +3234,10 @@ fn cmd_graph() {
     let light = LightGossipNode::new(light_id, &demo_genesis(), [1, 2]);
     let mut net = LightNetwork::new(vec![full], vec![light]);
 
-    // Side-channel next_set_for so the M22 sync runs through apply_header.
-    let sets = committed_sets(&demo_genesis(), &blocks);
-    let next_set_for = |h: u64| sets.get((h - 1) as usize).cloned();
-
+    // M147: headers-with-sets sync — next sets ride the wire, no oracle needed.
     net.announce_all();
     for _ in 0..20 {
-        let n = net.run(1, light_id, &next_set_for);
+        let n = net.run();
         if n == 0 && net.light_node(light_id).tracker().height() == 1 {
             break;
         }

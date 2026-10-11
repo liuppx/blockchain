@@ -271,6 +271,45 @@ pub fn decode_certified_header(buf: &[u8]) -> Result<CertifiedHeader, CodecError
     Ok(CertifiedHeader { header, cert })
 }
 
+/// M147: wire encoding of a full [`ValidatorSet`] — a length-prefixed list of
+/// `(u64 id, 32-byte pubkey, u64 power)`, mirroring the validator-update layout the
+/// block header already uses. Deterministic: `ValidatorSet::new` sorts by id, so the
+/// encoding is stable. Shipped alongside each header in `GossipMsg::HeadersWithSets`
+/// so a light client can verify header succession across validator-set changes from
+/// wire data alone (the set's `merkle_root` is checked against the prior header's
+/// `next_validators_root`).
+pub fn encode_validator_set(vs: &ValidatorSet) -> Vec<u8> {
+    let mut e = Enc(Vec::new());
+    let vals = vs.validators();
+    e.u64(vals.len() as u64);
+    for v in vals {
+        e.u64(v.id);
+        e.raw(&v.pubkey);
+        e.u64(v.power);
+    }
+    e.0
+}
+
+/// Inverse of [`encode_validator_set`]. Rejects an implausible count and any trailing
+/// bytes. The returned set is re-sorted by `ValidatorSet::new`, so a non-canonical
+/// (unsorted) encoding decodes to the canonical set.
+pub fn decode_validator_set(buf: &[u8]) -> Result<ValidatorSet, CodecError> {
+    let mut d = Dec { buf, pos: 0 };
+    let n = d.count()?;
+    let mut vals = Vec::with_capacity(n as usize);
+    for _ in 0..n {
+        let id = d.u64()?;
+        let mut pubkey = [0u8; 32];
+        pubkey.copy_from_slice(d.take(32)?);
+        let power = d.u64()?;
+        vals.push(Validator { id, pubkey, power });
+    }
+    if d.pos != d.buf.len() {
+        return Err(CodecError::TrailingBytes);
+    }
+    Ok(ValidatorSet::new(vals))
+}
+
 /// A cert-signed projection of a [`Block`] — the header fields only, never the
 /// tx / stake-op / evidence bodies themselves. Lives in this module alongside
 /// the codec so `decode_block` / `encode_block` and `encode_header` /
@@ -2029,6 +2068,42 @@ mod tests {
         let back2 = decode_block(&encode_block(&plain)).unwrap();
         assert!(back2.validator_updates.is_empty());
         assert_ne!(back.hash(), back2.hash()); // updates are covered by the hash
+    }
+
+    #[test]
+    fn validator_set_wire_round_trips() {
+        // M147: a full ValidatorSet round-trips over the wire; the encoding is stable,
+        // canonicalizes order (ValidatorSet::new sorts by id), and rejects trailing bytes.
+        let vs = ValidatorSet::new(vec![
+            Validator {
+                id: 21,
+                pubkey: [1u8; 32],
+                power: 3,
+            },
+            Validator {
+                id: 5,
+                pubkey: [2u8; 32],
+                power: 1,
+            },
+        ]);
+        let bytes = encode_validator_set(&vs);
+        let back = decode_validator_set(&bytes).unwrap();
+        assert_eq!(back.merkle_root(), vs.merkle_root());
+        assert_eq!(back.validators()[0].id, 5, "decoded set is id-sorted");
+        assert_eq!(encode_validator_set(&back), bytes, "re-encode stable");
+        // trailing bytes are rejected.
+        let mut bad = bytes.clone();
+        bad.push(0);
+        assert!(matches!(
+            decode_validator_set(&bad),
+            Err(CodecError::TrailingBytes)
+        ));
+        // empty set round-trips (length-0 prefix).
+        let empty = ValidatorSet::new(vec![]);
+        assert!(decode_validator_set(&encode_validator_set(&empty))
+            .unwrap()
+            .validators()
+            .is_empty());
     }
 
     #[test]
