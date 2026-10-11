@@ -487,6 +487,11 @@ pub struct MempoolConfig {
     /// sentinel as `seen_cache`. A value above `capacity` is legal but never binds
     /// (the global cap trips first).
     pub per_account_limit: usize,
+    /// M143: nonce pipelining window — how many future nonces beyond an account's
+    /// current one the pool will buffer so they can be laid into one block in nonce
+    /// order. `0` ⇒ strict one-pending-tx-per-account (the behavior-preserving
+    /// default; byte-identical to pre-M143).
+    pub nonce_lookahead: usize,
 }
 
 impl Default for MempoolConfig {
@@ -500,6 +505,7 @@ impl Default for MempoolConfig {
             per_peer_tx_burst: 256.0,
             seen_cache: 0,
             per_account_limit: 0,
+            nonce_lookahead: 0,
         }
     }
 }
@@ -2144,6 +2150,27 @@ mod tests {
 
         // Remove the now-obsolete pre-M33 keystore if a prior run left one.
         let _ = std::fs::remove_file(dir.join("keystore.toml"));
+    }
+
+    #[test]
+    fn mempool_config_nonce_lookahead_defaults_zero() {
+        // M143: a `[mempool]` section without `nonce_lookahead` (or no section at all)
+        // defaults to 0 — strict one-pending-tx-per-account, behavior-preserving.
+        let toml = r#"
+            genesis = "genesis.toml"
+
+            [node]
+            id = 21
+            listen = "127.0.0.1:9021"
+            data_dir = "/tmp/x"
+
+            [mempool]
+            capacity = 100
+        "#;
+        let cfg: NodeConfig = toml::from_str(toml).expect("parse mempool config");
+        assert_eq!(cfg.mempool.capacity, 100);
+        assert_eq!(cfg.mempool.nonce_lookahead, 0);
+        assert_eq!(MempoolConfig::default().nonce_lookahead, 0);
     }
 
     #[test]

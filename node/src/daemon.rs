@@ -6400,6 +6400,11 @@ impl Node {
         if cfg.mempool.per_account_limit > 0 {
             node.set_mempool_per_account_limit(cfg.mempool.per_account_limit);
         }
+        // M143: nonce pipelining window. `nonce_lookahead == 0` ⇒ strict one-pending-tx-
+        // per-account (the default) ⇒ setter not called ⇒ behavior byte-identical.
+        if cfg.mempool.nonce_lookahead > 0 {
+            node.set_mempool_nonce_lookahead(cfg.mempool.nonce_lookahead);
+        }
         // M141: a validator that snapshot-boots into a set it is not a member of will
         // follow + serve but never propose (its `start_height` membership guard never
         // opens). Surface that loudly rather than letting the node idle silently.

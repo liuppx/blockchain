@@ -1341,6 +1341,22 @@ M116 的 `node rpc` 只能 GET。M117 补上写侧，让它成为**全能** RPC 
 
 **已知边界（顺延至 M121+）**：身份读三类已齐（`/genesis` 链 / `/node` 节点 / `/info` 链尖）；读面两分（`/params`/`/config`）已齐；RPC 自带端点发现 + 全能客户端 + 完整链读/写面；内容协商三轴已齐（仅 `identity`，真压缩顺延）；离线工具篮子已补；运维篮子剩余：证书/密钥轮换与落盘、follower 认证、指标端 TLS、OTel/push exporter、每-sink 独立 rotation 覆盖、时延直方图；keygen 篮子剩余：助记词 / BIP-39、口令加密 keystore、密钥轮换；剩余：游标分页、未知方法 `405`；共识 / wire 篮子（破 head 不变量）：**货币费用** + 费用优先排序、nonce / 序列号反重放。
 
+## nonce 流水线：每账户多笔待打包 tx（Milestone 143 · mempool pipelining）
+
+M122（wire v1）已完整实现 nonce 反重放，但 `validate_tx` 的严格 `tx.nonce == acct.nonce` 在 **mempool 准入**（`Mempool::insert`）也生效，导致**一个账户同时只能有一笔待打包 tx**——下一笔（nonce+1）须等前一笔提交才能准入。M143 加 **nonce 流水线**：允许账户缓冲一个有界窗口内的未来 nonce，出块时按**账户内 nonce 顺序 + 跨账户 fee 优先**确定性打包，使 nonce N、N+1 进同一个块。
+
+- **链上不破坏**：`apply_tx`/`validate_tx`（共识路径）仍严格相等，块按精确 nonce 顺序应用。改动纯在 mempool（准入 + 出块 + 清理）。
+- **默认 `lookahead = 0` = 现严格行为**（opt-in，照 M54/M57 capacity/quota 范式）→ localnet head + 582 既有测试逐字节不变。
+- **验证拆分**（`lib.rs`）：抽出 `validate_tx_ignoring_nonce`（除严格 nonce 外全部检查）；`validate_tx` = 它 + 末尾严格 nonce（apply 路径等价——多条件同失败时仅改返回的错误变体，不改「拒绝=跳过」与块组成）。新错误 `ChainError::NonceTooFarAhead { account, got, limit }`。
+- **准入窗口**（`mempool.rs` `insert`）：`validate_tx_ignoring_nonce` 后——`tx.nonce < acct.nonce` → `BadNonce`（重放）；`tx.nonce > acct.nonce + nonce_lookahead` → `NonceTooFarAhead`；否则准入。新字段 `nonce_lookahead` + `set_nonce_lookahead`/getter。
+- **确定性流水线出块**（`mempool.rs` `build_block`，无条件重写）：候选按 `(fee desc, hash asc)` 排序；tx 仅在其 nonce == 账户当前 trial nonce 时**合格**；多趟循环——每趟按序试应用合格者，应用推进账户 trial nonce 暴露后继，直到整趟无进展。**`lookahead=0` 时每账户 ≤1 笔合格 tx，首趟即全合格 → 与现单趟 fee-sort 逐字节等价**（账户相互独立 + 全序 tiebreak，已证）。
+- **过期清理**（`mempool.rs` `prune_stale(&chain)`）：丢弃 `tx.nonce < acct.nonce` 的 pending（重放 / 同-nonce 落败重复——此类泄漏 M122 已存在），同步 quota。在两个 commit 点 `remove_included` 后调用（`net.rs` `apply_certified`、`driver.rs`）。
+- **配置/布线**：`MempoolConfig.nonce_lookahead`（`#[serde(default)]`=0）；`GossipNode::set_mempool_nonce_lookahead` 代理；`Node::start` 按 `cfg.mempool.nonce_lookahead > 0` 布线（0→不调用→不变）。
+- **不碰**：`apply_tx`/`apply_block`/codec/wire（nonce 已在 wire v1）；`localnet` 头仍 wire v1 `a045426e…3b87bc`。
+- **测试（+9 → 591）**：mempool `lookahead_zero_rejects_future_nonce`（默认严格）、`pipeline_admits_consecutive_nonces_when_lookahead_set`、`pipeline_builds_account_txs_in_nonce_order_in_one_block`（三 nonce 一块内升序、commit 干净、守恒）、`build_fee_priority_across_accounts_respects_per_account_nonce_order`（高 fee 账户先，但账户内 nonce 保序）、`pipeline_rejects_stale_and_too_far_ahead`、`prune_stale_drops_committed_and_stale_duplicates`；lib `validate_tx_ignoring_nonce_matches_validate_tx_sans_nonce`、`nonce_too_far_ahead_error_display`；config `mempool_config_nonce_lookahead_defaults_zero`。
+
+**已知边界（顺延）**：显式 replace-by-fee（同 nonce 更高 fee 替换，现为出块时隐式取 fee 最优）；光守护进程；`Cmd::QueryBlock` 线性 find 改索引。
+
 ## 轻客户端快照 fast-sync 种子（Milestone 142 · 快速同步收官）
 
 快速同步大件收官：M131–M136 建离线快照工具链 + 轻客户端 `ValidatorTracker::from_snapshot`（M136）；M139–M141 让 full-node 能采纳快照启动/重启续尾/法定人数验证。唯一还卡在创世起算的消费者是 `LightGossipNode`——构造函数硬编码 `ValidatorTracker::from_genesis`。M142 给它补上快照种子：轻客户端下载 `(snapshot, header, cert)`、对**钉死的可信验证人集**（弱主观性检查点）验完，就能在高度 H 直接起步、从 H+1 续 `/headers` 跟踪——与「从创世跟到 H」逐字段等价。

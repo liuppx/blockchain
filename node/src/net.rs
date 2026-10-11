@@ -1083,6 +1083,9 @@ impl GossipNode {
             return false;
         }
         self.mempool.remove_included(&block);
+        // M143: the commit advanced some accounts' nonces, so drop any now-stale pending
+        // txs (replays / losing same-nonce duplicates) a pipelining pool may hold.
+        self.mempool.prune_stale(&self.chain);
         // M33: every validator builds candidates from its own pending pools, so
         // once a block commits we must drop the evidence / stake ops it carried —
         // otherwise this node would re-propose already-applied ops at the next
@@ -1172,6 +1175,14 @@ impl GossipNode {
     /// ⇒ unbounded. Admission past it is rejected with `ChainError::AccountQuotaFull`.
     pub fn set_mempool_per_account_limit(&mut self, limit: usize) {
         self.mempool.set_per_account_limit(limit);
+    }
+
+    /// M143: set the mempool's nonce pipelining window — how many future nonces beyond
+    /// an account's current one may be buffered so they can be laid into one block in
+    /// nonce order. `0` ⇒ strict one-pending-tx-per-account (the default; byte-identical
+    /// to pre-M143).
+    pub fn set_mempool_nonce_lookahead(&mut self, lookahead: usize) {
+        self.mempool.set_nonce_lookahead(lookahead);
     }
 
     /// M55: bound each gossip dedup set (`seen_tx`/`seen_evidence`/`seen_stake_op`)

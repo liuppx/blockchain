@@ -339,6 +339,8 @@ impl ChainDriver {
         let mut owned = block.clone();
         self.chain.commit(&mut owned).map_err(DriverError::Apply)?;
         self.mempool.remove_included(block);
+        // M143: drop now-stale pending txs after the commit advanced account nonces.
+        self.mempool.prune_stale(&self.chain);
         Ok(())
     }
 
