@@ -3714,28 +3714,18 @@ fn cmd_inspect_cert(args: &[String]) {
     }
 }
 
-fn cmd_run(config_path: String, args: &[String]) {
-    // M44: load the config first, then install the subscriber from its optional
-    // `[logging]` section (absent ⇒ the M37 default). Config-load errors print via
-    // `fail_msg`/eprintln — not tracing — so no log lines are lost by ordering the
-    // load before the subscriber init.
-    let mut cfg =
-        config::load_node_config(&config_path).unwrap_or_else(|e| fail_msg("load node config", &e));
-    // M140: optional snapshot-boot flags — `--snapshot FILE` + `--snapshot-header HEX`. The two
-    // flags are a coherent pair; if either is given we set `cfg.snapshot` so `Node::start`
-    // adopts the snapshot at boot (reconciling the on-disk log + verifying the cert-signed
-    // header against the snapshot's three roots).
-    // M141: optional `--snapshot-cert HEX` + `--snapshot-validators FILE` upgrade the boot to a
-    // `>2/3` quorum check against an operator-pinned trusted set. They require the base pair and
-    // are themselves a coherent pair; the final cert/trusted-set coherence is enforced in
-    // `load_snapshot_boot` (authoritative for both the CLI and the TOML keypath).
+/// M140/M141/M149: fold the `--snapshot*` CLI flags into `cfg.snapshot`, shared by
+/// `node run` (M140/M141) and `node light-run` (M149). `--snapshot` + `--snapshot-header`
+/// are a required pair; `--snapshot-cert` + `--snapshot-validators` upgrade to a quorum
+/// check and require the base pair. `who` names the subcommand in error messages.
+fn merge_snapshot_flags(cfg: &mut config::NodeConfig, args: &[String], who: &str) {
     let snap_path = opt_arg(args, "--snapshot").map(str::to_string);
     let snap_header = opt_arg(args, "--snapshot-header").map(str::to_string);
     let snap_cert = opt_arg(args, "--snapshot-cert").map(str::to_string);
     let snap_vals = opt_arg(args, "--snapshot-validators").map(str::to_string);
     match (snap_path, snap_header) {
         (Some(_), None) | (None, Some(_)) => fail_msg(
-            "node run",
+            who,
             &"--snapshot and --snapshot-header must be given together",
         ),
         (Some(path), Some(header_hex)) => {
@@ -3756,12 +3746,30 @@ fn cmd_run(config_path: String, args: &[String]) {
         (None, None) => {
             if snap_cert.is_some() || snap_vals.is_some() {
                 fail_msg(
-                    "node run",
+                    who,
                     &"--snapshot-cert/--snapshot-validators require --snapshot and --snapshot-header",
                 );
             }
         }
     }
+}
+
+fn cmd_run(config_path: String, args: &[String]) {
+    // M44: load the config first, then install the subscriber from its optional
+    // `[logging]` section (absent ⇒ the M37 default). Config-load errors print via
+    // `fail_msg`/eprintln — not tracing — so no log lines are lost by ordering the
+    // load before the subscriber init.
+    let mut cfg =
+        config::load_node_config(&config_path).unwrap_or_else(|e| fail_msg("load node config", &e));
+    // M140: optional snapshot-boot flags — `--snapshot FILE` + `--snapshot-header HEX`. The two
+    // flags are a coherent pair; if either is given we set `cfg.snapshot` so `Node::start`
+    // adopts the snapshot at boot (reconciling the on-disk log + verifying the cert-signed
+    // header against the snapshot's three roots).
+    // M141: optional `--snapshot-cert HEX` + `--snapshot-validators FILE` upgrade the boot to a
+    // `>2/3` quorum check against an operator-pinned trusted set. They require the base pair and
+    // are themselves a coherent pair; the final cert/trusted-set coherence is enforced in
+    // `load_snapshot_boot` (authoritative for both the CLI and the TOML keypath).
+    merge_snapshot_flags(&mut cfg, args, "node run");
     daemon::init_tracing_with(cfg.logging.as_ref());
     let gcfg = config::load_genesis(&cfg.genesis).unwrap_or_else(|e| fail_msg("load genesis", &e));
     let genesis = gcfg
@@ -3790,9 +3798,12 @@ fn cmd_run(config_path: String, args: &[String]) {
 /// TCP, pull `GetHeadersWithSets` (M147), and track the validator set with a
 /// `LightGossipNode`. Headers-only: no block bodies, consensus, mempool, or on-disk
 /// state. Mirrors `cmd_run` but never resolves a validator key.
-fn cmd_light_run(config_path: String, _args: &[String]) {
-    let cfg =
+fn cmd_light_run(config_path: String, args: &[String]) {
+    let mut cfg =
         config::load_node_config(&config_path).unwrap_or_else(|e| fail_msg("load node config", &e));
+    // M149: a light node may snapshot-seed via `--snapshot*` (verified in light_start,
+    // which requires a cert + trusted set — a light node can't recompute roots locally).
+    merge_snapshot_flags(&mut cfg, args, "node light-run");
     daemon::init_tracing_with(cfg.logging.as_ref());
     let gcfg = config::load_genesis(&cfg.genesis).unwrap_or_else(|e| fail_msg("load genesis", &e));
     let genesis = gcfg

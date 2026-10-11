@@ -6723,6 +6723,59 @@ async fn run_light_actor(mut actor: LightActor, mut rx: mpsc::UnboundedReceiver<
     }
 }
 
+/// M149: build a snapshot-seeded [`crate::net::LightGossipNode`] from a snapshot-boot
+/// config. A light node can't recompute state roots locally, so it requires a cert +
+/// trusted validator set and verifies via `from_verified_snapshot` (M134/M142): the
+/// cert must reach `>2/3` of the pinned trusted set and bind the header, and the
+/// snapshot must recompute the header's three roots. A `[snapshot]` without a cert is
+/// rejected (unlike a full node, a light node has no fallback commitment check).
+fn load_light_snapshot_seed(
+    s: &crate::config::SnapshotBootConfig,
+    my_id: u64,
+    peer_ids: &[u64],
+) -> io::Result<crate::net::LightGossipNode> {
+    s.validate()
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+    let cert_hex = s.cert_hex.as_ref().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "light snapshot-seed requires a cert + trusted_validators (cert_hex missing)",
+        )
+    })?;
+    let bytes = std::fs::read(&s.path)?;
+    let state = crate::codec::decode_snapshot(&bytes).map_err(|e| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("decode snapshot {}: {e:?}", s.path),
+        )
+    })?;
+    let header =
+        crate::codec::decode_header(&hex_to_bytes(&s.header_hex).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidData, "header_hex not valid hex")
+        })?)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("decode header: {e:?}")))?;
+    let cert = crate::codec::decode_commit(
+        &hex_to_bytes(cert_hex)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "cert_hex not valid hex"))?,
+    )
+    .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("decode cert: {e:?}")))?;
+    let trusted = snapshot_trusted_set(s)?;
+    crate::net::LightGossipNode::from_verified_snapshot(
+        my_id,
+        &state,
+        &header,
+        &cert,
+        &trusted,
+        peer_ids.iter().copied(),
+    )
+    .map_err(|e| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("light snapshot verification failed: {e}"),
+        )
+    })
+}
+
 /// M148: a handle to a running light daemon.
 pub struct LightNode {
     cmd: mpsc::UnboundedSender<LightCmd>,
@@ -6752,7 +6805,12 @@ impl LightNode {
         }
 
         let peer_ids: Vec<u64> = cfg.peers.iter().map(|p| p.id).collect();
-        let node = crate::net::LightGossipNode::new(my_id, &genesis, peer_ids.iter().copied());
+        // M149: snapshot-seed if `[snapshot]` is configured (fast-sync from a verified
+        // checkpoint); otherwise track from genesis.
+        let node = match cfg.snapshot.as_ref() {
+            Some(s) => load_light_snapshot_seed(s, my_id, &peer_ids)?,
+            None => crate::net::LightGossipNode::new(my_id, &genesis, peer_ids.iter().copied()),
+        };
 
         // Reuse the full-node AuthContext build with no key. Encryption-only TLS
         // (`enable_tls` without `require_peer_certs`) needs no credential.
@@ -15589,7 +15647,7 @@ vote_b.validator=5 vote_b.height=9 vote_b.round=2 vote_b.block_hash={b_h} vote_b
         std::fs::create_dir_all(&dir).expect("mkdir data dir");
         let snap_path = std::path::Path::new(&dir).join("snapshot.bin");
         std::fs::write(&snap_path, &snap_bytes).expect("write snapshot");
-        cfg.snapshot = Some(SnapshotBootConfig {
+        cfg.snapshot = Some(crate::config::SnapshotBootConfig {
             path: snap_path.to_string_lossy().into_owned(),
             header_hex,
             cert_hex: None,
@@ -16127,6 +16185,57 @@ vote_b.validator=5 vote_b.height=9 vote_b.round=2 vote_b.block_hash={b_h} vote_b
         match LightNode::start(cfg, genesis).await {
             Err(e) => assert_eq!(e.kind(), io::ErrorKind::InvalidInput),
             Ok(_) => panic!("require_peer_auth without a key must be rejected"),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // --- M149: light daemon snapshot-seed ----------------------------------------
+
+    #[tokio::test]
+    async fn light_snapshot_seed_starts_at_tip() {
+        // M149: a light daemon configured with a verified snapshot (cert + trusted set)
+        // boots directly at the snapshot tip instead of tracking from genesis.
+        let (snap_bytes, header, cert, tv, state) = quorum_snapshot_fixture();
+        let dir = tmp_dir("light-seed");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = std::path::Path::new(&dir).join("snap.bin");
+        std::fs::write(&path, &snap_bytes).unwrap();
+
+        let mut cfg = node_config(21, 20660, &[21], dir.clone());
+        cfg.snapshot = Some(crate::config::SnapshotBootConfig {
+            path: path.to_string_lossy().into_owned(),
+            header_hex: crate::hash::hex(&crate::codec::encode_header(&header)),
+            cert_hex: Some(crate::hash::hex(&crate::codec::encode_commit(&cert))),
+            trusted_validators: tv,
+        });
+        let light = LightNode::start(cfg, test_genesis())
+            .await
+            .expect("light snapshot-seed boot");
+        let (h, _) = light.status().await.expect("light status");
+        assert_eq!(h, state.height, "seeded at the snapshot tip");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn light_snapshot_seed_requires_cert() {
+        // M149: a light node can't recompute roots locally, so a `[snapshot]` without a
+        // cert + trusted set is rejected (no fallback commitment check like a full node).
+        let (snap_bytes, header, _cert, _tv, _state) = quorum_snapshot_fixture();
+        let dir = tmp_dir("light-seed-nocert");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = std::path::Path::new(&dir).join("snap.bin");
+        std::fs::write(&path, &snap_bytes).unwrap();
+
+        let mut cfg = node_config(21, 20680, &[21], dir.clone());
+        cfg.snapshot = Some(crate::config::SnapshotBootConfig {
+            path: path.to_string_lossy().into_owned(),
+            header_hex: crate::hash::hex(&crate::codec::encode_header(&header)),
+            cert_hex: None,
+            trusted_validators: vec![],
+        });
+        match LightNode::start(cfg, test_genesis()).await {
+            Err(e) => assert_eq!(e.kind(), io::ErrorKind::InvalidData),
+            Ok(_) => panic!("light snapshot-seed without a cert must be rejected"),
         }
         let _ = std::fs::remove_dir_all(&dir);
     }

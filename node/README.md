@@ -1341,6 +1341,18 @@ M116 的 `node rpc` 只能 GET。M117 补上写侧，让它成为**全能** RPC 
 
 **已知边界（顺延至 M121+）**：身份读三类已齐（`/genesis` 链 / `/node` 节点 / `/info` 链尖）；读面两分（`/params`/`/config`）已齐；RPC 自带端点发现 + 全能客户端 + 完整链读/写面；内容协商三轴已齐（仅 `identity`，真压缩顺延）；离线工具篮子已补；运维篮子剩余：证书/密钥轮换与落盘、follower 认证、指标端 TLS、OTel/push exporter、每-sink 独立 rotation 覆盖、时延直方图；keygen 篮子剩余：助记词 / BIP-39、口令加密 keystore、密钥轮换；剩余：游标分页、未知方法 `405`；共识 / wire 篮子（破 head 不变量）：**货币费用** + 费用优先排序、nonce / 序列号反重放。
 
+## 轻守护进程快照种子（Milestone 149 · light daemon Phase 3a）
+
+M148 的 `node light-run` 是从创世跟踪的 MVP。M149 接上 fast-sync 收尾：让轻守护进程经 `[snapshot]` 配置（M141 的 cert + trusted_validators）**快照种子起步**，使 M142 的 `from_verified_snapshot` 在生产中可达。
+
+- **`load_light_snapshot_seed`**（`daemon.rs`）：解码 snapshot/header/cert + 建 trusted `ValidatorSet`（复用 `snapshot_trusted_set`），调 `LightGossipNode::from_verified_snapshot`（M134/M142：cert 达 trusted 集 >2/3 + 绑头 + 三根重算一致）。`LightNode::start` 在 `cfg.snapshot` 为 `Some` 时走此、否则 `::new`。
+- **轻节点必须 cert**：轻节点无本地状态重算三根，`[snapshot]` 缺 cert → 报错（不像全节点有 M135 承诺回退）。
+- **CLI**：`cmd_run` 的 `--snapshot*` 解析抽成共享 `merge_snapshot_flags`，`node light-run` 复用——`node light-run --config F --snapshot FILE --snapshot-header HEX --snapshot-cert HEX --snapshot-validators FILE`。
+- **不碰** `net.rs`（`from_verified_snapshot` 已全）/共识/codec；localnet 头仍 wire v1 `a045426e…3b87bc`。
+- **测试（+2 → 611）**：`light_snapshot_seed_starts_at_tip`（配 snapshot+cert+trusted → 轻节点直接在快照尖端起步，`status().height == snapshot.height`）、`light_snapshot_seed_requires_cert`（缺 cert → 报错）。
+
+**顺延 Phase 3 余项**：轻 RPC/metrics 读面、peer discovery、headers 持久化、弱主观性引导、`HeadersWithSets` 仅变更附集压缩。
+
 ## `node light-run` — 生产级轻客户端守护进程（Milestone 148 · light daemon Phase 2）
 
 M131–M147 把 fast-sync 的协议与库件做齐，但轻客户端至今只有 demo/测试用的进程内 `LightNetwork`，没有真正长跑的守护进程。M148 建 **`node light-run --config F`**：长跑轻节点 over TCP 连全节点 peer、拉 `GetHeadersWithSets`（M147）、用 `LightGossipNode` 跟踪验证人集。**headers-only——无块体、无共识、无 mempool、无 ChainState 执行、无落盘。**
