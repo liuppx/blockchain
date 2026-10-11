@@ -49,6 +49,12 @@ pub struct Mempool {
     /// newcomer is rejected). `false` (default) keeps the pre-M144 behavior — same-slot
     /// competitors coexist and the builder picks the highest fee at build time.
     replace_by_fee: bool,
+    /// M145: minimum fee increment a replace-by-fee bid must clear — a replacement is
+    /// admitted only when `new.fee >= incumbent.fee + min_fee_bump`. Default `1`, which
+    /// for integer fees is exactly "strictly higher" (byte-identical to M144). A larger
+    /// value dampens replacement churn (anti-spam); `0` permits equal-fee replacement.
+    /// Only consulted when `replace_by_fee` is on.
+    min_fee_bump: u64,
 }
 
 impl Mempool {
@@ -62,6 +68,7 @@ impl Mempool {
             rejected_quota: 0,
             nonce_lookahead: 0,
             replace_by_fee: false,
+            min_fee_bump: 1,
         }
     }
 
@@ -116,6 +123,18 @@ impl Mempool {
     /// M144: whether replace-by-fee admission is enabled.
     pub fn replace_by_fee(&self) -> bool {
         self.replace_by_fee
+    }
+
+    /// M145: set the minimum fee increment a replace-by-fee bid must clear (a
+    /// replacement needs `new.fee >= incumbent.fee + min_fee_bump`). Default `1`
+    /// (= strictly higher). Only consulted when replace-by-fee is on.
+    pub fn set_min_fee_bump(&mut self, min_fee_bump: u64) {
+        self.min_fee_bump = min_fee_bump;
+    }
+
+    /// M145: the configured replace-by-fee minimum increment (default `1`).
+    pub fn min_fee_bump(&self) -> u64 {
+        self.min_fee_bump
     }
 
     pub fn len(&self) -> usize {
@@ -194,7 +213,9 @@ impl Mempool {
                 .find(|(ih, t)| t.author == tx.author && t.nonce == tx.nonce && **ih != h)
                 .map(|(ih, t)| (*ih, t.fee));
             if let Some((inc_hash, inc_fee)) = incumbent {
-                if tx.fee > inc_fee {
+                // M145: require the bid to clear the incumbent's fee by at least
+                // `min_fee_bump` (default 1 = strictly higher for integer fees).
+                if tx.fee >= inc_fee.saturating_add(self.min_fee_bump) {
                     // Drop the incumbent first so the capacity/quota gates below see the
                     // freed slot — a replacement keeps the pool and quota size unchanged.
                     self.pending.remove(&inc_hash);
@@ -896,5 +917,64 @@ mod tests {
         mp.insert(&chain, tx_fee(1, 1, 1, 2 * MICRO, 1, 0)).unwrap();
         mp.insert(&chain, tx_fee(1, 2, 2, 2 * MICRO, 5, 0)).unwrap();
         assert_eq!(mp.len(), 2);
+    }
+
+    // --- M145: replace-by-fee minimum bump -------------------------------------
+
+    #[test]
+    fn rbf_default_min_bump_is_one_strictly_higher() {
+        // Default min_fee_bump == 1: for integer fees this is exactly "strictly higher".
+        let chain = Chain::new(genesis());
+        let mut mp = Mempool::new(16);
+        assert_eq!(mp.min_fee_bump(), 1);
+        mp.set_replace_by_fee(true);
+        mp.insert(&chain, tx_fee(1, 1, 1, 2 * MICRO, 5, 0)).unwrap();
+        // +1 clears the bump → replaces.
+        let hi = mp.insert(&chain, tx_fee(1, 2, 2, 2 * MICRO, 6, 0)).unwrap();
+        assert_eq!(mp.len(), 1);
+        assert!(mp.contains(&hi));
+    }
+
+    #[test]
+    fn rbf_min_bump_requires_larger_increment() {
+        // With a min bump of 10, a +5 bid is rejected; a +10 bid replaces.
+        let chain = Chain::new(genesis());
+        let mut mp = Mempool::new(16);
+        mp.set_replace_by_fee(true);
+        mp.set_min_fee_bump(10);
+        mp.insert(&chain, tx_fee(1, 1, 1, 2 * MICRO, 100, 0))
+            .unwrap();
+        // +5 (105) does not clear 100 + 10 → rejected, incumbent stays.
+        assert!(matches!(
+            mp.insert(&chain, tx_fee(1, 2, 2, 2 * MICRO, 105, 0)),
+            Err(ChainError::FeeTooLowToReplace {
+                existing_fee: 100,
+                got_fee: 105,
+                ..
+            })
+        ));
+        assert_eq!(mp.len(), 1);
+        // +10 (110) clears the bump → replaces.
+        let hi = mp
+            .insert(&chain, tx_fee(1, 3, 3, 2 * MICRO, 110, 0))
+            .unwrap();
+        assert_eq!(mp.len(), 1);
+        assert!(mp.contains(&hi));
+    }
+
+    #[test]
+    fn rbf_min_bump_zero_allows_equal_fee_replacement() {
+        // min_fee_bump == 0 permits equal-fee replacement (new content wins the slot).
+        let chain = Chain::new(genesis());
+        let mut mp = Mempool::new(16);
+        mp.set_replace_by_fee(true);
+        mp.set_min_fee_bump(0);
+        let lo = mp.insert(&chain, tx_fee(1, 1, 1, 2 * MICRO, 5, 0)).unwrap();
+        let eq = mp.insert(&chain, tx_fee(1, 2, 2, 2 * MICRO, 5, 0)).unwrap();
+        assert_eq!(mp.len(), 1);
+        assert!(
+            mp.contains(&eq) && !mp.contains(&lo),
+            "equal-fee newcomer took the slot"
+        );
     }
 }

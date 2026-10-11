@@ -1341,6 +1341,18 @@ M116 的 `node rpc` 只能 GET。M117 补上写侧，让它成为**全能** RPC 
 
 **已知边界（顺延至 M121+）**：身份读三类已齐（`/genesis` 链 / `/node` 节点 / `/info` 链尖）；读面两分（`/params`/`/config`）已齐；RPC 自带端点发现 + 全能客户端 + 完整链读/写面；内容协商三轴已齐（仅 `identity`，真压缩顺延）；离线工具篮子已补；运维篮子剩余：证书/密钥轮换与落盘、follower 认证、指标端 TLS、OTel/push exporter、每-sink 独立 rotation 覆盖、时延直方图；keygen 篮子剩余：助记词 / BIP-39、口令加密 keystore、密钥轮换；剩余：游标分页、未知方法 `405`；共识 / wire 篮子（破 head 不变量）：**货币费用** + 费用优先排序、nonce / 序列号反重放。
 
+## replace-by-fee 最小加价阈值（Milestone 145 · mempool RBF anti-churn）
+
+M144 的 RBF 要求替换 tx「fee 严格更高」，但哪怕只高 1 micro 也能替换——敌手可用极小加价反复替换同槽 tx 制造 churn。M145 加**最小加价阈值** `min_fee_bump`：替换须满足 `new.fee >= incumbent.fee + min_fee_bump`。
+
+- **默认 `min_fee_bump = 1`**：对整数 fee 恰为「严格更高」（`fee >= inc+1` ⟺ `fee > inc`），故与 M144 **逐字节等价**——既有 599 测 + localnet head 不变（38 个 mempool 测含全部 M144 RBF 测在默认 bump=1 下全绿即证）。
+- **语义**（`mempool.rs` `insert`）：RBF 分支的比较从 `tx.fee > inc_fee` 改为 `tx.fee >= inc_fee.saturating_add(self.min_fee_bump)`（`saturating_add` 防溢出）。`min_fee_bump > 1` 要求更大跳涨（抑制 churn）；`= 0` 允许等 fee 替换（新内容夺槽）。仅 RBF 开启时生效。
+- **新字段** `min_fee_bump: u64`（默认 1）+ `set_min_fee_bump`/getter；`MempoolConfig.min_fee_bump`（`#[serde(default)]`=1）；`GossipNode::set_mempool_min_fee_bump` 代理；`Node::start` 在 RBF 开启块内布线（RBF 关 → 不涉及）。
+- **不碰** build/apply/codec/wire；`localnet` 头仍 wire v1 `a045426e…3b87bc`。
+- **测试（+3 → 602）**：`rbf_default_min_bump_is_one_strictly_higher`（默认 1 = 严格更高，+1 替换）、`rbf_min_bump_requires_larger_increment`（bump 10：+5 拒、+10 替换）、`rbf_min_bump_zero_allows_equal_fee_replacement`（bump 0：等 fee 新内容夺槽）；config 测扩展断言 `min_fee_bump` 缺省 1。
+
+**已知边界（顺延）**：百分比加价（bps，跨 fee 量级更稳；本轮为绝对增量）；光守护进程；`Cmd::QueryBlock` 线性 find 改索引。
+
 ## 显式 replace-by-fee（Milestone 144 · mempool RBF）
 
 M143 让 mempool 可按 (account, nonce) 流水线缓冲多笔 tx，但同一 (author, nonce) 的竞争 tx（同槽不同内容/fee）今天会**同时**驻留（`pending` 按 content-hash 键），出块隐式取 fee 最优、落败者滞留到 `prune_stale`——浪费池容量 + quota，替换语义隐式。M144 加**显式 replace-by-fee**：准入时若新 tx 与某在池 tx 同 (author, nonce)，仅当新 fee **严格更高**才替换旧的，否则拒绝新的，使每槽位至多一笔 pending。

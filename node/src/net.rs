@@ -1192,6 +1192,12 @@ impl GossipNode {
         self.mempool.set_replace_by_fee(enabled);
     }
 
+    /// M145: set the replace-by-fee minimum fee increment (`new.fee >= incumbent.fee +
+    /// min_fee_bump`). Default `1` (= strictly higher). Only used when RBF is on.
+    pub fn set_mempool_min_fee_bump(&mut self, min_fee_bump: u64) {
+        self.mempool.set_min_fee_bump(min_fee_bump);
+    }
+
     /// M55: bound each gossip dedup set (`seen_tx`/`seen_evidence`/`seen_stake_op`)
     /// to `capacity` most-recent entries (FIFO eviction). `usize::MAX` ⇒ unbounded
     /// (the default). The three sets are bounded independently to the same value.

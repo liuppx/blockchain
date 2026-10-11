@@ -6406,9 +6406,11 @@ impl Node {
             node.set_mempool_nonce_lookahead(cfg.mempool.nonce_lookahead);
         }
         // M144: replace-by-fee admission. `false` (the default) ⇒ setter not called ⇒
-        // behavior byte-identical.
+        // behavior byte-identical. M145: the min-fee-bump threshold is only meaningful
+        // under RBF, so it is applied here alongside it.
         if cfg.mempool.replace_by_fee {
             node.set_mempool_replace_by_fee(true);
+            node.set_mempool_min_fee_bump(cfg.mempool.min_fee_bump);
         }
         // M141: a validator that snapshot-boots into a set it is not a member of will
         // follow + serve but never propose (its `start_height` membership guard never

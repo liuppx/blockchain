@@ -496,6 +496,11 @@ pub struct MempoolConfig {
     /// *replacing* the incumbent iff it bids a strictly higher fee. `false` (the
     /// behavior-preserving default) keeps same-slot competitors coexisting.
     pub replace_by_fee: bool,
+    /// M145: minimum fee increment a replace-by-fee bid must clear
+    /// (`new.fee >= incumbent.fee + min_fee_bump`). Default `1` (= strictly higher,
+    /// byte-identical to M144); larger dampens replacement churn; only used when
+    /// `replace_by_fee` is on.
+    pub min_fee_bump: u64,
 }
 
 impl Default for MempoolConfig {
@@ -511,6 +516,7 @@ impl Default for MempoolConfig {
             per_account_limit: 0,
             nonce_lookahead: 0,
             replace_by_fee: false,
+            min_fee_bump: 1,
         }
     }
 }
@@ -2195,6 +2201,9 @@ mod tests {
         let cfg: NodeConfig = toml::from_str(toml).expect("parse mempool config");
         assert!(!cfg.mempool.replace_by_fee);
         assert!(!MempoolConfig::default().replace_by_fee);
+        // M145: min_fee_bump defaults to 1 (= strictly higher).
+        assert_eq!(cfg.mempool.min_fee_bump, 1);
+        assert_eq!(MempoolConfig::default().min_fee_bump, 1);
     }
 
     #[test]
