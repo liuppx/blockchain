@@ -1566,12 +1566,16 @@ impl Network {
 /// those into the light peer's protocol.
 pub struct LightGossipNode {
     pub id: u64,
-    /// Validated headers in height order. Index `i` is height `i + 1`.
+    /// M142: the snapshot tip height this node was seeded at — `0` for a fresh-from-
+    /// genesis node (today's contract), `snapshot.height` for a snapshot-seeded node.
+    /// `headers[i]`/`next_sets[i]` is therefore height `base_height + 1 + i`.
+    base_height: u64,
+    /// Validated headers in height order. Index `i` is height `base_height + 1 + i`.
     headers: Vec<CertifiedHeader>,
     /// The next set we were told certifies each header. The same full node
     /// that produced the header can produce this snapshot (it knows its own
     /// `state.validators` after applying the block). For `apply_header` we
-    /// accept it alongside the header.
+    /// accept it alongside the header. Index `i` is height `base_height + 1 + i`.
     next_sets: Vec<ValidatorSet>,
     /// Header hashes already seen — re-delivery is a no-op (mirrors the
     /// full-node dedup discipline for blocks/txs).
@@ -1608,6 +1612,7 @@ impl LightGossipNode {
         let peers = peers.into_iter().filter(|&p| p != id).collect();
         LightGossipNode {
             id,
+            base_height: 0,
             headers: Vec::new(),
             next_sets: Vec::new(),
             seen: BTreeSet::new(),
@@ -1618,6 +1623,67 @@ impl LightGossipNode {
             batches: None,
             locks: None,
         }
+    }
+
+    /// M142: seed a light node from a snapshot `state` at height `state.height`
+    /// instead of tracking from genesis — the light-client analogue of
+    /// [`GossipNode::from_snapshot`] (M139). The validator-set tracker is built via
+    /// [`ValidatorTracker::from_snapshot`] (M136); `headers`/`next_sets` start empty
+    /// and `apply_header` resumes at `state.height + 1` (its gate is already
+    /// `tracker.height()`-relative). `head` is the snapshot's tip block hash — the
+    /// state alone can't recompute it, so the snapshot provider supplies it.
+    ///
+    /// This is **infallible plumbing**: it does not verify the snapshot. Callers that
+    /// adopt a snapshot from an untrusted peer MUST verify it first (see
+    /// [`Self::from_verified_snapshot`], or
+    /// [`ValidatorTracker::verify_snapshot_against_header`] directly).
+    pub fn from_snapshot(
+        id: u64,
+        state: &crate::ChainState,
+        head: Hash,
+        peers: impl IntoIterator<Item = u64>,
+    ) -> Self {
+        let peers = peers.into_iter().filter(|&p| p != id).collect();
+        LightGossipNode {
+            id,
+            base_height: state.height,
+            headers: Vec::new(),
+            next_sets: Vec::new(),
+            seen: BTreeSet::new(),
+            tracker: ValidatorTracker::from_snapshot(state, head),
+            peers,
+            proofs: BTreeMap::new(),
+            diffs: None,
+            batches: None,
+            locks: None,
+        }
+    }
+
+    /// M142: the safe snapshot-seed entry point — verify the snapshot against a
+    /// cert-signed `header` + its `cert` before adopting it, then seed via
+    /// [`Self::from_snapshot`]. `trusted_set` is the operator-pinned weak-subjectivity
+    /// checkpoint the cert must reach `>2/3` of (a light client bootstrapping from
+    /// nothing has no tracked set yet, so it must be supplied out-of-band — the
+    /// light-client analogue of M141's full-node `trusted_validators`). Returns the
+    /// same `SnapshotMismatch`/quorum errors as
+    /// [`ValidatorTracker::verify_snapshot_against_header`] (M134) on any failure.
+    pub fn from_verified_snapshot(
+        id: u64,
+        state: &crate::ChainState,
+        header: &crate::codec::BlockHeader,
+        cert: &crate::consensus::Commit,
+        trusted_set: &ValidatorSet,
+        peers: impl IntoIterator<Item = u64>,
+    ) -> Result<Self, crate::light::LightError> {
+        ValidatorTracker::verify_snapshot_against_header(state, header, cert, trusted_set)?;
+        Ok(Self::from_snapshot(id, state, header.hash(), peers))
+    }
+
+    /// M142: the snapshot tip height this node was seeded at — `0` for a fresh-from-
+    /// genesis node, `snapshot.height` for a snapshot-seeded node. `headers()[i]` is
+    /// height `base_height() + 1 + i`.
+    pub fn base_height(&self) -> u64 {
+        self.base_height
     }
 
     /// Pop the cached proof for `(kind, id)` (consumes the entry — a wallet
@@ -3676,6 +3742,161 @@ mod tests {
             light.tracker().height(),
             0,
             "tracker unchanged on rejection"
+        );
+    }
+
+    // --- M142: light-client snapshot fast-sync seed -----------------------------
+
+    /// Build the genesis validator set (21-24, power 1) — the set that certifies
+    /// every header in a `certified_chain` (no validator updates), i.e. the
+    /// weak-subjectivity trust anchor for the M142 verify tests.
+    fn trusted_genesis_set() -> ValidatorSet {
+        ValidatorSet::new(
+            [21u64, 22, 23, 24]
+                .iter()
+                .map(|&id| Validator {
+                    id,
+                    pubkey: kp(id).public(),
+                    power: 1,
+                })
+                .collect(),
+        )
+    }
+
+    #[test]
+    fn light_node_from_snapshot_resumes_and_matches_genesis_tracked() {
+        // M142: a light node seeded from a snapshot at height H resumes header-sync
+        // from H+1 over the bus and reaches the same height + validator set as a
+        // genesis-tracked light node (cf. `light_node_pulls_headers_and_tracks_validator_set`).
+        let (blocks, certs) = certified_chain(3); // heights 1..=3
+        let mut full = GossipNode::new(1, genesis(), 8, [1, 2]);
+        full.load_certified(&blocks, &certs);
+
+        // Snapshot at height 1 (the state + head after block 1).
+        let h = 1usize;
+        let snap = Chain::replay(genesis(), &blocks[..h]).expect("replay to H");
+        assert_eq!(snap.state.height, 1);
+
+        let light_id = 2u64;
+        let light = LightGossipNode::from_snapshot(light_id, &snap.state, snap.head, [1, 2]);
+        assert_eq!(light.base_height(), 1, "seeded at the snapshot tip");
+        assert_eq!(
+            light.tracker().height(),
+            1,
+            "tracker starts at the snapshot tip"
+        );
+
+        let mut net = LightNetwork::new(vec![full], vec![light]);
+        let sets = committed_sets(&genesis(), &blocks);
+        let next_set_for = |h: u64| sets.get((h - 1) as usize).cloned();
+        net.announce_all();
+        for _ in 0..10 {
+            if net.run(1, light_id, &next_set_for) == 0 {
+                break;
+            }
+        }
+
+        let l = net.light_node(light_id);
+        assert_eq!(
+            l.tracker().height(),
+            3,
+            "snapshot-seeded light node resumed to the full node's height"
+        );
+        let authoritative = authoritative_final_set(&genesis(), &blocks);
+        assert_eq!(
+            l.tracker().validators().merkle_root(),
+            authoritative.merkle_root(),
+            "snapshot-seeded set equals the authoritative replayed set"
+        );
+    }
+
+    #[test]
+    fn light_node_base_height_reports_snapshot_tip() {
+        // M142: `base_height()` is 0 for a genesis-start node, the snapshot tip for a
+        // snapshot-seeded one.
+        let (blocks, _certs) = certified_chain(2);
+        let fresh = LightGossipNode::new(1, &genesis(), [1]);
+        assert_eq!(fresh.base_height(), 0);
+
+        let snap = Chain::replay(genesis(), &blocks[..2]).expect("replay");
+        let seeded = LightGossipNode::from_snapshot(1, &snap.state, snap.head, [1]);
+        assert_eq!(seeded.base_height(), 2);
+        assert_eq!(seeded.tracker().height(), 2);
+    }
+
+    #[test]
+    fn light_node_from_verified_snapshot_accepts_valid_cert() {
+        // M142: the safe seed path accepts a snapshot whose cert-signed header reaches
+        // >2/3 of the pinned trusted set, and leaves the node ready to follow H+1.
+        let (blocks, certs) = certified_chain(3);
+        let h = 2usize;
+        let snap = Chain::replay(genesis(), &blocks[..h]).expect("replay");
+        let header = blocks[h - 1].header();
+        let cert = &certs[h - 1];
+        let node = LightGossipNode::from_verified_snapshot(
+            9,
+            &snap.state,
+            &header,
+            cert,
+            &trusted_genesis_set(),
+            [1],
+        )
+        .expect("valid snapshot accepted");
+        assert_eq!(node.base_height(), 2);
+        assert_eq!(node.tracker().height(), 2);
+        assert_eq!(node.tracker().head(), header.hash());
+    }
+
+    #[test]
+    fn light_node_from_verified_snapshot_rejects_forged_snapshot() {
+        // M142: tamper one account balance so the snapshot's roots no longer match the
+        // cert-signed header → SnapshotMismatch (M134 layer), before any adoption.
+        let (blocks, certs) = certified_chain(3);
+        let h = 2usize;
+        let mut snap = Chain::replay(genesis(), &blocks[..h]).expect("replay");
+        snap.state.accounts.get_mut(&1).unwrap().balance += 1;
+        let header = blocks[h - 1].header();
+        let err = match LightGossipNode::from_verified_snapshot(
+            9,
+            &snap.state,
+            &header,
+            &certs[h - 1],
+            &trusted_genesis_set(),
+            [1],
+        ) {
+            Err(e) => e,
+            Ok(_) => panic!("forged snapshot must be rejected"),
+        };
+        assert!(
+            matches!(err, crate::light::LightError::SnapshotMismatch { .. }),
+            "got {err}"
+        );
+    }
+
+    #[test]
+    fn light_node_from_verified_snapshot_rejects_untrusted_cert() {
+        // M142: a cert that does not reach >2/3 of the pinned trusted set is rejected
+        // (here the trusted set is a single stranger the real signers aren't in).
+        let (blocks, certs) = certified_chain(3);
+        let h = 2usize;
+        let snap = Chain::replay(genesis(), &blocks[..h]).expect("replay");
+        let header = blocks[h - 1].header();
+        let bogus = ValidatorSet::new(vec![Validator {
+            id: 99,
+            pubkey: crate::Keypair::from_seed([7u8; 32]).public(),
+            power: 1,
+        }]);
+        assert!(
+            LightGossipNode::from_verified_snapshot(
+                9,
+                &snap.state,
+                &header,
+                &certs[h - 1],
+                &bogus,
+                [1],
+            )
+            .is_err(),
+            "cert not backed by the trusted set must be rejected"
         );
     }
 

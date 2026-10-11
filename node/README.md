@@ -1341,6 +1341,20 @@ M116 的 `node rpc` 只能 GET。M117 补上写侧，让它成为**全能** RPC 
 
 **已知边界（顺延至 M121+）**：身份读三类已齐（`/genesis` 链 / `/node` 节点 / `/info` 链尖）；读面两分（`/params`/`/config`）已齐；RPC 自带端点发现 + 全能客户端 + 完整链读/写面；内容协商三轴已齐（仅 `identity`，真压缩顺延）；离线工具篮子已补；运维篮子剩余：证书/密钥轮换与落盘、follower 认证、指标端 TLS、OTel/push exporter、每-sink 独立 rotation 覆盖、时延直方图；keygen 篮子剩余：助记词 / BIP-39、口令加密 keystore、密钥轮换；剩余：游标分页、未知方法 `405`；共识 / wire 篮子（破 head 不变量）：**货币费用** + 费用优先排序、nonce / 序列号反重放。
 
+## 轻客户端快照 fast-sync 种子（Milestone 142 · 快速同步收官）
+
+快速同步大件收官：M131–M136 建离线快照工具链 + 轻客户端 `ValidatorTracker::from_snapshot`（M136）；M139–M141 让 full-node 能采纳快照启动/重启续尾/法定人数验证。唯一还卡在创世起算的消费者是 `LightGossipNode`——构造函数硬编码 `ValidatorTracker::from_genesis`。M142 给它补上快照种子：轻客户端下载 `(snapshot, header, cert)`、对**钉死的可信验证人集**（弱主观性检查点）验完，就能在高度 H 直接起步、从 H+1 续 `/headers` 跟踪——与「从创世跟到 H」逐字段等价。
+
+- **范围：纯库 + 测试，无 CLI/config**。轻客户端没有生产守护进程（`LightGossipNode`/`LightNetwork` 只在 demo 与测试里用，`daemon.rs` 零引用），没有可注入 `[snapshot]` 配置的光节点——真正的光守护进程是未来里程碑，届时复用 M141 `SnapshotBootConfig` 模式。
+- **`base_height` 字段**（`net.rs`）：0 = 创世起算、`snapshot.height` = 快照种子；`headers[i]`/`next_sets[i]` 即高度 `base_height+1+i`。镜像 M139 full-node `GossipNode.base_height`。核实 `LightGossipNode` 内部**全程无绝对高度索引**（只经 `headers()` 整切片读 + `apply_header` push），高度门控（`apply_header`/`on_message`/`announce`）已是 `tracker.height()`-相对，故 `base_height` 只需「字段 + getter + 文档订正」，非偏移重构。
+- **`LightGossipNode::from_snapshot(id, &state, head, peers)`**：不可错 plumbing——`ValidatorTracker::from_snapshot(state, head)` 种子 tracker、`base_height=state.height`、headers/next_sets 空；不验证（同 `GossipNode::from_snapshot`），验证由下方安全入口或调用方负责。不需 `genesis`（种子从 `state` 建 tracker）。
+- **`LightGossipNode::from_verified_snapshot(id, &state, &header, &cert, &trusted_set, peers) -> Result<Self, LightError>`**：安全入口——先 `ValidatorTracker::verify_snapshot_against_header`（M134：cert 绑定头且达 `trusted_set` >2/3 + 三根重算一致），通过才 `from_snapshot`。`trusted_set` 是调用方钉死的弱主观性检查点（轻客户端的 M141 等价物：从零起步的光节点无既有 tracker，须带外获得可信集）；`head` 取 `header.hash()`。
+- **不碰**：`light.rs`（`from_snapshot`+`verify_snapshot_against_header` 全复用）、`config.rs`/`main.rs`/`daemon.rs`（无光守护进程）、`store.rs`/`lib.rs`/`consensus.rs`。
+- **不变量保持**：创世路径（`new`）加 `base_height: 0` 其余不变 → 既有光客户端测绿即等价证明；纯库新增、无 wire/共识/状态/依赖/config 改动 → `localnet` 头仍 wire v1 `a045426e…3b87bc`。
+- **测试（+5 → 582）**：`light_node_from_snapshot_resumes_and_matches_genesis_tracked`（快照 H=1 种子 → 经 `LightNetwork` 总线从 H+1 跟到 3，height/set 与创世跟踪 + 权威重放集逐一相等）、`light_node_base_height_reports_snapshot_tip`（`new`→0、`from_snapshot`→H）、`light_node_from_verified_snapshot_accepts_valid_cert`（真 cert+可信集→Ok，tracker 就位）、`..._rejects_forged_snapshot`（篡改账户余额三根发散→`SnapshotMismatch`）、`..._rejects_untrusted_cert`（cert 不达可信集 >2/3→Err）。
+
+**已知边界（顺延）**：真正长跑的 light `Node::start` + `[snapshot]` 配置（复用 M141 `SnapshotBootConfig` + quorum-verify，届时把 `from_verified_snapshot` 接进启动路径）；`Cmd::QueryBlock` 线性 `find` 改索引（full-node 侧，非正确性）。
+
 ## 快照启动：重启持久化 + 法定人数验证（Milestone 141 · 快速同步 full-node 加固）
 
 承接 M140（`node run --snapshot` daemon wiring）。两次对当前树的审计暴露两个独立缺口，本轮合并交付：
