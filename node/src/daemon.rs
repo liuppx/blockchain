@@ -1652,34 +1652,29 @@ async fn run_actor(mut actor: Actor, mut rx: mpsc::UnboundedReceiver<Cmd>) {
             }
             Cmd::QueryBlock { height, reply } => {
                 // M113: locate the committed block at `height` and summarize its header + body.
-                let summary = actor
-                    .node
-                    .blocks()
-                    .iter()
-                    .find(|b| b.height == height)
-                    .map(|b| BlockSummary {
-                        height: b.height,
-                        hash: b.hash(),
-                        prev_hash: b.prev_hash,
-                        timestamp_days: b.timestamp_days,
-                        proposer: b.proposer,
-                        state_root: b.state_root,
-                        accounts_root: b.accounts_root,
-                        n_txs: b.txs.len(),
-                        fees: b.txs.iter().map(|t| t.fee).sum(),
-                        n_stake_ops: b.stake_ops.len(),
-                        n_evidence: b.slashing_evidence.len(),
-                        n_validator_updates: b.validator_updates.len(),
-                    });
+                // M146: O(1) offset-aware lookup via `block_at` (was a linear scan).
+                let summary = actor.node.block_at(height).map(|b| BlockSummary {
+                    height: b.height,
+                    hash: b.hash(),
+                    prev_hash: b.prev_hash,
+                    timestamp_days: b.timestamp_days,
+                    proposer: b.proposer,
+                    state_root: b.state_root,
+                    accounts_root: b.accounts_root,
+                    n_txs: b.txs.len(),
+                    fees: b.txs.iter().map(|t| t.fee).sum(),
+                    n_stake_ops: b.stake_ops.len(),
+                    n_evidence: b.slashing_evidence.len(),
+                    n_validator_updates: b.validator_updates.len(),
+                });
                 let _ = reply.send(summary);
             }
             Cmd::QueryBlockTxs { height, reply } => {
                 // M114: the tx references (hash + author) of the committed block at `height`.
+                // M146: O(1) offset-aware lookup via `block_at` (was a linear scan).
                 let txs = actor
                     .node
-                    .blocks()
-                    .iter()
-                    .find(|b| b.height == height)
+                    .block_at(height)
                     .map(|b| b.txs.iter().map(|tx| (tx.hash(), tx.author)).collect());
                 let _ = reply.send(txs);
             }

@@ -1341,6 +1341,17 @@ M116 的 `node rpc` 只能 GET。M117 补上写侧，让它成为**全能** RPC 
 
 **已知边界（顺延至 M121+）**：身份读三类已齐（`/genesis` 链 / `/node` 节点 / `/info` 链尖）；读面两分（`/params`/`/config`）已齐；RPC 自带端点发现 + 全能客户端 + 完整链读/写面；内容协商三轴已齐（仅 `identity`，真压缩顺延）；离线工具篮子已补；运维篮子剩余：证书/密钥轮换与落盘、follower 认证、指标端 TLS、OTel/push exporter、每-sink 独立 rotation 覆盖、时延直方图；keygen 篮子剩余：助记词 / BIP-39、口令加密 keystore、密钥轮换；剩余：游标分页、未知方法 `405`；共识 / wire 篮子（破 head 不变量）：**货币费用** + 费用优先排序、nonce / 序列号反重放。
 
+## `/block/{h}` O(1) 按高度索引（Milestone 146 · 读路径 perf）
+
+`Cmd::QueryBlock` / `Cmd::QueryBlockTxs`（服务 `/block/{h}` 与 `/block/{h}/txs`）此前对 `node.blocks()` 做**线性 `find`**（O(n)）。但节点自 M139 起已偏移感知（`base_height` + `vec_idx`），高度→索引本是纯算术。M146 加 `GossipNode::block_at(height)` 复用 `vec_idx` 做 O(1) 查，两个 handler 改用它。
+
+- **行为逐字节不变**：`blocks[i]` = 高度 `base_height+1+i`（M139 不变量），故索引算术与线性 `find` 等价——创世节点、快照节点、pruned/past-tip 全部同 None/Some；410-vs-404 下游逻辑（`query_base_height`）不变。既有 602 测绿即证。
+- **`block_at`**（`net.rs`）：`self.vec_idx(height).map(|i| &self.blocks[i])`——pruned（`≤ base_height`）/ 创世（0）/ 过尖端均 None。
+- **不碰** wire/codec/共识/config；`localnet` 头仍 wire v1 `a045426e…3b87bc`。
+- **测试（+1 → 603）**：`block_at_is_offset_aware_o1_lookup`（创世节点与快照节点各验 pruned/有效/过尖端）。
+
+**已知边界（顺延）**：百分比 RBF 加价（bps）；光守护进程；keystore 口令加密 / BIP-39。
+
 ## replace-by-fee 最小加价阈值（Milestone 145 · mempool RBF anti-churn）
 
 M144 的 RBF 要求替换 tx「fee 严格更高」，但哪怕只高 1 micro 也能替换——敌手可用极小加价反复替换同槽 tx 制造 churn。M145 加**最小加价阈值** `min_fee_bump`：替换须满足 `new.fee >= incumbent.fee + min_fee_bump`。

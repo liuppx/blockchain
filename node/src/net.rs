@@ -472,6 +472,13 @@ impl GossipNode {
         &self.blocks
     }
 
+    /// M146: O(1) lookup of the retained committed block at `height`, using the
+    /// offset-aware `vec_idx`. `None` for a pruned height (`≤ base_height`), genesis
+    /// (height 0), or a height past the tip — replacing a linear scan of `blocks()`.
+    pub fn block_at(&self, height: u64) -> Option<&Block> {
+        self.vec_idx(height).map(|i| &self.blocks[i])
+    }
+
     pub fn certificates(&self) -> &[Commit] {
         &self.certs
     }
@@ -4842,6 +4849,32 @@ mod tests {
         // blocks[0] of the snapshot node is height 2 (offset-aware indexing).
         assert_eq!(snap.blocks().len(), 1);
         assert_eq!(snap.blocks()[0].height, 2);
+    }
+
+    #[test]
+    fn block_at_is_offset_aware_o1_lookup() {
+        // M146: `block_at` resolves a committed block by height in O(1), honoring the
+        // base_height offset — pruned/genesis/past-tip all yield None.
+        let (blocks, certs) = certified_chain(3); // heights 1,2,3
+
+        // Genesis-start node: block_at matches the retained Vec by height.
+        let mut full = GossipNode::new(1, genesis(), 8, []);
+        assert!(full.load_certified(&blocks, &certs));
+        assert!(full.block_at(0).is_none(), "genesis has no block");
+        assert_eq!(full.block_at(2).map(|b| b.height), Some(2));
+        assert_eq!(full.block_at(3).map(|b| b.height), Some(3));
+        assert!(full.block_at(4).is_none(), "past the tip");
+
+        // Snapshot-booted node at height 1: heights <= base_height are pruned.
+        let at_1 = crate::Chain::replay(genesis(), &blocks[..1]).expect("replay to 1");
+        let mut snap =
+            GossipNode::from_snapshot(1, genesis(), at_1.state.clone(), at_1.head, 8, []);
+        assert!(snap.apply_certified(blocks[1].clone(), certs[1].clone()));
+        assert!(snap.apply_certified(blocks[2].clone(), certs[2].clone()));
+        assert!(snap.block_at(1).is_none(), "height 1 is pruned");
+        assert_eq!(snap.block_at(2).map(|b| b.height), Some(2));
+        assert_eq!(snap.block_at(3).map(|b| b.height), Some(3));
+        assert!(snap.block_at(4).is_none(), "past the tip");
     }
 
     #[test]
