@@ -1341,6 +1341,23 @@ M116 的 `node rpc` 只能 GET。M117 补上写侧，让它成为**全能** RPC 
 
 **已知边界（顺延至 M121+）**：身份读三类已齐（`/genesis` 链 / `/node` 节点 / `/info` 链尖）；读面两分（`/params`/`/config`）已齐；RPC 自带端点发现 + 全能客户端 + 完整链读/写面；内容协商三轴已齐（仅 `identity`，真压缩顺延）；离线工具篮子已补；运维篮子剩余：证书/密钥轮换与落盘、follower 认证、指标端 TLS、OTel/push exporter、每-sink 独立 rotation 覆盖、时延直方图；keygen 篮子剩余：助记词 / BIP-39、口令加密 keystore、密钥轮换；剩余：游标分页、未知方法 `405`；共识 / wire 篮子（破 head 不变量）：**货币费用** + 费用优先排序、nonce / 序列号反重放。
 
+## 快照启动：重启持久化 + 法定人数验证（Milestone 141 · 快速同步 full-node 加固）
+
+承接 M140（`node run --snapshot` daemon wiring）。两次对当前树的审计暴露两个独立缺口，本轮合并交付：
+
+1. **重启数据丢失（correctness）**：M140 在 `cfg.snapshot=Some` 时**整文件删除** `blocks.log`/`certs.log`（且 `let _ = remove_file` 吞错），把首次启动后持久化的 post-snapshot 块每次重启都抹掉。
+2. **启动校验偏弱（hardening）**：`load_snapshot_boot` 只做 M135 **cert-less** 承诺一致性检查——不证明头被 >2/3 法定人数最终确定。
+
+- **Feature 1 — sticky-once 重启**：把日志 open+read **挪到快照决策之前**，再按纯函数 `plan_snapshot_logs(snap_height, first_block_height)` 分支——空日志 `EmptyFresh`、尾部首块 `== snap_height+1` 则 `ResumeTail`（保留并 `load_certified` 到快照基态，重启**不重新同步**）、genesis-era（首块=1）`TruncateThenFresh`（截断，`truncate_log` **硬 error** 取代静默 `let _ =`，并重 `open` 以免 `append_record` 无 `create(true)` 导致首次 persist 失败）、其它首高 → 硬 error（错配快照）。下游 `load_certified`/`appended`/`tx_index`/`boot_height` 自然成立：`from_snapshot(H)` 后 `height()==H`、`head()==快照头`，尾部首块 H+1 且 `prev_hash==快照头`，经 `apply_certified`（用 `self.height()+1`）逐块链上。
+- **Feature 2 — 法定人数验证（config-pinned 可信集）**：`SnapshotBootConfig` 加 `cert_hex: Option<String>`（`codec::encode_commit` 的 hex）+ `trusted_validators: Vec<ValidatorConfig>`（复用 genesis `[[validators]]` 编码），均 `#[serde(default)]`（向后兼容 M140 两字段 TOML）。`validate()` 强制 XOR 配对（cert 与可信集必须同在同缺）。`load_snapshot_boot` 始终跑 M135 承诺检查；cert 存在时额外：`decode_commit`、要求 `cert.height==header.height && cert.block_hash==header.hash()`、按 `trusted_validators` 建 `ValidatorSet`、`cert.verify(&trusted)`——**法定人数在 `Commit::verify` 内部强制**（`consensus.rs:157`，不足返 `NotEnoughPower`）。信任根是操作员钉死的**弱主观性检查点**（而非快照自己的 `state.validators`，后者循环）。
+- **CLI**：`--snapshot-cert HEX` + `--snapshot-validators FILE`（小 TOML `[[validator]]`，`config::load_trusted_validators`）。任一给出但缺基础 `--snapshot`/`--snapshot-header` → `fail_msg`。最终 cert/可信集一致性在 `load_snapshot_boot` 权威把关（TOML 与 CLI 两路径汇合处——`load_node_config` 在 CLI merge 前跑）。
+- **G.3 警告**：snapshot-boot 的验证人若不在快照验证人集内（`node.chain.state.validators.get(my_id).is_none()`），`eprintln!` 明示「将跟随+服务但永不出块」，不再静默空转。
+- **不碰**：`store.rs`（无 truncate API，沿用 remove_file + 重 open 规避）；`net.rs`/`lib.rs`/`consensus.rs`（`from_snapshot`/`load_certified`/`apply_certified`/`Commit::verify` 全复用）。
+- **不变量保持**：默认配置（无 `[snapshot]`）`snapshot_boot` 仍 `None`，唯一结构变化是把 `blocks`/`certs` 的 read 提前几行——下游行为逐一相同；两新 serde 字段 `#[serde(default)]` ⇒ 既有 TOML 照常解析；`localnet` 头仍 wire v1 `a045426e…3b87bc`。
+- **测试（+14 → 577）**：`plan_snapshot_logs_*`（4，空/尾/genesis-era/错配）；`load_snapshot_boot_*`（6：quorum 接受、forged 拒、power 不足拒、错头拒、XOR 一致性拒、M135-only 向后兼容）；`snapshot_config_*`（2：M140 两字段解析、`validate()` XOR）；E2E `snapshot_reboot_resumes_tail_without_resync`（快照 H=1 + 预置尾 2、3 → 重启后 `BaseHeight==1` **且** `status().height>=3`，未抹尾）、`snapshot_reboot_truncates_genesis_era_log`（预置 genesis-era 日志 → 在 H=3 fresh 启动、日志被截、无 torn/unproven error）。
+
+**已知边界（顺延至 M142+）**：light 端 `LightGossipNode` 快照种子（`net.rs` 的 `ValidatorTracker::from_genesis` 换 M136 `from_snapshot`）；`Cmd::QueryBlock` 线性 `find` 改索引（非正确性）。
+
 ## `node run --snapshot` — full-node 快照 fast-sync 启动（Milestone 140 · 快速同步 full-node 闭环）
 
 承接 M139（`GossipNode` 偏移感知基础）：本轮把 daemon + CLI + config + 410-Gone HTTP 接起来，让一个 full-node 在启动时**采纳快照**并从其尖端继续 gossip——`node run --config F --snapshot FILE --snapshot-header HEX`。至此 M131–M139 的快照工具链对 **full-node** 端到端可用（此前只服务 `light::ValidatorTracker` M136）。**M140 纯 wiring**：无新库代码、无 offset 改动（M139 已覆盖）、无状态/wire 变更；密码学校验复用 M134/M135。

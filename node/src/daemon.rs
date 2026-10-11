@@ -684,17 +684,24 @@ pub struct Node {
     cmd: mpsc::UnboundedSender<Cmd>,
 }
 
-/// M140: decode + verify a snapshot-boot config into `(state, tip_head_hash)`. The
+/// M140/M141: decode + verify a snapshot-boot config into `(state, tip_head_hash)`. The
 /// cert-signed `header_hex` (the on-wire form `GET /header/{h}` returns) must agree
-/// with the snapshot's height and all three cert-signed roots — the same cert-less
-/// check `node check-snapshot` runs, which is the right strength at boot (the operator
-/// has no cert + tracked validator set to do the M134 quorum check). The returned head
-/// is `header.hash()` — the tip block hash `GossipNode::from_snapshot` needs. Any
-/// decode/mismatch is surfaced as an `io::Error` so `Node::start` fails fast without
-/// touching the on-disk log.
+/// with the snapshot's height and all three cert-signed roots (the M135 cert-less
+/// commitment check — always run). M141: when the config also carries a `cert_hex` +
+/// `trusted_validators`, the header must additionally be certified by a `>2/3` quorum
+/// of that operator-pinned trusted set (a weak-subjectivity checkpoint) — upgrading the
+/// boot from "the bytes are self-consistent" to "a quorum finalized this tip". The
+/// returned head is `header.hash()` — the tip block hash `GossipNode::from_snapshot`
+/// needs. Any decode/mismatch/coherence/quorum failure is surfaced as an `io::Error`
+/// so `Node::start` fails fast without touching the on-disk log.
 fn load_snapshot_boot(
     s: &crate::config::SnapshotBootConfig,
 ) -> io::Result<(crate::ChainState, Hash)> {
+    // M141: the authoritative coherence gate (cert XOR trusted-set is an error). Runs
+    // here — the one point both the TOML and the CLI keypath converge — because
+    // `load_node_config` runs before `cmd_run` merges the CLI flags.
+    s.validate()
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
     let bytes = std::fs::read(&s.path)?;
     let state = crate::codec::decode_snapshot(&bytes).map_err(|e| {
         io::Error::new(
@@ -729,7 +736,58 @@ fn load_snapshot_boot(
             ),
         ));
     }
+    // M141: quorum-bound verify. `validate()` guarantees a non-empty trusted set
+    // whenever `cert_hex` is present, so this is the full quorum path.
+    if let Some(cert_hex) = &s.cert_hex {
+        let cert_bytes = hex_to_bytes(cert_hex).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "snapshot cert_hex is not valid hex",
+            )
+        })?;
+        let cert = crate::codec::decode_commit(&cert_bytes).map_err(|e| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("decode snapshot cert: {e:?}"),
+            )
+        })?;
+        // The cert must certify *this* header's tip, not some other block.
+        if cert.height != header.height || cert.block_hash != header.hash() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "snapshot cert certifies height {} / a different block_hash, not the supplied header at height {}",
+                    cert.height, header.height
+                ),
+            ));
+        }
+        let trusted = snapshot_trusted_set(s)?;
+        // `Commit::verify` enforces the `>2/3` quorum internally (returns
+        // `NotEnoughPower` below the threshold) and checks every precommit's
+        // type/height/round/block_hash + signature against the pinned set.
+        cert.verify(&trusted).map_err(|e| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("snapshot cert fails >2/3 quorum against the trusted validator set: {e:?}"),
+            )
+        })?;
+    }
     Ok((state, header.hash()))
+}
+
+/// M141: build the operator-pinned trusted [`ValidatorSet`] from a snapshot-boot
+/// config's `trusted_validators` (reusing the genesis pubkey-hex decoder).
+fn snapshot_trusted_set(
+    s: &crate::config::SnapshotBootConfig,
+) -> io::Result<crate::validator::ValidatorSet> {
+    let decoded = s
+        .trusted_validators_decoded()
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+    let validators = decoded
+        .into_iter()
+        .map(|(id, pubkey, power)| crate::validator::Validator { id, pubkey, power })
+        .collect();
+    Ok(crate::validator::ValidatorSet::new(validators))
 }
 
 /// M140: lowercase/uppercase hex → bytes; `None` on odd length or a non-hex char.
@@ -751,6 +809,60 @@ fn hex_to_bytes(s: &str) -> Option<Vec<u8>> {
         i += 2;
     }
     Some(out)
+}
+
+/// M141: how `Node::start` reconciles an existing on-disk log with a configured
+/// snapshot. Keyed purely on the log's first-block height vs the snapshot tip, so it
+/// is a small pure function (unit-tested directly).
+#[derive(Debug, PartialEq, Eq)]
+enum SnapshotLogPlan {
+    /// No log on disk → fresh snapshot boot.
+    EmptyFresh,
+    /// A genesis-era log (first block is height 1) is contradictory with a snapshot →
+    /// truncate it and boot fresh from the snapshot.
+    TruncateThenFresh,
+    /// A valid post-snapshot tail (first block is `snapshot.height + 1`) → keep it and
+    /// replay it onto the snapshot base, so a restart resumes without re-syncing.
+    ResumeTail,
+}
+
+/// M141: decide what to do with an existing `blocks.log` given the snapshot tip height.
+/// `first_block_height` is `None` for an empty log, else the height of `blocks[0]`.
+/// A first-block height that is neither `1` (genesis-era) nor `snap_height + 1`
+/// (the expected post-snapshot tail) means the operator pointed a snapshot at a
+/// data_dir holding some *other* chain's history — refuse rather than guess.
+fn plan_snapshot_logs(
+    snap_height: u64,
+    first_block_height: Option<u64>,
+) -> io::Result<SnapshotLogPlan> {
+    match first_block_height {
+        None => Ok(SnapshotLogPlan::EmptyFresh),
+        Some(h) if h == snap_height + 1 => Ok(SnapshotLogPlan::ResumeTail),
+        Some(1) => Ok(SnapshotLogPlan::TruncateThenFresh),
+        Some(h) => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "snapshot-boot: on-disk blocks.log starts at height {h}, but the snapshot tip is \
+                 {snap_height} (expected a post-snapshot tail starting at {} or a genesis-era log \
+                 starting at 1); refusing to boot against a mismatched snapshot",
+                snap_height + 1
+            ),
+        )),
+    }
+}
+
+/// M141: delete a log file, surfacing a failure as an error (M140 discarded it with
+/// `let _ =`, which could silently leave stale history to collide with the snapshot).
+fn truncate_log(path: &str) -> io::Result<()> {
+    if std::path::Path::new(path).exists() {
+        std::fs::remove_file(path).map_err(|e| {
+            io::Error::new(
+                e.kind(),
+                format!("snapshot-boot: failed to truncate {path}: {e}"),
+            )
+        })?;
+    }
+    Ok(())
 }
 
 impl Node {
@@ -6209,48 +6321,56 @@ impl Node {
         let bpath = format!("{}/blocks.log", cfg.node.data_dir);
         let cpath = format!("{}/certs.log", cfg.node.data_dir);
 
+        // M140/M141: read the on-disk log FIRST, then decide. (M140 deleted the log
+        // before reading it, wiping post-snapshot history on every restart; M141 makes
+        // snapshot-boot "sticky-once" by inspecting the log's first-block height.)
+        let blog = BlockLog::open(&bpath)?;
+        let clog = CertLog::open(&cpath)?;
+        let mut blocks = blog.read_all()?; // torn-tail still errors here
+        let mut certs = clog.read_all()?;
+
         // M140: snapshot-boot path. When configured, decode + verify the snapshot against the
-        // supplied cert-signed header (M135's cert-less check — the right strength at boot,
-        // before the operator has a known validator set), then truncate the on-disk log so
-        // the post-snapshot chain starts from `base_height = state.height` with `blocks`/`certs`
-        // empty. The default path (no `snapshot` config) is byte-identical to pre-M140.
+        // supplied cert-signed header (M135 commitment check, plus the M141 quorum check when a
+        // cert + trusted set are supplied). Then reconcile the on-disk log with the snapshot:
+        //   * empty log            → fresh snapshot boot (nothing to load);
+        //   * tail at snapshot.H+1 → RESUME: load the post-snapshot tail onto the snapshot base
+        //                            (survives restart without re-syncing — the M141 durability fix);
+        //   * genesis-era log (H=1)→ contradictory with a snapshot: truncate (hard-error on failure);
+        //   * any other first-height→ a mismatched/stale snapshot tail: refuse to boot.
+        // The default path (no `snapshot` config) is byte-identical to pre-M140.
         let snapshot_boot: Option<(crate::ChainState, Hash)> = match cfg.snapshot.as_ref() {
             Some(s) => {
                 let (state, head) = load_snapshot_boot(s)?;
-                // Operator-side contract: a non-empty log + a snapshot is contradictory
-                // (the snapshot represents the tip; the log would represent pre-snapshot
-                // history the snapshot explicitly prunes). Truncate with a clear message so a
-                // mistake is loud, not silent. `OpenOptions::create(true).append(true)` then
-                // re-creates an empty log on next `open_touch`.
-                if std::path::Path::new(&bpath).exists() {
-                    eprintln!(
-                        "snapshot-boot: truncating existing {} (a populated log is contradictory with a snapshot)",
-                        bpath
-                    );
-                    let _ = std::fs::remove_file(&bpath);
-                }
-                if std::path::Path::new(&cpath).exists() {
-                    eprintln!(
-                        "snapshot-boot: truncating existing {} (a populated log is contradictory with a snapshot)",
-                        cpath
-                    );
-                    let _ = std::fs::remove_file(&cpath);
+                match plan_snapshot_logs(state.height, blocks.first().map(|b| b.height))? {
+                    SnapshotLogPlan::EmptyFresh => { /* blocks/certs already empty */ }
+                    SnapshotLogPlan::ResumeTail => { /* keep the tail; load_certified below */ }
+                    SnapshotLogPlan::TruncateThenFresh => {
+                        eprintln!(
+                            "snapshot-boot: truncating genesis-era log in {} (contradictory with a snapshot at height {})",
+                            cfg.node.data_dir, state.height
+                        );
+                        truncate_log(&bpath)?;
+                        truncate_log(&cpath)?;
+                        // `BlockLog::append` opens with `append(true)` but not `create(true)`,
+                        // so re-touch the files or the first post-boot `persist` would fail.
+                        BlockLog::open(&bpath)?;
+                        CertLog::open(&cpath)?;
+                        blocks.clear();
+                        certs.clear();
+                    }
                 }
                 Some((state, head))
             }
             None => None,
         };
-        let blog = BlockLog::open(&bpath)?;
-        let clog = CertLog::open(&cpath)?;
-        let blocks = blog.read_all()?;
-        let certs = clog.read_all()?;
 
         let peer_ids: Vec<u64> = cfg.peers.iter().map(|p| p.id).collect();
 
-        // M140: a snapshot-booted node starts with the post-snapshot state; a fresh node
-        // starts from genesis. The rest of `Node::start` (load_certified + tx_index seed)
-        // is naturally a no-op on snapshot-boot because `blocks`/`certs` are empty (the
-        // on-disk log was truncated above).
+        // M140/M141: a snapshot-booted node starts with the post-snapshot state; a fresh
+        // node starts from genesis. On a fresh snapshot boot `blocks`/`certs` are empty, so
+        // `load_certified`/`appended`/tx_index below are no-ops; on a RESUME (M141) they
+        // replay the post-snapshot tail onto the snapshot base (`apply_certified` accepts
+        // it because it keys off `self.height()+1`, which is the snapshot tip + offset).
         let mut node = match snapshot_boot.as_ref() {
             Some((state, head)) => GossipNode::from_snapshot(
                 my_id,
@@ -6279,6 +6399,18 @@ impl Node {
         // == 0` ⇒ unbounded (the default) ⇒ setter not called ⇒ behavior unchanged.
         if cfg.mempool.per_account_limit > 0 {
             node.set_mempool_per_account_limit(cfg.mempool.per_account_limit);
+        }
+        // M141: a validator that snapshot-boots into a set it is not a member of will
+        // follow + serve but never propose (its `start_height` membership guard never
+        // opens). Surface that loudly rather than letting the node idle silently.
+        if snapshot_boot.is_some()
+            && validator_key.is_some()
+            && node.chain.state.validators.get(my_id).is_none()
+        {
+            eprintln!(
+                "snapshot-boot: validator id {my_id} is not in the snapshot's validator set; \
+                 this node will follow and serve but never propose"
+            );
         }
         if !blocks.is_empty() && !node.load_certified(&blocks, &certs) {
             return Err(io::Error::new(
@@ -15249,6 +15381,8 @@ vote_b.validator=5 vote_b.height=9 vote_b.round=2 vote_b.block_hash={b_h} vote_b
         cfg.snapshot = Some(SnapshotBootConfig {
             path: snap_path.to_string_lossy().into_owned(),
             header_hex,
+            cert_hex: None,
+            trusted_validators: Vec::new(),
         });
 
         // 4. boot the node from the snapshot.
@@ -15321,6 +15455,394 @@ vote_b.validator=5 vote_b.height=9 vote_b.round=2 vote_b.block_hash={b_h} vote_b
         assert!(
             body.contains("proposer=21"),
             "self-validator is the proposer: {body}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // --- M141: snapshot-boot restart durability + quorum-bound verify ------------
+
+    /// M141: build a 4-validator (test_genesis) offline chain of `n` tx-blocks and
+    /// return `(snapshot_bytes, tip_header, tip_cert, trusted_validator_configs,
+    /// tip_block)` for the quorum-verify tests. The tip cert is a real `>2/3`
+    /// certificate produced by the driver.
+    fn quorum_snapshot_fixture() -> (
+        Vec<u8>,
+        crate::codec::BlockHeader,
+        Commit,
+        Vec<crate::config::ValidatorConfig>,
+        crate::ChainState,
+    ) {
+        use crate::driver::ChainDriver;
+        let genesis = test_genesis(); // validators 21-24, quorum 3
+        let seeds: BTreeMap<u64, [u8; 32]> = [21u64, 22, 23, 24]
+            .iter()
+            .map(|&id| (id, seed(id)))
+            .collect();
+        let mut d = ChainDriver::new(genesis, seeds, 1);
+        d.submit(test_tx(1, 1, 1)).expect("tx1");
+        d.submit(test_tx(2, 2, 2)).expect("tx2");
+        d.submit(test_tx(3, 3, 3)).expect("tx3");
+        assert_eq!(d.produce_until_drained(1.0, 8).expect("produce"), 3);
+        let state = d.chain.state.clone();
+        let tip = d.blocks()[2].clone();
+        let header = crate::codec::BlockHeader::from_block(&tip);
+        let cert = d.certificates()[2].clone();
+        let snap_bytes = crate::codec::encode_snapshot(&state);
+        let tv: Vec<crate::config::ValidatorConfig> = [21u64, 22, 23, 24]
+            .iter()
+            .map(|&id| crate::config::ValidatorConfig {
+                id,
+                pubkey_hex: crate::hash::hex(&kp(id).public()),
+                power: 1,
+            })
+            .collect();
+        (snap_bytes, header, cert, tv, state)
+    }
+
+    #[test]
+    fn plan_snapshot_logs_empty_is_fresh() {
+        assert_eq!(
+            plan_snapshot_logs(3, None).unwrap(),
+            SnapshotLogPlan::EmptyFresh
+        );
+    }
+
+    #[test]
+    fn plan_snapshot_logs_tail_resumes() {
+        assert_eq!(
+            plan_snapshot_logs(3, Some(4)).unwrap(),
+            SnapshotLogPlan::ResumeTail
+        );
+    }
+
+    #[test]
+    fn plan_snapshot_logs_genesis_era_truncates() {
+        assert_eq!(
+            plan_snapshot_logs(3, Some(1)).unwrap(),
+            SnapshotLogPlan::TruncateThenFresh
+        );
+    }
+
+    #[test]
+    fn plan_snapshot_logs_mismatched_tail_errors() {
+        // A first-block height that is neither 1 nor snap_height+1 is a mismatched
+        // snapshot/data_dir pairing — refuse rather than guess.
+        assert!(plan_snapshot_logs(3, Some(10)).is_err());
+        assert!(plan_snapshot_logs(3, Some(3)).is_err());
+    }
+
+    #[test]
+    fn load_snapshot_boot_quorum_accepts_valid_cert() {
+        let (snap_bytes, header, cert, tv, state) = quorum_snapshot_fixture();
+        let dir = tmp_dir("snap-q-accept");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = std::path::Path::new(&dir).join("snap.bin");
+        std::fs::write(&path, &snap_bytes).unwrap();
+        let s = crate::config::SnapshotBootConfig {
+            path: path.to_string_lossy().into_owned(),
+            header_hex: crate::hash::hex(&crate::codec::encode_header(&header)),
+            cert_hex: Some(crate::hash::hex(&crate::codec::encode_commit(&cert))),
+            trusted_validators: tv,
+        };
+        let (st, head) = load_snapshot_boot(&s).expect("valid quorum cert accepted");
+        assert_eq!(st.height, state.height);
+        assert_eq!(head, header.hash());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn load_snapshot_boot_quorum_rejects_forged_snapshot() {
+        // Tamper one account balance so the snapshot's roots no longer match the
+        // (cert-signed) header — the M135 commitment layer rejects before the quorum check.
+        let (_snap, header, cert, tv, mut state) = quorum_snapshot_fixture();
+        state.accounts.get_mut(&1).unwrap().balance += 1;
+        let forged = crate::codec::encode_snapshot(&state);
+        let dir = tmp_dir("snap-q-forged");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = std::path::Path::new(&dir).join("snap.bin");
+        std::fs::write(&path, &forged).unwrap();
+        let s = crate::config::SnapshotBootConfig {
+            path: path.to_string_lossy().into_owned(),
+            header_hex: crate::hash::hex(&crate::codec::encode_header(&header)),
+            cert_hex: Some(crate::hash::hex(&crate::codec::encode_commit(&cert))),
+            trusted_validators: tv,
+        };
+        assert!(
+            load_snapshot_boot(&s).is_err(),
+            "forged snapshot must be rejected"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn load_snapshot_boot_quorum_rejects_insufficient_power() {
+        use crate::consensus::{Vote, VoteType};
+        // A cert signed by only 1 of 4 equal-power validators (quorum = 3) → NotEnoughPower.
+        let (snap_bytes, header, _full_cert, tv, _state) = quorum_snapshot_fixture();
+        let weak = Commit {
+            height: header.height,
+            round: 0,
+            block_hash: header.hash(),
+            precommits: vec![Vote::signed(
+                21,
+                header.height,
+                0,
+                header.hash(),
+                VoteType::Precommit,
+                &kp(21),
+            )],
+        };
+        let dir = tmp_dir("snap-q-weak");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = std::path::Path::new(&dir).join("snap.bin");
+        std::fs::write(&path, &snap_bytes).unwrap();
+        let s = crate::config::SnapshotBootConfig {
+            path: path.to_string_lossy().into_owned(),
+            header_hex: crate::hash::hex(&crate::codec::encode_header(&header)),
+            cert_hex: Some(crate::hash::hex(&crate::codec::encode_commit(&weak))),
+            trusted_validators: tv,
+        };
+        assert!(
+            load_snapshot_boot(&s).is_err(),
+            "cert below quorum must be rejected"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn load_snapshot_boot_quorum_rejects_cert_for_wrong_header() {
+        use crate::consensus::{Vote, VoteType};
+        // A full-quorum cert that certifies a DIFFERENT block_hash (at the same height)
+        // must be rejected at the header-binding check, before the quorum verify.
+        let (snap_bytes, header, _full_cert, tv, _state) = quorum_snapshot_fixture();
+        let bogus = [9u8; 32];
+        let precommits = [21u64, 22, 23, 24]
+            .iter()
+            .map(|&id| Vote::signed(id, header.height, 0, bogus, VoteType::Precommit, &kp(id)))
+            .collect();
+        let wrong = Commit {
+            height: header.height,
+            round: 0,
+            block_hash: bogus,
+            precommits,
+        };
+        let dir = tmp_dir("snap-q-wrong");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = std::path::Path::new(&dir).join("snap.bin");
+        std::fs::write(&path, &snap_bytes).unwrap();
+        let s = crate::config::SnapshotBootConfig {
+            path: path.to_string_lossy().into_owned(),
+            header_hex: crate::hash::hex(&crate::codec::encode_header(&header)),
+            cert_hex: Some(crate::hash::hex(&crate::codec::encode_commit(&wrong))),
+            trusted_validators: tv,
+        };
+        assert!(
+            load_snapshot_boot(&s).is_err(),
+            "cert for a different block_hash must be rejected"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn load_snapshot_boot_coherence_errors() {
+        // Coherence (cert XOR trusted-set) is enforced before the file is even read,
+        // so a bogus path still surfaces the coherence error, not an io error.
+        let (_snap, header, cert, tv, _state) = quorum_snapshot_fixture();
+        let header_hex = crate::hash::hex(&crate::codec::encode_header(&header));
+        let cert_hex = crate::hash::hex(&crate::codec::encode_commit(&cert));
+        // cert without set.
+        let cert_only = crate::config::SnapshotBootConfig {
+            path: "/nonexistent/snap.bin".into(),
+            header_hex: header_hex.clone(),
+            cert_hex: Some(cert_hex),
+            trusted_validators: vec![],
+        };
+        match load_snapshot_boot(&cert_only) {
+            Err(e) => assert!(e.to_string().contains("snapshot"), "coherence error: {e}"),
+            Ok(_) => panic!("cert without trusted set must be rejected"),
+        }
+        // set without cert.
+        let set_only = crate::config::SnapshotBootConfig {
+            path: "/nonexistent/snap.bin".into(),
+            header_hex,
+            cert_hex: None,
+            trusted_validators: tv,
+        };
+        assert!(load_snapshot_boot(&set_only).is_err());
+    }
+
+    #[test]
+    fn load_snapshot_boot_m135_only_backward_compat() {
+        // No cert + no set → M140 behavior: good snapshot Ok, forged snapshot Err.
+        let (snap_bytes, header, _cert, _tv, mut state) = quorum_snapshot_fixture();
+        let dir = tmp_dir("snap-m135");
+        std::fs::create_dir_all(&dir).unwrap();
+        let good = std::path::Path::new(&dir).join("good.bin");
+        std::fs::write(&good, &snap_bytes).unwrap();
+        let header_hex = crate::hash::hex(&crate::codec::encode_header(&header));
+        let ok = crate::config::SnapshotBootConfig {
+            path: good.to_string_lossy().into_owned(),
+            header_hex: header_hex.clone(),
+            cert_hex: None,
+            trusted_validators: vec![],
+        };
+        assert!(
+            load_snapshot_boot(&ok).is_ok(),
+            "M135-only good snapshot accepted"
+        );
+        // Forged.
+        state.accounts.get_mut(&1).unwrap().balance += 1;
+        let forged = std::path::Path::new(&dir).join("forged.bin");
+        std::fs::write(&forged, crate::codec::encode_snapshot(&state)).unwrap();
+        let bad = crate::config::SnapshotBootConfig {
+            path: forged.to_string_lossy().into_owned(),
+            header_hex,
+            cert_hex: None,
+            trusted_validators: vec![],
+        };
+        assert!(
+            load_snapshot_boot(&bad).is_err(),
+            "M135-only forged snapshot rejected"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn snapshot_reboot_resumes_tail_without_resync() {
+        // M141 core regression: a snapshot-booted node that persisted post-snapshot
+        // blocks must, on restart, RESUME from the tail (not wipe it and reset to the
+        // snapshot tip). Deterministic: snapshot at H=1, pre-seed a 2-block tail
+        // (heights 2,3) into the data_dir, then boot and assert the node loaded it.
+        use crate::driver::ChainDriver;
+        let dir = tmp_dir("snap-reboot-resume");
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut genesis = test_genesis();
+        genesis.validators = vec![(21, kp(21).public(), 1)]; // single validator, quorum 1
+
+        let seeds: BTreeMap<u64, [u8; 32]> = [(21u64, seed(21))].into_iter().collect();
+        let mut d = ChainDriver::new(genesis.clone(), seeds, 1);
+        d.submit(test_tx(1, 1, 1)).expect("tx1");
+        d.submit(test_tx(2, 2, 2)).expect("tx2");
+        d.submit(test_tx(3, 3, 3)).expect("tx3");
+        // Snapshot at height 1.
+        assert_eq!(d.produce_until_drained(1.0, 1).expect("produce h1"), 1);
+        let snap_state = d.chain.state.clone();
+        assert_eq!(snap_state.height, 1);
+        let header1 = crate::codec::BlockHeader::from_block(&d.blocks()[0]);
+        let snap_bytes = crate::codec::encode_snapshot(&snap_state);
+        // Produce the tail (heights 2,3).
+        assert_eq!(d.produce_until_drained(1.0, 8).expect("produce tail"), 2);
+        let tail_blocks = d.blocks()[1..3].to_vec();
+        let tail_certs = d.certificates()[1..3].to_vec();
+        assert_eq!(tail_blocks[0].height, 2);
+
+        // Pre-seed the data_dir log with the tail (as a prior run's `persist` would have).
+        {
+            let blog = BlockLog::open(format!("{dir}/blocks.log")).unwrap();
+            let clog = CertLog::open(format!("{dir}/certs.log")).unwrap();
+            for b in &tail_blocks {
+                blog.append(b).unwrap();
+            }
+            for c in &tail_certs {
+                clog.append(c).unwrap();
+            }
+        }
+
+        // Write the snapshot blob + boot against the SAME data_dir.
+        let snap_path = std::path::Path::new(&dir).join("snapshot.bin");
+        std::fs::write(&snap_path, &snap_bytes).unwrap();
+        let mut cfg = node_config(21, 21341, &[21], dir.clone());
+        cfg.snapshot = Some(crate::config::SnapshotBootConfig {
+            path: snap_path.to_string_lossy().into_owned(),
+            header_hex: crate::hash::hex(&crate::codec::encode_header(&header1)),
+            cert_hex: None,
+            trusted_validators: vec![],
+        });
+        let node = Node::start(cfg, genesis, Some(kp(21)))
+            .await
+            .expect("snapshot reboot");
+
+        // base_height is the snapshot tip (1) — the node adopted the snapshot...
+        let (reply, rx) = oneshot::channel();
+        node.cmd.send(Cmd::BaseHeight(reply)).unwrap();
+        let base = tokio::time::timeout(Duration::from_secs(2), rx)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(base, 1, "snapshot adopted at height 1");
+        // ...AND it resumed the persisted tail rather than wiping it (height == 3, not 1).
+        let (h, _) = node.status().await.expect("status");
+        assert!(
+            h >= 3,
+            "node resumed the post-snapshot tail to height {h}, expected >= 3"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn snapshot_reboot_truncates_genesis_era_log() {
+        // M141: a snapshot pointed at a data_dir holding a genesis-era log (blocks from
+        // height 1) is a contradictory switch — the genesis-era log is truncated and the
+        // node boots fresh from the snapshot tip, with no "torn/unproven" error.
+        use crate::driver::ChainDriver;
+        let dir = tmp_dir("snap-reboot-truncate");
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut genesis = test_genesis();
+        genesis.validators = vec![(21, kp(21).public(), 1)];
+
+        let seeds: BTreeMap<u64, [u8; 32]> = [(21u64, seed(21))].into_iter().collect();
+        let mut d = ChainDriver::new(genesis.clone(), seeds, 1);
+        d.submit(test_tx(1, 1, 1)).expect("tx1");
+        d.submit(test_tx(2, 2, 2)).expect("tx2");
+        d.submit(test_tx(3, 3, 3)).expect("tx3");
+        assert_eq!(d.produce_until_drained(1.0, 8).expect("produce"), 3);
+        let snap_state = d.chain.state.clone(); // height 3
+        let header3 = crate::codec::BlockHeader::from_block(&d.blocks()[2]);
+        let snap_bytes = crate::codec::encode_snapshot(&snap_state);
+
+        // Pre-seed a GENESIS-ERA log (blocks 1,2,3) into the data_dir.
+        {
+            let blog = BlockLog::open(format!("{dir}/blocks.log")).unwrap();
+            let clog = CertLog::open(format!("{dir}/certs.log")).unwrap();
+            for b in d.blocks() {
+                blog.append(b).unwrap();
+            }
+            for c in d.certificates() {
+                clog.append(c).unwrap();
+            }
+        }
+
+        let snap_path = std::path::Path::new(&dir).join("snapshot.bin");
+        std::fs::write(&snap_path, &snap_bytes).unwrap();
+        let mut cfg = node_config(21, 21351, &[21], dir.clone());
+        cfg.snapshot = Some(crate::config::SnapshotBootConfig {
+            path: snap_path.to_string_lossy().into_owned(),
+            header_hex: crate::hash::hex(&crate::codec::encode_header(&header3)),
+            cert_hex: None,
+            trusted_validators: vec![],
+        });
+        let node = Node::start(cfg, genesis, Some(kp(21)))
+            .await
+            .expect("snapshot boot truncates genesis-era log");
+
+        let (reply, rx) = oneshot::channel();
+        node.cmd.send(Cmd::BaseHeight(reply)).unwrap();
+        let base = tokio::time::timeout(Duration::from_secs(2), rx)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(base, 3, "booted fresh at the snapshot tip (3)");
+        // The genesis-era log was truncated: on-disk blocks.log holds only post-snapshot
+        // tail (0 at boot, 1 if the node already self-produced height 4).
+        let on_disk = BlockLog::open(format!("{dir}/blocks.log"))
+            .unwrap()
+            .read_all()
+            .unwrap();
+        assert!(
+            on_disk.first().map(|b| b.height).unwrap_or(4) > 3,
+            "genesis-era blocks were removed; any remaining block is post-snapshot"
         );
 
         let _ = std::fs::remove_dir_all(&dir);

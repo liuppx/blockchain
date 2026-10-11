@@ -399,7 +399,7 @@ fn usage() {
     eprintln!("  node bridge             trustless bridge: chain A locks to chain B, relayer ferries a cert-signed envelope, B's endpoint verifies + credits — no relayer trust");
     eprintln!("  node redeem             consensus-level redeem: B's producer follows A on-chain and mints from a source lock inside its state machine — the mint is BFT-enforced, not off-chain");
     eprintln!("  node run    --config F  run the networked BFT daemon (tokio TCP P2P): load config/genesis/validator key, gossip votes + sync/verify over sockets");
-    eprintln!("  node run    --config F --snapshot FILE --snapshot-header HEX  adopt a M131 snapshot at boot (M140 fast-sync); truncates the on-disk log, verifies the cert-signed header's three roots against the snapshot");
+    eprintln!("  node run    --config F --snapshot FILE --snapshot-header HEX [--snapshot-cert HEX --snapshot-validators FILE]  adopt a M131 snapshot at boot (fast-sync): verify the header's three roots against the snapshot (M135) and, when a cert + trusted set are given, additionally require the cert to reach >2/3 of that pinned set (M141); restart resumes the post-snapshot tail without re-syncing");
     eprintln!("  node check-config --config F  dry-run: load + validate config, its genesis, and validator key (if any) without starting the daemon; print a summary or the first error");
     eprintln!("  node genesis-hash --config F  print the chain identity derived from the config's genesis: genesis_hash + initial state_root + validator count (compare across operators before joining)");
     eprintln!("  node inspect-genesis --config F  dump the config's genesis contents: every account (id/balance/pubkey), reviewer, validator, plus params (the detail view to genesis-hash's identity)");
@@ -3728,19 +3728,44 @@ fn cmd_run(config_path: String, args: &[String]) {
         config::load_node_config(&config_path).unwrap_or_else(|e| fail_msg("load node config", &e));
     // M140: optional snapshot-boot flags — `--snapshot FILE` + `--snapshot-header HEX`. The two
     // flags are a coherent pair; if either is given we set `cfg.snapshot` so `Node::start`
-    // adopts the snapshot at boot (truncating the on-disk log + verifying the cert-signed
+    // adopts the snapshot at boot (reconciling the on-disk log + verifying the cert-signed
     // header against the snapshot's three roots).
+    // M141: optional `--snapshot-cert HEX` + `--snapshot-validators FILE` upgrade the boot to a
+    // `>2/3` quorum check against an operator-pinned trusted set. They require the base pair and
+    // are themselves a coherent pair; the final cert/trusted-set coherence is enforced in
+    // `load_snapshot_boot` (authoritative for both the CLI and the TOML keypath).
     let snap_path = opt_arg(args, "--snapshot").map(str::to_string);
     let snap_header = opt_arg(args, "--snapshot-header").map(str::to_string);
+    let snap_cert = opt_arg(args, "--snapshot-cert").map(str::to_string);
+    let snap_vals = opt_arg(args, "--snapshot-validators").map(str::to_string);
     match (snap_path, snap_header) {
         (Some(_), None) | (None, Some(_)) => fail_msg(
             "node run",
             &"--snapshot and --snapshot-header must be given together",
         ),
         (Some(path), Some(header_hex)) => {
-            cfg.snapshot = Some(config::SnapshotBootConfig { path, header_hex });
+            let trusted_validators = snap_vals
+                .as_ref()
+                .map(|p| {
+                    config::load_trusted_validators(p)
+                        .unwrap_or_else(|e| fail_msg("load snapshot trusted validators", &e))
+                })
+                .unwrap_or_default();
+            cfg.snapshot = Some(config::SnapshotBootConfig {
+                path,
+                header_hex,
+                cert_hex: snap_cert,
+                trusted_validators,
+            });
         }
-        (None, None) => {}
+        (None, None) => {
+            if snap_cert.is_some() || snap_vals.is_some() {
+                fail_msg(
+                    "node run",
+                    &"--snapshot-cert/--snapshot-validators require --snapshot and --snapshot-header",
+                );
+            }
+        }
     }
     daemon::init_tracing_with(cfg.logging.as_ref());
     let gcfg = config::load_genesis(&cfg.genesis).unwrap_or_else(|e| fail_msg("load genesis", &e));

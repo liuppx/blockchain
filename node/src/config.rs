@@ -42,6 +42,9 @@ pub enum ConfigError {
     BadLogRotation { value: String },
     /// M54: a `[mempool]` tuning value was out of range (e.g. zero capacity).
     BadMempool { detail: String },
+    /// M141: a `[snapshot]` boot config was internally incoherent (e.g. a cert
+    /// without a trusted validator set, or vice versa).
+    BadSnapshot { detail: String },
 }
 
 impl std::fmt::Display for ConfigError {
@@ -69,6 +72,7 @@ impl std::fmt::Display for ConfigError {
                 )
             }
             ConfigError::BadMempool { detail } => write!(f, "config bad mempool: {detail}"),
+            ConfigError::BadSnapshot { detail } => write!(f, "config bad snapshot: {detail}"),
         }
     }
 }
@@ -157,6 +161,68 @@ pub struct SnapshotBootConfig {
     /// `GET /header/{h}` produces); the boot-time check verifies its
     /// `state_root`/`accounts_root`/`bridge_root` match the snapshot.
     pub header_hex: String,
+    /// M141: optional hex-encoded finality `Commit` (the `codec::encode_commit`
+    /// form) certifying the snapshot's tip header. When present, boot additionally
+    /// requires it to reach `>2/3` of `trusted_validators` (a weak-subjectivity
+    /// checkpoint the operator pins out-of-band). Paired with `trusted_validators`.
+    #[serde(default)]
+    pub cert_hex: Option<String>,
+    /// M141: operator-pinned trusted validator set the `cert_hex` must reach
+    /// `>2/3` of. Reuses the genesis `[[validators]]` encoding (id/pubkey_hex/power).
+    /// Empty ⇒ no quorum check (M135 commitment-only). Paired with `cert_hex`.
+    #[serde(default)]
+    pub trusted_validators: Vec<ValidatorConfig>,
+}
+
+impl SnapshotBootConfig {
+    /// M141: a snapshot-boot config is coherent only if `cert_hex` and
+    /// `trusted_validators` are both present (quorum-bound boot) or both absent
+    /// (M135 commitment-only boot). A cert without a set (nothing to verify it
+    /// against) or a set without a cert (nothing to verify) is an operator error.
+    /// This is the authoritative gate — it runs at `Node::start` (via
+    /// [`crate::daemon`]) for both the TOML and the CLI keypath.
+    pub fn validate(&self) -> Result<(), ConfigError> {
+        if self.cert_hex.is_some() != !self.trusted_validators.is_empty() {
+            return Err(ConfigError::BadSnapshot {
+                detail: "`cert_hex` and `trusted_validators` must be given together \
+                         (a cert needs a trusted set to verify against, and vice versa)"
+                    .to_string(),
+            });
+        }
+        Ok(())
+    }
+
+    /// M141: decode `trusted_validators` into `(id, PubKey, power)` tuples, reusing
+    /// the genesis pubkey-hex decoder + `BadHex` errors. Empty ⇒ empty vec.
+    pub fn trusted_validators_decoded(&self) -> Result<Vec<(u64, PubKey, u64)>, ConfigError> {
+        let mut out = Vec::with_capacity(self.trusted_validators.len());
+        for v in &self.trusted_validators {
+            out.push((
+                v.id,
+                decode_pubkey(&v.pubkey_hex, "snapshot.trusted_validators.pubkey_hex")?,
+                v.power,
+            ));
+        }
+        Ok(out)
+    }
+}
+
+/// M141: a standalone TOML file holding the trusted validator set for a
+/// quorum-bound snapshot boot, supplied via `node run --snapshot-validators FILE`.
+/// Reuses the genesis `[[validator]]` entry shape.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TrustedValidatorsFile {
+    #[serde(default)]
+    pub validator: Vec<ValidatorConfig>,
+}
+
+/// M141: read + parse a `--snapshot-validators FILE` TOML into the entry list the
+/// CLI merges into `SnapshotBootConfig::trusted_validators`.
+pub fn load_trusted_validators(path: &str) -> Result<Vec<ValidatorConfig>, ConfigError> {
+    let s = std::fs::read_to_string(path)?;
+    let f: TrustedValidatorsFile =
+        toml::from_str(&s).map_err(|e| ConfigError::Toml(e.to_string()))?;
+    Ok(f.validator)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2078,5 +2144,82 @@ mod tests {
 
         // Remove the now-obsolete pre-M33 keystore if a prior run left one.
         let _ = std::fs::remove_file(dir.join("keystore.toml"));
+    }
+
+    #[test]
+    fn snapshot_config_m140_two_field_toml_parses() {
+        // M141: an M140-era `[snapshot]` with only `path` + `header_hex` must still
+        // deserialize — the two new fields are `#[serde(default)]` (None / empty).
+        let toml = r#"
+            genesis = "genesis.toml"
+
+            [node]
+            id = 21
+            listen = "127.0.0.1:9021"
+            data_dir = "/tmp/x"
+
+            [snapshot]
+            path = "snap.bin"
+            header_hex = "abcd"
+        "#;
+        let cfg: NodeConfig = toml::from_str(toml).expect("parse M140 snapshot config");
+        let s = cfg.snapshot.expect("snapshot section present");
+        assert_eq!(s.path, "snap.bin");
+        assert_eq!(s.header_hex, "abcd");
+        assert!(s.cert_hex.is_none(), "cert_hex defaults to None");
+        assert!(
+            s.trusted_validators.is_empty(),
+            "trusted_validators defaults to empty"
+        );
+        // And an M135-only config (no cert, no set) is coherent.
+        assert!(s.validate().is_ok());
+    }
+
+    #[test]
+    fn snapshot_config_coherence_validate() {
+        // M141: `cert_hex` and `trusted_validators` must be given together (XOR is an error).
+        let one_validator = vec![ValidatorConfig {
+            id: 21,
+            pubkey_hex: hex(&demo_seed(21)), // shape only; validate() doesn't decode
+            power: 1,
+        }];
+        // Both present → ok.
+        let both = SnapshotBootConfig {
+            path: "p".into(),
+            header_hex: "ab".into(),
+            cert_hex: Some("cd".into()),
+            trusted_validators: one_validator.clone(),
+        };
+        assert!(both.validate().is_ok());
+        // Neither present → ok (M135-only).
+        let neither = SnapshotBootConfig {
+            path: "p".into(),
+            header_hex: "ab".into(),
+            cert_hex: None,
+            trusted_validators: vec![],
+        };
+        assert!(neither.validate().is_ok());
+        // Cert without a set → error.
+        let cert_only = SnapshotBootConfig {
+            path: "p".into(),
+            header_hex: "ab".into(),
+            cert_hex: Some("cd".into()),
+            trusted_validators: vec![],
+        };
+        assert!(matches!(
+            cert_only.validate(),
+            Err(ConfigError::BadSnapshot { .. })
+        ));
+        // Set without a cert → error.
+        let set_only = SnapshotBootConfig {
+            path: "p".into(),
+            header_hex: "ab".into(),
+            cert_hex: None,
+            trusted_validators: one_validator,
+        };
+        assert!(matches!(
+            set_only.validate(),
+            Err(ConfigError::BadSnapshot { .. })
+        ));
     }
 }
