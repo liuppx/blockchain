@@ -1341,6 +1341,18 @@ M116 的 `node rpc` 只能 GET。M117 补上写侧，让它成为**全能** RPC 
 
 **已知边界（顺延至 M121+）**：身份读三类已齐（`/genesis` 链 / `/node` 节点 / `/info` 链尖）；读面两分（`/params`/`/config`）已齐；RPC 自带端点发现 + 全能客户端 + 完整链读/写面；内容协商三轴已齐（仅 `identity`，真压缩顺延）；离线工具篮子已补；运维篮子剩余：证书/密钥轮换与落盘、follower 认证、指标端 TLS、OTel/push exporter、每-sink 独立 rotation 覆盖、时延直方图；keygen 篮子剩余：助记词 / BIP-39、口令加密 keystore、密钥轮换；剩余：游标分页、未知方法 `405`；共识 / wire 篮子（破 head 不变量）：**货币费用** + 费用优先排序、nonce / 序列号反重放。
 
+## 轻节点 peer discovery（Milestone 153 · light daemon Phase 3d）
+
+M148 的轻节点只连静态配置的 peer——若该 peer 挂了就孤立。M153 给它 peer discovery（复用全节点 M39 地址簿范式）：经 `Peers` gossip 学新 full-node peer 并自动拨号，网络更有韧性。
+
+- **`LightActor` 加 M39 式字段**：`my_id`/`peer_exchange`/`addrs: HashMap<u64,String>`/`dialing: HashSet<u64>`/`auth: Arc<AuthContext>`/`self_tx`。
+- **`peers_msg`/`gossip_peers`/`on_peers`**（`daemon.rs`，镜像全节点）：`on_peers` first-wins 合并地址簿、跳过自身、对**更高 id** 的新 peer 自动 `tokio::spawn(run_connector::<LightCmd>)`（dial-higher-id 不变量——低 id 侧从同一 gossip 学到我们的 addr 并拨我们）。
+- **`run_light_actor`**：`Register` 时（若 `peer_exchange`）附发 `peers_msg`；`Inbound` 拦截 `GossipMsg::Peers` 走 `on_peers`（纯 light 核心丢弃它）；`Announce` 加 `gossip_peers()` 周期传播。
+- **`LightNode::start`**：地址簿种自身 listen（`self_advertise_addr`）+ 配置 peer，高 id 配置 peer 标记已 dialing（boot 连接器覆盖）。gated by `cfg.network.enable_peer_exchange`（默认关 → M148 行为不变）。
+- **顺带清理**：M147 删 oracle 后遗留的 `main.rs` `committed_sets` 死代码移除。
+- **不碰** 共识/codec/wire；localnet 头仍 wire v1 `a045426e…3b87bc`。
+- **测试（+1 → 616）**：`light_on_peers_learns_and_dials_higher_ids`（确定性单测：学全 peer、跳自身、只拨更高 id、`peer_exchange` 关则 no-op；TCP 端到端 discovery 由全节点 M39 测 + M148 同步测覆盖）。
+
 ## 轻节点只读 RPC（Milestone 152 · light daemon Phase 3c）
 
 M148–M151 的轻守护进程此前是黑盒——运维无从查其同步高度。M152 给它一个**只读 RPC** 读面（opt-in `[rpc]`），复用全节点 HTTP framing。

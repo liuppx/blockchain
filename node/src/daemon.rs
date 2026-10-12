@@ -6686,6 +6686,13 @@ struct LightActor {
     hlog: Option<crate::store::HeaderLog>,
     /// M151: number of retained headers already written to `hlog`.
     appended: usize,
+    /// M153: peer discovery state (mirrors the full-node actor's M39 fields).
+    my_id: u64,
+    peer_exchange: bool,
+    addrs: HashMap<u64, String>,
+    dialing: HashSet<u64>,
+    auth: Arc<AuthContext>,
+    self_tx: mpsc::UnboundedSender<LightCmd>,
 }
 
 impl LightActor {
@@ -6693,6 +6700,47 @@ impl LightActor {
         for (dst, msg) in out {
             if let Some(tx) = self.outbound.get(&dst) {
                 let _ = tx.send(msg);
+            }
+        }
+    }
+
+    /// M153: the address book as a `Peers` gossip message.
+    fn peers_msg(&self) -> GossipMsg {
+        GossipMsg::Peers(self.addrs.iter().map(|(id, a)| (*id, a.clone())).collect())
+    }
+
+    /// M153: propagate the address book to every connected peer (periodic). No-op when
+    /// peer exchange is disabled.
+    fn gossip_peers(&self) {
+        if !self.peer_exchange {
+            return;
+        }
+        let msg = self.peers_msg();
+        for tx in self.outbound.values() {
+            let _ = tx.send(msg.clone());
+        }
+    }
+
+    /// M153: ingest a peer's address book — first-wins merge, and auto-dial any
+    /// newly-learned higher-id peer (the lower-id side learns our addr from the same
+    /// gossip and dials us). Mirrors the full node's `on_peers` (M39). No-op when peer
+    /// exchange is disabled.
+    fn on_peers(&mut self, book: Vec<(u64, String)>) {
+        if !self.peer_exchange {
+            return;
+        }
+        for (id, addr) in book {
+            if id == self.my_id {
+                continue;
+            }
+            self.addrs.entry(id).or_insert_with(|| addr.clone());
+            if id > self.my_id && !self.dialing.contains(&id) {
+                if let Ok(sa) = addr.parse::<SocketAddr>() {
+                    self.dialing.insert(id);
+                    let tx = self.self_tx.clone();
+                    tokio::spawn(run_connector(sa, self.auth.clone(), tx));
+                    info!(node = self.my_id, peer = id, %addr, "light: discovered peer, dialing");
+                }
             }
         }
     }
@@ -6728,19 +6776,31 @@ async fn run_light_actor(mut actor: LightActor, mut rx: mpsc::UnboundedReceiver<
                 let _ = tx.send(GossipMsg::Status {
                     height: actor.node.tracker().height(),
                 });
+                // M153: hand the new peer our address book so it can learn + dial the rest.
+                if actor.peer_exchange {
+                    let _ = tx.send(actor.peers_msg());
+                }
                 actor.outbound.insert(id, tx);
             }
             LightCmd::Unregister { id } => {
                 actor.outbound.remove(&id);
             }
             LightCmd::Inbound { from, msg } => {
-                let out = actor.node.on_message(from, *msg);
+                let msg = *msg;
+                // M153: address-book gossip drives peer discovery + auto-dial (the pure
+                // light core drops it).
+                if let GossipMsg::Peers(book) = msg {
+                    actor.on_peers(book);
+                    continue;
+                }
+                let out = actor.node.on_message(from, msg);
                 actor.route(out);
                 actor.persist(); // M151: durably record any headers just applied
             }
             LightCmd::Announce => {
                 let out = actor.node.announce();
                 actor.route(out);
+                actor.gossip_peers(); // M153: periodic address-book propagation
             }
             LightCmd::Status(reply) => {
                 let _ = reply.send((actor.node.tracker().height(), actor.node.tracker().head()));
@@ -6883,11 +6943,34 @@ impl LightNode {
         });
 
         let (cmd_tx, cmd_rx) = mpsc::unbounded_channel::<LightCmd>();
+
+        // M153: seed the discovery address book with our own listen addr + every
+        // configured peer; mark higher-id configured peers as already-dialing (the boot
+        // connectors below cover them). Discovery grows both as `Peers` gossip arrives.
+        let mut addrs: HashMap<u64, String> = HashMap::new();
+        addrs.insert(
+            my_id,
+            self_advertise_addr(&cfg.node.listen, &cfg.network.advertise_addr),
+        );
+        let mut dialing: HashSet<u64> = HashSet::new();
+        for p in &cfg.peers {
+            addrs.entry(p.id).or_insert_with(|| p.addr.clone());
+            if p.id > my_id {
+                dialing.insert(p.id);
+            }
+        }
+
         let actor = LightActor {
             node,
             outbound: HashMap::new(),
             hlog,
             appended,
+            my_id,
+            peer_exchange: cfg.network.enable_peer_exchange,
+            addrs,
+            dialing,
+            auth: auth.clone(),
+            self_tx: cmd_tx.clone(),
         };
         tokio::spawn(run_light_actor(actor, cmd_rx));
 
@@ -16522,5 +16605,54 @@ vote_b.validator=5 vote_b.height=9 vote_b.round=2 vote_b.block_hash={b_h} vote_b
         assert!(p.contains("Allow: GET\r\n"), "405 carries Allow: {p}");
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // --- M153: light-node peer discovery ------------------------------------------
+
+    #[tokio::test]
+    async fn light_on_peers_learns_and_dials_higher_ids() {
+        // M153: a light actor ingesting a `Peers` book learns every peer's address
+        // (first-wins), skips itself, and auto-dials only higher-id peers (the
+        // dial-higher-id invariant); with peer exchange off it is a no-op. (TCP
+        // end-to-end discovery is covered by the full node's M39 tests + M148's sync.)
+        let auth = Arc::new(AuthContext {
+            my_id: 5,
+            kp: None,
+            validators: HashMap::new(),
+            require: false,
+            tls: None,
+            bind_channel: false,
+        });
+        let (tx, _rx) = mpsc::unbounded_channel::<LightCmd>();
+        let mut actor = LightActor {
+            node: crate::net::LightGossipNode::new(5, &test_genesis(), []),
+            outbound: HashMap::new(),
+            hlog: None,
+            appended: 0,
+            my_id: 5,
+            peer_exchange: true,
+            addrs: HashMap::new(),
+            dialing: HashSet::new(),
+            auth,
+            self_tx: tx,
+        };
+        actor.on_peers(vec![
+            (3, "127.0.0.1:1".into()),     // lower id: learn, don't dial
+            (9, "127.0.0.1:65000".into()), // higher id: learn + dial
+            (5, "127.0.0.1:2".into()),     // self: skipped
+        ]);
+        assert!(actor.addrs.contains_key(&3), "learned lower-id peer");
+        assert!(actor.addrs.contains_key(&9), "learned higher-id peer");
+        assert!(!actor.addrs.contains_key(&5), "self is not added");
+        assert!(actor.dialing.contains(&9), "dials the higher-id peer");
+        assert!(!actor.dialing.contains(&3), "does not dial a lower-id peer");
+
+        // peer_exchange off → on_peers is a no-op.
+        actor.peer_exchange = false;
+        actor.on_peers(vec![(10, "127.0.0.1:3".into())]);
+        assert!(
+            !actor.addrs.contains_key(&10),
+            "discovery off: nothing learned"
+        );
     }
 }

@@ -4968,20 +4968,6 @@ fn demo_driver_seeds() -> std::collections::BTreeMap<u64, [u8; 32]> {
         .collect()
 }
 
-/// Per-height committed sets from an authoritative replay: `sets[i]` is the
-/// validator set that certifies height `i + 2` (what block `i + 1` commits to
-/// in `next_validators_root`).
-fn committed_sets(g: &Genesis, blocks: &[Block]) -> Vec<ValidatorSet> {
-    let mut replay = Chain::new(g.clone());
-    let mut sets = Vec::new();
-    for b in blocks {
-        let mut b = b.clone();
-        replay.commit(&mut b).expect("commit");
-        sets.push(replay.state.validators.clone());
-    }
-    sets
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
