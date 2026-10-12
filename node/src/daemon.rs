@@ -6918,6 +6918,15 @@ impl LightNode {
             });
         }
 
+        // M152: opt-in read-only RPC (`[rpc] enabled = true`) — exposes the light node's
+        // sync status (/status, /info), /version, and a health probe. No write path.
+        if let Some(rc) = cfg.rpc.as_ref().filter(|r| r.enabled) {
+            let addr = rc.listen_addr().map_err(cfg_io)?;
+            let rlistener = TcpListener::bind(addr).await?;
+            info!(node = my_id, addr = %rlistener.local_addr()?, "light rpc listening");
+            tokio::spawn(run_light_rpc(rlistener, my_id, cmd_tx.clone()));
+        }
+
         Ok(LightNode { cmd: cmd_tx })
     }
 
@@ -6936,6 +6945,107 @@ pub async fn light_run(cfg: NodeConfig, genesis: Genesis) -> io::Result<()> {
     tokio::signal::ctrl_c().await?;
     info!("shutdown requested — exiting (light node holds no on-disk state)");
     Ok(())
+}
+
+/// M152: accept loop for the light node's read-only RPC.
+async fn run_light_rpc(listener: TcpListener, my_id: u64, cmd: mpsc::UnboundedSender<LightCmd>) {
+    loop {
+        match listener.accept().await {
+            Ok((stream, _addr)) => {
+                tokio::spawn(serve_light_rpc_conn(stream, cmd.clone()));
+            }
+            Err(e) => warn!(node = my_id, error = %e, "light rpc accept error"),
+        }
+    }
+}
+
+/// M152: serve one read-only HTTP request to a light node. `GET /status` (alias
+/// `/info`) returns the tracked `height` + `head`; `GET /version` the software version;
+/// `GET /` (or any unknown path) is a `200 OK` health probe. A light node exposes no
+/// write path, so any non-`GET` method is `405 Method Not Allowed`. `?format=json`
+/// selects the JSON twin. Client-side errors are swallowed — a broken client never
+/// affects the node.
+async fn serve_light_rpc_conn(mut stream: TcpStream, cmd: mpsc::UnboundedSender<LightCmd>) {
+    let mut acc: Vec<u8> = Vec::new();
+    let mut buf = [0u8; 1024];
+    loop {
+        match stream.read(&mut buf).await {
+            Ok(0) => return,
+            Ok(n) => {
+                acc.extend_from_slice(&buf[..n]);
+                if acc.windows(4).any(|w| w == b"\r\n\r\n") {
+                    break;
+                }
+                if acc.len() >= MAX_RPC_HEADER {
+                    let _ = stream
+                        .write_all(
+                            http_response(
+                                "431 Request Header Fields Too Large",
+                                "header too large",
+                            )
+                            .as_bytes(),
+                        )
+                        .await;
+                    return;
+                }
+            }
+            Err(_) => return,
+        }
+    }
+    let Ok(head) = std::str::from_utf8(&acc) else {
+        let _ = stream
+            .write_all(http_response("400 Bad Request", "malformed headers").as_bytes())
+            .await;
+        return;
+    };
+    let method = head.split_whitespace().next().unwrap_or("");
+    let target = head.split_whitespace().nth(1).unwrap_or("");
+    let (path, query) = split_query(target);
+    if !method.eq_ignore_ascii_case("GET") {
+        // RFC 9110 §15.5.6: 405 carries an `Allow` header. A light node serves GET only.
+        let body = "light node is read-only — use GET";
+        let resp = format!(
+            "HTTP/1.1 405 Method Not Allowed\r\n\
+             Allow: GET\r\n\
+             Content-Type: text/plain; charset=utf-8\r\n\
+             Content-Length: {}\r\n\
+             Connection: close\r\n\
+             \r\n\
+             {}",
+            body.len(),
+            body
+        );
+        let _ = stream.write_all(resp.as_bytes()).await;
+        return;
+    }
+    let fmt = response_format(query).unwrap_or(RespFormat::Text);
+    let resp = match path {
+        "/status" | "/info" => {
+            let (tx, rx) = oneshot::channel();
+            if cmd.send(LightCmd::Status(tx)).is_err() {
+                http_response("503 Service Unavailable", "node stopped")
+            } else {
+                match rx.await {
+                    Ok((h, hd)) => {
+                        let hex = crate::hash::hex(&hd);
+                        ok_body(
+                            fmt,
+                            &format!("height={h}\nhead={hex}"),
+                            &format!("{{\"height\":{},\"head\":{}}}", json_u64(h), json_str(&hex)),
+                        )
+                    }
+                    Err(_) => http_response("503 Service Unavailable", "node stopped"),
+                }
+            }
+        }
+        "/version" => ok_body(
+            fmt,
+            &format!("version={NODE_VERSION}"),
+            &format!("{{\"version\":{}}}", json_str(NODE_VERSION)),
+        ),
+        _ => http_response("200 OK", "ok"),
+    };
+    let _ = stream.write_all(resp.as_bytes()).await;
 }
 
 /// M37: install a process-global `tracing` subscriber (stderr, `RUST_LOG`-filtered,
@@ -16338,6 +16448,79 @@ vote_b.validator=5 vote_b.height=9 vote_b.round=2 vote_b.block_hash={b_h} vote_b
             .expect("light node resumes from persisted headers");
         let (h, _) = light.status().await.expect("light status");
         assert_eq!(h, 3, "resumed at the persisted height without a peer");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // --- M152: light-node read-only RPC -------------------------------------------
+
+    #[tokio::test]
+    async fn light_rpc_status_over_tcp() {
+        // M152: a light node with `[rpc]` enabled serves its sync status over HTTP.
+        // Seed from a verified snapshot at height 3 (no peer), then GET /status.
+        let (snap_bytes, header, cert, tv, _state) = quorum_snapshot_fixture();
+        let dir = tmp_dir("light-rpc");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = std::path::Path::new(&dir).join("snap.bin");
+        std::fs::write(&path, &snap_bytes).unwrap();
+
+        let mut cfg = node_config(21, 20720, &[21], dir.clone());
+        let rpc_addr = "127.0.0.1:20731";
+        cfg.rpc = Some(crate::config::RpcConfig {
+            enabled: true,
+            listen: rpc_addr.into(),
+        });
+        cfg.snapshot = Some(crate::config::SnapshotBootConfig {
+            path: path.to_string_lossy().into_owned(),
+            header_hex: crate::hash::hex(&crate::codec::encode_header(&header)),
+            cert_hex: Some(crate::hash::hex(&crate::codec::encode_commit(&cert))),
+            trusted_validators: tv,
+        });
+        let _light = LightNode::start(cfg, test_genesis())
+            .await
+            .expect("light rpc boot");
+
+        async fn get(addr: &str, pathq: &str) -> String {
+            let req =
+                format!("GET {pathq} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
+            let mut s = TcpStream::connect(addr).await.expect("connect light rpc");
+            s.write_all(req.as_bytes()).await.expect("send");
+            let mut resp = Vec::new();
+            s.read_to_end(&mut resp).await.expect("read");
+            String::from_utf8_lossy(&resp).into_owned()
+        }
+        fn body_of(resp: &str) -> &str {
+            resp.split_once("\r\n\r\n").map(|(_, b)| b).unwrap_or("")
+        }
+
+        // /status (text) reports the seeded height.
+        let s = get(rpc_addr, "/status").await;
+        assert!(s.starts_with("HTTP/1.1 200 OK"), "status: {s}");
+        assert!(body_of(&s).starts_with("height=3\n"), "status body: {s}");
+        assert!(body_of(&s).contains("\nhead="), "status has a head: {s}");
+
+        // JSON twin.
+        let j = get(rpc_addr, "/status?format=json").await;
+        assert!(
+            body_of(&j).starts_with("{\"height\":\"3\","),
+            "status json: {j}"
+        );
+
+        // A write method is rejected (read-only node).
+        async fn post(addr: &str) -> String {
+            let req = "POST /tx HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+            let mut s = TcpStream::connect(addr).await.expect("connect");
+            s.write_all(req.as_bytes()).await.expect("send");
+            let mut resp = Vec::new();
+            s.read_to_end(&mut resp).await.expect("read");
+            String::from_utf8_lossy(&resp).into_owned()
+        }
+        let p = post(rpc_addr).await;
+        assert!(
+            p.starts_with("HTTP/1.1 405 Method Not Allowed"),
+            "write rejected: {p}"
+        );
+        assert!(p.contains("Allow: GET\r\n"), "405 carries Allow: {p}");
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

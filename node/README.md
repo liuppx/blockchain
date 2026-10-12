@@ -1341,6 +1341,16 @@ M116 的 `node rpc` 只能 GET。M117 补上写侧，让它成为**全能** RPC 
 
 **已知边界（顺延至 M121+）**：身份读三类已齐（`/genesis` 链 / `/node` 节点 / `/info` 链尖）；读面两分（`/params`/`/config`）已齐；RPC 自带端点发现 + 全能客户端 + 完整链读/写面；内容协商三轴已齐（仅 `identity`，真压缩顺延）；离线工具篮子已补；运维篮子剩余：证书/密钥轮换与落盘、follower 认证、指标端 TLS、OTel/push exporter、每-sink 独立 rotation 覆盖、时延直方图；keygen 篮子剩余：助记词 / BIP-39、口令加密 keystore、密钥轮换；剩余：游标分页、未知方法 `405`；共识 / wire 篮子（破 head 不变量）：**货币费用** + 费用优先排序、nonce / 序列号反重放。
 
+## 轻节点只读 RPC（Milestone 152 · light daemon Phase 3c）
+
+M148–M151 的轻守护进程此前是黑盒——运维无从查其同步高度。M152 给它一个**只读 RPC** 读面（opt-in `[rpc]`），复用全节点 HTTP framing。
+
+- **端点**：`GET /status`（别名 `/info`）返 tracked `height`+`head`（文本 `height=…\nhead=…` / `?format=json` 返 `{"height":"…","head":"…"}`）；`GET /version` 返软件版本；`GET /`（及未知路径）200 健康探针。
+- **只读**：轻节点无写路径，任何非 GET 方法 → `405 Method Not Allowed`（带 `Allow: GET`，RFC 9110 §15.5.6）。
+- **复用**（`daemon.rs`）：`http_response`/`ok_body`/`RespFormat`/`response_format`/`split_query`/`json_u64`/`json_str`/`MAX_RPC_HEADER`/`NODE_VERSION`——自包含 `serve_light_rpc_conn` + `run_light_rpc`，经 `LightCmd::Status` 查询。`LightNode::start` 在 `cfg.rpc` enabled 时 bind（照全节点 `run_rpc` 范式）。
+- **不碰** 共识/codec/wire；localnet 头仍 wire v1 `a045426e…3b87bc`。
+- **测试（+1 → 615）**：`light_rpc_status_over_tcp`（快照种子到高度 3 的轻节点 over loopback TCP：`GET /status` 文本 `height=3`、JSON `{"height":"3",…}`、`POST` → 405 带 `Allow: GET`）。
+
 ## 轻节点 header 持久化（Milestone 151 · light daemon Phase 3b）
 
 M148 的轻守护进程不落盘，每次重启从创世/快照重新全量同步。M151 让它**持久化已验证的 headers**：重启从磁盘重放恢复到上次高度，而非重新同步。
