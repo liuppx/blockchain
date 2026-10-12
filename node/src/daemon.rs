@@ -6682,6 +6682,10 @@ impl TransportCmd for LightCmd {
 struct LightActor {
     node: crate::net::LightGossipNode,
     outbound: HashMap<u64, mpsc::UnboundedSender<GossipMsg>>,
+    /// M151: optional header persistence — `Some` when the light node has a data_dir.
+    hlog: Option<crate::store::HeaderLog>,
+    /// M151: number of retained headers already written to `hlog`.
+    appended: usize,
 }
 
 impl LightActor {
@@ -6690,6 +6694,27 @@ impl LightActor {
             if let Some(tx) = self.outbound.get(&dst) {
                 let _ = tx.send(msg);
             }
+        }
+    }
+
+    /// M151: append any newly-applied `(header, next_set)` pairs to the header log so a
+    /// restart can resume. No-op when persistence is off or nothing new was applied.
+    fn persist(&mut self) {
+        let Some(hlog) = self.hlog.as_ref() else {
+            return;
+        };
+        let headers = self.node.headers();
+        let next_sets = self.node.next_sets();
+        while self.appended < headers.len() {
+            if hlog
+                .append(&headers[self.appended], &next_sets[self.appended])
+                .is_err()
+            {
+                // A write failure must not crash the actor; stop persisting (the node
+                // keeps serving from memory, and re-sync on restart still recovers).
+                break;
+            }
+            self.appended += 1;
         }
     }
 }
@@ -6711,6 +6736,7 @@ async fn run_light_actor(mut actor: LightActor, mut rx: mpsc::UnboundedReceiver<
             LightCmd::Inbound { from, msg } => {
                 let out = actor.node.on_message(from, *msg);
                 actor.route(out);
+                actor.persist(); // M151: durably record any headers just applied
             }
             LightCmd::Announce => {
                 let out = actor.node.announce();
@@ -6807,9 +6833,32 @@ impl LightNode {
         let peer_ids: Vec<u64> = cfg.peers.iter().map(|p| p.id).collect();
         // M149: snapshot-seed if `[snapshot]` is configured (fast-sync from a verified
         // checkpoint); otherwise track from genesis.
-        let node = match cfg.snapshot.as_ref() {
+        let mut node = match cfg.snapshot.as_ref() {
             Some(s) => load_light_snapshot_seed(s, my_id, &peer_ids)?,
             None => crate::net::LightGossipNode::new(my_id, &genesis, peer_ids.iter().copied()),
+        };
+
+        // M151: header persistence. When a data_dir is configured, open (and replay) a
+        // `headers.log` so a restart resumes at the last verified height instead of
+        // re-syncing. The persisted `(header, next_set)` pairs replay via `apply_header`
+        // onto the just-built base node (genesis or snapshot seed); a replay failure
+        // means the log is inconsistent with the base — surfaced as an error.
+        let (hlog, appended) = if cfg.node.data_dir.is_empty() {
+            (None, 0)
+        } else {
+            let path = format!("{}/headers.log", cfg.node.data_dir);
+            let log = crate::store::HeaderLog::open(&path)?;
+            let persisted = log.read_all()?;
+            let appended = persisted.len();
+            for (ch, set) in persisted {
+                node.apply_header(ch, &set).map_err(|e| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("persisted header log inconsistent with the base: {e}"),
+                    )
+                })?;
+            }
+            (Some(log), appended)
         };
 
         // Reuse the full-node AuthContext build with no key. Encryption-only TLS
@@ -6837,6 +6886,8 @@ impl LightNode {
         let actor = LightActor {
             node,
             outbound: HashMap::new(),
+            hlog,
+            appended,
         };
         tokio::spawn(run_light_actor(actor, cmd_rx));
 
@@ -16237,6 +16288,56 @@ vote_b.validator=5 vote_b.height=9 vote_b.round=2 vote_b.block_hash={b_h} vote_b
             Err(e) => assert_eq!(e.kind(), io::ErrorKind::InvalidData),
             Ok(_) => panic!("light snapshot-seed without a cert must be rejected"),
         }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // --- M151: light-node header persistence --------------------------------------
+
+    #[tokio::test]
+    async fn light_resumes_from_persisted_headers() {
+        // M151: a light daemon with a pre-seeded headers.log resumes at its last height
+        // on boot — no peer, no re-sync. (Deterministic: pre-seed the log directly, like
+        // the M141 full-node restart test, to avoid two live actors.)
+        use crate::driver::ChainDriver;
+        let dir = tmp_dir("light-resume");
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // Build a 3-block certified chain and its per-height validator sets.
+        let seeds: BTreeMap<u64, [u8; 32]> = [21u64, 22, 23, 24]
+            .iter()
+            .map(|&id| (id, seed(id)))
+            .collect();
+        let mut d = ChainDriver::new(test_genesis(), seeds, 1);
+        d.submit(test_tx(1, 1, 1)).unwrap();
+        d.submit(test_tx(2, 2, 2)).unwrap();
+        d.submit(test_tx(3, 3, 3)).unwrap();
+        assert_eq!(d.produce_until_drained(1.0, 8).unwrap(), 3);
+        let blocks = d.blocks().to_vec();
+        let certs = d.certificates().to_vec();
+        let mut replay = crate::Chain::new(test_genesis());
+        let mut sets = Vec::new();
+        for b in &blocks {
+            let mut b = b.clone();
+            replay.commit(&mut b).unwrap();
+            sets.push(replay.state.validators.clone());
+        }
+
+        // Pre-seed the header log as a prior run's persist() would have.
+        {
+            let hlog = crate::store::HeaderLog::open(format!("{dir}/headers.log")).unwrap();
+            for (i, b) in blocks.iter().enumerate() {
+                let ch = crate::codec::CertifiedHeader::from_certified(b, &certs[i]);
+                hlog.append(&ch, &sets[i]).unwrap();
+            }
+        }
+
+        // Boot a light node (no peers) against the same data_dir — it replays the log.
+        let cfg = node_config(21, 20700, &[21], dir.clone());
+        let light = LightNode::start(cfg, test_genesis())
+            .await
+            .expect("light node resumes from persisted headers");
+        let (h, _) = light.status().await.expect("light status");
+        assert_eq!(h, 3, "resumed at the persisted height without a peer");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

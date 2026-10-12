@@ -16,8 +16,12 @@ use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 
-use crate::codec::{decode_block, decode_commit, encode_block, encode_commit};
+use crate::codec::{
+    decode_block, decode_certified_header, decode_commit, decode_validator_set, encode_block,
+    encode_certified_header, encode_commit, encode_validator_set, CertifiedHeader,
+};
 use crate::consensus::Commit;
+use crate::validator::ValidatorSet;
 use crate::Block;
 
 /// Ensure the parent directory of `path` exists, then touch the file so a fresh
@@ -134,6 +138,59 @@ impl CertLog {
 
 fn torn(msg: &str) -> io::Error {
     io::Error::new(io::ErrorKind::UnexpectedEof, msg)
+}
+
+/// M151: append-only log of a light client's verified headers, each paired with the
+/// validator set the tracker adopted after it. A restarted light daemon replays this
+/// log (via `LightGossipNode::apply_header`) to resume at its last height instead of
+/// re-syncing from genesis/snapshot. Each record is
+/// `u32 header_len ‖ encode_certified_header ‖ encode_validator_set` (the header length
+/// prefix splits the two variable-length payloads within one framed record).
+pub struct HeaderLog {
+    path: PathBuf,
+}
+
+impl HeaderLog {
+    /// Open (creating if absent) the header log at `path`.
+    pub fn open<P: AsRef<Path>>(path: P) -> io::Result<Self> {
+        let path = path.as_ref().to_path_buf();
+        open_touch(&path)?;
+        Ok(HeaderLog { path })
+    }
+
+    /// Append one `(certified header, next validator set)` pair and flush it.
+    pub fn append(&self, ch: &CertifiedHeader, set: &ValidatorSet) -> io::Result<()> {
+        let hb = encode_certified_header(ch);
+        let hlen = u32::try_from(hb.len())
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "header too large"))?;
+        let mut rec = Vec::with_capacity(4 + hb.len() + 64);
+        rec.extend_from_slice(&hlen.to_be_bytes());
+        rec.extend_from_slice(&hb);
+        rec.extend_from_slice(&encode_validator_set(set));
+        append_record(&self.path, &rec)
+    }
+
+    /// Read and decode every `(header, set)` pair in order (torn tail reported).
+    pub fn read_all(&self) -> io::Result<Vec<(CertifiedHeader, ValidatorSet)>> {
+        read_records(&self.path)?
+            .iter()
+            .map(|r| {
+                if r.len() < 4 {
+                    return Err(torn("truncated header record"));
+                }
+                let hlen = u32::from_be_bytes(r[0..4].try_into().unwrap()) as usize;
+                let end = 4usize
+                    .checked_add(hlen)
+                    .ok_or_else(|| torn("length overflow"))?;
+                if end > r.len() {
+                    return Err(torn("truncated header payload"));
+                }
+                let ch = decode_certified_header(&r[4..end]).map_err(decode_err)?;
+                let set = decode_validator_set(&r[end..]).map_err(decode_err)?;
+                Ok((ch, set))
+            })
+            .collect()
+    }
 }
 
 #[cfg(test)]
@@ -275,6 +332,45 @@ mod tests {
         File::open(&path).unwrap().read_to_end(&mut bytes).unwrap();
         std::fs::write(&path, &bytes[..bytes.len() - 1]).unwrap();
         assert!(CertLog::open(&path).unwrap().read_all().is_err());
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn header_log_round_trips() {
+        // M151: the light-client header log stores (CertifiedHeader, ValidatorSet) pairs.
+        use crate::validator::Validator;
+        let path = tmp("headers");
+        let log = HeaderLog::open(&path).unwrap();
+        let b1 = blk(1, [0u8; 32]);
+        let b2 = blk(2, b1.hash());
+        let ch1 = CertifiedHeader::from_certified(&b1, &commit(1, b1.hash()));
+        let ch2 = CertifiedHeader::from_certified(&b2, &commit(2, b2.hash()));
+        let set1 = ValidatorSet::new(vec![Validator {
+            id: 21,
+            pubkey: [1u8; 32],
+            power: 1,
+        }]);
+        let set2 = ValidatorSet::new(vec![
+            Validator {
+                id: 21,
+                pubkey: [1u8; 32],
+                power: 1,
+            },
+            Validator {
+                id: 22,
+                pubkey: [2u8; 32],
+                power: 1,
+            },
+        ]);
+        log.append(&ch1, &set1).unwrap();
+        log.append(&ch2, &set2).unwrap();
+
+        let read = HeaderLog::open(&path).unwrap().read_all().unwrap();
+        assert_eq!(read.len(), 2);
+        assert_eq!(read[0].0.header.hash(), ch1.header.hash());
+        assert_eq!(read[0].1.merkle_root(), set1.merkle_root());
+        assert_eq!(read[1].0.header.height, 2);
+        assert_eq!(read[1].1.merkle_root(), set2.merkle_root());
         std::fs::remove_file(&path).ok();
     }
 }

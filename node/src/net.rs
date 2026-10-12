@@ -1853,6 +1853,14 @@ impl LightGossipNode {
         &self.headers
     }
 
+    /// M151: the validator sets adopted alongside each retained header (parallel to
+    /// [`Self::headers`]: `next_sets()[i]` is the set the tracker adopted after applying
+    /// `headers()[i]`). The light daemon persists `(header, next_set)` pairs so a
+    /// restart can replay them instead of re-syncing from genesis/snapshot.
+    pub fn next_sets(&self) -> &[ValidatorSet] {
+        &self.next_sets
+    }
+
     /// Light-side equivalent of [`GossipNode::apply_certified`]. Accepts one
     /// cert-signed header + the next set the sender says the header commits
     /// to; the header's `next_validators_root` is the unforgeable commitment

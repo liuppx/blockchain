@@ -1341,6 +1341,17 @@ M116 的 `node rpc` 只能 GET。M117 补上写侧，让它成为**全能** RPC 
 
 **已知边界（顺延至 M121+）**：身份读三类已齐（`/genesis` 链 / `/node` 节点 / `/info` 链尖）；读面两分（`/params`/`/config`）已齐；RPC 自带端点发现 + 全能客户端 + 完整链读/写面；内容协商三轴已齐（仅 `identity`，真压缩顺延）；离线工具篮子已补；运维篮子剩余：证书/密钥轮换与落盘、follower 认证、指标端 TLS、OTel/push exporter、每-sink 独立 rotation 覆盖、时延直方图；keygen 篮子剩余：助记词 / BIP-39、口令加密 keystore、密钥轮换；剩余：游标分页、未知方法 `405`；共识 / wire 篮子（破 head 不变量）：**货币费用** + 费用优先排序、nonce / 序列号反重放。
 
+## 轻节点 header 持久化（Milestone 151 · light daemon Phase 3b）
+
+M148 的轻守护进程不落盘，每次重启从创世/快照重新全量同步。M151 让它**持久化已验证的 headers**：重启从磁盘重放恢复到上次高度，而非重新同步。
+
+- **`HeaderLog`**（`store.rs`）：复用现有 `u32 长度前缀 + payload` 追加日志范式，存 `(CertifiedHeader, ValidatorSet)` 对（记录内 `u32 header_len ‖ encode_certified_header ‖ encode_validator_set` 分隔两变长 payload）；torn-tail 照既有检测报错。
+- **`LightGossipNode::next_sets()`** 访问器（`net.rs`，与 `headers()` 平行）——暴露每个 header 采纳的验证人集供持久化。
+- **`LightActor` 持久化**（`daemon.rs`）：`hlog: Option<HeaderLog>` + `appended`，每次 `Inbound` apply 后 `persist()` 追加新 `(header, next_set)` 对（镜像全节点 actor 的 persist；写失败不崩，内存仍服务、重启再同步兜底）。
+- **`LightNode::start` 重放**：`data_dir` 非空时开 `{data_dir}/headers.log`、`read_all` 后经 `apply_header` 重放到刚建的基节点（创世或快照种子），`appended = 持久化数`；重放失败（与基不一致）报错。`data_dir` 空 → 持久化关（M148 的 ephemeral 行为）。
+- **不碰** 共识/codec/wire；localnet 头仍 wire v1 `a045426e…3b87bc`。
+- **测试（+2 → 614）**：`store::header_log_round_trips`（`(header, set)` 对往返）；`light_resumes_from_persisted_headers`（预置 headers.log 的 3 块链 → 轻节点**无 peer** 启动即重放恢复到高度 3，证明重启免重同步）。
+
 ## `HeadersWithSets` 仅变更附集压缩（Milestone 150 · light wire 效率）
 
 M147 的 `HeadersWithSets` 每个头都附**完整**验证人集，即便集未变——对长批次（256 头、集罕变）是巨大冗余。M150 改为 `Vec<(CertifiedHeader, Option<ValidatorSet>)>`：`None` = 「该高度集未变，复用当前集」，`Some(set)` 只在真实换集时携带。
