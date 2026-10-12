@@ -190,12 +190,15 @@ pub enum GossipMsg {
     /// light node can verify succession across validator-set changes from wire data
     /// alone (no in-process oracle). Full nodes serve; light nodes drop.
     GetHeadersWithSets { from: u64 },
-    /// M147: the response to `GetHeadersWithSets` — a height-ordered batch where entry
-    /// `i` is `(header at from+i, the ValidatorSet in state after applying block
-    /// from+i)`. That set's `merkle_root()` equals the header's `next_validators_root`,
-    /// so a light node feeds each pair straight into `apply_header` to advance its
-    /// tracker. Capped at [`MAX_BATCH`] pairs.
-    HeadersWithSets(Vec<(CertifiedHeader, ValidatorSet)>),
+    /// M147/M150: the response to `GetHeadersWithSets` — a height-ordered batch where
+    /// entry `i` is `(header at from+i, next validator set)`. The set is the validators
+    /// in state after applying block `from+i` (whose `merkle_root()` equals the header's
+    /// `next_validators_root`). M150: the set is `None` when it is **unchanged** from the
+    /// header's own certifying set (the common case — no validator rotation at that
+    /// height), which the light node reconstructs by reusing its current tracked set;
+    /// `Some(set)` carries the new set only across an actual change. Capped at
+    /// [`MAX_BATCH`] pairs.
+    HeadersWithSets(Vec<(CertifiedHeader, Option<ValidatorSet>)>),
 }
 
 /// M39: maximum entries in a single [`GossipMsg::Peers`] address book — over the
@@ -1071,20 +1074,21 @@ impl GossipNode {
             .collect()
     }
 
-    /// M147: the response payload for `GetHeadersWithSets` — pairs each retained
-    /// header from `height` onward with the validator set that certifies the
-    /// **next** header (i.e. the set the recipient's tracker should adopt after
-    /// `apply_header`). Capped at [`MAX_BATCH`].
+    /// M147/M150: the response payload for `GetHeadersWithSets` — pairs each retained
+    /// header from `height` onward with the validator set that certifies the **next**
+    /// header, or `None` when that set is unchanged from the header's own certifying set
+    /// (M150 compression — the light node reuses its current tracked set). Capped at
+    /// [`MAX_BATCH`].
     ///
-    /// Implementation is one replay pass: start from `replay_to_state_at(height - 1)`
-    /// (the post-apply state at `height-1`, which is the parent of the first header
-    /// we serve), then commit each successive block, snapshotting `state.validators`
-    /// alongside the corresponding `CertifiedHeader`. For a genesis-start node
-    /// (`base == None`) `height - 1 == 0` rebuilds from genesis — equivalent to
-    /// the demo helper `committed_sets` over the retained tail. For a snapshot-booted
-    /// node the `from` must be `> base_height` (pruned heights return empty,
-    /// matching `headers_from`).
-    pub fn headers_with_sets_from(&self, height: u64) -> Vec<(CertifiedHeader, ValidatorSet)> {
+    /// Implementation is one replay pass: seed at the base (genesis, or the snapshot
+    /// base), commit each block, and for each block from index `start` compare the
+    /// validator set before vs after applying it — emit `None` when unchanged, else
+    /// `Some(new_set)`. A snapshot-booted node's `from` must be `> base_height` (pruned
+    /// heights return empty, matching `headers_from`).
+    pub fn headers_with_sets_from(
+        &self,
+        height: u64,
+    ) -> Vec<(CertifiedHeader, Option<ValidatorSet>)> {
         if height == 0 || height <= self.base_height {
             return Vec::new();
         }
@@ -1104,6 +1108,8 @@ impl GossipNode {
         };
         let mut out = Vec::with_capacity(end - start);
         for i in 0..end {
+            // M150: the set that certifies this header (before applying its block).
+            let before_root = chain.state.validators.merkle_root();
             let mut block = self.blocks[i].clone();
             if chain.commit(&mut block).is_err() {
                 // A replay failure means the retained log is inconsistent with the
@@ -1112,9 +1118,15 @@ impl GossipNode {
                 break;
             }
             if i >= start {
+                // Attach the next set only across an actual validator-set change.
+                let next = if chain.state.validators.merkle_root() == before_root {
+                    None
+                } else {
+                    Some(chain.state.validators.clone())
+                };
                 out.push((
                     CertifiedHeader::from_certified(&self.blocks[i], &self.certs[i]),
-                    chain.state.validators.clone(),
+                    next,
                 ));
             }
         }
@@ -1989,11 +2001,16 @@ impl LightGossipNode {
     fn on_headers_with_sets(
         &mut self,
         from: u64,
-        batch: Vec<(CertifiedHeader, ValidatorSet)>,
+        batch: Vec<(CertifiedHeader, Option<ValidatorSet>)>,
     ) -> Vec<(u64, GossipMsg)> {
         let mut advanced = 0usize;
         for (ch, next_set) in batch {
-            match self.apply_header(ch, &next_set) {
+            // M150: `None` means the set is unchanged across this header — reuse the
+            // current tracked set (which certifies this header). `apply_header` still
+            // verifies it against `header.next_validators_root`, so a server that lies
+            // (omits a real change) is rejected at the root check.
+            let next = next_set.unwrap_or_else(|| self.tracker.validators().clone());
+            match self.apply_header(ch, &next) {
                 Ok(_) => advanced += 1,
                 Err(_) => break, // out-of-order / bad set — resync on the next round
             }
@@ -2286,7 +2303,15 @@ pub fn encode_gossip(m: &GossipMsg) -> Vec<u8> {
             out.extend_from_slice(&(batch.len() as u64).to_be_bytes());
             for (ch, set) in batch {
                 put_bytes(&mut out, &encode_certified_header(ch));
-                put_bytes(&mut out, &crate::codec::encode_validator_set(set));
+                // M150: 1 presence byte (0 = None / unchanged, 1 = Some) then the
+                // length-prefixed set when present.
+                match set {
+                    Some(s) => {
+                        out.push(1);
+                        put_bytes(&mut out, &crate::codec::encode_validator_set(s));
+                    }
+                    None => out.push(0),
+                }
             }
         }
     }
@@ -2469,7 +2494,14 @@ pub fn decode_gossip(buf: &[u8]) -> Result<GossipMsg, CodecError> {
             let mut batch = Vec::with_capacity(n as usize);
             for _ in 0..n {
                 let ch = decode_certified_header(take_bytes(&mut rest)?)?;
-                let set = crate::codec::decode_validator_set(take_bytes(&mut rest)?)?;
+                // M150: 1 presence byte, then the set when present.
+                let present = rest.first().copied().ok_or(CodecError::UnexpectedEof)?;
+                rest = &rest[1..];
+                let set = match present {
+                    0 => None,
+                    1 => Some(crate::codec::decode_validator_set(take_bytes(&mut rest)?)?),
+                    other => return Err(CodecError::BadEnum(other as u32)),
+                };
                 batch.push((ch, set));
             }
             GossipMsg::HeadersWithSets(batch)
@@ -3934,26 +3966,33 @@ mod tests {
 
     #[test]
     fn headers_with_sets_serve_pairs_each_header_with_its_next_set() {
-        // M147: the full node's `headers_with_sets_from` pairs each header with the set
-        // that certifies the next one — i.e. the set whose merkle_root equals the
-        // header's `next_validators_root` — across a validator-set change.
+        // M147/M150: `headers_with_sets_from` attaches a set only across an actual
+        // validator-set change (Some), else None (unchanged — reuse current set). The
+        // chain adds validator 25 at height 1, then no change at height 2.
         let (blocks, certs) = chain_with_validator_change();
         let mut full = GossipNode::new(1, genesis(), 8, []);
         assert!(full.load_certified(&blocks, &certs));
 
         let pairs = full.headers_with_sets_from(1);
         assert_eq!(pairs.len(), 2, "both retained heights served");
-        for (ch, set) in &pairs {
-            assert_eq!(
-                set.merkle_root(),
-                ch.header.next_validators_root,
-                "paired set certifies the next header"
-            );
-        }
-        // The set paired with header 1 (the state after block 1) includes validator 25.
+        // Header 1: the set changed (added 25) → Some, root matches, contains 25.
+        let set1 = pairs[0]
+            .1
+            .as_ref()
+            .expect("height 1 changed the set → Some");
+        assert_eq!(
+            set1.merkle_root(),
+            pairs[0].0.header.next_validators_root,
+            "attached set certifies the next header"
+        );
         assert!(
-            pairs[0].1.get(25).is_some(),
-            "the validator added at height 1 is in header 1's next set"
+            set1.get(25).is_some(),
+            "validator added at height 1 is present"
+        );
+        // Header 2: the set was unchanged → None (M150 compression).
+        assert!(
+            pairs[1].1.is_none(),
+            "unchanged set at height 2 is omitted (None)"
         );
     }
 
@@ -3991,14 +4030,51 @@ mod tests {
     }
 
     #[test]
+    fn light_syncs_unchanged_set_via_none_entries() {
+        // M150: on a chain whose validator set never changes, every header's next set is
+        // omitted (None); the light node reconstructs it by reusing its current tracked
+        // set and still advances to the tip over wire.
+        let (blocks, certs) = certified_chain(3); // constant validator set
+        let mut full = GossipNode::new(1, genesis(), 8, [1, 2]);
+        assert!(full.load_certified(&blocks, &certs));
+        // Every served entry omits the set (compression active).
+        assert!(
+            full.headers_with_sets_from(1)
+                .iter()
+                .all(|(_, s)| s.is_none()),
+            "unchanged-set chain omits every set"
+        );
+        let light_id = 2u64;
+        let light = LightGossipNode::new(light_id, &genesis(), [1, 2]);
+        let mut net = LightNetwork::new(vec![full], vec![light]);
+        net.announce_all();
+        for _ in 0..20 {
+            if net.run() == 0 {
+                break;
+            }
+        }
+        assert_eq!(
+            net.light_node(light_id).tracker().height(),
+            3,
+            "light synced to tip reconstructing None sets"
+        );
+    }
+
+    #[test]
     fn gossip_wire_round_trips_headers_with_sets() {
-        // M147: the new header-sync-with-sets gossip pair round-trips.
+        // M147/M150: the header-sync-with-sets pair round-trips, including both the
+        // Some(set) and the None (unchanged) entry forms.
         let (blocks, certs) = certified_chain(2);
-        let ch = CertifiedHeader::from_certified(&blocks[0], &certs[0]);
+        let ch0 = CertifiedHeader::from_certified(&blocks[0], &certs[0]);
+        let ch1 = CertifiedHeader::from_certified(&blocks[1], &certs[1]);
         let set = authoritative_final_set(&genesis(), &blocks);
-        let msg = GossipMsg::HeadersWithSets(vec![(ch, set)]);
+        let msg = GossipMsg::HeadersWithSets(vec![(ch0, Some(set)), (ch1, None)]);
         match decode_gossip(&encode_gossip(&msg)).unwrap() {
-            GossipMsg::HeadersWithSets(b) => assert_eq!(b.len(), 1),
+            GossipMsg::HeadersWithSets(b) => {
+                assert_eq!(b.len(), 2);
+                assert!(b[0].1.is_some(), "first entry carries a set");
+                assert!(b[1].1.is_none(), "second entry omits the set");
+            }
             other => panic!("expected HeadersWithSets, got {other:?}"),
         }
         let g = GossipMsg::GetHeadersWithSets { from: 7 };

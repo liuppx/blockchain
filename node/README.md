@@ -1341,6 +1341,16 @@ M116 的 `node rpc` 只能 GET。M117 补上写侧，让它成为**全能** RPC 
 
 **已知边界（顺延至 M121+）**：身份读三类已齐（`/genesis` 链 / `/node` 节点 / `/info` 链尖）；读面两分（`/params`/`/config`）已齐；RPC 自带端点发现 + 全能客户端 + 完整链读/写面；内容协商三轴已齐（仅 `identity`，真压缩顺延）；离线工具篮子已补；运维篮子剩余：证书/密钥轮换与落盘、follower 认证、指标端 TLS、OTel/push exporter、每-sink 独立 rotation 覆盖、时延直方图；keygen 篮子剩余：助记词 / BIP-39、口令加密 keystore、密钥轮换；剩余：游标分页、未知方法 `405`；共识 / wire 篮子（破 head 不变量）：**货币费用** + 费用优先排序、nonce / 序列号反重放。
 
+## `HeadersWithSets` 仅变更附集压缩（Milestone 150 · light wire 效率）
+
+M147 的 `HeadersWithSets` 每个头都附**完整**验证人集，即便集未变——对长批次（256 头、集罕变）是巨大冗余。M150 改为 `Vec<(CertifiedHeader, Option<ValidatorSet>)>`：`None` = 「该高度集未变，复用当前集」，`Some(set)` 只在真实换集时携带。
+
+- **serve**（`net.rs` `headers_with_sets_from`）：单趟重放中比较每块 apply 前后 `validators.merkle_root()`，相等 → `None`、否则 `Some(新集)`（未变时连 clone 都省）。
+- **consume**（`on_headers_with_sets`）：`None` → `next = tracker.validators().clone()`（当前跟踪集即认证该头的集）；`apply_header` 仍验 `next.merkle_root() == header.next_validators_root`，故服务端谎报（该变却发 None）会被根校验拒——**压缩不削弱 soundness**。
+- **wire**（`encode_gossip`/`decode_gossip`）：每条目 1 presence 字节（0=None / 1=Some + 长度前缀集），镜像 `Proof` 的 Option 编码。
+- **不碰** 共识/块 codec；localnet 头仍 wire v1 `a045426e…3b87bc`（gossip 信封，不折入哈希）。
+- **测试（+1 → 612，另改 2 测）**：`light_syncs_unchanged_set_via_none_entries`（常集链每头 serve 皆 None，轻节点靠复用当前集同步到尖端）；`headers_with_sets_serve_pairs_each_header_with_its_next_set` 改为断言换集头 Some+含新验证人、未变头 None；`gossip_wire_round_trips_headers_with_sets` 改为往返 Some+None 两形；跨变更 soundness 测 `light_syncs_across_validator_set_change_over_wire` 仍绿（Some 与 None 混合）。
+
 ## 轻守护进程快照种子（Milestone 149 · light daemon Phase 3a）
 
 M148 的 `node light-run` 是从创世跟踪的 MVP。M149 接上 fast-sync 收尾：让轻守护进程经 `[snapshot]` 配置（M141 的 cert + trusted_validators）**快照种子起步**，使 M142 的 `from_verified_snapshot` 在生产中可达。
