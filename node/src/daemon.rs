@@ -6501,6 +6501,11 @@ impl Node {
             node.set_mempool_replace_by_fee(true);
             node.set_mempool_min_fee_bump(cfg.mempool.min_fee_bump);
         }
+        // M157: minimum-fee admission floor. `0` (the default) ⇒ setter not called ⇒
+        // behavior byte-identical.
+        if cfg.mempool.min_fee > 0 {
+            node.set_mempool_min_fee(cfg.mempool.min_fee);
+        }
         // M141: a validator that snapshot-boots into a set it is not a member of will
         // follow + serve but never propose (its `start_height` membership guard never
         // opens). Surface that loudly rather than letting the node idle silently.

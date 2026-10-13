@@ -1283,6 +1283,11 @@ impl GossipNode {
         self.mempool.set_min_fee_bump(min_fee_bump);
     }
 
+    /// M157: set the mempool minimum-fee admission floor (anti-spam). `0` ⇒ no floor.
+    pub fn set_mempool_min_fee(&mut self, min_fee: u64) {
+        self.mempool.set_min_fee(min_fee);
+    }
+
     /// M55: bound each gossip dedup set (`seen_tx`/`seen_evidence`/`seen_stake_op`)
     /// to `capacity` most-recent entries (FIFO eviction). `usize::MAX` ⇒ unbounded
     /// (the default). The three sets are bounded independently to the same value.

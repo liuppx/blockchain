@@ -1341,6 +1341,15 @@ M116 的 `node rpc` 只能 GET。M117 补上写侧，让它成为**全能** RPC 
 
 **已知边界（顺延至 M121+）**：身份读三类已齐（`/genesis` 链 / `/node` 节点 / `/info` 链尖）；读面两分（`/params`/`/config`）已齐；RPC 自带端点发现 + 全能客户端 + 完整链读/写面；内容协商三轴已齐（仅 `identity`，真压缩顺延）；离线工具篮子已补；运维篮子剩余：证书/密钥轮换与落盘、follower 认证、指标端 TLS、OTel/push exporter、每-sink 独立 rotation 覆盖、时延直方图；keygen 篮子剩余：助记词 / BIP-39、口令加密 keystore、密钥轮换；剩余：游标分页、未知方法 `405`；共识 / wire 篮子（破 head 不变量）：**货币费用** + 费用优先排序、nonce / 序列号反重放。
 
+## mempool 最低费用门槛（Milestone 157 · 反垃圾）
+
+mempool 此前接受任意费用（含 0）。M157 加**可选最低费用门槛**：`[mempool] min_fee` 非 0 时，低于该费的 tx 在准入处拒绝。opt-in（默认 0 = 关），且是**本地准入策略非共识规则**——携带低费 tx 的块仍正常应用（故 head 不变）。
+
+- **`insert` 最前置门控**（`mempool.rs`）：`min_fee > 0 && tx.fee < min_fee` → `ChainError::FeeBelowMinimum { got, min }`，在（更贵的）签名/状态校验**之前**，让垃圾尽早被拒。
+- **新字段** `Mempool.min_fee` + `set_min_fee`/getter（照 M54/M57/M143/M145 opt-in 范式）；`MempoolConfig.min_fee`（`#[serde(default)]`=0）；`GossipNode::set_mempool_min_fee` 代理；`Node::start` 在 `min_fee > 0` 时布线（0 → 不调用 → 逐字节不变）。
+- **不碰** apply/codec/wire（`apply_tx` 不设费用门槛——块级无条件应用）；localnet 头仍 wire v1 `a045426e…3b87bc`（默认 0，fee=0 tx 仍准入）。
+- **测试（+2 → 622）**：`min_fee_floor_rejects_below_and_admits_at_or_above`（门槛 10：fee 9 拒、10/50 准）、`min_fee_floor_off_by_default_admits_zero_fee`（默认 0 → fee 0 准入）；config 测扩展断言 `min_fee` 缺省 0。
+
 ## RPC 写路径 bearer 鉴权（Milestone 156 · RPC 运营加固）
 
 M53 的外部 tx-ingress `POST /submit_tx` 此前对任何能连上端口的客户端开放。本轮加**可选** bearer 鉴权：`[rpc] auth_token` 留空（默认）→ 行为完全同 M53；非空时 tx 提交 POST 必须带 `Authorization: Bearer <token>`，否则 401。**读路径（`/batch`、`/validate`、所有 `GET`）保持公开**——只锁写。

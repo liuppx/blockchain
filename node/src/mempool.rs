@@ -55,6 +55,10 @@ pub struct Mempool {
     /// value dampens replacement churn (anti-spam); `0` permits equal-fee replacement.
     /// Only consulted when `replace_by_fee` is on.
     min_fee_bump: u64,
+    /// M157: operator-configured minimum fee a tx must pay to be admitted (anti-spam
+    /// floor). `0` (default) ⇒ no floor — behavior-preserving. A local admission policy,
+    /// not a consensus rule: a block carrying a below-floor tx still applies.
+    min_fee: u64,
 }
 
 impl Mempool {
@@ -69,6 +73,7 @@ impl Mempool {
             nonce_lookahead: 0,
             replace_by_fee: false,
             min_fee_bump: 1,
+            min_fee: 0,
         }
     }
 
@@ -137,6 +142,17 @@ impl Mempool {
         self.min_fee_bump
     }
 
+    /// M157: set the minimum-fee admission floor (anti-spam). `0` ⇒ no floor (the
+    /// behavior-preserving default).
+    pub fn set_min_fee(&mut self, min_fee: u64) {
+        self.min_fee = min_fee;
+    }
+
+    /// M157: the configured minimum-fee admission floor (`0` ⇒ off).
+    pub fn min_fee(&self) -> u64 {
+        self.min_fee
+    }
+
     pub fn len(&self) -> usize {
         self.pending.len()
     }
@@ -173,6 +189,14 @@ impl Mempool {
     /// account cannot monopolize the pool. Checked after `validate_tx` (the author
     /// is signature-authenticated first) and after the global capacity gate.
     pub fn insert(&mut self, chain: &Chain, tx: SubmissionTx) -> Result<Hash, ChainError> {
+        // M157: cheap anti-spam gate first — reject a below-floor fee before the
+        // (costlier) signature/state validation. `min_fee == 0` ⇒ no floor.
+        if self.min_fee > 0 && tx.fee < self.min_fee {
+            return Err(ChainError::FeeBelowMinimum {
+                got: tx.fee,
+                min: self.min_fee,
+            });
+        }
         // M143: validate everything except the nonce, then apply the pipelining window
         // instead of the strict `tx.nonce == acct.nonce` gate. With `nonce_lookahead == 0`
         // this is exactly the strict rule (only the current nonce admits), so behavior is
@@ -976,5 +1000,36 @@ mod tests {
             mp.contains(&eq) && !mp.contains(&lo),
             "equal-fee newcomer took the slot"
         );
+    }
+
+    // --- M157: minimum-fee admission floor ----------------------------------------
+
+    #[test]
+    fn min_fee_floor_rejects_below_and_admits_at_or_above() {
+        let chain = Chain::new(genesis());
+        let mut mp = Mempool::new(16);
+        assert_eq!(mp.min_fee(), 0);
+        mp.set_min_fee(10);
+        // Below the floor → rejected.
+        assert!(matches!(
+            mp.insert(&chain, tx_fee(1, 1, 1, 2 * MICRO, 9, 0)),
+            Err(ChainError::FeeBelowMinimum { got: 9, min: 10 })
+        ));
+        assert!(mp.is_empty());
+        // At the floor → admitted.
+        assert!(mp.insert(&chain, tx_fee(2, 2, 2, 2 * MICRO, 10, 0)).is_ok());
+        // Above the floor → admitted.
+        assert!(mp.insert(&chain, tx_fee(3, 3, 3, 2 * MICRO, 50, 0)).is_ok());
+        assert_eq!(mp.len(), 2);
+    }
+
+    #[test]
+    fn min_fee_floor_off_by_default_admits_zero_fee() {
+        // Default floor is 0 (off): a zero-fee tx is admitted, so the pre-M157 path and
+        // localnet (fee 0) are byte-identical.
+        let chain = Chain::new(genesis());
+        let mut mp = Mempool::new(16);
+        assert!(mp.insert(&chain, tx_fee(1, 1, 1, 2 * MICRO, 0, 0)).is_ok());
+        assert_eq!(mp.len(), 1);
     }
 }

@@ -548,6 +548,10 @@ pub struct MempoolConfig {
     /// byte-identical to M144); larger dampens replacement churn; only used when
     /// `replace_by_fee` is on.
     pub min_fee_bump: u64,
+    /// M157: minimum fee a tx must pay to be admitted to the mempool (anti-spam floor).
+    /// `0` (the behavior-preserving default) ⇒ no floor. A local admission policy, not a
+    /// consensus rule.
+    pub min_fee: u64,
 }
 
 impl Default for MempoolConfig {
@@ -564,6 +568,7 @@ impl Default for MempoolConfig {
             nonce_lookahead: 0,
             replace_by_fee: false,
             min_fee_bump: 1,
+            min_fee: 0,
         }
     }
 }
@@ -2253,6 +2258,9 @@ mod tests {
         // M145: min_fee_bump defaults to 1 (= strictly higher).
         assert_eq!(cfg.mempool.min_fee_bump, 1);
         assert_eq!(MempoolConfig::default().min_fee_bump, 1);
+        // M157: min_fee defaults to 0 (no floor).
+        assert_eq!(cfg.mempool.min_fee, 0);
+        assert_eq!(MempoolConfig::default().min_fee, 0);
     }
 
     #[test]

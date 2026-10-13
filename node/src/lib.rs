@@ -724,6 +724,13 @@ pub enum ChainError {
         existing_fee: u64,
         got_fee: u64,
     },
+    /// M157: a tx was rejected at mempool admission because its `fee` is below the
+    /// operator-configured minimum-fee floor. A local anti-spam policy, not a consensus
+    /// rule — a block carrying a below-floor tx still applies.
+    FeeBelowMinimum {
+        got: u64,
+        min: u64,
+    },
     BadScore {
         reviewer: u64,
         score: f32,
@@ -887,6 +894,9 @@ impl std::fmt::Display for ChainError {
                 f,
                 "account {author} nonce {nonce}: replacement fee {got_fee} not higher than pending {existing_fee}"
             ),
+            ChainError::FeeBelowMinimum { got, min } => {
+                write!(f, "tx fee {got} below the mempool minimum {min}")
+            }
             ChainError::BadScore { reviewer, score } => {
                 write!(f, "reviewer {reviewer} score {score} out of [0,1]")
             }
