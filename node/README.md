@@ -1341,6 +1341,17 @@ M116 的 `node rpc` 只能 GET。M117 补上写侧，让它成为**全能** RPC 
 
 **已知边界（顺延至 M121+）**：身份读三类已齐（`/genesis` 链 / `/node` 节点 / `/info` 链尖）；读面两分（`/params`/`/config`）已齐；RPC 自带端点发现 + 全能客户端 + 完整链读/写面；内容协商三轴已齐（仅 `identity`，真压缩顺延）；离线工具篮子已补；运维篮子剩余：证书/密钥轮换与落盘、follower 认证、指标端 TLS、OTel/push exporter、每-sink 独立 rotation 覆盖、时延直方图、bearer 失败响应延迟 jitter；keygen 篮子剩余：助记词 / BIP-39、口令加密 keystore、密钥轮换；剩余：游标分页、未知方法 `405`；共识 / wire 篮子（破 head 不变量）：**货币费用** + 费用优先排序、nonce / 序列号反重放。
 
+## 401 鉴权失败计数指标（Milestone 163 · auth 层可观测）
+
+M156/M158 给 RPC 写路径与 `/metrics` 加了可选 bearer 鉴权，M160 把比较改常时。但鉴权失败（401）本身无计数——运维看不到有多少请求因缺/错 token 被拒，无法从 `/metrics` 察觉凭证配置错误或正被扫探。M161/M162 刚把 mempool 五条拒绝路径都加了 counter；M163 把同样的可观测性延伸到 auth 层。
+
+- **共享原子计数器**（`daemon.rs`）：401 发生在每连接 spawn 的 serve 任务里（只持 `cmd` 句柄、不碰 actor 状态），故用 `Arc<AtomicU64>`——serve 任务写 401 前 `fetch_add(1, Relaxed)`，actor 在 `Cmd::Metrics` 臂 `load(Relaxed)` 读进快照。无新 `Cmd` 变体、无 actor-loop 改动。
+- **两个 counter**：`zhixing_rpc_auth_failures_total`（M156 写路径 401：缺/错 token；malformed header 的 400 是协议错不计）、`zhixing_metrics_auth_failures_total`（M158 scrape 401）。
+- **布线**：`Node::start` 建两 Arc → clone 进 `Actor` + clone 进 `run_rpc`/`run_metrics`（透传 `serve_rpc_conn`/`serve_metrics_conn`）；`Metrics` 加两字段 + `render_prometheus` 紧跟 mempool counter 组渲两 counter。
+- **不碰** apply/codec/wire/共识；RPC/metrics 默认关 ⇒ 计数恒 0、端点不绑；localnet 头仍 wire v1 `a045426e…3b87bc`。
+- **测试（+0 → 624）**：扩展 `metrics_endpoint_bearer_auth_gates_scrapes`（两次 401 后正确 scrape 断言 `zhixing_metrics_auth_failures_total 2`）+ `render_prometheus_emits_counters`（两新 counter 入期望表）。
+- **已知边界**：`Relaxed` 顺序足够（单调自增 + 读快照，无跨变量不变量）；轻节点 RPC（M152）/metrics（M155）走独立 `LightActor` 无 bearer，不涉及。bearer 失败响应延迟 jitter、counter `_created` 时间戳属后续篮子。
+
 ## mempool 剩余拒绝路径计数指标（Milestone 162 · 反垃圾可观测收尾）
 
 M161 补了 min-fee floor 的 counter，但 mempool 另外四条 opt-in 拒路径仍无计数——运维无从判断 `[mempool] capacity / nonce_lookahead / replace_by_fee` 及反重放实际拦了多少。M162 一次性补齐，全部照 M161 范式（mempool 内部 `rejected_*: u64` + getter → `Metrics` 字段 → `render_prometheus` counter，**仅 `insert` 路径计数**）。

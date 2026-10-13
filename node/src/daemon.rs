@@ -51,6 +51,7 @@
 use std::collections::{HashMap, HashSet};
 use std::io;
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use std::time::Instant;
@@ -684,6 +685,12 @@ pub struct Metrics {
     /// M162: cumulative admissions rejected by an under-bid M144 replace-by-fee attempt
     /// (monotonic counter; `0` while replace-by-fee is off).
     pub txs_replace_fee_rejected: u64,
+    /// M163: cumulative RPC write-path requests rejected by bearer auth (M156)
+    /// (monotonic counter; `0` while `[rpc] auth_token` is empty or the RPC is off).
+    pub rpc_auth_failures: u64,
+    /// M163: cumulative `/metrics` scrapes rejected by bearer auth (M158)
+    /// (monotonic counter; `0` while `[metrics] auth_token` is empty or metrics is off).
+    pub metrics_auth_failures: u64,
     /// M125: block-apply (consensus→committed) latency histogram. `block_apply_buckets[i]`
     /// is the *non-cumulative* count of applies that fell in bucket `i` (≤ `BLOCK_APPLY_BUCKET_MICROS[i]`
     /// and above the previous bound); applies slower than the last finite bound land only in the
@@ -1077,6 +1084,13 @@ struct Actor {
     tx_burst: f64,
     /// M54: count of gossip txs dropped by the per-peer rate limiter.
     txs_rate_limited: u64,
+    /// M163: cumulative RPC write-path requests rejected by bearer auth (M156). Shared
+    /// with the per-connection `serve_rpc_conn` tasks via `Arc<AtomicU64>` — they
+    /// `fetch_add` on each 401, the actor `load`s it into the metrics snapshot.
+    rpc_auth_failures: Arc<AtomicU64>,
+    /// M163: cumulative `/metrics` scrapes rejected by bearer auth (M158). Same sharing
+    /// model as [`Actor::rpc_auth_failures`].
+    metrics_auth_failures: Arc<AtomicU64>,
 }
 
 /// M54: a minimal token bucket for per-peer gossip rate limiting. Refills
@@ -1809,6 +1823,8 @@ async fn run_actor(mut actor: Actor, mut rx: mpsc::UnboundedReceiver<Cmd>) {
                     txs_bad_nonce_rejected: actor.node.mempool.rejected_bad_nonce(),
                     txs_nonce_too_far_rejected: actor.node.mempool.rejected_nonce_too_far(),
                     txs_replace_fee_rejected: actor.node.mempool.rejected_replace_fee(),
+                    rpc_auth_failures: actor.rpc_auth_failures.load(Ordering::Relaxed),
+                    metrics_auth_failures: actor.metrics_auth_failures.load(Ordering::Relaxed),
                     block_apply_buckets: actor.block_apply_buckets,
                     block_apply_sum_micros: actor.block_apply_sum_micros,
                     block_apply_count: actor.block_apply_count,
@@ -2463,6 +2479,18 @@ fn render_prometheus(m: &Metrics) -> String {
         "Cumulative admissions rejected by an under-bid replace-by-fee attempt (M144).",
         m.txs_replace_fee_rejected,
     );
+    counter(
+        &mut s,
+        "zhixing_rpc_auth_failures_total",
+        "Cumulative RPC write-path requests rejected by bearer auth (M156).",
+        m.rpc_auth_failures,
+    );
+    counter(
+        &mut s,
+        "zhixing_metrics_auth_failures_total",
+        "Cumulative /metrics scrapes rejected by bearer auth (M158).",
+        m.metrics_auth_failures,
+    );
     // M125: block-apply latency histogram (the `histogram` half of the Prometheus data model).
     // `_bucket{le="X"}` is the cumulative count of applies ≤ X seconds; `le="+Inf"` equals the
     // total `_count`. Bounds are stored in micros; emit them in seconds for Prometheus.
@@ -2528,12 +2556,18 @@ async fn run_metrics(
     listener: TcpListener,
     my_id: u64,
     auth_token: String,
+    auth_failures: Arc<AtomicU64>,
     cmd: mpsc::UnboundedSender<Cmd>,
 ) {
     loop {
         match listener.accept().await {
             Ok((stream, _addr)) => {
-                tokio::spawn(serve_metrics_conn(stream, auth_token.clone(), cmd.clone()));
+                tokio::spawn(serve_metrics_conn(
+                    stream,
+                    auth_token.clone(),
+                    auth_failures.clone(),
+                    cmd.clone(),
+                ));
             }
             Err(e) => warn!(node = my_id, error = %e, "metrics accept error"),
         }
@@ -2548,6 +2582,7 @@ async fn run_metrics(
 async fn serve_metrics_conn(
     mut stream: TcpStream,
     auth_token: String,
+    auth_failures: Arc<AtomicU64>,
     cmd: mpsc::UnboundedSender<Cmd>,
 ) {
     // Accumulate the request headers (bounded) so we can read an optional
@@ -2574,6 +2609,7 @@ async fn serve_metrics_conn(
         let authorized =
             matches!(parse_authorization_bearer(head), Ok(Some(t)) if ct_str_eq(&t, &auth_token));
         if !authorized {
+            auth_failures.fetch_add(1, Ordering::Relaxed);
             let _ = stream
                 .write_all(unauthorized_bearer_response().as_bytes())
                 .await;
@@ -2864,13 +2900,19 @@ async fn run_rpc(
     listener: TcpListener,
     my_id: u64,
     auth_token: String,
+    auth_failures: Arc<AtomicU64>,
     cmd: mpsc::UnboundedSender<Cmd>,
 ) {
     loop {
         match listener.accept().await {
             Ok((stream, _addr)) => {
                 let token = auth_token.clone();
-                tokio::spawn(serve_rpc_conn(stream, token, cmd.clone()));
+                tokio::spawn(serve_rpc_conn(
+                    stream,
+                    token,
+                    auth_failures.clone(),
+                    cmd.clone(),
+                ));
             }
             Err(e) => warn!(node = my_id, error = %e, "rpc accept error"),
         }
@@ -5304,6 +5346,7 @@ async fn query_base_height(cmd: &mpsc::UnboundedSender<Cmd>) -> u64 {
 async fn serve_rpc_conn(
     mut stream: TcpStream,
     auth_token: String,
+    auth_failures: Arc<AtomicU64>,
     cmd: mpsc::UnboundedSender<Cmd>,
 ) {
     // Accumulate bytes until we see the end-of-headers marker, keeping any body
@@ -6330,6 +6373,9 @@ async fn serve_rpc_conn(
         match parse_authorization_bearer(head) {
             Ok(Some(t)) if ct_str_eq(&t, &auth_token) => {} // authorized
             Ok(Some(_)) | Ok(None) => {
+                // M163: count the 401 (missing/wrong token). A malformed header (the
+                // `Err` arm below) is a 400 protocol error, not an auth rejection.
+                auth_failures.fetch_add(1, Ordering::Relaxed);
                 let _ = stream
                     .write_all(unauthorized_bearer_response().as_bytes())
                     .await;
@@ -6715,6 +6761,11 @@ impl Node {
         // moves into the actor.
         let boot_height = node.height();
 
+        // M163: bearer-auth 401 counters, shared with the per-connection RPC/metrics
+        // serve tasks (they `fetch_add`, the actor `load`s into the metrics snapshot).
+        let rpc_auth_failures = Arc::new(AtomicU64::new(0));
+        let metrics_auth_failures = Arc::new(AtomicU64::new(0));
+
         let actor = Actor {
             node,
             outbound: HashMap::new(),
@@ -6745,6 +6796,8 @@ impl Node {
             tx_rate: cfg.mempool.per_peer_tx_per_sec,
             tx_burst: cfg.mempool.per_peer_tx_burst,
             txs_rate_limited: 0,
+            rpc_auth_failures: rpc_auth_failures.clone(),
+            metrics_auth_failures: metrics_auth_failures.clone(),
         };
         tokio::spawn(run_actor(actor, cmd_rx));
 
@@ -6792,7 +6845,13 @@ impl Node {
             let mlistener = TcpListener::bind(addr).await?;
             let auth = mc.auth_token.clone();
             info!(node = my_id, addr = %mlistener.local_addr()?, auth = !auth.is_empty(), "metrics listening");
-            tokio::spawn(run_metrics(mlistener, my_id, auth, cmd_tx.clone()));
+            tokio::spawn(run_metrics(
+                mlistener,
+                my_id,
+                auth,
+                metrics_auth_failures.clone(),
+                cmd_tx.clone(),
+            ));
         }
 
         // M53: optionally bind the external transaction-ingress RPC. Opt-in like
@@ -6803,7 +6862,13 @@ impl Node {
             let rlistener = TcpListener::bind(addr).await?;
             let auth = rc.auth_token.clone();
             info!(node = my_id, addr = %rlistener.local_addr()?, auth = !auth.is_empty(), "rpc listening");
-            tokio::spawn(run_rpc(rlistener, my_id, auth, cmd_tx.clone()));
+            tokio::spawn(run_rpc(
+                rlistener,
+                my_id,
+                auth,
+                rpc_auth_failures.clone(),
+                cmd_tx.clone(),
+            ));
         }
 
         // M33: kick off consensus for the first height after the mesh has had a
@@ -8616,6 +8681,8 @@ mod tests {
             txs_bad_nonce_rejected: 43,
             txs_nonce_too_far_rejected: 47,
             txs_replace_fee_rejected: 53,
+            rpc_auth_failures: 59,
+            metrics_auth_failures: 61,
             // M125: a sample latency histogram — buckets sum to 6, with two applies above the
             // last finite bound (count 8 > finite total 6).
             block_apply_buckets: [1, 2, 0, 3, 0, 0, 0, 0, 0, 0, 0],
@@ -8689,6 +8756,8 @@ mod tests {
             ("zhixing_txs_bad_nonce_rejected_total", 43),
             ("zhixing_txs_nonce_too_far_rejected_total", 47),
             ("zhixing_txs_replace_fee_rejected_total", 53),
+            ("zhixing_rpc_auth_failures_total", 59),
+            ("zhixing_metrics_auth_failures_total", 61),
         ] {
             assert!(
                 out.contains(&format!("# TYPE {name} counter")),
@@ -8894,6 +8963,11 @@ mod tests {
         let ok = scrape(metrics_addr, Some("scrape-key")).await;
         assert!(ok.starts_with("HTTP/1.1 200 OK"), "correct token: {ok}");
         assert!(ok.contains("zhixing_height"), "metrics body: {ok}");
+        // M163: the two prior 401s (no token + wrong token) are counted and surfaced.
+        assert!(
+            ok.contains("zhixing_metrics_auth_failures_total 2"),
+            "auth-failure counter: {ok}"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
