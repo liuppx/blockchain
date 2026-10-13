@@ -1339,7 +1339,18 @@ M116 的 `node rpc` 只能 GET。M117 补上写侧，让它成为**全能** RPC 
 - **测试（+3 → 529）**：新纯 `route_get_parses_node`（`/node` ⇒ `Node`、`/node/` ⇒ `Health`）/`node_renders_text_and_json`（validator/follower 两态的文本与 JSON），新 TCP `rpc_node_over_tcp`（以验证人 52 启动 ⇒ `node_id=52`/`role=validator`/crate 版本）。
 - **不变量保持**：纯读面增量、无 `serde_json`、无引擎 / codec / crypto / wire / 共识 / 状态变更、无新依赖，RPC 默认关，故 `localnet` 逐字节同块、head 仍 `44309755…ea04ba`。
 
-**已知边界（顺延至 M121+）**：身份读三类已齐（`/genesis` 链 / `/node` 节点 / `/info` 链尖）；读面两分（`/params`/`/config`）已齐；RPC 自带端点发现 + 全能客户端 + 完整链读/写面；内容协商三轴已齐（仅 `identity`，真压缩顺延）；离线工具篮子已补；运维篮子剩余：证书/密钥轮换与落盘、follower 认证、指标端 TLS、OTel/push exporter、每-sink 独立 rotation 覆盖、时延直方图；keygen 篮子剩余：助记词 / BIP-39、口令加密 keystore、密钥轮换；剩余：游标分页、未知方法 `405`；共识 / wire 篮子（破 head 不变量）：**货币费用** + 费用优先排序、nonce / 序列号反重放。
+**已知边界（顺延至 M121+）**：身份读三类已齐（`/genesis` 链 / `/node` 节点 / `/info` 链尖）；读面两分（`/params`/`/config`）已齐；RPC 自带端点发现 + 全能客户端 + 完整链读/写面；内容协商三轴已齐（仅 `identity`，真压缩顺延）；离线工具篮子已补；运维篮子剩余：证书/密钥轮换与落盘、follower 认证、指标端 TLS、OTel/push exporter、每-sink 独立 rotation 覆盖、时延直方图、bearer 失败响应延迟 jitter；keygen 篮子剩余：助记词 / BIP-39、口令加密 keystore、密钥轮换；剩余：游标分页、未知方法 `405`；共识 / wire 篮子（破 head 不变量）：**货币费用** + 费用优先排序、nonce / 序列号反重放。
+
+## bearer 鉴权常时比较（Milestone 160 · 鉴权加固）
+
+M156/M158 在 `[rpc] auth_token` 与 `[metrics] auth_token` 处用 `t == auth_token` 逐字节短路比较——第一个不等字节即返 `false`，对公网监听/共享 token 部署构成**逐字节时序侧信道**（攻击者经端到端延迟推 prefix）。M160 改用**常时字符串相等**比较。
+
+- **新辅助** `ct_str_eq(a, b) -> bool`（`daemon.rs`）：长度先短路（长度从 HTTP 头框可读，**不**当秘密；不常时不算新泄露），等长则 XOR 累加所有字节到 `u8` accumulator，无早退；最后 `acc == 0`。
+- **两处闸门换比较**（`daemon.rs`）：`serve_metrics_conn` 块（M158）+ `serve_rpc_conn` 的 `/submit_tx` 闸门（M156），`t == auth_token` → `ct_str_eq(&t, &auth_token)`。
+- **不引 `subtle`**：纯 std。`aarch64`/`x86_64` 上 Rust 编译产物累加循环一般不被分支化；审计严苛场景后续换 `subtle::ConstantTimeEq` 即可。
+- **不碰** 鉴权 parse/响应/失败语义/codec/wire/共识；现有 M156/M158 TCP 测（正确 token 准/错 token 拒）在新比较下行为等价。
+- **测试（+1 → 624）**：`ct_str_eq_basic_properties`——空串等/等长等/等长差一字节（位置 2）/长度差 ×2/大小写差共 6 断言；时间性质（长度除外不常时）单元测不直接观测。
+- **已知边界**：长度差不常时（攻击者已从 HTTP 头框知长度，不算新增泄露）；失败响应延迟无 jitter（顺沿 M156/M158）；多 token/scope/轮换/审计日志/真用 `subtle` 均属后续运维篮子。
 
 ## `/config` 暴露 mempool opt-in 调参（Milestone 159 · 运维可观测）
 

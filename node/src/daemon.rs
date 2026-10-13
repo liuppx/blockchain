@@ -2522,7 +2522,8 @@ async fn serve_metrics_conn(
     // M158: optional bearer gate. Empty token ⇒ open (pre-M158 behavior).
     if !auth_token.is_empty() {
         let head = std::str::from_utf8(&acc).unwrap_or("");
-        let authorized = matches!(parse_authorization_bearer(head), Ok(Some(t)) if t == auth_token);
+        let authorized =
+            matches!(parse_authorization_bearer(head), Ok(Some(t)) if ct_str_eq(&t, &auth_token));
         if !authorized {
             let _ = stream
                 .write_all(unauthorized_bearer_response().as_bytes())
@@ -2578,12 +2579,30 @@ fn parse_content_length(headers: &str) -> Option<usize> {
     None
 }
 
+/// M160: constant-time string equality for bearer tokens. The length check is the only
+/// short-circuit (lengths are not secret — an attacker already reads the token's length
+/// off the HTTP header framing) and is independent of token content; once lengths match,
+/// every byte of the secret is XOR-accumulated with no early exit. The accumulator plus
+/// the length-equality boolean is what determines the result, so two tokens of the same
+/// length always walk the whole buffer regardless of where they differ — a wrong byte at
+/// position 0 costs the same as a wrong byte at the end, closing the per-byte timing
+/// side channel that `==` (short-circuiting on the first mismatch) leaves open.
+fn ct_str_eq(a: &str, b: &str) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut acc: u8 = 0;
+    for (x, y) in a.as_bytes().iter().zip(b.as_bytes().iter()) {
+        acc |= x ^ y;
+    }
+    acc == 0
+}
+
 /// M156: pull the `Bearer` token from the request's `Authorization` header (RFC 6750
 /// §2.1). Returns `Ok(None)` when the header is absent (caller chooses 401 policy);
-/// `Err` for a malformed header (caller chooses 400 policy). Comparison is exact-byte
-/// (not constant-time) — fine for a single-operator RPC; tightening to a constant-time
-/// compare is a documented follow-up for any deployment that needs timing-attack
-/// resistance.
+/// `Err` for a malformed header (caller chooses 400 policy). The extracted token is
+/// compared against the configured secret with [`ct_str_eq`] (constant-time except for
+/// length) at the call sites, so this parse step carries no timing obligation itself.
 fn parse_authorization_bearer(headers: &str) -> Result<Option<String>, String> {
     for line in headers.split("\r\n") {
         let Some((name, value)) = line.split_once(':') else {
@@ -6260,7 +6279,7 @@ async fn serve_rpc_conn(
     // auth.
     if !auth_token.is_empty() {
         match parse_authorization_bearer(head) {
-            Ok(Some(t)) if t == auth_token => {} // authorized
+            Ok(Some(t)) if ct_str_eq(&t, &auth_token) => {} // authorized
             Ok(Some(_)) | Ok(None) => {
                 let _ = stream
                     .write_all(unauthorized_bearer_response().as_bytes())
@@ -9025,6 +9044,21 @@ mod tests {
         assert_eq!(parse_authorization_bearer("Host: x\r\n").unwrap(), None);
         assert!(parse_authorization_bearer("Authorization: Basic zzz\r\n").is_err());
         assert!(parse_authorization_bearer("Authorization: Bearer \r\n").is_err());
+    }
+
+    #[test]
+    fn ct_str_eq_basic_properties() {
+        // M160: constant-time bearer compare agrees with `==` on the result (the timing
+        // property itself isn't observable in a unit test, but correctness must hold).
+        assert!(ct_str_eq("", ""));
+        assert!(ct_str_eq("abc", "abc"));
+        // equal length, differing byte (near the end) — still rejected.
+        assert!(!ct_str_eq("abc", "abd"));
+        // length mismatch, both directions.
+        assert!(!ct_str_eq("abc", "ab"));
+        assert!(!ct_str_eq("abc", "abcd"));
+        // case-sensitive (tokens are secrets, not identifiers).
+        assert!(!ct_str_eq("abc", "ABC"));
     }
 
     #[test]
