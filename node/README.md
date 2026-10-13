@@ -1341,6 +1341,17 @@ M116 的 `node rpc` 只能 GET。M117 补上写侧，让它成为**全能** RPC 
 
 **已知边界（顺延至 M121+）**：身份读三类已齐（`/genesis` 链 / `/node` 节点 / `/info` 链尖）；读面两分（`/params`/`/config`）已齐；RPC 自带端点发现 + 全能客户端 + 完整链读/写面；内容协商三轴已齐（仅 `identity`，真压缩顺延）；离线工具篮子已补；运维篮子剩余：证书/密钥轮换与落盘、follower 认证、指标端 TLS、OTel/push exporter、每-sink 独立 rotation 覆盖、时延直方图；keygen 篮子剩余：助记词 / BIP-39、口令加密 keystore、密钥轮换；剩余：游标分页、未知方法 `405`；共识 / wire 篮子（破 head 不变量）：**货币费用** + 费用优先排序、nonce / 序列号反重放。
 
+## `/metrics` 端点 bearer 鉴权（Milestone 158 · metrics 端加固）
+
+M37 的全节点 `[metrics]` 端点对能连上端口的任何人开放（暴露内部状态/peer 计数等）。M158 加**可选** bearer——`[metrics] auth_token` 空（默认）= M37 行为；非空时任何 scrape 须带 `Authorization: Bearer <token>` 否则 401。
+
+- **Config**（`config.rs`）：`MetricsConfig.auth_token: String`（`#[serde(default)]` 空=关）。
+- **编解码**：复用 M156 的 `parse_authorization_bearer` + `unauthorized_bearer_response`（`401 + WWW-Authenticate: Bearer realm=...`，RFC 6750 §3）。
+- **`run_metrics`/`serve_metrics_conn`** 串 token；`serve_metrics_conn` 改为累积请求头（而非 M37 的"读完即丢"），过 bearer 闸门再问 actor 拿快照。
+- **不碰** Prometheus 渲染 / 共识/codec/wire；localnet 头仍 wire v1 `a045426e…3b87bc`。
+- **测试（+1 → 623）**：`metrics_endpoint_bearer_auth_gates_scrapes`（无 token→401+challenge、错 token→401、正确→200 含 `zhixing_height`）。
+- **已知边界**：与 M156 同——byte-精确比较（不防计时攻击，单运维场景可接受）；多 token/scope/轮转/审计属后续运维篮子。
+
 ## mempool 最低费用门槛（Milestone 157 · 反垃圾）
 
 mempool 此前接受任意费用（含 0）。M157 加**可选最低费用门槛**：`[mempool] min_fee` 非 0 时，低于该费的 tx 在准入处拒绝。opt-in（默认 0 = 关），且是**本地准入策略非共识规则**——携带低费 tx 的块仍正常应用（故 head 不变）。

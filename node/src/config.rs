@@ -437,6 +437,12 @@ pub struct MetricsConfig {
     pub enabled: bool,
     /// Address the metrics HTTP listener binds, e.g. `"127.0.0.1:9600"`.
     pub listen: String,
+    /// M158: optional bearer token gating scrapes. Empty (the default) ⇒ open (the
+    /// pre-M158 behavior). When set, every request must carry `Authorization:
+    /// Bearer <token>`, else `401` — for private deployments that don't want metrics
+    /// readable by anyone who can reach the port.
+    #[serde(default)]
+    pub auth_token: String,
 }
 
 impl Default for MetricsConfig {
@@ -444,6 +450,7 @@ impl Default for MetricsConfig {
         Self {
             enabled: false,
             listen: "127.0.0.1:9600".into(),
+            auth_token: String::new(),
         }
     }
 }

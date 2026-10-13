@@ -2471,39 +2471,60 @@ fn render_prometheus(m: &Metrics) -> String {
 /// Accept loop for the metrics/health endpoint. Mirrors [`run_listener`]: each
 /// connection is handled on its own task; an accept error is logged and the loop
 /// continues (a transient error must not take the endpoint down).
-async fn run_metrics(listener: TcpListener, my_id: u64, cmd: mpsc::UnboundedSender<Cmd>) {
+async fn run_metrics(
+    listener: TcpListener,
+    my_id: u64,
+    auth_token: String,
+    cmd: mpsc::UnboundedSender<Cmd>,
+) {
     loop {
         match listener.accept().await {
             Ok((stream, _addr)) => {
-                tokio::spawn(serve_metrics_conn(stream, cmd.clone()));
+                tokio::spawn(serve_metrics_conn(stream, auth_token.clone(), cmd.clone()));
             }
             Err(e) => warn!(node = my_id, error = %e, "metrics accept error"),
         }
     }
 }
 
-/// Serve one metrics request: best-effort discard the HTTP request (bounded), ask
-/// the actor for a snapshot, and write a fixed-shape `HTTP/1.1 200 OK` reply whose
-/// body is the Prometheus exposition. Any path returns metrics, so a bare `GET /`
-/// doubles as a health check (`200` ⇒ alive). Errors are swallowed — a broken
-/// client connection must never affect the node.
-async fn serve_metrics_conn(mut stream: TcpStream, cmd: mpsc::UnboundedSender<Cmd>) {
-    // Drain the request headers so the client's write side is satisfied, but cap
-    // the read so a malformed/never-terminated request can't hang or grow the
-    // buffer without bound. We don't parse it — every request returns metrics.
+/// Serve one metrics request: read the HTTP request headers (bounded), optionally
+/// gate on a bearer token (M158), ask the actor for a snapshot, and write a
+/// fixed-shape `HTTP/1.1 200 OK` reply whose body is the Prometheus exposition. With
+/// no token configured any path returns metrics, so a bare `GET /` doubles as a health
+/// check. Errors are swallowed — a broken client connection must never affect the node.
+async fn serve_metrics_conn(
+    mut stream: TcpStream,
+    auth_token: String,
+    cmd: mpsc::UnboundedSender<Cmd>,
+) {
+    // Accumulate the request headers (bounded) so we can read an optional
+    // `Authorization` header. We still don't route on the path — every authorized
+    // request returns metrics.
+    let mut acc: Vec<u8> = Vec::new();
     let mut buf = [0u8; 1024];
-    let mut total = 0usize;
     loop {
         match stream.read(&mut buf).await {
             Ok(0) => break, // client closed
             Ok(n) => {
-                total += n;
-                // End of request headers, or the read cap — stop reading either way.
-                if buf[..n].windows(4).any(|w| w == b"\r\n\r\n") || total >= 8192 {
+                acc.extend_from_slice(&buf[..n]);
+                if acc.windows(4).any(|w| w == b"\r\n\r\n") || acc.len() >= 8192 {
                     break;
                 }
             }
             Err(_) => return,
+        }
+    }
+
+    // M158: optional bearer gate. Empty token ⇒ open (pre-M158 behavior).
+    if !auth_token.is_empty() {
+        let head = std::str::from_utf8(&acc).unwrap_or("");
+        let authorized = matches!(parse_authorization_bearer(head), Ok(Some(t)) if t == auth_token);
+        if !authorized {
+            let _ = stream
+                .write_all(unauthorized_bearer_response().as_bytes())
+                .await;
+            let _ = stream.flush().await;
+            return;
         }
     }
 
@@ -6681,8 +6702,9 @@ impl Node {
         if let Some(mc) = cfg.metrics.as_ref().filter(|m| m.enabled) {
             let addr = mc.listen_addr().map_err(cfg_io)?;
             let mlistener = TcpListener::bind(addr).await?;
-            info!(node = my_id, addr = %mlistener.local_addr()?, "metrics listening");
-            tokio::spawn(run_metrics(mlistener, my_id, cmd_tx.clone()));
+            let auth = mc.auth_token.clone();
+            info!(node = my_id, addr = %mlistener.local_addr()?, auth = !auth.is_empty(), "metrics listening");
+            tokio::spawn(run_metrics(mlistener, my_id, auth, cmd_tx.clone()));
         }
 
         // M53: optionally bind the external transaction-ingress RPC. Opt-in like
@@ -8700,6 +8722,7 @@ mod tests {
         cfg.metrics = Some(crate::config::MetricsConfig {
             enabled: true,
             listen: metrics_addr.into(),
+            auth_token: String::new(),
         });
         let _node = Node::start(cfg, test_genesis(), Some(kp(21)))
             .await
@@ -8729,6 +8752,50 @@ mod tests {
             "missing height gauge: {text}"
         );
         assert!(text.contains("# TYPE zhixing_height gauge"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn metrics_endpoint_bearer_auth_gates_scrapes() {
+        // M158: with `[metrics] auth_token` set, a scrape needs
+        // `Authorization: Bearer <token>`; no/wrong token → 401, correct → 200.
+        let dir = tmp_dir("metrics-auth");
+        let mut cfg = node_config(21, 20780, &[21], dir.clone());
+        let metrics_addr = "127.0.0.1:20791";
+        cfg.metrics = Some(crate::config::MetricsConfig {
+            enabled: true,
+            listen: metrics_addr.into(),
+            auth_token: "scrape-key".into(),
+        });
+        let _node = Node::start(cfg, test_genesis(), Some(kp(21)))
+            .await
+            .expect("start node");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        async fn scrape(addr: &str, auth: Option<&str>) -> String {
+            let mut req = String::from("GET /metrics HTTP/1.1\r\nHost: localhost\r\n");
+            if let Some(a) = auth {
+                req.push_str(&format!("Authorization: Bearer {a}\r\n"));
+            }
+            req.push_str("Connection: close\r\n\r\n");
+            let mut s = TcpStream::connect(addr).await.expect("connect");
+            s.write_all(req.as_bytes()).await.expect("send");
+            let mut resp = Vec::new();
+            s.read_to_end(&mut resp).await.expect("read");
+            String::from_utf8_lossy(&resp).into_owned()
+        }
+
+        let no = scrape(metrics_addr, None).await;
+        assert!(
+            no.starts_with("HTTP/1.1 401 Unauthorized"),
+            "no token: {no}"
+        );
+        let wrong = scrape(metrics_addr, Some("nope")).await;
+        assert!(wrong.starts_with("HTTP/1.1 401"), "wrong token: {wrong}");
+        let ok = scrape(metrics_addr, Some("scrape-key")).await;
+        assert!(ok.starts_with("HTTP/1.1 200 OK"), "correct token: {ok}");
+        assert!(ok.contains("zhixing_height"), "metrics body: {ok}");
 
         let _ = std::fs::remove_dir_all(&dir);
     }
