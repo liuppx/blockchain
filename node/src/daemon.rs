@@ -670,6 +670,9 @@ pub struct Metrics {
     /// M57: cumulative admissions rejected by the per-account mempool quota
     /// (monotonic counter; `0` when the quota is disabled).
     pub txs_quota_rejected: u64,
+    /// M161: cumulative admissions rejected by the M157 min-fee floor
+    /// (monotonic counter; `0` when the floor is disabled, i.e. `min_fee == 0`).
+    pub txs_min_fee_rejected: u64,
     /// M125: block-apply (consensus→committed) latency histogram. `block_apply_buckets[i]`
     /// is the *non-cumulative* count of applies that fell in bucket `i` (≤ `BLOCK_APPLY_BUCKET_MICROS[i]`
     /// and above the previous bound); applies slower than the last finite bound land only in the
@@ -1790,6 +1793,7 @@ async fn run_actor(mut actor: Actor, mut rx: mpsc::UnboundedReceiver<Cmd>) {
                     slashing_events: actor.slashing_events,
                     txs_rate_limited: actor.txs_rate_limited,
                     txs_quota_rejected: actor.node.mempool.rejected_quota(),
+                    txs_min_fee_rejected: actor.node.mempool.rejected_min_fee(),
                     block_apply_buckets: actor.block_apply_buckets,
                     block_apply_sum_micros: actor.block_apply_sum_micros,
                     block_apply_count: actor.block_apply_count,
@@ -2413,6 +2417,12 @@ fn render_prometheus(m: &Metrics) -> String {
         "zhixing_txs_quota_rejected_total",
         "Cumulative admissions rejected by the per-account mempool quota.",
         m.txs_quota_rejected,
+    );
+    counter(
+        &mut s,
+        "zhixing_txs_min_fee_rejected_total",
+        "Cumulative admissions rejected by the min-fee floor (M157 anti-spam).",
+        m.txs_min_fee_rejected,
     );
     // M125: block-apply latency histogram (the `histogram` half of the Prometheus data model).
     // `_bucket{le="X"}` is the cumulative count of applies ≤ X seconds; `le="+Inf"` equals the
@@ -8562,6 +8572,7 @@ mod tests {
             slashing_events: 19,
             txs_rate_limited: 23,
             txs_quota_rejected: 29,
+            txs_min_fee_rejected: 31,
             // M125: a sample latency histogram — buckets sum to 6, with two applies above the
             // last finite bound (count 8 > finite total 6).
             block_apply_buckets: [1, 2, 0, 3, 0, 0, 0, 0, 0, 0, 0],
@@ -8630,6 +8641,7 @@ mod tests {
             ("zhixing_slashing_events_total", 19),
             ("zhixing_txs_rate_limited_total", 23),
             ("zhixing_txs_quota_rejected_total", 29),
+            ("zhixing_txs_min_fee_rejected_total", 31),
         ] {
             assert!(
                 out.contains(&format!("# TYPE {name} counter")),

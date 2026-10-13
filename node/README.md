@@ -1341,6 +1341,17 @@ M116 的 `node rpc` 只能 GET。M117 补上写侧，让它成为**全能** RPC 
 
 **已知边界（顺延至 M121+）**：身份读三类已齐（`/genesis` 链 / `/node` 节点 / `/info` 链尖）；读面两分（`/params`/`/config`）已齐；RPC 自带端点发现 + 全能客户端 + 完整链读/写面；内容协商三轴已齐（仅 `identity`，真压缩顺延）；离线工具篮子已补；运维篮子剩余：证书/密钥轮换与落盘、follower 认证、指标端 TLS、OTel/push exporter、每-sink 独立 rotation 覆盖、时延直方图、bearer 失败响应延迟 jitter；keygen 篮子剩余：助记词 / BIP-39、口令加密 keystore、密钥轮换；剩余：游标分页、未知方法 `405`；共识 / wire 篮子（破 head 不变量）：**货币费用** + 费用优先排序、nonce / 序列号反重放。
 
+## min-fee 拒绝计数指标（Milestone 161 · mempool 反垃圾可观测）
+
+M157 的最低费用门槛（`[mempool] min_fee`）在 `insert` 最前置拒掉低于门槛的 tx，但这条拒绝路径此前**无计数**——运维无法从 `/metrics` 看出门槛实际拦了多少 tx。相邻两条拒绝路径都已有计数器（M54 速率限制 `zhixing_txs_rate_limited_total`、M57 配额 `zhixing_txs_quota_rejected_total`）。M161 补齐第三条，暴露 `zhixing_txs_min_fee_rejected_total`。
+
+- **mempool 内部计数器**（`mempool.rs`，照 M57 `rejected_quota`）：新字段 `rejected_min_fee: u64`（`new` 初始化 0），M157 门控臂在返 `FeeBelowMinimum` 前 `+= 1`，新 getter `rejected_min_fee()`。
+- **Metrics 字段 + 填充**（`daemon.rs`）：`Metrics.txs_min_fee_rejected: u64`，`Cmd::Metrics` 臂从 `actor.node.mempool.rejected_min_fee()` 拉。
+- **Prometheus 渲染**（`daemon.rs`）：`render_prometheus` 在 `zhixing_txs_quota_rejected_total` 后紧跟渲一个 counter `zhixing_txs_min_fee_rejected_total`。
+- **不碰** apply/codec/wire/共识；`min_fee==0` 默认时计数恒 0、metrics 默认关；localnet 头仍 wire v1 `a045426e…3b87bc`。
+- **测试（+0 → 624）**：扩展 M157 `min_fee_floor_rejects_below_and_admits_at_or_above`（拒后 `rejected_min_fee()==1`、准入不递增）+ `render_prometheus_emits_counters`（新 counter 在期望表）。
+- **已知边界**：boot 起单调累加（Prometheus counter，重启归零，运维用 `rate()`）；仅 `insert` 路径计数，块级无费用门槛（M157 设计）故不含块内低费 tx，与门槛「本地准入策略非共识规则」定位一致。同理给 nonce-too-far/replace-by-fee/mempool-full 各补计数器、401 鉴权失败计数属后续篮子。
+
 ## bearer 鉴权常时比较（Milestone 160 · 鉴权加固）
 
 M156/M158 在 `[rpc] auth_token` 与 `[metrics] auth_token` 处用 `t == auth_token` 逐字节短路比较——第一个不等字节即返 `false`，对公网监听/共享 token 部署构成**逐字节时序侧信道**（攻击者经端到端延迟推 prefix）。M160 改用**常时字符串相等**比较。

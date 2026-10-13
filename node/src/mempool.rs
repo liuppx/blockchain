@@ -59,6 +59,10 @@ pub struct Mempool {
     /// floor). `0` (default) ⇒ no floor — behavior-preserving. A local admission policy,
     /// not a consensus rule: a block carrying a below-floor tx still applies.
     min_fee: u64,
+    /// M161: cumulative admissions rejected by the M157 min-fee floor since boot
+    /// (observability; surfaced as the `zhixing_txs_min_fee_rejected_total` counter).
+    /// `0` while `min_fee == 0` (the floor is off).
+    rejected_min_fee: u64,
 }
 
 impl Mempool {
@@ -74,6 +78,7 @@ impl Mempool {
             replace_by_fee: false,
             min_fee_bump: 1,
             min_fee: 0,
+            rejected_min_fee: 0,
         }
     }
 
@@ -104,6 +109,12 @@ impl Mempool {
     /// M57: cumulative admissions rejected by the per-account quota since boot.
     pub fn rejected_quota(&self) -> u64 {
         self.rejected_quota
+    }
+
+    /// M161: cumulative admissions rejected by the M157 min-fee floor since boot
+    /// (monotonic counter; `0` while the floor is off).
+    pub fn rejected_min_fee(&self) -> u64 {
+        self.rejected_min_fee
     }
 
     /// M143: set the nonce pipelining window — how many future nonces beyond an
@@ -192,6 +203,7 @@ impl Mempool {
         // M157: cheap anti-spam gate first — reject a below-floor fee before the
         // (costlier) signature/state validation. `min_fee == 0` ⇒ no floor.
         if self.min_fee > 0 && tx.fee < self.min_fee {
+            self.rejected_min_fee += 1;
             return Err(ChainError::FeeBelowMinimum {
                 got: tx.fee,
                 min: self.min_fee,
@@ -1009,6 +1021,7 @@ mod tests {
         let chain = Chain::new(genesis());
         let mut mp = Mempool::new(16);
         assert_eq!(mp.min_fee(), 0);
+        assert_eq!(mp.rejected_min_fee(), 0);
         mp.set_min_fee(10);
         // Below the floor → rejected.
         assert!(matches!(
@@ -1016,11 +1029,15 @@ mod tests {
             Err(ChainError::FeeBelowMinimum { got: 9, min: 10 })
         ));
         assert!(mp.is_empty());
+        // M161: the rejection is counted for observability.
+        assert_eq!(mp.rejected_min_fee(), 1);
         // At the floor → admitted.
         assert!(mp.insert(&chain, tx_fee(2, 2, 2, 2 * MICRO, 10, 0)).is_ok());
         // Above the floor → admitted.
         assert!(mp.insert(&chain, tx_fee(3, 3, 3, 2 * MICRO, 50, 0)).is_ok());
         assert_eq!(mp.len(), 2);
+        // Admissions do not bump the rejection counter.
+        assert_eq!(mp.rejected_min_fee(), 1);
     }
 
     #[test]
