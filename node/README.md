@@ -1341,6 +1341,16 @@ M116 的 `node rpc` 只能 GET。M117 补上写侧，让它成为**全能** RPC 
 
 **已知边界（顺延至 M121+）**：身份读三类已齐（`/genesis` 链 / `/node` 节点 / `/info` 链尖）；读面两分（`/params`/`/config`）已齐；RPC 自带端点发现 + 全能客户端 + 完整链读/写面；内容协商三轴已齐（仅 `identity`，真压缩顺延）；离线工具篮子已补；运维篮子剩余：证书/密钥轮换与落盘、follower 认证、指标端 TLS、OTel/push exporter、每-sink 独立 rotation 覆盖、时延直方图；keygen 篮子剩余：助记词 / BIP-39、口令加密 keystore、密钥轮换；剩余：游标分页、未知方法 `405`；共识 / wire 篮子（破 head 不变量）：**货币费用** + 费用优先排序、nonce / 序列号反重放。
 
+## `/config` 暴露 mempool opt-in 调参（Milestone 159 · 运维可观测）
+
+`/config` 自 M119 起只吐共识计时 + 角色 + `mempool_capacity`/`mempool_per_account_limit` 两项 mempool 调参，但 M143/M144/M145/M157 陆续加的四个 opt-in 旋钮（`nonce_lookahead` / `replace_by_fee` / `min_fee_bump` / `min_fee`）从未进读面——运维无法经 wire 核对它们实际生效的值。M159 把这四项补进 `/config` 的文本与 JSON 两种表示。
+
+- **`ConfigView`**（`daemon.rs`）：加 `mempool_nonce_lookahead: usize`、`mempool_replace_by_fee: bool`、`mempool_min_fee_bump: u64`、`mempool_min_fee: u64` 四字段。
+- **`Cmd::QueryConfig`** 处理臂从 `actor.node.mempool.{nonce_lookahead,replace_by_fee,min_fee_bump,min_fee}()` getter 填充。
+- **`format_config`** 追加四行文本（`mempool_min_fee` 为末行）；**`json_config`** 追加四键（数值沿用 `json_u64` 引号串约定，`replace_by_fee` 用 `json_bool` 裸布尔）。
+- **不碰** 共识/codec/wire，RPC 默认关；localnet 头仍 wire v1 `a045426e…3b87bc`。
+- **测试（+0 → 623）**：扩展 `config_renders_text_and_json` 断言四项新 key 在文本与 JSON 两种表示中出现，且文本末行为 `mempool_min_fee`。
+
 ## `/metrics` 端点 bearer 鉴权（Milestone 158 · metrics 端加固）
 
 M37 的全节点 `[metrics]` 端点对能连上端口的任何人开放（暴露内部状态/peer 计数等）。M158 加**可选** bearer——`[metrics] auth_token` 空（默认）= M37 行为；非空时任何 scrape 须带 `Authorization: Bearer <token>` 否则 401。

@@ -420,9 +420,9 @@ cargo test --release                                 # 623 项单元测试（见
 | $COG / $WATT / $FLOP | 认知币（主）/ 电力凭证 / 算力凭证 |
 | cNFT | 认知贡献证书 |
 
-## 里程碑变更日志（M6–M158）
+## 里程碑变更日志（M6–M159）
 
-截至 M158 共 **623** 项单元测试。早期里程碑（M6–M23）主题：确定性/守恒/回滚/持久化/Merkle/BFT/认证链/最终性复验/动态验证人集/P2P gossip/质押绑定/等价双签罚没/块级 ops 走 gossip/轻客户端跟随验证人集/验证人集 Merkle 承诺入头/头部轻同步传输/钱包 SPV 账户证明。此后逐里程碑：
+截至 M159 共 **623** 项单元测试。早期里程碑（M6–M23）主题：确定性/守恒/回滚/持久化/Merkle/BFT/认证链/最终性复验/动态验证人集/P2P gossip/质押绑定/等价双签罚没/块级 ops 走 gossip/轻客户端跟随验证人集/验证人集 Merkle 承诺入头/头部轻同步传输/钱包 SPV 账户证明。此后逐里程碑：
 
 - **M24** 泛化批量化证明请求总线：Account/Reviewer/Validator 同一 GetProof 对、单一 verify_proof_against_header 验证器、reviewer_proof 闭合审阅人路径、MAX_PROOF_BATCH=32 上限
 - **M25** 图节点 cert-signed 包含证明
@@ -568,6 +568,7 @@ cargo test --release                                 # 623 项单元测试（见
 - **M156** RPC 写路径 bearer 鉴权（RPC 运营加固。M53 的 `POST /submit_tx` 对任何能连端口者开放；本轮加可选 bearer——`[rpc] auth_token` 空默认行为同 M53，非空时 tx 提交 POST 须带 `Authorization: Bearer <token>` 否则 401，读路径 `/batch`/`/validate`/所有 GET 保持公开只锁写）`RpcConfig.auth_token: String`（`#[serde(default)]` 空=关）；`parse_authorization_bearer`（header 名大小写无关、scheme 大小写都接受、空 token/错 scheme 返 Err）+ `unauthorized_bearer_response()`（401 + `WWW-Authenticate: Bearer realm="zhixing-rpc"` RFC 6750 §3）；`run_rpc`/`serve_rpc_conn` 串 token，在 `/validate` 处理后 tx-submission body 读前门控（`/batch` 已先返不受影响）；不碰共识/codec/wire，localnet 头仍 wire v1 `a045426e…3b87bc`；新测 `rpc_bearer_auth_gates_the_write_path`（无/错 token→401+challenge、正确→200、`GET /height` 无 token 仍 200）+ `parse_authorization_bearer_cases`，共 620 测 顺延（byte-精确比较不防计时攻击；多 token/scope/轮转/审计日志属后续运维篮子；全节点 metrics TLS、OTel exporter、cursor 分页）
 - **M157** mempool 最低费用门槛（反垃圾。mempool 此前接受任意费用含 0；本轮加可选最低费门槛 `[mempool] min_fee` 非 0 时低于该费的 tx 准入处拒绝，opt-in 默认 0=关，且是本地准入策略非共识规则——携带低费 tx 的块仍正常应用故 head 不变）`insert` 最前置门控 `min_fee > 0 && tx.fee < min_fee` → `ChainError::FeeBelowMinimum { got, min }`，在更贵的签名/状态校验之前让垃圾尽早被拒；新字段 `Mempool.min_fee` + `set_min_fee`/getter + `MempoolConfig.min_fee`（`#[serde(default)]`=0）+ `GossipNode::set_mempool_min_fee` 代理 + `Node::start` 在 >0 时布线；不碰 apply/codec/wire（`apply_tx` 无费用门槛块级无条件应用），localnet 头仍 wire v1 `a045426e…3b87bc`；新测 `min_fee_floor_rejects_below_and_admits_at_or_above`（门槛 10：fee 9 拒、10/50 准）+ `min_fee_floor_off_by_default_admits_zero_fee`，共 622 测
 - **M158** `/metrics` 端点 bearer 鉴权（metrics 端加固。M37 全节点 `[metrics]` 端对任何能连端口者开放；本轮加可选 bearer——`[metrics] auth_token` 空默认 = M37 行为，非空时任何 scrape 须 `Authorization: Bearer <token>` 否则 401）`MetricsConfig.auth_token: String`（`#[serde(default)]` 空=关）；复用 M156 的 `parse_authorization_bearer` + `unauthorized_bearer_response`（401 + `WWW-Authenticate: Bearer realm=...` RFC 6750 §3）；`run_metrics`/`serve_metrics_conn` 串 token，`serve_metrics_conn` 改为累积请求头（而非 M37 读完即丢）过 bearer 闸门再问 actor 拿快照；不碰 Prometheus 渲染/共识/codec/wire，localnet 头仍 wire v1 `a045426e…3b87bc`；新测 `metrics_endpoint_bearer_auth_gates_scrapes`（无→401+challenge、错→401、正确→200 含 `zhixing_height`），共 623 测。与 M156 同——byte 精确比较（不防计时攻击）；多 token/scope/轮转/审计属后续运维篮子
+- **M159** `/config` 暴露 mempool opt-in 调参（运维可观测。`/config` 自 M119 起只吐共识计时+角色+`mempool_capacity`/`mempool_per_account_limit`；M143/M144/M145/M157 加的四个 opt-in 旋钮从未进读面，运维无法经 wire 核对其实际生效值）`ConfigView` 加 `mempool_nonce_lookahead: usize`/`mempool_replace_by_fee: bool`/`mempool_min_fee_bump: u64`/`mempool_min_fee: u64` 四字段 + `Cmd::QueryConfig` 从 `actor.node.mempool.{nonce_lookahead,replace_by_fee,min_fee_bump,min_fee}()` getter 填充；`format_config` 追加四行文本（`mempool_min_fee` 末行）、`json_config` 追加四键（数值沿用 `json_u64` 引号串、`replace_by_fee` 用 `json_bool` 裸布尔）；不碰共识/codec/wire，RPC 默认关，localnet 头仍 wire v1 `a045426e…3b87bc`；扩展 `config_renders_text_and_json` 断言四项新 key 在文本与 JSON 两表示中出现（+0 → 623 测）
 
 ## 状态
 

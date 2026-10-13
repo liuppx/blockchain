@@ -1741,6 +1741,10 @@ async fn run_actor(mut actor: Actor, mut rx: mpsc::UnboundedReceiver<Cmd>) {
                     create_empty_blocks: actor.timing.create_empty_blocks,
                     mempool_capacity: actor.node.mempool.capacity(),
                     mempool_per_account_limit: actor.node.mempool.per_account_limit(),
+                    mempool_nonce_lookahead: actor.node.mempool.nonce_lookahead(),
+                    mempool_replace_by_fee: actor.node.mempool.replace_by_fee(),
+                    mempool_min_fee_bump: actor.node.mempool.min_fee_bump(),
+                    mempool_min_fee: actor.node.mempool.min_fee(),
                 });
             }
             Cmd::QueryNode { reply } => {
@@ -4448,6 +4452,12 @@ struct ConfigView {
     create_empty_blocks: bool,
     mempool_capacity: usize,
     mempool_per_account_limit: usize,
+    /// M159: the opt-in mempool knobs added since M119 (M143/M144/M145/M157), so an
+    /// operator can verify them over the wire.
+    mempool_nonce_lookahead: usize,
+    mempool_replace_by_fee: bool,
+    mempool_min_fee_bump: u64,
+    mempool_min_fee: u64,
 }
 
 /// M119: render a mempool bound — a number, or `unbounded` when it is `usize::MAX` (the
@@ -4464,7 +4474,8 @@ fn bound_str(n: usize) -> String {
 fn format_config(c: &ConfigView) -> String {
     format!(
         "role={}\npropose_timeout_ms={}\nprevote_timeout_ms={}\nprecommit_timeout_ms={}\n\
-timeout_delta_ms={}\nblock_interval_ms={}\ncreate_empty_blocks={}\nmempool_capacity={}\nmempool_per_account_limit={}",
+timeout_delta_ms={}\nblock_interval_ms={}\ncreate_empty_blocks={}\nmempool_capacity={}\nmempool_per_account_limit={}\n\
+mempool_nonce_lookahead={}\nmempool_replace_by_fee={}\nmempool_min_fee_bump={}\nmempool_min_fee={}",
         c.role,
         c.propose_timeout_ms,
         c.prevote_timeout_ms,
@@ -4474,6 +4485,10 @@ timeout_delta_ms={}\nblock_interval_ms={}\ncreate_empty_blocks={}\nmempool_capac
         c.create_empty_blocks,
         bound_str(c.mempool_capacity),
         bound_str(c.mempool_per_account_limit),
+        c.mempool_nonce_lookahead,
+        c.mempool_replace_by_fee,
+        c.mempool_min_fee_bump,
+        c.mempool_min_fee,
     )
 }
 
@@ -4483,7 +4498,8 @@ timeout_delta_ms={}\nblock_interval_ms={}\ncreate_empty_blocks={}\nmempool_capac
 fn json_config(c: &ConfigView) -> String {
     format!(
         "{{\"role\":{},\"propose_timeout_ms\":{},\"prevote_timeout_ms\":{},\"precommit_timeout_ms\":{},\
-\"timeout_delta_ms\":{},\"block_interval_ms\":{},\"create_empty_blocks\":{},\"mempool_capacity\":{},\"mempool_per_account_limit\":{}}}",
+\"timeout_delta_ms\":{},\"block_interval_ms\":{},\"create_empty_blocks\":{},\"mempool_capacity\":{},\"mempool_per_account_limit\":{},\
+\"mempool_nonce_lookahead\":{},\"mempool_replace_by_fee\":{},\"mempool_min_fee_bump\":{},\"mempool_min_fee\":{}}}",
         json_str(c.role),
         json_u64(c.propose_timeout_ms),
         json_u64(c.prevote_timeout_ms),
@@ -4493,6 +4509,10 @@ fn json_config(c: &ConfigView) -> String {
         json_bool(c.create_empty_blocks),
         json_str(&bound_str(c.mempool_capacity)),
         json_str(&bound_str(c.mempool_per_account_limit)),
+        json_u64(c.mempool_nonce_lookahead as u64),
+        json_bool(c.mempool_replace_by_fee),
+        json_u64(c.mempool_min_fee_bump),
+        json_u64(c.mempool_min_fee),
     )
 }
 
@@ -13446,13 +13466,23 @@ vote_b.validator=5 vote_b.height=9 vote_b.round=2 vote_b.block_hash={b_h} vote_b
             create_empty_blocks: true,
             mempool_capacity: usize::MAX,
             mempool_per_account_limit: 32,
+            mempool_nonce_lookahead: 4,
+            mempool_replace_by_fee: true,
+            mempool_min_fee_bump: 1,
+            mempool_min_fee: 7,
         };
         let text = format_config(&c);
         assert!(text.starts_with("role=validator\n"), "{text}");
         assert!(text.contains("block_interval_ms=1000\n"), "{text}");
         assert!(text.contains("create_empty_blocks=true\n"), "{text}");
         assert!(text.contains("mempool_capacity=unbounded\n"), "{text}");
-        assert!(text.ends_with("mempool_per_account_limit=32"), "{text}");
+        assert!(text.contains("mempool_per_account_limit=32\n"), "{text}");
+        // M159: the opt-in mempool knobs added since M119 are surfaced so operators can
+        // verify them over the wire; min_fee is the last line.
+        assert!(text.contains("mempool_nonce_lookahead=4\n"), "{text}");
+        assert!(text.contains("mempool_replace_by_fee=true\n"), "{text}");
+        assert!(text.contains("mempool_min_fee_bump=1\n"), "{text}");
+        assert!(text.ends_with("mempool_min_fee=7"), "{text}");
 
         let json = json_config(&c);
         assert!(json.contains("\"role\":\"validator\""), "{json}");
@@ -13466,6 +13496,10 @@ vote_b.validator=5 vote_b.height=9 vote_b.round=2 vote_b.block_hash={b_h} vote_b
             json.contains("\"mempool_per_account_limit\":\"32\""),
             "{json}"
         );
+        assert!(json.contains("\"mempool_nonce_lookahead\":\"4\""), "{json}");
+        assert!(json.contains("\"mempool_replace_by_fee\":true"), "{json}");
+        assert!(json.contains("\"mempool_min_fee_bump\":\"1\""), "{json}");
+        assert!(json.contains("\"mempool_min_fee\":\"7\""), "{json}");
         // bound_str maps a real bound to its number, the sentinel to `unbounded`.
         assert_eq!(bound_str(0), "0");
         assert_eq!(bound_str(usize::MAX), "unbounded");
