@@ -6663,6 +6663,8 @@ enum LightCmd {
     Announce,
     /// Handle query: current `(tracker height, head)`.
     Status(oneshot::Sender<(u64, Hash)>),
+    /// M155: handle query for a Prometheus metrics snapshot.
+    Metrics(oneshot::Sender<LightMetrics>),
 }
 
 impl TransportCmd for LightCmd {
@@ -6805,6 +6807,14 @@ async fn run_light_actor(mut actor: LightActor, mut rx: mpsc::UnboundedReceiver<
             LightCmd::Status(reply) => {
                 let _ = reply.send((actor.node.tracker().height(), actor.node.tracker().head()));
             }
+            LightCmd::Metrics(reply) => {
+                let _ = reply.send(LightMetrics {
+                    height: actor.node.tracker().height(),
+                    head: actor.node.tracker().head(),
+                    peers_connected: actor.outbound.len() as u64,
+                    addrs_known: actor.addrs.len() as u64,
+                });
+            }
         }
     }
 }
@@ -6860,6 +6870,17 @@ fn load_light_snapshot_seed(
             format!("light snapshot verification failed: {e}"),
         )
     })
+}
+
+/// M155: snapshot of the light node's observable state for the `/metrics` endpoint.
+#[derive(Clone, Debug)]
+pub struct LightMetrics {
+    pub height: u64,
+    pub head: Hash,
+    /// Number of peers currently connected (live outbound queues).
+    pub peers_connected: u64,
+    /// Number of addresses in the discovery book.
+    pub addrs_known: u64,
 }
 
 /// M148: a handle to a running light daemon.
@@ -7039,6 +7060,13 @@ impl LightNode {
         self.cmd.send(LightCmd::Status(tx)).ok()?;
         rx.await.ok()
     }
+
+    /// M155: a metrics snapshot (height, head, peer counts), or `None` if stopped.
+    pub async fn metrics(&self) -> Option<LightMetrics> {
+        let (tx, rx) = oneshot::channel();
+        self.cmd.send(LightCmd::Metrics(tx)).ok()?;
+        rx.await.ok()
+    }
 }
 
 /// CLI entry point for `node light-run`: start the light daemon and block until Ctrl-C.
@@ -7122,6 +7150,40 @@ async fn serve_light_rpc_conn(mut stream: TcpStream, cmd: mpsc::UnboundedSender<
     }
     let fmt = response_format(query).unwrap_or(RespFormat::Text);
     let resp = match path {
+        "/metrics" => {
+            // M155: Prometheus plaintext (Content-Type comes from the inner render, so
+            // `?format=json` is intentionally ignored — Prometheus expects text/plain).
+            let (tx, rx) = oneshot::channel();
+            if cmd.send(LightCmd::Metrics(tx)).is_err() {
+                http_response("503 Service Unavailable", "node stopped")
+            } else {
+                match rx.await {
+                    Ok(m) => {
+                        let head_hex = crate::hash::hex(&m.head);
+                        let body = format!(
+                            "# HELP zhixing_height Certified chain height.\n\
+                             # TYPE zhixing_height gauge\n\
+                             zhixing_height {h}\n\
+                             # HELP zhixing_head_info Block hash the next header must chain to (info-gauge).\n\
+                             # TYPE zhixing_head_info gauge\n\
+                             zhixing_head_info {h} {head}\n\
+                             # HELP zhixing_peers_connected Number of peers currently connected.\n\
+                             # TYPE zhixing_peers_connected gauge\n\
+                             zhixing_peers_connected {p}\n\
+                             # HELP zhixing_addrs_known Number of addresses in the discovery book.\n\
+                             # TYPE zhixing_addrs_known gauge\n\
+                             zhixing_addrs_known {a}\n",
+                            h = m.height,
+                            head = head_hex,
+                            p = m.peers_connected,
+                            a = m.addrs_known,
+                        );
+                        http_response_ct("200 OK", "text/plain; version=0.0.4", &body)
+                    }
+                    Err(_) => http_response("503 Service Unavailable", "node stopped"),
+                }
+            }
+        }
         "/status" | "/info" => {
             let (tx, rx) = oneshot::channel();
             if cmd.send(LightCmd::Status(tx)).is_err() {
@@ -16624,6 +16686,19 @@ vote_b.validator=5 vote_b.height=9 vote_b.round=2 vote_b.block_hash={b_h} vote_b
             "write rejected: {p}"
         );
         assert!(p.contains("Allow: GET\r\n"), "405 carries Allow: {p}");
+
+        // M155: /metrics serves Prometheus text with the height gauge.
+        let m = get(rpc_addr, "/metrics").await;
+        assert!(m.starts_with("HTTP/1.1 200 OK"), "metrics status: {m}");
+        assert!(
+            m.contains("# TYPE zhixing_height gauge\n")
+                && body_of(&m).contains("zhixing_height 3\n"),
+            "metrics body: {m}"
+        );
+        assert!(
+            body_of(&m).contains("zhixing_peers_connected "),
+            "metrics has peer gauge: {m}"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
