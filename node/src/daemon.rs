@@ -2553,6 +2553,49 @@ fn parse_content_length(headers: &str) -> Option<usize> {
     None
 }
 
+/// M156: pull the `Bearer` token from the request's `Authorization` header (RFC 6750
+/// §2.1). Returns `Ok(None)` when the header is absent (caller chooses 401 policy);
+/// `Err` for a malformed header (caller chooses 400 policy). Comparison is exact-byte
+/// (not constant-time) — fine for a single-operator RPC; tightening to a constant-time
+/// compare is a documented follow-up for any deployment that needs timing-attack
+/// resistance.
+fn parse_authorization_bearer(headers: &str) -> Result<Option<String>, String> {
+    for line in headers.split("\r\n") {
+        let Some((name, value)) = line.split_once(':') else {
+            continue;
+        };
+        if !name.trim().eq_ignore_ascii_case("authorization") {
+            continue;
+        }
+        let value = value.trim();
+        let rest = value
+            .strip_prefix("Bearer ")
+            .or_else(|| value.strip_prefix("bearer "))
+            .ok_or_else(|| "authorization scheme must be Bearer".to_string())?;
+        if rest.is_empty() {
+            return Err("bearer token is empty".into());
+        }
+        return Ok(Some(rest.to_string()));
+    }
+    Ok(None)
+}
+
+/// M156: fixed-shape `401 Unauthorized` with `WWW-Authenticate: Bearer` (RFC 6750
+/// §3), so well-behaved clients can prompt / retry.
+fn unauthorized_bearer_response() -> String {
+    format!(
+        "HTTP/1.1 401 Unauthorized\r\n\
+         WWW-Authenticate: Bearer realm=\"zhixing-rpc\"\r\n\
+         Content-Type: text/plain; charset=utf-8\r\n\
+         Content-Length: {}\r\n\
+         Connection: close\r\n\
+         \r\n\
+         {}",
+        b"unauthorized".len(),
+        "unauthorized"
+    )
+}
+
 /// Build a fixed-shape `HTTP/1.1` response with a plain-text body. `status_line`
 /// is e.g. `"200 OK"`; the connection is closed after the response.
 fn http_response(status_line: &str, body: &str) -> String {
@@ -2724,11 +2767,17 @@ fn not_acceptable_encoding_json() -> String {
 /// Accept loop for the ingress RPC endpoint. Mirrors [`run_metrics`]: each
 /// connection is handled on its own task; an accept error is logged and the loop
 /// continues.
-async fn run_rpc(listener: TcpListener, my_id: u64, cmd: mpsc::UnboundedSender<Cmd>) {
+async fn run_rpc(
+    listener: TcpListener,
+    my_id: u64,
+    auth_token: String,
+    cmd: mpsc::UnboundedSender<Cmd>,
+) {
     loop {
         match listener.accept().await {
             Ok((stream, _addr)) => {
-                tokio::spawn(serve_rpc_conn(stream, cmd.clone()));
+                let token = auth_token.clone();
+                tokio::spawn(serve_rpc_conn(stream, token, cmd.clone()));
             }
             Err(e) => warn!(node = my_id, error = %e, "rpc accept error"),
         }
@@ -5143,7 +5192,11 @@ async fn query_base_height(cmd: &mpsc::UnboundedSender<Cmd>) -> u64 {
     rx.await.unwrap_or(0)
 }
 
-async fn serve_rpc_conn(mut stream: TcpStream, cmd: mpsc::UnboundedSender<Cmd>) {
+async fn serve_rpc_conn(
+    mut stream: TcpStream,
+    auth_token: String,
+    cmd: mpsc::UnboundedSender<Cmd>,
+) {
     // Accumulate bytes until we see the end-of-headers marker, keeping any body
     // bytes that arrived in the same read.
     let mut acc: Vec<u8> = Vec::new();
@@ -6158,6 +6211,32 @@ async fn serve_rpc_conn(mut stream: TcpStream, cmd: mpsc::UnboundedSender<Cmd>) 
         return;
     }
 
+    // M156: the remaining POST path is tx submission. When the operator configured a
+    // bearer token on `[rpc]`, gate it with `Authorization: Bearer <token>` — reads
+    // (`/batch`, `/validate`, every `GET`) stay public. A missing/wrong token yields
+    // `401 Unauthorized` (or `WWW-Authenticate: Bearer` so well-behaved clients can
+    // re-prompt), and we close the connection — same RFC-recommended behavior for failed
+    // auth.
+    if !auth_token.is_empty() {
+        match parse_authorization_bearer(head) {
+            Ok(Some(t)) if t == auth_token => {} // authorized
+            Ok(Some(_)) | Ok(None) => {
+                let _ = stream
+                    .write_all(unauthorized_bearer_response().as_bytes())
+                    .await;
+                let _ = stream.flush().await;
+                return;
+            }
+            Err(e) => {
+                let _ = stream
+                    .write_all(http_response("400 Bad Request", &e).as_bytes())
+                    .await;
+                let _ = stream.flush().await;
+                return;
+            }
+        }
+    }
+
     // Determine how many body bytes to expect, capped.
     let Some(len) = parse_content_length(head) else {
         let _ = stream
@@ -6607,8 +6686,9 @@ impl Node {
         if let Some(rc) = cfg.rpc.as_ref().filter(|r| r.enabled) {
             let addr = rc.listen_addr().map_err(cfg_io)?;
             let rlistener = TcpListener::bind(addr).await?;
-            info!(node = my_id, addr = %rlistener.local_addr()?, "rpc listening");
-            tokio::spawn(run_rpc(rlistener, my_id, cmd_tx.clone()));
+            let auth = rc.auth_token.clone();
+            info!(node = my_id, addr = %rlistener.local_addr()?, auth = !auth.is_empty(), "rpc listening");
+            tokio::spawn(run_rpc(rlistener, my_id, auth, cmd_tx.clone()));
         }
 
         // M33: kick off consensus for the first height after the mesh has had a
@@ -8705,6 +8785,7 @@ mod tests {
         cfg.rpc = Some(crate::config::RpcConfig {
             enabled: true,
             listen: rpc_addr.into(),
+            auth_token: String::new(),
         });
         let mut genesis = test_genesis();
         genesis.validators = vec![(21, kp(21).public(), 1)];
@@ -8768,6 +8849,92 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    #[tokio::test]
+    async fn rpc_bearer_auth_gates_the_write_path() {
+        // M156: with `[rpc] auth_token` set, a tx-submission POST needs
+        // `Authorization: Bearer <token>`. No/wrong token → 401; correct token → 200.
+        // Reads (GET) stay public regardless of the token.
+        let dir = tmp_dir("rpc-auth");
+        let mut cfg = node_config(21, 20760, &[21], dir.clone());
+        let rpc_addr = "127.0.0.1:20771";
+        cfg.rpc = Some(crate::config::RpcConfig {
+            enabled: true,
+            listen: rpc_addr.into(),
+            auth_token: "s3cret".into(),
+        });
+        let mut genesis = test_genesis();
+        genesis.validators = vec![(21, kp(21).public(), 1)];
+        let node = Node::start(cfg, genesis, Some(kp(21)))
+            .await
+            .expect("start node");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        let body = crate::codec::encode_tx(&test_tx(1, 0, 1));
+        let post = |auth: Option<&str>| {
+            let mut headers = format!(
+                "POST /submit_tx HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\nConnection: close\r\n",
+                body.len()
+            );
+            if let Some(a) = auth {
+                headers.push_str(&format!("Authorization: Bearer {a}\r\n"));
+            }
+            headers.push_str("\r\n");
+            let mut r = headers.into_bytes();
+            r.extend_from_slice(&body);
+            r
+        };
+        async fn send(addr: &str, req: &[u8]) -> String {
+            let mut s = TcpStream::connect(addr).await.expect("connect");
+            s.write_all(req).await.expect("send");
+            let mut resp = Vec::new();
+            s.read_to_end(&mut resp).await.expect("read");
+            String::from_utf8_lossy(&resp).into_owned()
+        }
+
+        // No token → 401.
+        let no = send(rpc_addr, &post(None)).await;
+        assert!(
+            no.starts_with("HTTP/1.1 401 Unauthorized"),
+            "no-token: {no}"
+        );
+        assert!(
+            no.contains("WWW-Authenticate: Bearer"),
+            "401 challenge: {no}"
+        );
+        // Wrong token → 401.
+        let wrong = send(rpc_addr, &post(Some("nope"))).await;
+        assert!(wrong.starts_with("HTTP/1.1 401"), "wrong-token: {wrong}");
+        // Correct token → 200, tx admitted.
+        let ok = send(rpc_addr, &post(Some("s3cret"))).await;
+        assert!(ok.starts_with("HTTP/1.1 200 OK"), "correct-token: {ok}");
+
+        // Reads stay public (no token required).
+        let get = {
+            let req = "GET /height HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n";
+            send(rpc_addr, req.as_bytes()).await
+        };
+        assert!(get.starts_with("HTTP/1.1 200 OK"), "public read: {get}");
+
+        let _ = node;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn parse_authorization_bearer_cases() {
+        assert_eq!(
+            parse_authorization_bearer("Authorization: Bearer abc\r\n").unwrap(),
+            Some("abc".to_string())
+        );
+        // header-name case-insensitive, lowercase scheme accepted.
+        assert_eq!(
+            parse_authorization_bearer("authorization: bearer xyz\r\n").unwrap(),
+            Some("xyz".to_string())
+        );
+        assert_eq!(parse_authorization_bearer("Host: x\r\n").unwrap(), None);
+        assert!(parse_authorization_bearer("Authorization: Basic zzz\r\n").is_err());
+        assert!(parse_authorization_bearer("Authorization: Bearer \r\n").is_err());
+    }
+
     #[test]
     fn route_get_parses_paths() {
         // M58: the read-class router. Unknown non-/account paths stay Health (200) so
@@ -8814,6 +8981,7 @@ mod tests {
         cfg.rpc = Some(crate::config::RpcConfig {
             enabled: true,
             listen: rpc_addr.into(),
+            auth_token: String::new(),
         });
         let mut genesis = test_genesis();
         genesis.validators = vec![(21, kp(21).public(), 1)];
@@ -8957,6 +9125,7 @@ mod tests {
         cfg.rpc = Some(crate::config::RpcConfig {
             enabled: true,
             listen: rpc_addr.into(),
+            auth_token: String::new(),
         });
         let mut genesis = test_genesis();
         genesis.validators = vec![(21, kp(21).public(), 1)];
@@ -9020,6 +9189,7 @@ mod tests {
         cfg.rpc = Some(crate::config::RpcConfig {
             enabled: true,
             listen: rpc_addr.into(),
+            auth_token: String::new(),
         });
         let mut genesis = test_genesis();
         genesis.validators = vec![(21, kp(21).public(), 1)];
@@ -9102,6 +9272,7 @@ mod tests {
         cfg.rpc = Some(crate::config::RpcConfig {
             enabled: true,
             listen: rpc_addr.into(),
+            auth_token: String::new(),
         });
         let mut genesis = test_genesis();
         genesis.validators = vec![(21, kp(21).public(), 1)];
@@ -9177,6 +9348,7 @@ mod tests {
         cfg.rpc = Some(crate::config::RpcConfig {
             enabled: true,
             listen: rpc_addr.into(),
+            auth_token: String::new(),
         });
         let mut genesis = test_genesis();
         genesis.validators = vec![(21, kp(21).public(), 1)];
@@ -9334,6 +9506,7 @@ mod tests {
         cfg.rpc = Some(crate::config::RpcConfig {
             enabled: true,
             listen: rpc_addr.into(),
+            auth_token: String::new(),
         });
         let mut genesis = test_genesis();
         genesis.validators = vec![(21, kp(21).public(), 1)];
@@ -9387,6 +9560,7 @@ mod tests {
         cfg.rpc = Some(crate::config::RpcConfig {
             enabled: true,
             listen: rpc_addr.into(),
+            auth_token: String::new(),
         });
         let mut genesis = test_genesis();
         genesis.validators = vec![(21, kp(21).public(), 1)];
@@ -9477,6 +9651,7 @@ mod tests {
         cfg.rpc = Some(crate::config::RpcConfig {
             enabled: true,
             listen: rpc_addr.into(),
+            auth_token: String::new(),
         });
         let mut genesis = test_genesis();
         genesis.validators = vec![(24, kp(24).public(), 1)]; // quorum 1 ⇒ self-commit
@@ -9578,6 +9753,7 @@ mod tests {
         cfg.rpc = Some(crate::config::RpcConfig {
             enabled: true,
             listen: rpc_addr.into(),
+            auth_token: String::new(),
         });
         let mut genesis = test_genesis();
         genesis.validators = vec![(25, kp(25).public(), 1)]; // quorum 1 ⇒ self-commit
@@ -9690,6 +9866,7 @@ mod tests {
         cfg.rpc = Some(crate::config::RpcConfig {
             enabled: true,
             listen: rpc_addr.into(),
+            auth_token: String::new(),
         });
         let mut genesis = test_genesis();
         genesis.validators = vec![(26, kp(26).public(), 1)]; // quorum 1 ⇒ self-commit
@@ -9804,6 +9981,7 @@ mod tests {
         cfg.rpc = Some(crate::config::RpcConfig {
             enabled: true,
             listen: rpc_addr.into(),
+            auth_token: String::new(),
         });
         let mut genesis = test_genesis();
         genesis.validators = vec![(27, kp(27).public(), 1)]; // quorum 1 ⇒ self-commit
@@ -9897,6 +10075,7 @@ mod tests {
         cfg.rpc = Some(crate::config::RpcConfig {
             enabled: true,
             listen: rpc_addr.into(),
+            auth_token: String::new(),
         });
         let mut genesis = test_genesis();
         genesis.validators = vec![(28, kp(28).public(), 1)]; // quorum 1 ⇒ self-commit
@@ -9972,6 +10151,7 @@ mod tests {
         cfg.rpc = Some(crate::config::RpcConfig {
             enabled: true,
             listen: rpc_addr.into(),
+            auth_token: String::new(),
         });
         let mut genesis = test_genesis();
         genesis.validators = vec![(29, kp(29).public(), 1)]; // quorum 1 ⇒ self-commit
@@ -10050,6 +10230,7 @@ mod tests {
         cfg.rpc = Some(crate::config::RpcConfig {
             enabled: true,
             listen: rpc_addr.into(),
+            auth_token: String::new(),
         });
         let mut genesis = test_genesis();
         genesis.validators = vec![(30, kp(30).public(), 1)]; // quorum 1 ⇒ self-commit
@@ -10126,6 +10307,7 @@ mod tests {
         cfg.rpc = Some(crate::config::RpcConfig {
             enabled: true,
             listen: rpc_addr.into(),
+            auth_token: String::new(),
         });
         let mut genesis = test_genesis();
         genesis.validators = vec![(31, kp(31).public(), 1)]; // quorum 1 ⇒ self-commit
@@ -10204,6 +10386,7 @@ mod tests {
         cfg.rpc = Some(crate::config::RpcConfig {
             enabled: true,
             listen: rpc_addr.into(),
+            auth_token: String::new(),
         });
         let mut genesis = test_genesis();
         genesis.validators = vec![(32, kp(32).public(), 1)]; // quorum 1 ⇒ self-commit
@@ -10271,6 +10454,7 @@ mod tests {
         cfg.rpc = Some(crate::config::RpcConfig {
             enabled: true,
             listen: rpc_addr.into(),
+            auth_token: String::new(),
         });
         let mut genesis = test_genesis();
         genesis.validators = vec![(36, kp(36).public(), 1)]; // quorum 1 ⇒ self-commit
@@ -10340,6 +10524,7 @@ mod tests {
         cfg.rpc = Some(crate::config::RpcConfig {
             enabled: true,
             listen: rpc_addr.into(),
+            auth_token: String::new(),
         });
         let mut genesis = test_genesis();
         genesis.validators = vec![(44, kp(44).public(), 1)]; // quorum 1 ⇒ self-commit
@@ -10411,6 +10596,7 @@ mod tests {
         cfg.rpc = Some(crate::config::RpcConfig {
             enabled: true,
             listen: rpc_addr.into(),
+            auth_token: String::new(),
         });
         let mut genesis = test_genesis();
         genesis.validators = vec![(45, kp(45).public(), 1)]; // quorum 1 ⇒ self-commit
@@ -10495,6 +10681,7 @@ mod tests {
         cfg.rpc = Some(crate::config::RpcConfig {
             enabled: true,
             listen: rpc_addr.into(),
+            auth_token: String::new(),
         });
         let mut genesis = test_genesis();
         genesis.validators = vec![(46, kp(46).public(), 1)]; // quorum 1 ⇒ self-commit
@@ -10578,6 +10765,7 @@ mod tests {
         cfg.rpc = Some(crate::config::RpcConfig {
             enabled: true,
             listen: rpc_addr.into(),
+            auth_token: String::new(),
         });
         let mut genesis = test_genesis();
         genesis.validators = vec![(47, kp(47).public(), 1)]; // quorum 1 ⇒ self-commit
@@ -10662,6 +10850,7 @@ mod tests {
         cfg.rpc = Some(crate::config::RpcConfig {
             enabled: true,
             listen: rpc_addr.into(),
+            auth_token: String::new(),
         });
         let mut genesis = test_genesis();
         genesis.validators = vec![(48, kp(48).public(), 1)]; // quorum 1 ⇒ self-commit
@@ -10732,6 +10921,7 @@ mod tests {
         cfg.rpc = Some(crate::config::RpcConfig {
             enabled: true,
             listen: rpc_addr.into(),
+            auth_token: String::new(),
         });
         let mut genesis = test_genesis();
         genesis.validators = vec![(49, kp(49).public(), 1)]; // quorum 1 ⇒ self-commit
@@ -10774,6 +10964,7 @@ mod tests {
         cfg.rpc = Some(crate::config::RpcConfig {
             enabled: true,
             listen: rpc_addr.into(),
+            auth_token: String::new(),
         });
         let mut genesis = test_genesis();
         genesis.validators = vec![(50, kp(50).public(), 1)]; // quorum 1 ⇒ self-commit
@@ -10813,6 +11004,7 @@ mod tests {
         cfg.rpc = Some(crate::config::RpcConfig {
             enabled: true,
             listen: rpc_addr.into(),
+            auth_token: String::new(),
         });
         let mut genesis = test_genesis();
         genesis.validators = vec![(37, kp(37).public(), 1)]; // quorum 1 ⇒ self-commit
@@ -10890,6 +11082,7 @@ mod tests {
         cfg.rpc = Some(crate::config::RpcConfig {
             enabled: true,
             listen: rpc_addr.into(),
+            auth_token: String::new(),
         });
         let mut genesis = test_genesis();
         genesis.validators = vec![(38, kp(38).public(), 1)]; // quorum 1 ⇒ self-commit
@@ -10983,6 +11176,7 @@ mod tests {
         cfg.rpc = Some(crate::config::RpcConfig {
             enabled: true,
             listen: rpc_addr.into(),
+            auth_token: String::new(),
         });
         let mut genesis = test_genesis();
         genesis.validators = vec![(51, kp(51).public(), 1)]; // quorum 1 ⇒ self-commit
@@ -11042,6 +11236,7 @@ mod tests {
         cfg.rpc = Some(crate::config::RpcConfig {
             enabled: true,
             listen: rpc_addr.into(),
+            auth_token: String::new(),
         });
         let mut genesis = test_genesis();
         genesis.validators = vec![(52, kp(52).public(), 1)]; // quorum 1 ⇒ self-commit
@@ -11092,6 +11287,7 @@ mod tests {
         cfg.rpc = Some(crate::config::RpcConfig {
             enabled: true,
             listen: rpc_addr.into(),
+            auth_token: String::new(),
         });
         let mut genesis = test_genesis();
         genesis.validators = vec![(39, kp(39).public(), 1)]; // quorum 1 ⇒ self-commit
@@ -11164,6 +11360,7 @@ mod tests {
         cfg.rpc = Some(crate::config::RpcConfig {
             enabled: true,
             listen: rpc_addr.into(),
+            auth_token: String::new(),
         });
         let mut genesis = test_genesis();
         genesis.validators = vec![(40, kp(40).public(), 1)]; // quorum 1 ⇒ self-commit
@@ -11243,6 +11440,7 @@ mod tests {
         cfg.rpc = Some(crate::config::RpcConfig {
             enabled: true,
             listen: rpc_addr.into(),
+            auth_token: String::new(),
         });
         let mut genesis = test_genesis();
         genesis.validators = vec![(43, kp(43).public(), 1)]; // quorum 1 ⇒ self-commit
@@ -11296,6 +11494,7 @@ mod tests {
         cfg.rpc = Some(crate::config::RpcConfig {
             enabled: true,
             listen: rpc_addr.into(),
+            auth_token: String::new(),
         });
         let mut genesis = test_genesis();
         genesis.validators = vec![(41, kp(41).public(), 1)]; // quorum 1 ⇒ self-commit
@@ -11381,6 +11580,7 @@ mod tests {
         cfg.rpc = Some(crate::config::RpcConfig {
             enabled: true,
             listen: rpc_addr.into(),
+            auth_token: String::new(),
         });
         let mut genesis = test_genesis();
         genesis.validators = vec![(33, kp(33).public(), 1)]; // quorum 1 ⇒ self-commit
@@ -11456,6 +11656,7 @@ mod tests {
         cfg.rpc = Some(crate::config::RpcConfig {
             enabled: true,
             listen: rpc_addr.into(),
+            auth_token: String::new(),
         });
         let mut genesis = test_genesis();
         genesis.validators = vec![(34, kp(34).public(), 1)]; // quorum 1 ⇒ self-commit
@@ -11536,6 +11737,7 @@ mod tests {
         cfg.rpc = Some(crate::config::RpcConfig {
             enabled: true,
             listen: rpc_addr.into(),
+            auth_token: String::new(),
         });
         let mut genesis = test_genesis();
         genesis.validators = vec![(35, kp(35).public(), 1)]; // quorum 1 ⇒ self-commit
@@ -11590,6 +11792,7 @@ mod tests {
         cfg.rpc = Some(crate::config::RpcConfig {
             enabled: true,
             listen: rpc_addr.into(),
+            auth_token: String::new(),
         });
         let mut genesis = test_genesis();
         genesis.validators = vec![(21, kp(21).public(), 1)];
@@ -13703,6 +13906,7 @@ vote_b.validator=5 vote_b.height=9 vote_b.round=2 vote_b.block_hash={b_h} vote_b
         cfg.rpc = Some(crate::config::RpcConfig {
             enabled: true,
             listen: rpc_addr.into(),
+            auth_token: String::new(),
         });
         let mut genesis = test_genesis();
         genesis.validators = vec![(21, kp(21).public(), 1)];
@@ -13775,6 +13979,7 @@ vote_b.validator=5 vote_b.height=9 vote_b.round=2 vote_b.block_hash={b_h} vote_b
         cfg.rpc = Some(crate::config::RpcConfig {
             enabled: true,
             listen: rpc_addr.into(),
+            auth_token: String::new(),
         });
         let mut genesis = test_genesis();
         genesis.validators = vec![(21, kp(21).public(), 1)]; // quorum 1 ⇒ self-commit
@@ -13898,6 +14103,7 @@ vote_b.validator=5 vote_b.height=9 vote_b.round=2 vote_b.block_hash={b_h} vote_b
         cfg.rpc = Some(crate::config::RpcConfig {
             enabled: true,
             listen: rpc_addr.into(),
+            auth_token: String::new(),
         });
         let mut genesis = test_genesis();
         genesis.validators = vec![(21, kp(21).public(), 1)]; // quorum 1 ⇒ self-commit
@@ -14001,6 +14207,7 @@ vote_b.validator=5 vote_b.height=9 vote_b.round=2 vote_b.block_hash={b_h} vote_b
         cfg.rpc = Some(crate::config::RpcConfig {
             enabled: true,
             listen: rpc_addr.into(),
+            auth_token: String::new(),
         });
         let mut genesis = test_genesis();
         genesis.validators = vec![(21, kp(21).public(), 1)]; // quorum 1 ⇒ self-commit
@@ -14130,6 +14337,7 @@ vote_b.validator=5 vote_b.height=9 vote_b.round=2 vote_b.block_hash={b_h} vote_b
         cfg.rpc = Some(crate::config::RpcConfig {
             enabled: true,
             listen: rpc_addr.into(),
+            auth_token: String::new(),
         });
         let mut genesis = test_genesis();
         genesis.validators = vec![(23, kp(23).public(), 1)]; // quorum 1 ⇒ self-commit
@@ -14229,6 +14437,7 @@ vote_b.validator=5 vote_b.height=9 vote_b.round=2 vote_b.block_hash={b_h} vote_b
         cfg.rpc = Some(crate::config::RpcConfig {
             enabled: true,
             listen: rpc_addr.into(),
+            auth_token: String::new(),
         });
         let mut genesis = test_genesis();
         genesis.validators = vec![(42, kp(42).public(), 1)]; // quorum 1 ⇒ self-commit
@@ -14315,6 +14524,7 @@ vote_b.validator=5 vote_b.height=9 vote_b.round=2 vote_b.block_hash={b_h} vote_b
         cfg.rpc = Some(crate::config::RpcConfig {
             enabled: true,
             listen: rpc_addr.into(),
+            auth_token: String::new(),
         });
         let mut genesis = test_genesis();
         genesis.validators = vec![(21, kp(21).public(), 1)]; // quorum 1 ⇒ self-commit
@@ -14571,6 +14781,7 @@ vote_b.validator=5 vote_b.height=9 vote_b.round=2 vote_b.block_hash={b_h} vote_b
         cfg.rpc = Some(crate::config::RpcConfig {
             enabled: true,
             listen: rpc_addr.into(),
+            auth_token: String::new(),
         });
         let mut genesis = test_genesis();
         genesis.validators = vec![(21, kp(21).public(), 1)];
@@ -14656,6 +14867,7 @@ vote_b.validator=5 vote_b.height=9 vote_b.round=2 vote_b.block_hash={b_h} vote_b
         cfg.rpc = Some(crate::config::RpcConfig {
             enabled: true,
             listen: rpc_addr.into(),
+            auth_token: String::new(),
         });
         let mut genesis = test_genesis();
         genesis.validators = vec![(21, kp(21).public(), 1)];
@@ -15949,6 +16161,7 @@ vote_b.validator=5 vote_b.height=9 vote_b.round=2 vote_b.block_hash={b_h} vote_b
         cfg.rpc = Some(crate::config::RpcConfig {
             enabled: true,
             listen: rpc_addr.into(),
+            auth_token: String::new(),
         });
         let mut genesis = test_genesis();
         genesis.validators = vec![(21, kp(21).public(), 1)];
@@ -16634,6 +16847,7 @@ vote_b.validator=5 vote_b.height=9 vote_b.round=2 vote_b.block_hash={b_h} vote_b
         cfg.rpc = Some(crate::config::RpcConfig {
             enabled: true,
             listen: rpc_addr.into(),
+            auth_token: String::new(),
         });
         cfg.snapshot = Some(crate::config::SnapshotBootConfig {
             path: path.to_string_lossy().into_owned(),

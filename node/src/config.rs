@@ -471,6 +471,12 @@ pub struct RpcConfig {
     pub enabled: bool,
     /// Address the RPC HTTP listener binds, e.g. `"127.0.0.1:9700"`.
     pub listen: String,
+    /// M156: optional bearer token gating the *write* path (tx submission). Empty
+    /// (the default) ⇒ no auth — the write path is open exactly as pre-M156. When set,
+    /// a `POST` that submits a tx must carry `Authorization: Bearer <token>` (reads —
+    /// every `GET`, plus the read-only `POST /batch`/`/validate` — stay public).
+    #[serde(default)]
+    pub auth_token: String,
 }
 
 impl Default for RpcConfig {
@@ -478,6 +484,7 @@ impl Default for RpcConfig {
         Self {
             enabled: false,
             listen: "127.0.0.1:9700".into(),
+            auth_token: String::new(),
         }
     }
 }

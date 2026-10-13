@@ -1341,6 +1341,17 @@ M116 的 `node rpc` 只能 GET。M117 补上写侧，让它成为**全能** RPC 
 
 **已知边界（顺延至 M121+）**：身份读三类已齐（`/genesis` 链 / `/node` 节点 / `/info` 链尖）；读面两分（`/params`/`/config`）已齐；RPC 自带端点发现 + 全能客户端 + 完整链读/写面；内容协商三轴已齐（仅 `identity`，真压缩顺延）；离线工具篮子已补；运维篮子剩余：证书/密钥轮换与落盘、follower 认证、指标端 TLS、OTel/push exporter、每-sink 独立 rotation 覆盖、时延直方图；keygen 篮子剩余：助记词 / BIP-39、口令加密 keystore、密钥轮换；剩余：游标分页、未知方法 `405`；共识 / wire 篮子（破 head 不变量）：**货币费用** + 费用优先排序、nonce / 序列号反重放。
 
+## RPC 写路径 bearer 鉴权（Milestone 156 · RPC 运营加固）
+
+M53 的外部 tx-ingress `POST /submit_tx` 此前对任何能连上端口的客户端开放。本轮加**可选** bearer 鉴权：`[rpc] auth_token` 留空（默认）→ 行为完全同 M53；非空时 tx 提交 POST 必须带 `Authorization: Bearer <token>`，否则 401。**读路径（`/batch`、`/validate`、所有 `GET`）保持公开**——只锁写。
+
+- **Config**（`config.rs`）：`RpcConfig.auth_token: String`（`#[serde(default)]` → 默认空）；空 = 关。
+- **编解码**（`daemon.rs`）：`parse_authorization_bearer(headers) -> Result<Option<String>, String>` 提 `Authorization: Bearer …`（header 名大小写无关，scheme 大小写都接受；空 token / 错 scheme 返 Err）；`unauthorized_bearer_response()` 给 `401 Unauthorized` + `WWW-Authenticate: Bearer realm="zhixing-rpc"`（RFC 6750 §3），连接关。
+- **`run_rpc`/`serve_rpc_conn` 串 token**：`run_rpc` 把 `auth_token` 克隆进每个 `serve_rpc_conn`；后者在 `/validate` 处理后、tx-submission body 读前门控——`/batch` 在此之前已返（读路径不受影响）。
+- **不碰** 共识/codec/wire；localnet 头仍 wire v1 `a045426e…3b87bc`。
+- **测试（+2 → 620）**：`rpc_bearer_auth_gates_the_write_path`（无 token → 401+`WWW-Authenticate: Bearer`、错 token → 401、正确 token → 200、`GET /height` 无 token 仍 200）、`parse_authorization_bearer_cases`（大小写、缺、错 scheme、空 token）。
+- **已知边界（顺延）**：byte-精确比较（不防计时攻击——单运维场景可接受）；多 token/角色、scope、刷新轮转、审计日志是后续运维篮子。
+
 ## 轻节点 Prometheus `/metrics`（Milestone 155 · light daemon Phase 3 收尾）
 
 M152 的轻 RPC 加 `GET /metrics` Prometheus 读面，收尾 light daemon 可观测性。
