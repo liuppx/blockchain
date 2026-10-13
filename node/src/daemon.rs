@@ -6891,11 +6891,30 @@ impl LightNode {
         }
 
         let peer_ids: Vec<u64> = cfg.peers.iter().map(|p| p.id).collect();
-        // M149: snapshot-seed if `[snapshot]` is configured (fast-sync from a verified
-        // checkpoint); otherwise track from genesis.
-        let mut node = match cfg.snapshot.as_ref() {
-            Some(s) => load_light_snapshot_seed(s, my_id, &peer_ids)?,
-            None => crate::net::LightGossipNode::new(my_id, &genesis, peer_ids.iter().copied()),
+        // M149/M154: seed from a verified snapshot or a weak-subjectivity checkpoint if
+        // configured; otherwise track from genesis. Snapshot and checkpoint are mutually
+        // exclusive (one carries a cert-verified ChainState, the other a pure-trust anchor).
+        if cfg.snapshot.is_some() && cfg.checkpoint.is_some() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("light node {my_id} sets both [snapshot] and [checkpoint] (choose one)"),
+            ));
+        }
+        let mut node = match (cfg.snapshot.as_ref(), cfg.checkpoint.as_ref()) {
+            (Some(s), _) => load_light_snapshot_seed(s, my_id, &peer_ids)?,
+            (_, Some(cp)) => {
+                let (head, set) = cp.decode().map_err(cfg_io)?;
+                crate::net::LightGossipNode::from_checkpoint(
+                    my_id,
+                    set,
+                    head,
+                    cp.height,
+                    peer_ids.iter().copied(),
+                )
+            }
+            (None, None) => {
+                crate::net::LightGossipNode::new(my_id, &genesis, peer_ids.iter().copied())
+            }
         };
 
         // M151: header persistence. When a data_dir is configured, open (and replay) a
@@ -7864,6 +7883,7 @@ mod tests {
             logging: None,
             mempool: crate::config::MempoolConfig::default(),
             snapshot: None,
+            checkpoint: None,
         }
     }
 
@@ -14736,6 +14756,7 @@ vote_b.validator=5 vote_b.height=9 vote_b.round=2 vote_b.block_hash={b_h} vote_b
             logging: None,
             mempool: crate::config::MempoolConfig::default(),
             snapshot: None,
+            checkpoint: None,
         }
     }
 

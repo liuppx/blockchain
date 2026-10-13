@@ -151,6 +151,46 @@ pub struct NodeConfig {
     /// `GET /header/{h}` returns.
     #[serde(default)]
     pub snapshot: Option<SnapshotBootConfig>,
+    /// M154: opt-in weak-subjectivity checkpoint for a light node (`node light-run`).
+    /// When `Some`, the light node seeds its tracker from this pinned
+    /// `(height, head, validator set)` anchor and follows forward — no snapshot blob,
+    /// no cert. Ignored by the full node. Mutually exclusive with `snapshot`.
+    #[serde(default)]
+    pub checkpoint: Option<CheckpointConfig>,
+}
+
+/// M154: a weak-subjectivity checkpoint a light node trusts as its subjectivity anchor.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CheckpointConfig {
+    /// The checkpoint height (the light node follows `height + 1` onward).
+    pub height: u64,
+    /// Hex of the checkpoint block's hash — the head the next header must chain to.
+    pub head_hex: String,
+    /// The validator set active at the checkpoint (certifies `height + 1`). Reuses the
+    /// genesis `[[validators]]` encoding (id/pubkey_hex/power).
+    pub validators: Vec<ValidatorConfig>,
+}
+
+impl CheckpointConfig {
+    /// M154: decode into `(head hash, ValidatorSet)`. Rejects a malformed `head_hex`,
+    /// a bad validator pubkey, or an empty validator set.
+    pub fn decode(&self) -> Result<([u8; 32], crate::validator::ValidatorSet), ConfigError> {
+        let head = decode_hex_n::<32>(&self.head_hex, "checkpoint.head_hex")?;
+        if self.validators.is_empty() {
+            return Err(ConfigError::BadSnapshot {
+                detail: "checkpoint.validators must be non-empty".into(),
+            });
+        }
+        let mut vals = Vec::with_capacity(self.validators.len());
+        for v in &self.validators {
+            vals.push(crate::validator::Validator {
+                id: v.id,
+                pubkey: decode_pubkey(&v.pubkey_hex, "checkpoint.validators.pubkey_hex")?,
+                power: v.power,
+            });
+        }
+        Ok((head, crate::validator::ValidatorSet::new(vals)))
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1002,6 +1042,7 @@ mod tests {
             logging: None,
             mempool: MempoolConfig::default(),
             snapshot: None,
+            checkpoint: None,
         };
         let s = toml::to_string(&cfg).unwrap();
         let back: NodeConfig = toml::from_str(&s).unwrap();
@@ -2151,6 +2192,7 @@ mod tests {
                 logging: None,
                 mempool: MempoolConfig::default(),
                 snapshot: None,
+                checkpoint: None,
             };
             std::fs::write(
                 dir.join(format!("node{id}.toml")),
@@ -2281,5 +2323,41 @@ mod tests {
             set_only.validate(),
             Err(ConfigError::BadSnapshot { .. })
         ));
+    }
+
+    #[test]
+    fn checkpoint_config_decodes_and_rejects_bad_input() {
+        // M154: a well-formed checkpoint decodes to (head, set); bad hex / empty set reject.
+        let ok = CheckpointConfig {
+            height: 7,
+            head_hex: hex(&[9u8; 32]),
+            validators: vec![ValidatorConfig {
+                id: 21,
+                pubkey_hex: hex(&demo_seed(21)),
+                power: 1,
+            }],
+        };
+        let (head, set) = ok.decode().expect("valid checkpoint decodes");
+        assert_eq!(head, [9u8; 32]);
+        assert_eq!(set.len(), 1);
+
+        // Empty validator set → error.
+        let empty = CheckpointConfig {
+            height: 7,
+            head_hex: hex(&[9u8; 32]),
+            validators: vec![],
+        };
+        assert!(matches!(
+            empty.decode(),
+            Err(ConfigError::BadSnapshot { .. })
+        ));
+
+        // Malformed head hex → BadHex.
+        let bad_head = CheckpointConfig {
+            height: 7,
+            head_hex: "zz".into(),
+            validators: ok.validators.clone(),
+        };
+        assert!(matches!(bad_head.decode(), Err(ConfigError::BadHex { .. })));
     }
 }

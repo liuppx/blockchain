@@ -619,6 +619,24 @@ impl ValidatorTracker {
         }
     }
 
+    /// M154: seed a tracker from a **weak-subjectivity checkpoint** — a bare
+    /// `(validator set, head, height)` the operator pins and trusts as a subjectivity
+    /// anchor (no snapshot blob, no cert to verify against). Lighter than
+    /// [`Self::from_snapshot`]: it carries no `ChainState`, so `bonds`/`pubkeys` start
+    /// empty — fine for header-only following ([`Self::follow_header`] never reads them;
+    /// it verifies each subsequent cert against this `set` and adopts the wire-supplied
+    /// next set). The anchor's authenticity is the operator's trust assumption, exactly
+    /// as [`Self::from_genesis`] trusts the genesis set — hence *weak subjectivity*.
+    pub fn from_checkpoint(set: ValidatorSet, head: Hash, height: u64) -> Self {
+        ValidatorTracker {
+            set,
+            bonds: BTreeMap::new(),
+            pubkeys: BTreeMap::new(),
+            head,
+            height,
+        }
+    }
+
     /// The validator set active for the *next* height (the set that certifies
     /// it). After following height H this is the set that certifies H+1.
     pub fn validators(&self) -> &ValidatorSet {

@@ -1341,6 +1341,17 @@ M116 的 `node rpc` 只能 GET。M117 补上写侧，让它成为**全能** RPC 
 
 **已知边界（顺延至 M121+）**：身份读三类已齐（`/genesis` 链 / `/node` 节点 / `/info` 链尖）；读面两分（`/params`/`/config`）已齐；RPC 自带端点发现 + 全能客户端 + 完整链读/写面；内容协商三轴已齐（仅 `identity`，真压缩顺延）；离线工具篮子已补；运维篮子剩余：证书/密钥轮换与落盘、follower 认证、指标端 TLS、OTel/push exporter、每-sink 独立 rotation 覆盖、时延直方图；keygen 篮子剩余：助记词 / BIP-39、口令加密 keystore、密钥轮换；剩余：游标分页、未知方法 `405`；共识 / wire 篮子（破 head 不变量）：**货币费用** + 费用优先排序、nonce / 序列号反重放。
 
+## 轻节点弱主观性检查点引导（Milestone 154 · light daemon Phase 3e）
+
+M149 的快照种子要下载完整 `ChainState` 快照 + cert。M154 加**最轻引导**：轻节点信任一个运维钉死的 `(height, head, 验证人集)` 锚点（无快照 blob、无 cert），从该高度向前跟踪、对每个后续头用该集 cert 校验。锚点真实性是运维的信任假设——正如 `from_genesis` 信任创世集，故曰*弱主观性*。
+
+- **`ValidatorTracker::from_checkpoint(set, head, height)`**（`light.rs`）：仅置 set/head/height，bonds/pubkeys 空（header-only 跟踪的 `follow_header` 从不读它们）。
+- **`LightGossipNode::from_checkpoint(id, set, head, height, peers)`**（`net.rs`）：种子 tracker、`base_height=height`。
+- **config**（`config.rs`）：`CheckpointConfig { height, head_hex, validators }` + `NodeConfig.checkpoint: Option<_>`（`#[serde(default)]`，复用 genesis `[[validators]]` 编码）；`decode()` → `(head, ValidatorSet)`，拒坏 hex/空集。
+- **`LightNode::start`**：`[checkpoint]` 存在则 `from_checkpoint`；与 `[snapshot]` 互斥（快照是 cert 验证的 ChainState，检查点是纯信任锚）——两者皆设则报错。
+- **不碰** 共识/codec/wire；localnet 头仍 wire v1 `a045426e…3b87bc`。
+- **测试（+2 → 618）**：`light_from_checkpoint_follows_forward_over_wire`（高度 1 检查点种子 → 经 `LightNetwork` 跟到尖端 3、集匹配权威集）、`checkpoint_config_decodes_and_rejects_bad_input`（合法解码 + 空集/坏 hex 拒）。
+
 ## 轻节点 peer discovery（Milestone 153 · light daemon Phase 3d）
 
 M148 的轻节点只连静态配置的 peer——若该 peer 挂了就孤立。M153 给它 peer discovery（复用全节点 M39 地址簿范式）：经 `Peers` gossip 学新 full-node peer 并自动拨号，网络更有韧性。

@@ -4310,6 +4310,7 @@ fn cmd_localnet() {
             logging: None,
             mempool: crate::config::MempoolConfig::default(),
             snapshot: None,
+            checkpoint: None,
         }
     };
 

@@ -1799,9 +1799,36 @@ impl LightGossipNode {
         Ok(Self::from_snapshot(id, state, header.hash(), peers))
     }
 
-    /// M142: the snapshot tip height this node was seeded at — `0` for a fresh-from-
-    /// genesis node, `snapshot.height` for a snapshot-seeded node. `headers()[i]` is
-    /// height `base_height() + 1 + i`.
+    /// M154: seed a light node from a **weak-subjectivity checkpoint** — a pinned
+    /// `(validator set, head, height)` the operator trusts as a subjectivity anchor
+    /// (no snapshot blob, no cert). Lighter than [`Self::from_snapshot`]; the node tracks
+    /// forward from `height`, cert-verifying every subsequent header against `set`. The
+    /// anchor's authenticity is the operator's trust assumption (as with genesis).
+    pub fn from_checkpoint(
+        id: u64,
+        set: ValidatorSet,
+        head: Hash,
+        height: u64,
+        peers: impl IntoIterator<Item = u64>,
+    ) -> Self {
+        let peers = peers.into_iter().filter(|&p| p != id).collect();
+        LightGossipNode {
+            id,
+            base_height: height,
+            headers: Vec::new(),
+            next_sets: Vec::new(),
+            seen: BTreeSet::new(),
+            tracker: ValidatorTracker::from_checkpoint(set, head, height),
+            peers,
+            proofs: BTreeMap::new(),
+            diffs: None,
+            batches: None,
+            locks: None,
+        }
+    }
+
+    /// M142: the snapshot/checkpoint tip height this node was seeded at — `0` for a
+    /// fresh-from-genesis node. `headers()[i]` is height `base_height() + 1 + i`.
     pub fn base_height(&self) -> u64 {
         self.base_height
     }
@@ -4065,6 +4092,52 @@ mod tests {
             net.light_node(light_id).tracker().height(),
             3,
             "light synced to tip reconstructing None sets"
+        );
+    }
+
+    #[test]
+    fn light_from_checkpoint_follows_forward_over_wire() {
+        // M154: a light node seeded from a weak-subjectivity checkpoint at height H
+        // (pinned set + head, no snapshot/cert) follows forward over wire to the tip.
+        let (blocks, certs) = certified_chain(3);
+        let mut full = GossipNode::new(1, genesis(), 8, [1, 2]);
+        assert!(full.load_certified(&blocks, &certs));
+
+        // Checkpoint at height 1: the set that certifies height 2 + the head at 1.
+        let at_1 = crate::Chain::replay(genesis(), &blocks[..1]).expect("replay to 1");
+        let light_id = 2u64;
+        let light = LightGossipNode::from_checkpoint(
+            light_id,
+            at_1.state.validators.clone(),
+            at_1.head,
+            1,
+            [1, 2],
+        );
+        assert_eq!(
+            light.tracker().height(),
+            1,
+            "seeded at the checkpoint height"
+        );
+        assert_eq!(light.base_height(), 1);
+
+        let mut net = LightNetwork::new(vec![full], vec![light]);
+        net.announce_all();
+        for _ in 0..20 {
+            if net.run() == 0 {
+                break;
+            }
+        }
+        let l = net.light_node(light_id);
+        assert_eq!(
+            l.tracker().height(),
+            3,
+            "followed from the checkpoint to the tip"
+        );
+        let auth = authoritative_final_set(&genesis(), &blocks);
+        assert_eq!(
+            l.tracker().validators().merkle_root(),
+            auth.merkle_root(),
+            "tracked set matches the authoritative set"
         );
     }
 
