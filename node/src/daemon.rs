@@ -673,6 +673,17 @@ pub struct Metrics {
     /// M161: cumulative admissions rejected by the M157 min-fee floor
     /// (monotonic counter; `0` when the floor is disabled, i.e. `min_fee == 0`).
     pub txs_min_fee_rejected: u64,
+    /// M162: cumulative admissions rejected by the M54 global capacity bound
+    /// (monotonic counter; `0` while capacity is unbounded).
+    pub txs_full_rejected: u64,
+    /// M162: cumulative admissions rejected as a stale (replayed) nonce (monotonic counter).
+    pub txs_bad_nonce_rejected: u64,
+    /// M162: cumulative admissions rejected past the M143 nonce pipelining window
+    /// (monotonic counter; `0` under the strict default).
+    pub txs_nonce_too_far_rejected: u64,
+    /// M162: cumulative admissions rejected by an under-bid M144 replace-by-fee attempt
+    /// (monotonic counter; `0` while replace-by-fee is off).
+    pub txs_replace_fee_rejected: u64,
     /// M125: block-apply (consensus→committed) latency histogram. `block_apply_buckets[i]`
     /// is the *non-cumulative* count of applies that fell in bucket `i` (≤ `BLOCK_APPLY_BUCKET_MICROS[i]`
     /// and above the previous bound); applies slower than the last finite bound land only in the
@@ -1794,6 +1805,10 @@ async fn run_actor(mut actor: Actor, mut rx: mpsc::UnboundedReceiver<Cmd>) {
                     txs_rate_limited: actor.txs_rate_limited,
                     txs_quota_rejected: actor.node.mempool.rejected_quota(),
                     txs_min_fee_rejected: actor.node.mempool.rejected_min_fee(),
+                    txs_full_rejected: actor.node.mempool.rejected_full(),
+                    txs_bad_nonce_rejected: actor.node.mempool.rejected_bad_nonce(),
+                    txs_nonce_too_far_rejected: actor.node.mempool.rejected_nonce_too_far(),
+                    txs_replace_fee_rejected: actor.node.mempool.rejected_replace_fee(),
                     block_apply_buckets: actor.block_apply_buckets,
                     block_apply_sum_micros: actor.block_apply_sum_micros,
                     block_apply_count: actor.block_apply_count,
@@ -2423,6 +2438,30 @@ fn render_prometheus(m: &Metrics) -> String {
         "zhixing_txs_min_fee_rejected_total",
         "Cumulative admissions rejected by the min-fee floor (M157 anti-spam).",
         m.txs_min_fee_rejected,
+    );
+    counter(
+        &mut s,
+        "zhixing_txs_full_rejected_total",
+        "Cumulative admissions rejected by the mempool capacity bound (M54).",
+        m.txs_full_rejected,
+    );
+    counter(
+        &mut s,
+        "zhixing_txs_bad_nonce_rejected_total",
+        "Cumulative admissions rejected as a stale (replayed) nonce.",
+        m.txs_bad_nonce_rejected,
+    );
+    counter(
+        &mut s,
+        "zhixing_txs_nonce_too_far_rejected_total",
+        "Cumulative admissions rejected past the nonce pipelining window (M143).",
+        m.txs_nonce_too_far_rejected,
+    );
+    counter(
+        &mut s,
+        "zhixing_txs_replace_fee_rejected_total",
+        "Cumulative admissions rejected by an under-bid replace-by-fee attempt (M144).",
+        m.txs_replace_fee_rejected,
     );
     // M125: block-apply latency histogram (the `histogram` half of the Prometheus data model).
     // `_bucket{le="X"}` is the cumulative count of applies ≤ X seconds; `le="+Inf"` equals the
@@ -8573,6 +8612,10 @@ mod tests {
             txs_rate_limited: 23,
             txs_quota_rejected: 29,
             txs_min_fee_rejected: 31,
+            txs_full_rejected: 41,
+            txs_bad_nonce_rejected: 43,
+            txs_nonce_too_far_rejected: 47,
+            txs_replace_fee_rejected: 53,
             // M125: a sample latency histogram — buckets sum to 6, with two applies above the
             // last finite bound (count 8 > finite total 6).
             block_apply_buckets: [1, 2, 0, 3, 0, 0, 0, 0, 0, 0, 0],
@@ -8642,6 +8685,10 @@ mod tests {
             ("zhixing_txs_rate_limited_total", 23),
             ("zhixing_txs_quota_rejected_total", 29),
             ("zhixing_txs_min_fee_rejected_total", 31),
+            ("zhixing_txs_full_rejected_total", 41),
+            ("zhixing_txs_bad_nonce_rejected_total", 43),
+            ("zhixing_txs_nonce_too_far_rejected_total", 47),
+            ("zhixing_txs_replace_fee_rejected_total", 53),
         ] {
             assert!(
                 out.contains(&format!("# TYPE {name} counter")),

@@ -63,6 +63,19 @@ pub struct Mempool {
     /// (observability; surfaced as the `zhixing_txs_min_fee_rejected_total` counter).
     /// `0` while `min_fee == 0` (the floor is off).
     rejected_min_fee: u64,
+    /// M162: cumulative admissions rejected by the M54 global capacity bound
+    /// (`zhixing_txs_full_rejected_total`; `0` while capacity is unbounded).
+    rejected_full: u64,
+    /// M162: cumulative admissions rejected as a stale (already-consumed) nonce — a
+    /// replay (`zhixing_txs_bad_nonce_rejected_total`).
+    rejected_bad_nonce: u64,
+    /// M162: cumulative admissions rejected for a nonce past the M143 pipelining window
+    /// (`zhixing_txs_nonce_too_far_rejected_total`; `0` under the strict default).
+    rejected_nonce_too_far: u64,
+    /// M162: cumulative admissions rejected because an M144 replace-by-fee bid did not
+    /// clear the incumbent by `min_fee_bump` (`zhixing_txs_replace_fee_rejected_total`;
+    /// `0` while `replace_by_fee` is off).
+    rejected_replace_fee: u64,
 }
 
 impl Mempool {
@@ -79,6 +92,10 @@ impl Mempool {
             min_fee_bump: 1,
             min_fee: 0,
             rejected_min_fee: 0,
+            rejected_full: 0,
+            rejected_bad_nonce: 0,
+            rejected_nonce_too_far: 0,
+            rejected_replace_fee: 0,
         }
     }
 
@@ -115,6 +132,26 @@ impl Mempool {
     /// (monotonic counter; `0` while the floor is off).
     pub fn rejected_min_fee(&self) -> u64 {
         self.rejected_min_fee
+    }
+
+    /// M162: cumulative admissions rejected by the M54 global capacity bound since boot.
+    pub fn rejected_full(&self) -> u64 {
+        self.rejected_full
+    }
+
+    /// M162: cumulative admissions rejected as a stale (replayed) nonce since boot.
+    pub fn rejected_bad_nonce(&self) -> u64 {
+        self.rejected_bad_nonce
+    }
+
+    /// M162: cumulative admissions rejected past the M143 nonce pipelining window.
+    pub fn rejected_nonce_too_far(&self) -> u64 {
+        self.rejected_nonce_too_far
+    }
+
+    /// M162: cumulative admissions rejected by an under-bid M144 replace-by-fee attempt.
+    pub fn rejected_replace_fee(&self) -> u64 {
+        self.rejected_replace_fee
     }
 
     /// M143: set the nonce pipelining window — how many future nonces beyond an
@@ -222,6 +259,7 @@ impl Mempool {
             .nonce;
         if tx.nonce < acct_nonce {
             // Stale (already-consumed) nonce — a replay.
+            self.rejected_bad_nonce += 1;
             return Err(ChainError::BadNonce {
                 account: tx.author,
                 expected: acct_nonce,
@@ -230,6 +268,7 @@ impl Mempool {
         }
         let limit = acct_nonce.saturating_add(self.nonce_lookahead as u64);
         if tx.nonce > limit {
+            self.rejected_nonce_too_far += 1;
             return Err(ChainError::NonceTooFarAhead {
                 account: tx.author,
                 got: tx.nonce,
@@ -262,6 +301,7 @@ impl Mempool {
                         }
                     }
                 } else {
+                    self.rejected_replace_fee += 1;
                     return Err(ChainError::FeeTooLowToReplace {
                         author: tx.author,
                         nonce: tx.nonce,
@@ -274,6 +314,7 @@ impl Mempool {
         let is_new = !self.pending.contains_key(&h);
         if is_new {
             if self.pending.len() >= self.capacity {
+                self.rejected_full += 1;
                 return Err(ChainError::MempoolFull {
                     capacity: self.capacity,
                 });
@@ -606,6 +647,8 @@ mod tests {
             Err(ChainError::MempoolFull { capacity: 1 })
         ));
         assert_eq!(mp.len(), 1);
+        // M162: the capacity rejection is counted; the admission is not.
+        assert_eq!(mp.rejected_full(), 1);
     }
 
     #[test]
@@ -820,6 +863,8 @@ mod tests {
                 limit: 2
             })
         ));
+        // M162: the window rejection is counted.
+        assert_eq!(mp.rejected_nonce_too_far(), 1);
         // commit nonce 0 so the account advances to nonce 1.
         mp.insert(&chain, tx_nonce(1, 1, 1, 2 * MICRO, 0)).unwrap();
         let mut blk = mp.build_block(&chain, 1.0).unwrap();
@@ -837,6 +882,9 @@ mod tests {
                 got: 0
             })
         ));
+        // M162: the replay rejection is counted (independently of the window counter).
+        assert_eq!(mp.rejected_bad_nonce(), 1);
+        assert_eq!(mp.rejected_nonce_too_far(), 1);
     }
 
     #[test]
@@ -903,6 +951,8 @@ mod tests {
             })
         ));
         assert_eq!(mp.len(), 1, "incumbent (fee 5) stays");
+        // M162: both under-bid replacements are counted.
+        assert_eq!(mp.rejected_replace_fee(), 2);
     }
 
     #[test]

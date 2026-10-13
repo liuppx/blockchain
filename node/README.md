@@ -1341,6 +1341,21 @@ M116 的 `node rpc` 只能 GET。M117 补上写侧，让它成为**全能** RPC 
 
 **已知边界（顺延至 M121+）**：身份读三类已齐（`/genesis` 链 / `/node` 节点 / `/info` 链尖）；读面两分（`/params`/`/config`）已齐；RPC 自带端点发现 + 全能客户端 + 完整链读/写面；内容协商三轴已齐（仅 `identity`，真压缩顺延）；离线工具篮子已补；运维篮子剩余：证书/密钥轮换与落盘、follower 认证、指标端 TLS、OTel/push exporter、每-sink 独立 rotation 覆盖、时延直方图、bearer 失败响应延迟 jitter；keygen 篮子剩余：助记词 / BIP-39、口令加密 keystore、密钥轮换；剩余：游标分页、未知方法 `405`；共识 / wire 篮子（破 head 不变量）：**货币费用** + 费用优先排序、nonce / 序列号反重放。
 
+## mempool 剩余拒绝路径计数指标（Milestone 162 · 反垃圾可观测收尾）
+
+M161 补了 min-fee floor 的 counter，但 mempool 另外四条 opt-in 拒路径仍无计数——运维无从判断 `[mempool] capacity / nonce_lookahead / replace_by_fee` 及反重放实际拦了多少。M162 一次性补齐，全部照 M161 范式（mempool 内部 `rejected_*: u64` + getter → `Metrics` 字段 → `render_prometheus` counter，**仅 `insert` 路径计数**）。
+
+- **四个新 counter**（`mempool.rs` 字段 + getter + `insert` 返 `Err` 前 `+= 1`；`daemon.rs` Metrics 字段 + `Cmd::Metrics` 填充 + 渲染）：
+  - `zhixing_txs_full_rejected_total`（M54 容量满 `MempoolFull`）
+  - `zhixing_txs_bad_nonce_rejected_total`（stale/replay nonce `BadNonce`）
+  - `zhixing_txs_nonce_too_far_rejected_total`（M143 流水线窗口外 `NonceTooFarAhead`）
+  - `zhixing_txs_replace_fee_rejected_total`（M144 RBF 出价不够 `FeeTooLowToReplace`）
+- （M57 `AccountQuotaFull` 的 `zhixing_txs_quota_rejected_total` 早已存在，不重复。）
+- **顺序**：render 里按 `insert` 内拒绝触发顺序排（min-fee→capacity→bad-nonce→too-far→replace-fee），便于对照代码。
+- **不碰** apply/codec/wire/共识；opt-in 关闭时新计数恒 0、metrics 默认关；localnet 头仍 wire v1 `a045426e…3b87bc`。
+- **测试（+0 → 624）**：扩展既有 `insert_rejects_when_at_capacity`（`rejected_full()==1`）/`pipeline_rejects_stale_and_too_far_ahead`（`rejected_nonce_too_far()==1`、`rejected_bad_nonce()==1`）/`rbf_rejects_not_higher_fee`（`rejected_replace_fee()==2`）+ `render_prometheus_emits_counters`（四新 counter 入期望表）。
+- **已知边界**：boot 起单调累加（Prometheus counter，重启归零用 `rate()`）；仅 `insert` 计数不含块级。401 鉴权失败计数、bearer 失败延迟 jitter、`_created` 时间戳属后续篮子。
+
 ## min-fee 拒绝计数指标（Milestone 161 · mempool 反垃圾可观测）
 
 M157 的最低费用门槛（`[mempool] min_fee`）在 `insert` 最前置拒掉低于门槛的 tx，但这条拒绝路径此前**无计数**——运维无法从 `/metrics` 看出门槛实际拦了多少 tx。相邻两条拒绝路径都已有计数器（M54 速率限制 `zhixing_txs_rate_limited_total`、M57 配额 `zhixing_txs_quota_rejected_total`）。M161 补齐第三条，暴露 `zhixing_txs_min_fee_rejected_total`。
