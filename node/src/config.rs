@@ -443,6 +443,14 @@ pub struct MetricsConfig {
     /// readable by anyone who can reach the port.
     #[serde(default)]
     pub auth_token: String,
+    /// M164: optional encryption-only TLS for this endpoint. Off by default (the
+    /// M37 plaintext behavior); `true` ⇒ every accepted connection is wrapped in
+    /// TLS using an ephemeral self-signed cert — mirrors `[network] enable_tls` for
+    /// the P2P transport. A scraper must connect via TLS (e.g. trust-on-first-use
+    /// or `AcceptAnyServerCert`); a plaintext probe of the port fails the TLS
+    /// handshake. Ephemeral cert rotates on every restart, matching P2P.
+    #[serde(default)]
+    pub enable_tls: bool,
 }
 
 impl Default for MetricsConfig {
@@ -451,6 +459,7 @@ impl Default for MetricsConfig {
             enabled: false,
             listen: "127.0.0.1:9600".into(),
             auth_token: String::new(),
+            enable_tls: false,
         }
     }
 }
@@ -484,6 +493,14 @@ pub struct RpcConfig {
     /// every `GET`, plus the read-only `POST /batch`/`/validate` — stay public).
     #[serde(default)]
     pub auth_token: String,
+    /// M164: optional encryption-only TLS for this endpoint. Off by default (the
+    /// M53 plaintext behavior); `true` ⇒ every accepted connection is wrapped in
+    /// TLS using an ephemeral self-signed cert. A submitter must connect via TLS;
+    /// a plaintext probe fails the handshake. Composable with `auth_token` (TLS
+    /// encrypts the bearer token so it's no longer sniffable). Ephemeral cert
+    /// rotates on every restart, matching `[network] enable_tls`.
+    #[serde(default)]
+    pub enable_tls: bool,
 }
 
 impl Default for RpcConfig {
@@ -492,6 +509,7 @@ impl Default for RpcConfig {
             enabled: false,
             listen: "127.0.0.1:9700".into(),
             auth_token: String::new(),
+            enable_tls: false,
         }
     }
 }

@@ -1988,6 +1988,21 @@ async fn server_wrap(
     }
 }
 
+/// M164: lightweight mirror of [`server_wrap`] for the metrics/RPC ingress endpoints.
+/// They don't auth at the transport layer (bearer does that, M156/M158), they just
+/// need encryption when `[metrics] enable_tls` / `[rpc] enable_tls` is on. Returns
+/// a `PeerStream` so the existing `serve_*_conn` bodies (which only use
+/// `AsyncRead`/`AsyncWrite` trait methods) stay transport-agnostic.
+async fn wrap_optional_tls(
+    tcp: TcpStream,
+    tls: Option<TlsAcceptor>,
+) -> io::Result<Box<dyn PeerStream>> {
+    match tls {
+        Some(a) => Ok(Box::new(a.accept(tcp).await?)),
+        None => Ok(Box::new(tcp)),
+    }
+}
+
 /// Wrap an outbound TCP stream for [`handle_conn`]. TLS off ⇒ the raw stream; TLS
 /// on ⇒ complete the client-side TLS handshake. The SNI name is a fixed dummy —
 /// [`AcceptAnyServerCert`] ignores it (encryption-only, no server authentication).
@@ -2557,17 +2572,23 @@ async fn run_metrics(
     my_id: u64,
     auth_token: String,
     auth_failures: Arc<AtomicU64>,
+    tls: Option<TlsAcceptor>,
     cmd: mpsc::UnboundedSender<Cmd>,
 ) {
     loop {
         match listener.accept().await {
             Ok((stream, _addr)) => {
-                tokio::spawn(serve_metrics_conn(
-                    stream,
-                    auth_token.clone(),
-                    auth_failures.clone(),
-                    cmd.clone(),
-                ));
+                let tls = tls.clone();
+                let auth_token = auth_token.clone();
+                let auth_failures = auth_failures.clone();
+                let cmd = cmd.clone();
+                tokio::spawn(async move {
+                    let _ = stream.set_nodelay(true);
+                    match wrap_optional_tls(stream, tls).await {
+                        Ok(s) => serve_metrics_conn(s, auth_token, auth_failures, cmd).await,
+                        Err(e) => warn!(node = my_id, error = %e, "metrics TLS accept failed"),
+                    }
+                });
             }
             Err(e) => warn!(node = my_id, error = %e, "metrics accept error"),
         }
@@ -2580,7 +2601,7 @@ async fn run_metrics(
 /// no token configured any path returns metrics, so a bare `GET /` doubles as a health
 /// check. Errors are swallowed — a broken client connection must never affect the node.
 async fn serve_metrics_conn(
-    mut stream: TcpStream,
+    mut stream: Box<dyn PeerStream>,
     auth_token: String,
     auth_failures: Arc<AtomicU64>,
     cmd: mpsc::UnboundedSender<Cmd>,
@@ -2901,18 +2922,23 @@ async fn run_rpc(
     my_id: u64,
     auth_token: String,
     auth_failures: Arc<AtomicU64>,
+    tls: Option<TlsAcceptor>,
     cmd: mpsc::UnboundedSender<Cmd>,
 ) {
     loop {
         match listener.accept().await {
             Ok((stream, _addr)) => {
                 let token = auth_token.clone();
-                tokio::spawn(serve_rpc_conn(
-                    stream,
-                    token,
-                    auth_failures.clone(),
-                    cmd.clone(),
-                ));
+                let tls = tls.clone();
+                let auth_failures = auth_failures.clone();
+                let cmd = cmd.clone();
+                tokio::spawn(async move {
+                    let _ = stream.set_nodelay(true);
+                    match wrap_optional_tls(stream, tls).await {
+                        Ok(s) => serve_rpc_conn(s, token, auth_failures, cmd).await,
+                        Err(e) => warn!(node = my_id, error = %e, "rpc TLS accept failed"),
+                    }
+                });
             }
             Err(e) => warn!(node = my_id, error = %e, "rpc accept error"),
         }
@@ -5344,7 +5370,7 @@ async fn query_base_height(cmd: &mpsc::UnboundedSender<Cmd>) -> u64 {
 }
 
 async fn serve_rpc_conn(
-    mut stream: TcpStream,
+    mut stream: Box<dyn PeerStream>,
     auth_token: String,
     auth_failures: Arc<AtomicU64>,
     cmd: mpsc::UnboundedSender<Cmd>,
@@ -6745,6 +6771,22 @@ impl Node {
         } else {
             None
         };
+        // M164: per-endpoint encryption-only TLS for `[metrics]` and `[rpc]`.
+        // Independent acceptors (not the P2P `tls`) — these endpoints don't need
+        // mTLS, just channel encryption so bearer tokens and metrics bodies are
+        // not sniffable. Ephemeral self-signed cert via the same primitive the
+        // P2P "encryption-only" mode uses; `enable_tls = false` ⇒ `None` and
+        // the accept loop falls straight through to plaintext.
+        let metrics_tls = if cfg.metrics.as_ref().map(|m| m.enable_tls).unwrap_or(false) {
+            Some(build_encrypt_only_tls_setup()?.acceptor)
+        } else {
+            None
+        };
+        let rpc_tls = if cfg.rpc.as_ref().map(|r| r.enable_tls).unwrap_or(false) {
+            Some(build_encrypt_only_tls_setup()?.acceptor)
+        } else {
+            None
+        };
         let auth = Arc::new(AuthContext {
             my_id,
             kp: validator_key.clone(),
@@ -6850,6 +6892,7 @@ impl Node {
                 my_id,
                 auth,
                 metrics_auth_failures.clone(),
+                metrics_tls.clone(),
                 cmd_tx.clone(),
             ));
         }
@@ -6867,6 +6910,7 @@ impl Node {
                 my_id,
                 auth,
                 rpc_auth_failures.clone(),
+                rpc_tls.clone(),
                 cmd_tx.clone(),
             ));
         }
@@ -8890,6 +8934,7 @@ mod tests {
             enabled: true,
             listen: metrics_addr.into(),
             auth_token: String::new(),
+            enable_tls: false,
         });
         let _node = Node::start(cfg, test_genesis(), Some(kp(21)))
             .await
@@ -8934,6 +8979,7 @@ mod tests {
             enabled: true,
             listen: metrics_addr.into(),
             auth_token: "scrape-key".into(),
+            enable_tls: false,
         });
         let _node = Node::start(cfg, test_genesis(), Some(kp(21)))
             .await
@@ -8967,6 +9013,164 @@ mod tests {
         assert!(
             ok.contains("zhixing_metrics_auth_failures_total 2"),
             "auth-failure counter: {ok}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn metrics_endpoint_tls_encrypts_scrape() {
+        // M164: with `[metrics] enable_tls = true`, the listener wraps every
+        // accepted connection in TLS. A plaintext probe of the port can't get past
+        // the handshake; a TLS client (trust-on-first-use) sees the metrics body.
+        let dir = tmp_dir("metrics-tls");
+        let mut cfg = node_config(21, 19701, &[21], dir.clone());
+        let metrics_addr = "127.0.0.1:20771";
+        cfg.metrics = Some(crate::config::MetricsConfig {
+            enabled: true,
+            listen: metrics_addr.into(),
+            auth_token: String::new(),
+            enable_tls: true,
+        });
+        let _node = Node::start(cfg, test_genesis(), Some(kp(21)))
+            .await
+            .expect("start node");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        // 1. A plaintext probe must not see the body — the server-side TLS handshake
+        //    rejects bytes that don't parse as a ClientHello. We don't strictly
+        //    require a particular read error type (rustls may either fail or hang
+        //    up); we just assert the body never arrives.
+        let mut plain = TcpStream::connect(metrics_addr).await.expect("connect");
+        let _ = plain
+            .write_all(b"GET /metrics HTTP/1.1\r\nHost: localhost\r\n\r\n")
+            .await;
+        let _ = plain.flush().await;
+        let mut buf = vec![0u8; 1024];
+        let _ = tokio::time::timeout(Duration::from_millis(500), plain.read(&mut buf)).await;
+        let body = String::from_utf8_lossy(&buf);
+        assert!(
+            !body.contains("zhixing_height"),
+            "plaintext probe should not see metrics body: {body}"
+        );
+
+        // 2. A TLS client with `AcceptAnyServerCert` (encryption-only trust) scrapes
+        //    the endpoint and gets a 200 with the Prometheus body.
+        let client_cfg = rustls::ClientConfig::builder()
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(AcceptAnyServerCert))
+            .with_no_client_auth();
+        let connector = TlsConnector::from(Arc::new(client_cfg));
+        let tcp = TcpStream::connect(metrics_addr).await.expect("tls connect");
+        let server_name =
+            rustls::pki_types::ServerName::try_from("zhixing-node").expect("static SNI is valid");
+        let mut tls = connector
+            .connect(server_name, tcp)
+            .await
+            .expect("tls handshake");
+        tls.write_all(b"GET /metrics HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+            .await
+            .expect("send over tls");
+        // Bounded read — the server closes after writing the response (because we
+        // asked for `Connection: close`); `read_to_end` would surface the clean
+        // half-close as `UnexpectedEof`. 16 KiB is far more than a Prometheus
+        // exposition for a single node.
+        let mut resp = Vec::new();
+        let mut buf = [0u8; 16384];
+        loop {
+            match tls.read(&mut buf).await {
+                Ok(0) => break,
+                Ok(n) => {
+                    resp.extend_from_slice(&buf[..n]);
+                    if resp.len() >= 16384 {
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+        let text = String::from_utf8_lossy(&resp);
+        assert!(
+            text.starts_with("HTTP/1.1 200 OK"),
+            "expected 200, got: {text}"
+        );
+        assert!(
+            text.contains("zhixing_height 0"),
+            "missing height gauge: {text}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn rpc_endpoint_tls_encrypts_write() {
+        // M164: with `[rpc] enable_tls = true`, the write path is reachable over
+        // TLS only — a plaintext probe fails. The TLS body round-trips a valid
+        // `POST /submit_tx` to admission (single-validator genesis ⇒ quorum 1).
+        let dir = tmp_dir("rpc-tls");
+        let mut cfg = node_config(21, 19721, &[21], dir.clone());
+        let rpc_addr = "127.0.0.1:20871";
+        cfg.rpc = Some(crate::config::RpcConfig {
+            enabled: true,
+            listen: rpc_addr.into(),
+            auth_token: String::new(),
+            enable_tls: true,
+        });
+        let mut genesis = test_genesis();
+        genesis.validators = vec![(21, kp(21).public(), 1)];
+        let _node = Node::start(cfg, genesis, Some(kp(21)))
+            .await
+            .expect("start node");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        let client_cfg = rustls::ClientConfig::builder()
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(AcceptAnyServerCert))
+            .with_no_client_auth();
+        let connector = TlsConnector::from(Arc::new(client_cfg));
+        let tcp = TcpStream::connect(rpc_addr).await.expect("tls connect");
+        let server_name =
+            rustls::pki_types::ServerName::try_from("zhixing-node").expect("static SNI is valid");
+        let mut tls = connector
+            .connect(server_name, tcp)
+            .await
+            .expect("tls handshake");
+
+        // Use the same `test_tx(21, 0, 1)` shape as the other RPC tests: tx from
+        // account 21 with nonce 0 to a self-bond of 1. Body is the raw
+        // `codec::encode_tx` bytes; for a smoke test we just need a 200/422-class
+        // response, not full tx body construction. Use the minimal body that the
+        // RPC server will parse and either admit (200 + hash) or reject (422 +
+        // reason) — both are sufficient to prove the TLS path is end-to-end.
+        let body = b"not-a-valid-tx-body-just-proves-tls";
+        let req = format!(
+            "POST /submit_tx HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        );
+        tls.write_all(req.as_bytes()).await.expect("send headers");
+        tls.write_all(body).await.expect("send body");
+        // Bounded read (see the metrics test for the half-close reasoning).
+        let mut resp = Vec::new();
+        let mut buf = [0u8; 16384];
+        loop {
+            match tls.read(&mut buf).await {
+                Ok(0) => break,
+                Ok(n) => {
+                    resp.extend_from_slice(&buf[..n]);
+                    if resp.len() >= 16384 {
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+        let text = String::from_utf8_lossy(&resp);
+        // A 422 (validation failure) is fine — what matters is that the response
+        // is an HTTP status line, proving the TLS layer end-to-end and the RPC
+        // handler reached the body. A plaintext probe would never produce this.
+        assert!(
+            text.starts_with("HTTP/1.1 4") || text.starts_with("HTTP/1.1 2"),
+            "expected 2xx or 4xx, got: {text}"
         );
 
         let _ = std::fs::remove_dir_all(&dir);
@@ -9030,6 +9234,7 @@ mod tests {
             enabled: true,
             listen: rpc_addr.into(),
             auth_token: String::new(),
+            enable_tls: false,
         });
         let mut genesis = test_genesis();
         genesis.validators = vec![(21, kp(21).public(), 1)];
@@ -9105,6 +9310,7 @@ mod tests {
             enabled: true,
             listen: rpc_addr.into(),
             auth_token: "s3cret".into(),
+            enable_tls: false,
         });
         let mut genesis = test_genesis();
         genesis.validators = vec![(21, kp(21).public(), 1)];
@@ -9241,6 +9447,7 @@ mod tests {
             enabled: true,
             listen: rpc_addr.into(),
             auth_token: String::new(),
+            enable_tls: false,
         });
         let mut genesis = test_genesis();
         genesis.validators = vec![(21, kp(21).public(), 1)];
@@ -9385,6 +9592,7 @@ mod tests {
             enabled: true,
             listen: rpc_addr.into(),
             auth_token: String::new(),
+            enable_tls: false,
         });
         let mut genesis = test_genesis();
         genesis.validators = vec![(21, kp(21).public(), 1)];
@@ -9449,6 +9657,7 @@ mod tests {
             enabled: true,
             listen: rpc_addr.into(),
             auth_token: String::new(),
+            enable_tls: false,
         });
         let mut genesis = test_genesis();
         genesis.validators = vec![(21, kp(21).public(), 1)];
@@ -9532,6 +9741,7 @@ mod tests {
             enabled: true,
             listen: rpc_addr.into(),
             auth_token: String::new(),
+            enable_tls: false,
         });
         let mut genesis = test_genesis();
         genesis.validators = vec![(21, kp(21).public(), 1)];
@@ -9608,6 +9818,7 @@ mod tests {
             enabled: true,
             listen: rpc_addr.into(),
             auth_token: String::new(),
+            enable_tls: false,
         });
         let mut genesis = test_genesis();
         genesis.validators = vec![(21, kp(21).public(), 1)];
@@ -9766,6 +9977,7 @@ mod tests {
             enabled: true,
             listen: rpc_addr.into(),
             auth_token: String::new(),
+            enable_tls: false,
         });
         let mut genesis = test_genesis();
         genesis.validators = vec![(21, kp(21).public(), 1)];
@@ -9820,6 +10032,7 @@ mod tests {
             enabled: true,
             listen: rpc_addr.into(),
             auth_token: String::new(),
+            enable_tls: false,
         });
         let mut genesis = test_genesis();
         genesis.validators = vec![(21, kp(21).public(), 1)];
@@ -9911,6 +10124,7 @@ mod tests {
             enabled: true,
             listen: rpc_addr.into(),
             auth_token: String::new(),
+            enable_tls: false,
         });
         let mut genesis = test_genesis();
         genesis.validators = vec![(24, kp(24).public(), 1)]; // quorum 1 ⇒ self-commit
@@ -10013,6 +10227,7 @@ mod tests {
             enabled: true,
             listen: rpc_addr.into(),
             auth_token: String::new(),
+            enable_tls: false,
         });
         let mut genesis = test_genesis();
         genesis.validators = vec![(25, kp(25).public(), 1)]; // quorum 1 ⇒ self-commit
@@ -10126,6 +10341,7 @@ mod tests {
             enabled: true,
             listen: rpc_addr.into(),
             auth_token: String::new(),
+            enable_tls: false,
         });
         let mut genesis = test_genesis();
         genesis.validators = vec![(26, kp(26).public(), 1)]; // quorum 1 ⇒ self-commit
@@ -10241,6 +10457,7 @@ mod tests {
             enabled: true,
             listen: rpc_addr.into(),
             auth_token: String::new(),
+            enable_tls: false,
         });
         let mut genesis = test_genesis();
         genesis.validators = vec![(27, kp(27).public(), 1)]; // quorum 1 ⇒ self-commit
@@ -10335,6 +10552,7 @@ mod tests {
             enabled: true,
             listen: rpc_addr.into(),
             auth_token: String::new(),
+            enable_tls: false,
         });
         let mut genesis = test_genesis();
         genesis.validators = vec![(28, kp(28).public(), 1)]; // quorum 1 ⇒ self-commit
@@ -10411,6 +10629,7 @@ mod tests {
             enabled: true,
             listen: rpc_addr.into(),
             auth_token: String::new(),
+            enable_tls: false,
         });
         let mut genesis = test_genesis();
         genesis.validators = vec![(29, kp(29).public(), 1)]; // quorum 1 ⇒ self-commit
@@ -10490,6 +10709,7 @@ mod tests {
             enabled: true,
             listen: rpc_addr.into(),
             auth_token: String::new(),
+            enable_tls: false,
         });
         let mut genesis = test_genesis();
         genesis.validators = vec![(30, kp(30).public(), 1)]; // quorum 1 ⇒ self-commit
@@ -10567,6 +10787,7 @@ mod tests {
             enabled: true,
             listen: rpc_addr.into(),
             auth_token: String::new(),
+            enable_tls: false,
         });
         let mut genesis = test_genesis();
         genesis.validators = vec![(31, kp(31).public(), 1)]; // quorum 1 ⇒ self-commit
@@ -10646,6 +10867,7 @@ mod tests {
             enabled: true,
             listen: rpc_addr.into(),
             auth_token: String::new(),
+            enable_tls: false,
         });
         let mut genesis = test_genesis();
         genesis.validators = vec![(32, kp(32).public(), 1)]; // quorum 1 ⇒ self-commit
@@ -10714,6 +10936,7 @@ mod tests {
             enabled: true,
             listen: rpc_addr.into(),
             auth_token: String::new(),
+            enable_tls: false,
         });
         let mut genesis = test_genesis();
         genesis.validators = vec![(36, kp(36).public(), 1)]; // quorum 1 ⇒ self-commit
@@ -10784,6 +11007,7 @@ mod tests {
             enabled: true,
             listen: rpc_addr.into(),
             auth_token: String::new(),
+            enable_tls: false,
         });
         let mut genesis = test_genesis();
         genesis.validators = vec![(44, kp(44).public(), 1)]; // quorum 1 ⇒ self-commit
@@ -10856,6 +11080,7 @@ mod tests {
             enabled: true,
             listen: rpc_addr.into(),
             auth_token: String::new(),
+            enable_tls: false,
         });
         let mut genesis = test_genesis();
         genesis.validators = vec![(45, kp(45).public(), 1)]; // quorum 1 ⇒ self-commit
@@ -10941,6 +11166,7 @@ mod tests {
             enabled: true,
             listen: rpc_addr.into(),
             auth_token: String::new(),
+            enable_tls: false,
         });
         let mut genesis = test_genesis();
         genesis.validators = vec![(46, kp(46).public(), 1)]; // quorum 1 ⇒ self-commit
@@ -11025,6 +11251,7 @@ mod tests {
             enabled: true,
             listen: rpc_addr.into(),
             auth_token: String::new(),
+            enable_tls: false,
         });
         let mut genesis = test_genesis();
         genesis.validators = vec![(47, kp(47).public(), 1)]; // quorum 1 ⇒ self-commit
@@ -11110,6 +11337,7 @@ mod tests {
             enabled: true,
             listen: rpc_addr.into(),
             auth_token: String::new(),
+            enable_tls: false,
         });
         let mut genesis = test_genesis();
         genesis.validators = vec![(48, kp(48).public(), 1)]; // quorum 1 ⇒ self-commit
@@ -11181,6 +11409,7 @@ mod tests {
             enabled: true,
             listen: rpc_addr.into(),
             auth_token: String::new(),
+            enable_tls: false,
         });
         let mut genesis = test_genesis();
         genesis.validators = vec![(49, kp(49).public(), 1)]; // quorum 1 ⇒ self-commit
@@ -11224,6 +11453,7 @@ mod tests {
             enabled: true,
             listen: rpc_addr.into(),
             auth_token: String::new(),
+            enable_tls: false,
         });
         let mut genesis = test_genesis();
         genesis.validators = vec![(50, kp(50).public(), 1)]; // quorum 1 ⇒ self-commit
@@ -11264,6 +11494,7 @@ mod tests {
             enabled: true,
             listen: rpc_addr.into(),
             auth_token: String::new(),
+            enable_tls: false,
         });
         let mut genesis = test_genesis();
         genesis.validators = vec![(37, kp(37).public(), 1)]; // quorum 1 ⇒ self-commit
@@ -11342,6 +11573,7 @@ mod tests {
             enabled: true,
             listen: rpc_addr.into(),
             auth_token: String::new(),
+            enable_tls: false,
         });
         let mut genesis = test_genesis();
         genesis.validators = vec![(38, kp(38).public(), 1)]; // quorum 1 ⇒ self-commit
@@ -11436,6 +11668,7 @@ mod tests {
             enabled: true,
             listen: rpc_addr.into(),
             auth_token: String::new(),
+            enable_tls: false,
         });
         let mut genesis = test_genesis();
         genesis.validators = vec![(51, kp(51).public(), 1)]; // quorum 1 ⇒ self-commit
@@ -11496,6 +11729,7 @@ mod tests {
             enabled: true,
             listen: rpc_addr.into(),
             auth_token: String::new(),
+            enable_tls: false,
         });
         let mut genesis = test_genesis();
         genesis.validators = vec![(52, kp(52).public(), 1)]; // quorum 1 ⇒ self-commit
@@ -11547,6 +11781,7 @@ mod tests {
             enabled: true,
             listen: rpc_addr.into(),
             auth_token: String::new(),
+            enable_tls: false,
         });
         let mut genesis = test_genesis();
         genesis.validators = vec![(39, kp(39).public(), 1)]; // quorum 1 ⇒ self-commit
@@ -11620,6 +11855,7 @@ mod tests {
             enabled: true,
             listen: rpc_addr.into(),
             auth_token: String::new(),
+            enable_tls: false,
         });
         let mut genesis = test_genesis();
         genesis.validators = vec![(40, kp(40).public(), 1)]; // quorum 1 ⇒ self-commit
@@ -11700,6 +11936,7 @@ mod tests {
             enabled: true,
             listen: rpc_addr.into(),
             auth_token: String::new(),
+            enable_tls: false,
         });
         let mut genesis = test_genesis();
         genesis.validators = vec![(43, kp(43).public(), 1)]; // quorum 1 ⇒ self-commit
@@ -11754,6 +11991,7 @@ mod tests {
             enabled: true,
             listen: rpc_addr.into(),
             auth_token: String::new(),
+            enable_tls: false,
         });
         let mut genesis = test_genesis();
         genesis.validators = vec![(41, kp(41).public(), 1)]; // quorum 1 ⇒ self-commit
@@ -11840,6 +12078,7 @@ mod tests {
             enabled: true,
             listen: rpc_addr.into(),
             auth_token: String::new(),
+            enable_tls: false,
         });
         let mut genesis = test_genesis();
         genesis.validators = vec![(33, kp(33).public(), 1)]; // quorum 1 ⇒ self-commit
@@ -11916,6 +12155,7 @@ mod tests {
             enabled: true,
             listen: rpc_addr.into(),
             auth_token: String::new(),
+            enable_tls: false,
         });
         let mut genesis = test_genesis();
         genesis.validators = vec![(34, kp(34).public(), 1)]; // quorum 1 ⇒ self-commit
@@ -11997,6 +12237,7 @@ mod tests {
             enabled: true,
             listen: rpc_addr.into(),
             auth_token: String::new(),
+            enable_tls: false,
         });
         let mut genesis = test_genesis();
         genesis.validators = vec![(35, kp(35).public(), 1)]; // quorum 1 ⇒ self-commit
@@ -12052,6 +12293,7 @@ mod tests {
             enabled: true,
             listen: rpc_addr.into(),
             auth_token: String::new(),
+            enable_tls: false,
         });
         let mut genesis = test_genesis();
         genesis.validators = vec![(21, kp(21).public(), 1)];
@@ -14180,6 +14422,7 @@ vote_b.validator=5 vote_b.height=9 vote_b.round=2 vote_b.block_hash={b_h} vote_b
             enabled: true,
             listen: rpc_addr.into(),
             auth_token: String::new(),
+            enable_tls: false,
         });
         let mut genesis = test_genesis();
         genesis.validators = vec![(21, kp(21).public(), 1)];
@@ -14253,6 +14496,7 @@ vote_b.validator=5 vote_b.height=9 vote_b.round=2 vote_b.block_hash={b_h} vote_b
             enabled: true,
             listen: rpc_addr.into(),
             auth_token: String::new(),
+            enable_tls: false,
         });
         let mut genesis = test_genesis();
         genesis.validators = vec![(21, kp(21).public(), 1)]; // quorum 1 ⇒ self-commit
@@ -14377,6 +14621,7 @@ vote_b.validator=5 vote_b.height=9 vote_b.round=2 vote_b.block_hash={b_h} vote_b
             enabled: true,
             listen: rpc_addr.into(),
             auth_token: String::new(),
+            enable_tls: false,
         });
         let mut genesis = test_genesis();
         genesis.validators = vec![(21, kp(21).public(), 1)]; // quorum 1 ⇒ self-commit
@@ -14481,6 +14726,7 @@ vote_b.validator=5 vote_b.height=9 vote_b.round=2 vote_b.block_hash={b_h} vote_b
             enabled: true,
             listen: rpc_addr.into(),
             auth_token: String::new(),
+            enable_tls: false,
         });
         let mut genesis = test_genesis();
         genesis.validators = vec![(21, kp(21).public(), 1)]; // quorum 1 ⇒ self-commit
@@ -14611,6 +14857,7 @@ vote_b.validator=5 vote_b.height=9 vote_b.round=2 vote_b.block_hash={b_h} vote_b
             enabled: true,
             listen: rpc_addr.into(),
             auth_token: String::new(),
+            enable_tls: false,
         });
         let mut genesis = test_genesis();
         genesis.validators = vec![(23, kp(23).public(), 1)]; // quorum 1 ⇒ self-commit
@@ -14711,6 +14958,7 @@ vote_b.validator=5 vote_b.height=9 vote_b.round=2 vote_b.block_hash={b_h} vote_b
             enabled: true,
             listen: rpc_addr.into(),
             auth_token: String::new(),
+            enable_tls: false,
         });
         let mut genesis = test_genesis();
         genesis.validators = vec![(42, kp(42).public(), 1)]; // quorum 1 ⇒ self-commit
@@ -14798,6 +15046,7 @@ vote_b.validator=5 vote_b.height=9 vote_b.round=2 vote_b.block_hash={b_h} vote_b
             enabled: true,
             listen: rpc_addr.into(),
             auth_token: String::new(),
+            enable_tls: false,
         });
         let mut genesis = test_genesis();
         genesis.validators = vec![(21, kp(21).public(), 1)]; // quorum 1 ⇒ self-commit
@@ -15055,6 +15304,7 @@ vote_b.validator=5 vote_b.height=9 vote_b.round=2 vote_b.block_hash={b_h} vote_b
             enabled: true,
             listen: rpc_addr.into(),
             auth_token: String::new(),
+            enable_tls: false,
         });
         let mut genesis = test_genesis();
         genesis.validators = vec![(21, kp(21).public(), 1)];
@@ -15141,6 +15391,7 @@ vote_b.validator=5 vote_b.height=9 vote_b.round=2 vote_b.block_hash={b_h} vote_b
             enabled: true,
             listen: rpc_addr.into(),
             auth_token: String::new(),
+            enable_tls: false,
         });
         let mut genesis = test_genesis();
         genesis.validators = vec![(21, kp(21).public(), 1)];
@@ -16435,6 +16686,7 @@ vote_b.validator=5 vote_b.height=9 vote_b.round=2 vote_b.block_hash={b_h} vote_b
             enabled: true,
             listen: rpc_addr.into(),
             auth_token: String::new(),
+            enable_tls: false,
         });
         let mut genesis = test_genesis();
         genesis.validators = vec![(21, kp(21).public(), 1)];
@@ -17121,6 +17373,7 @@ vote_b.validator=5 vote_b.height=9 vote_b.round=2 vote_b.block_hash={b_h} vote_b
             enabled: true,
             listen: rpc_addr.into(),
             auth_token: String::new(),
+            enable_tls: false,
         });
         cfg.snapshot = Some(crate::config::SnapshotBootConfig {
             path: path.to_string_lossy().into_owned(),

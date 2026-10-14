@@ -1341,6 +1341,21 @@ M116 的 `node rpc` 只能 GET。M117 补上写侧，让它成为**全能** RPC 
 
 **已知边界（顺延至 M121+）**：身份读三类已齐（`/genesis` 链 / `/node` 节点 / `/info` 链尖）；读面两分（`/params`/`/config`）已齐；RPC 自带端点发现 + 全能客户端 + 完整链读/写面；内容协商三轴已齐（仅 `identity`，真压缩顺延）；离线工具篮子已补；运维篮子剩余：证书/密钥轮换与落盘、follower 认证、指标端 TLS、OTel/push exporter、每-sink 独立 rotation 覆盖、时延直方图、bearer 失败响应延迟 jitter；keygen 篮子剩余：助记词 / BIP-39、口令加密 keystore、密钥轮换；剩余：游标分页、未知方法 `405`；共识 / wire 篮子（破 head 不变量）：**货币费用** + 费用优先排序、nonce / 序列号反重放。
 
+## `/metrics` + RPC 端点可选 TLS（Milestone 164 · 端点加密）
+
+M156/M158/M160/M163 把 bearer 鉴权 + 常时比较 + 401 计数做齐了，但 token 走**明文 HTTP** 传输，嗅探者可在客户端 ↔ 节点链路上截获重放。M164 给 `[metrics]` 与 `[rpc]` 各加 `enable_tls: bool`（opt-in 默认关），**复用** M41 已有的 `build_encrypt_only_tls_setup`（ephemeral 自签 cert + `AcceptAnyServerCert`），client 配 trust-on-first-use / pin-by-hash。
+
+- **复用 P2P seam**：`trait PeerStream: AsyncRead+AsyncWrite+Unpin+Send`（`daemon.rs:268`）已存在；新 `wrap_optional_tls(tcp, Option<TlsAcceptor>) -> Box<dyn PeerStream>` 镜像 `server_wrap` 减去 `AuthContext`/channel-binding 包袱（ingress 端点不验身份，只加密）。
+- **签名改动**（`daemon.rs`）：`run_metrics`/`run_rpc` 各加 `tls: Option<TlsAcceptor>` 参 + accept loop 用 `wrap_optional_tls`；`serve_metrics_conn`/`serve_rpc_conn` 收 `Box<dyn PeerStream>` 而非 `TcpStream`（函数体只用 trait 方法，内部零改动）。
+- **`Node::start`**（`daemon.rs`）：照 P2P `tls` 范式在 metrics/RPC 各构造独立 acceptor（`Some(build_encrypt_only_tls_setup()?.acceptor)`）——不复用 P2P 那个，避免 P2P `MtlsMaterial` 把 ingress 一起拉成 mTLS。
+- **Config**（`config.rs`）：`MetricsConfig`/`RpcConfig` 各加 `pub enable_tls: bool`（`#[serde(default)]` 默认 `false`），Default + 既有测试字面量同步。
+- **不引 mTLS**：ingress 端点只加密（`AcceptAnyServerCert`）；bearer token 仍是身份断言层。P2P `MtlsMaterial` 不动。
+- **不碰** 共识/codec/wire/P2P transport；端点 TLS 默认关 ⇒ 既有 624 测零回归；localnet 头仍 wire v1 `a045426e…3b87bc`。
+- **测试（+2 → 626）**：
+  - `metrics_endpoint_tls_encrypts_scrape`——`enable_tls=true` 后：(a) 明文 probe 拿不到 `zhixing_height`（TLS handshake 拒）；(b) TLS client（`rustls::ClientConfig::builder().dangerous().with_custom_certificate_verifier(AcceptAnyServerCert).with_no_client_auth()`）连接 + `GET /metrics` ⇒ 200 + `zhixing_height 0`。
+  - `rpc_endpoint_tls_encrypts_write`——镜像：TLS 走 `POST /submit_tx`，断言 2xx/4xx（验证 body 到 RPC handler，端到端 TLS 通）。
+- **已知边界**：ephemeral cert 每次重启变（与 P2P 一致）——scraper/client 须 trust-on-first-use 或 pin-by-hash；mTLS/`require_client_cert`、持久 cert（`tls_cert_path`/`tls_key_path`）属后续篮子；轻节点 RPC TLS 同属后续。
+
 ## 401 鉴权失败计数指标（Milestone 163 · auth 层可观测）
 
 M156/M158 给 RPC 写路径与 `/metrics` 加了可选 bearer 鉴权，M160 把比较改常时。但鉴权失败（401）本身无计数——运维看不到有多少请求因缺/错 token 被拒，无法从 `/metrics` 察觉凭证配置错误或正被扫探。M161/M162 刚把 mempool 五条拒绝路径都加了 counter；M163 把同样的可观测性延伸到 auth 层。
