@@ -650,6 +650,28 @@ impl Block {
 
 // --- State -------------------------------------------------------------------
 
+/// M183 (whitepaper §6.1): a **cNFT — cognitive contribution certificate**.
+/// Minted (one per accepted submission) alongside the $COG reward and the
+/// cognitive-graph node, binding the *contributor* to *that* contribution — the
+/// per-contribution record the account's aggregate `accepted`/`earned_total`
+/// counters don't give. Keyed in [`ChainState::contributions`] by the graph
+/// `node_id` the same accept produced (1 accept = 1 graph node = 1 cNFT), so a
+/// cNFT points at its cognitive-graph node. **Non-transferable (soulbound) by
+/// construction**: there is no op to move it — `contributor` is permanent.
+/// Append-only and folded into `state_root` so it is authenticated consensus
+/// state (a snapshot-synced node recovers the identical set).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Cnft {
+    /// The account that authored the accepted submission.
+    pub contributor: u64,
+    /// The submission's cognitive domain.
+    pub domain: u32,
+    /// The $COG (micro) minted for this contribution (`base_emission × ΔK`).
+    pub reward_micro: u64,
+    /// The height at which this contribution was committed.
+    pub height: u64,
+}
+
 /// A withdrawal in flight: `amount` micro-$COG unbonded by `account`, returning
 /// to its balance once the chain reaches `mature_height`. Until then the funds
 /// are neither in a balance nor in the validator's power — they sit here, still
@@ -739,6 +761,11 @@ pub struct ChainState {
     pub accounts: BTreeMap<u64, Account>,
     pub reviewers: BTreeMap<u64, f32>, // reviewer id -> reputation
     pub graph: CognitiveGraph,
+    /// M183: cNFT cognitive-contribution certificates, keyed by the cognitive
+    /// graph `node_id` each accepted submission produced (1 accept = 1 node = 1
+    /// cNFT). Append-only (like `bridge_locks`), so a certificate reference stays
+    /// valid at any later height. Folded into `state_root`; non-transferable.
+    pub contributions: BTreeMap<u64, Cnft>,
     pub params: DeltaKParams,
     /// micro-$COG minted per unit ΔK (governance knob, B.2.3 / §5.1).
     pub base_emission_micro: u64,
@@ -1325,6 +1352,7 @@ impl ChainState {
             accounts,
             reviewers,
             graph,
+            contributions: BTreeMap::new(),
             params: g.params,
             base_emission_micro: g.base_emission_micro,
             slash_bps: g.slash_bps,
@@ -2190,7 +2218,21 @@ impl ChainState {
                 acct.accepted += 1;
             }
             self.supply += reward;
-            self.graph.add(tx.embedding, tx.domain);
+            // M183: minting the cognitive-graph node also mints a cNFT bound to
+            // the contributor. `graph.add` returns the new node_id (1 accept =
+            // 1 node = 1 cNFT). `self.height` is the pre-block height here (it is
+            // bumped only at the end of `apply_block_inner`), so `height + 1` is
+            // the height this block will commit at.
+            let node_id = self.graph.add(tx.embedding, tx.domain);
+            self.contributions.insert(
+                node_id,
+                Cnft {
+                    contributor: tx.author,
+                    domain: tx.domain,
+                    reward_micro: reward,
+                    height: self.height + 1,
+                },
+            );
             self.reward_reviewers(&tx.reviews, true);
             minted = reward;
             slashed = 0;
@@ -2271,6 +2313,17 @@ impl ChainState {
         for n in &self.graph.nodes {
             e.emb(&n.embedding);
             e.u32(n.domain);
+        }
+        // M183: cNFT contribution certificates are authenticated consensus state —
+        // fold them in so a snapshot-synced node can verify the identical set. Keyed
+        // by graph node_id; BTreeMap iterates sorted ⇒ canonical bytes.
+        e.u64(self.contributions.len() as u64);
+        for (node_id, c) in &self.contributions {
+            e.u64(*node_id);
+            e.u64(c.contributor);
+            e.u32(c.domain);
+            e.u64(c.reward_micro);
+            e.u64(c.height);
         }
         // validator set is consensus state: fold it into the root so a divergent
         // set (e.g. a missed on-chain update) yields a different state_root.
@@ -2365,6 +2418,11 @@ impl ChainState {
     /// Merkle root only and break the proof.
     pub fn merkle_root(&self) -> Hash {
         merkle::MerkleTree::from_leaf_hashes(self.merkle_leaves()).root()
+    }
+
+    /// M183: look up a cNFT contribution certificate by its graph `node_id`.
+    pub fn cnft(&self, node_id: u64) -> Option<&Cnft> {
+        self.contributions.get(&node_id)
     }
 
     /// Build an inclusion proof for `account_id` against [`Self::merkle_root`].
@@ -2968,6 +3026,68 @@ mod tests {
         assert!(r.minted > 0);
         assert!(chain.state.supply > start_supply); // reward minted
         assert!(chain.state.supply_conserved());
+    }
+
+    #[test]
+    fn accept_mints_a_cnft_and_reject_does_not() {
+        // M183: an accepted submission mints one cNFT bound to the contributor;
+        // a rejected (near-duplicate, ΔK=0) submission mints none.
+        let mut chain = Chain::new(base_genesis());
+        assert!(chain.state.contributions.is_empty());
+        let mut b = block(&chain, 1, vec![novel_tx(1, 1, 1, 1.0)]); // author 1, domain 1
+        let r = chain.commit(&mut b).unwrap();
+        assert_eq!(r.accepted, 1);
+        assert_eq!(chain.state.contributions.len(), 1, "one cNFT minted");
+        let (node_id, c) = chain.state.contributions.iter().next().unwrap();
+        assert_eq!(c.contributor, 1);
+        assert_eq!(c.domain, 1);
+        assert_eq!(c.reward_micro, r.minted, "cNFT records the minted reward");
+        assert_eq!(c.height, 1, "cNFT records the committing height");
+        // The cNFT is keyed by the graph node it accompanies.
+        assert!(chain.state.cnft(*node_id).is_some());
+
+        // A near-duplicate (same embedding in a seen domain ⇒ ΔK 0 ⇒ rejected)
+        // mints no new cNFT.
+        let dup = SubmissionTx {
+            author: 2,
+            embedding: unit(1.0, 0),
+            domain: 0, // domain 0 already seeded at genesis ⇒ novelty 0
+            stake: 2 * MICRO,
+            reviews: good_reviews(),
+            repl_success: 3,
+            repl_total: 3,
+            timestamp_days: 2.0,
+            signature: [0u8; 64],
+            fee: 0,
+            nonce: 0,
+        }
+        .signed(&kp(2));
+        let mut b2 = block(&chain, 2, vec![dup]);
+        let r2 = chain.commit(&mut b2).unwrap();
+        assert_eq!(r2.accepted, 0, "near-duplicate rejected");
+        assert_eq!(chain.state.contributions.len(), 1, "no cNFT for a reject");
+    }
+
+    #[test]
+    fn state_root_covers_contributions() {
+        // M183: cNFTs are folded into state_root, so two states differing only in
+        // their contribution set produce different roots (a snapshot-synced node
+        // can verify the set).
+        let base = Chain::new(base_genesis());
+        let r0 = base.state.state_root();
+        let mut more = base.state.clone();
+        more.contributions.insert(
+            7,
+            Cnft {
+                contributor: 1,
+                domain: 3,
+                reward_micro: 5 * MICRO,
+                height: 2,
+            },
+        );
+        assert_ne!(r0, more.state_root(), "a cNFT changes state_root");
+        // merkle_root (accounts_root) is unaffected — cNFTs are not in it.
+        assert_eq!(base.state.merkle_root(), more.merkle_root());
     }
 
     #[test]

@@ -1395,6 +1395,23 @@ M165 保留 3 端点（`/unbonding`/`/stake-ops`/`/evidence`）为 `next=` 是�
 - **测试（+1 → 631）**：新 `unbonding_entry_hash_is_stable_and_collision_safe`（4 断言：clone 等、改任一字段 hash 不同、32 字节长）；扩展 `rpc_unbonding_list_over_tcp`/`rpc_stake_ops_list_over_tcp`/`rpc_evidence_list_over_tcp` in-process 测改 `next`→`cursor`。
 - **已知边界**：`UnbondingEntry` 字段顺序（account/amount/mature_height）+ LE 字节序 = hash 格式的隐性契约；改字段顺序或加字段 = 改 hash 格式 = 旧 cursor 解析失败（文档说明）。`encode_unbonding` 真正的 codec 入口（若未来要把 UnbondingEntry 入 wire/快照/跨链）属后续篮子。
 
+## cNFT 认知贡献证书（Milestone 183 · 白皮书路线图 Phase 2）
+
+白皮书 §6.1 代币模型定义四种代币（$COG / $WATT / $FLOP / cNFT），节点已实现 $COG（ΔK 增发）。本轮做 **cNFT（认知贡献证书）**——"记录具体贡献，不可分割，按贡献铸造"（白皮书 §6.1 表 + Phase 2「cNFT 记录贡献者」）。
+
+**问题**：`apply_tx` 接受一笔提交时铸 $COG + 往认知图谱加一个 `GraphNode{node_id, embedding, domain}`，但图节点**不绑定贡献者**，账户只有聚合计数（`accepted`/`earned_total`）。没有"谁贡献了哪一笔"的链上记录。
+
+- **`Cnft { contributor, domain, reward_micro, height }`**（`lib.rs`）：一笔被接受提交的证书。`ChainState.contributions: BTreeMap<u64, Cnft>` 键为该次接受产生的认知图谱 `node_id`（`graph.add` 返回值，一次接受 = 一个图节点 = 一张 cNFT）。Append-only（照 `bridge_locks`）。
+- **铸造**（`apply_tx` 接受分支）：原先 `self.graph.add(...)` 的返回 id 被丢弃，现接住它并 `contributions.insert(node_id, Cnft{ contributor: tx.author, domain: tx.domain, reward_micro: reward, height: self.height + 1 })`。`self.height` 在 `apply_block_inner` 末尾才 bump，故 apply_tx 期间 `+1` 即本块将提交的高度。拒绝分支（ΔK=0）不铸。
+- **认证**（`state_root`）：折入 `contributions`（`node_id ‖ contributor ‖ domain ‖ reward_micro ‖ height`，BTreeMap 有序 ⇒ 规范字节）——cNFT 成为认证的共识状态，快照同步节点可验证完整集合。**不**入 `merkle_root`（accounts_root）：cNFT 的 typed SPV 证明留作后续。
+- **快照**（`codec.rs`）：`encode_snapshot`/`decode_snapshot` 加 contributions 段，`SNAPSHOT_VERSION` 2→3（旧 v2 被严格版本校验拒，重新 snap——pre-production）。
+- **非转让（soulbound）by construction**：没有转移 op，只铸不移；`contributor` 永久绑定。
+- **查询**：`ChainState::cnft(node_id) -> Option<&Cnft>`；`print_summary`/`demo` 显示 cNFT 总数（demo 4 图节点 = 1 创世种子 + 3 接受提交 → 3 张 cNFT；创世种子不是贡献，验证 cNFT 只跟贡献走）。
+- **无 wire 变更**：cNFT 是派生状态（由已接受提交确定性铸出），不经区块携带——不动 Block/BlockHeader/encode_block/gossip。
+- **state_root re-baseline**（加共识状态的预期代价，同 M122 性质）：有接受提交的链 state_root 移位——demo state_root `64184dab…`→`1db88ef6…2f28cc`、demo head→`db176f2d…`、localnet 头 `33cb2506…`→`e88b8b2d…`（均因 state_root 变→header 变）。**demo `merkle_root 5312ecf6…ee8c6b` 不变**（cNFT 不入 accounts_root）；`$COG` 增发/`supply_conserved` 不变（cNFT 纯加记录）。
+- **测试（+3 → 689）**：`accept_mints_a_cnft_and_reject_does_not`（接受铸 1、记四字段、按 node_id 可查；近重复拒绝不铸）+ `state_root_covers_contributions`（改 cNFT 集合改 state_root、merkle_root 不变）+ `snapshot_round_trips_contributions`（v3 encode→decode 保真 + state_root 复算一致）；M181 demo 守卫测更新为新 state_root（merkle_root 不变即证 cNFT 未入 accounts_root）。
+- **已知边界 / 非目标**：不做 typed SPV 证明（`ProofEntry::Cnft` / RPC 查询端点——像 reviewer 的 SPV 在 M24 才补，本轮 state_root 承诺 + 按 id 查询）；不做 $WATT/$FLOP/time_decay（其他路线图项）；不改 $COG 增发公式（经济不变）。
+
 ## pending keystore 交互式密码提示（Milestone 181）
 
 收尾 M180 留的小口：M180 的 pending 加密 keystore 只从 `ZHIXING_PENDING_KEYSTORE_PASSWORD` 读密码，缺失即硬失败——与活跃 keystore（M175 `read_keystore_password`：env 优先、否则交互 no-echo 提示）不一致。

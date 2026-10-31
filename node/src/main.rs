@@ -5536,6 +5536,7 @@ fn print_summary(chain: &Chain) {
     println!("supply           {} COG", cog(chain.state.supply));
     println!("treasury         {} COG", cog(chain.state.treasury));
     println!("graph nodes      {}", chain.state.graph.len());
+    println!("cNFTs            {}", chain.state.contributions.len());
     println!("supply conserved {}", chain.state.supply_conserved());
     println!("\naccounts:");
     for (id, a) in &chain.state.accounts {
@@ -5638,17 +5639,17 @@ mod tests {
     use super::*;
 
     /// M179 (doc-integrity guard): the `demo` chain's cert-signed STATE roots are
-    /// the canonical wire-v1 values the READMEs / whitepaper cite
-    /// (`state_root 64184dab…0070e6`, `merkle_root 5312ecf6…ee8c6b`). They are NOT
-    /// supposed to move on a header-only wire bump: M171 (B3) and M179 (B4) grew
-    /// the block *header* with per-body commitments, which changes the block
-    /// *hash* (the demo `head`) but leaves `state_root` / `accounts_root` untouched
-    /// for a chain with no bridge/rotation state. Pinning the two state roots here
-    /// means an accidental change to the demo's *state* — the kind that would
-    /// silently falsify the documented invariants — fails a test instead of
-    /// drifting unnoticed. The head (block hash) is deliberately NOT pinned; it
-    /// legitimately moves with every wire bump (see each wire-bump milestone's
-    /// README note).
+    /// M181/M183: guard the demo chain's cert-signed STATE roots against silent
+    /// drift. `merkle_root` (accounts_root) is the wire-v1 value the READMEs cite
+    /// (`5312ecf6…ee8c6b`) and must stay put — a header-only wire bump (M171 B3 /
+    /// M179 B4) changes the block *hash* (demo `head`), not the state roots, for a
+    /// chain with no bridge/rotation state. `state_root` is re-baselined by M183
+    /// (`1db88ef6…`): folding the cNFT contribution certificates into the digest
+    /// legitimately moved it (the demo accepts submissions → mints cNFTs). cNFTs
+    /// do NOT enter `accounts_root`, so `merkle_root` is unchanged — pinning both
+    /// catches an accidental, undocumented change to demo *state*. The head (block
+    /// hash) is deliberately NOT pinned; it moves with wire bumps and with this
+    /// state re-baseline.
     #[test]
     fn demo_chain_state_roots_match_the_documented_canon() {
         let mut chain = Chain::new(demo_genesis());
@@ -5658,7 +5659,7 @@ mod tests {
         }
         assert_eq!(
             hex(&chain.state.state_root()),
-            "64184dab08a3cac22d172378999fc5b7dc65cf7bb6251c8ff98f36601b0070e6"
+            "1db88ef6b1a6ff7088f547cf36d9b88b828eaf5fed2f2093207eea339d2f28cc"
         );
         assert_eq!(
             hex(&chain.state.merkle_root()),

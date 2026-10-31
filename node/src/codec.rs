@@ -1277,7 +1277,12 @@ pub fn decode_account(buf: &[u8]) -> Result<Account, CodecError> {
 /// `BridgeUnbond`. A v1 snapshot is now rejected (strict version check), so an
 /// operator must regenerate; this is pre-production and snapshots are
 /// disposable.
-pub const SNAPSHOT_VERSION: u32 = 2;
+///
+/// v3 (M183): the snapshot now also serializes `contributions` (the cNFT
+/// cognitive-contribution certificates), which M183 folded into `state_root`. A
+/// v2 snapshot would drop them on decode and fail the `state_root` cross-check,
+/// so v2 is now rejected — regenerate.
+pub const SNAPSHOT_VERSION: u32 = 3;
 
 /// Write the account's state fields into the shared stream (same layout as
 /// [`encode_account`], inlined so the snapshot controls framing).
@@ -1378,6 +1383,15 @@ pub fn encode_snapshot(s: &ChainState) -> Vec<u8> {
         e.u64(n.node_id);
         e.emb(&n.embedding);
         e.u32(n.domain);
+    }
+    // M183 (v3): cNFT contribution certificates, keyed by graph node_id.
+    e.u64(s.contributions.len() as u64);
+    for (node_id, c) in &s.contributions {
+        e.u64(*node_id);
+        e.u64(c.contributor);
+        e.u32(c.domain);
+        e.u64(c.reward_micro);
+        e.u64(c.height);
     }
     // bonds
     e.u64(s.bonds.len() as u64);
@@ -1488,6 +1502,25 @@ pub fn decode_snapshot(buf: &[u8]) -> Result<ChainState, CodecError> {
         });
     }
     let graph = CognitiveGraph { nodes };
+    // M183 (v3): cNFT contribution certificates, keyed by graph node_id.
+    let n = d.count()?;
+    let mut contributions = std::collections::BTreeMap::new();
+    for _ in 0..n {
+        let node_id = d.u64()?;
+        let contributor = d.u64()?;
+        let domain = d.u32()?;
+        let reward_micro = d.u64()?;
+        let height = d.u64()?;
+        contributions.insert(
+            node_id,
+            crate::Cnft {
+                contributor,
+                domain,
+                reward_micro,
+                height,
+            },
+        );
+    }
     // bonds
     let n = d.count()?;
     let mut bonds = std::collections::BTreeMap::new();
@@ -1563,6 +1596,7 @@ pub fn decode_snapshot(buf: &[u8]) -> Result<ChainState, CodecError> {
         accounts,
         reviewers,
         graph,
+        contributions,
         params,
         base_emission_micro,
         slash_bps,
@@ -3675,6 +3709,39 @@ mod tests {
         expected.insert((9u64, 0u64));
         assert_eq!(src.consumed_unbonds, expected);
         assert_eq!(encode_snapshot(&back), bytes, "re-encode stable");
+    }
+
+    #[test]
+    fn snapshot_round_trips_contributions() {
+        // M183 (v3): cNFT contribution certificates survive snapshot encode→decode
+        // (they are folded into state_root, so dropping them would fail the M135
+        // state_root cross-check on a snapshot boot).
+        let mut s = sample_state();
+        s.contributions.insert(
+            0,
+            crate::Cnft {
+                contributor: 1,
+                domain: 7,
+                reward_micro: 3 * MICRO,
+                height: 1,
+            },
+        );
+        s.contributions.insert(
+            4,
+            crate::Cnft {
+                contributor: 2,
+                domain: 9,
+                reward_micro: 11 * MICRO,
+                height: 5,
+            },
+        );
+        let bytes = encode_snapshot(&s);
+        let back = decode_snapshot(&bytes).expect("round-trips");
+        assert_eq!(back.contributions, s.contributions);
+        assert_eq!(back.cnft(4).unwrap().reward_micro, 11 * MICRO);
+        assert_eq!(encode_snapshot(&back), bytes, "re-encode stable");
+        // state_root is reproduced (the cross-check a snapshot boot relies on).
+        assert_eq!(back.state_root(), s.state_root());
     }
 
     #[test]
