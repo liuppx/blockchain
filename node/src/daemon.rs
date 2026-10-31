@@ -9918,7 +9918,7 @@ mod tests {
         // surfaces the admission result. A single-validator genesis (quorum 1)
         // keeps the node live; we assert on the mempool, not on a committed block.
         let dir = tmp_dir("submit-tx-handle");
-        let cfg = node_config(21, 19701, &[21], dir.clone());
+        let cfg = node_config(21, 21361, &[21], dir.clone());
         let mut genesis = test_genesis();
         genesis.validators = vec![(21, kp(21).public(), 1)];
         let node = Node::start(cfg, genesis, Some(kp(21)), None)
@@ -9951,7 +9951,7 @@ mod tests {
         // assert 200 + hash in the body; then confirm it entered the mempool.
         // A malformed body gets a 400.
         let dir = tmp_dir("rpc-endpoint");
-        let mut cfg = node_config(21, 19721, &[21], dir.clone());
+        let mut cfg = node_config(21, 21371, &[21], dir.clone());
         let rpc_addr = "127.0.0.1:19821";
         cfg.rpc = Some(crate::config::RpcConfig {
             enabled: true,
@@ -10028,7 +10028,7 @@ mod tests {
         // Reads (GET) stay public regardless of the token.
         let dir = tmp_dir("rpc-auth");
         let mut cfg = node_config(21, 20760, &[21], dir.clone());
-        let rpc_addr = "127.0.0.1:20771";
+        let rpc_addr = "127.0.0.1:21381";
         cfg.rpc = Some(crate::config::RpcConfig {
             enabled: true,
             listen: rpc_addr.into(),
