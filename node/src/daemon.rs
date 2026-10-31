@@ -70,7 +70,7 @@ use crate::light::{BatchItem, BatchResponseEnvelope, ProofEntry, ProofKind};
 use crate::net::{decode_gossip, encode_gossip, GossipMsg, GossipNode};
 use crate::round::{Action, Msg, RoundState, Step};
 use crate::store::{BlockLog, CertLog};
-use crate::{Account, Block, Genesis, Hash, Keypair, PubKey, SlashEvidence, SubmissionTx};
+use crate::{Account, Block, Cnft, Genesis, Hash, Keypair, PubKey, SlashEvidence, SubmissionTx};
 
 /// Hard cap on a single wire frame (16 MiB). The blocking `read_msg` has no cap
 /// (a hostile `u32` length would allocate up to 4 GiB); a real transport must.
@@ -483,6 +483,12 @@ enum Cmd {
     /// empty) list.
     QueryReviewers {
         reply: oneshot::Sender<Vec<(u64, f32)>>,
+    },
+    /// M184: list every cNFT (node_id + the `Cnft` record) for the plain read-class RPC
+    /// directory — the read sibling that surfaces the soulbound cognitive-contribution
+    /// certificates. Always a (possibly empty) node_id-sorted list.
+    QueryCnfts {
+        reply: oneshot::Sender<Vec<(u64, Cnft)>>,
     },
     /// M86: list all cognitive-graph nodes (node_id + domain + embedding) for the plain
     /// read-class RPC directory — the list sibling of the single `/graph/{id}` plain read.
@@ -1724,6 +1730,20 @@ async fn run_actor(mut actor: Actor, mut rx: mpsc::UnboundedReceiver<Cmd>) {
                     .map(|(&id, &r)| (id, r))
                     .collect();
                 let _ = reply.send(reviewers);
+            }
+            Cmd::QueryCnfts { reply } => {
+                // M184: snapshot the node_id-sorted cNFT map for the list directory. Keyed by
+                // the cognitive-graph node_id (one accepted submission = one graph node = one
+                // cNFT), so the keys are a stable, monotonic cursor space.
+                let cnfts = actor
+                    .node
+                    .chain
+                    .state
+                    .contributions
+                    .iter()
+                    .map(|(&id, c)| (id, c.clone()))
+                    .collect();
+                let _ = reply.send(cnfts);
             }
             Cmd::QueryGraphNodes { reply } => {
                 // M86: snapshot the insertion-ordered graph node vector (node_id == index).
@@ -3248,6 +3268,11 @@ enum GetRoute {
     /// M85: `GET /reviewers` — the plain (unverified) reviewer directory (id + reputation),
     /// the list sibling of `Plain(Reviewer, id)`.
     Reviewers,
+    /// M184: `GET /cnfts` — the plain (unverified) cNFT directory (node_id + contributor +
+    /// domain + reward_micro + height), the read sibling that exposes the soulbound
+    /// cognitive-contribution certificate bound to each accepted submission. No single-read
+    /// sibling yet.
+    Cnfts,
     /// M86: `GET /graph` — the plain (unverified) cognitive-graph directory (node_id +
     /// domain + embedding), the list sibling of `Plain(GraphNode, id)`.
     GraphNodes,
@@ -3660,6 +3685,9 @@ fn route_get(path: &str) -> GetRoute {
         // M85: the plain reviewer directory. Exact-match here, so it never collides with
         // the M60/M65 `/reviewer/` prefix below (`…reviewer` + `s`, not `…reviewer` + `/`).
         "/reviewers" => GetRoute::Reviewers,
+        // M184: the plain cNFT directory. Exact-match; there is no `/cnft/` single-read
+        // prefix, so `/cnfts/` simply falls through to `Health`.
+        "/cnfts" => GetRoute::Cnfts,
         // M86: the plain cognitive-graph directory. Exact-match; the `/graph/` prefix
         // (single reads/proofs) is handled in the fallthrough arm below, where `/graph/`
         // with an empty id already resolves to `NotFound`.
@@ -4249,6 +4277,7 @@ const READ_ROUTES: &[&str] = &[
     "/validators",
     "/accounts",
     "/reviewers",
+    "/cnfts",
     "/graph",
     "/bonds",
     "/unbonding",
@@ -4445,6 +4474,42 @@ fn json_reviewer_listing(reviewers: &[(u64, f32)]) -> String {
     let items = reviewers
         .iter()
         .map(|&(id, reputation)| json_entity(&EntityView::Reviewer { id, reputation }))
+        .collect::<Vec<_>>()
+        .join(",");
+    format!("[{items}]")
+}
+
+/// M184: render the cNFT directory as grep-friendly `key=value` lines, one per certificate
+/// (empty string when there are none). `node_id` is the cognitive-graph node the accept
+/// produced; `contributor`/`domain`/`reward_micro`/`height` are the soulbound record.
+fn format_cnft_listing(cnfts: &[(u64, Cnft)]) -> String {
+    cnfts
+        .iter()
+        .map(|(node_id, c)| {
+            format!(
+                "node_id={node_id} contributor={} domain={} reward_micro={} height={}",
+                c.contributor, c.domain, c.reward_micro, c.height
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// M184: `GET /cnfts?format=json` — the JSON sibling of [`format_cnft_listing`]. A JSON
+/// **array** of objects (`[]` when empty); u64 fields are strings per the house style.
+fn json_cnft_listing(cnfts: &[(u64, Cnft)]) -> String {
+    let items = cnfts
+        .iter()
+        .map(|(node_id, c)| {
+            format!(
+                "{{\"node_id\":{},\"contributor\":{},\"domain\":{},\"reward_micro\":{},\"height\":{}}}",
+                json_u64(*node_id),
+                json_u64(c.contributor),
+                json_u64(c.domain as u64),
+                json_u64(c.reward_micro),
+                json_u64(c.height),
+            )
+        })
         .collect::<Vec<_>>()
         .join(",");
     format!("[{items}]")
@@ -6228,6 +6293,44 @@ async fn serve_rpc_conn(
                                     total,
                                     cur.as_deref(),
                                 ),
+                            )
+                        }
+                        Err(_) => http_response("503 Service Unavailable", "node stopped"),
+                    }
+                }
+            }
+            GetRoute::Cnfts => {
+                // M184: plain cNFT directory — always a (possibly empty) `200`. Reuses the
+                // pagination stack keyed by node_id (a stable `?cursor=<node_id>` cursor),
+                // mirroring `/reviewers`, with the dedicated cNFT renderers.
+                let (reply, rx) = oneshot::channel();
+                if cmd.send(Cmd::QueryCnfts { reply }).is_err() {
+                    http_response("503 Service Unavailable", "node stopped")
+                } else {
+                    match rx.await {
+                        Ok(listing) => {
+                            let keys: Vec<u64> = listing.iter().map(|(id, _)| *id).collect();
+                            let cursor = usize_param(query, "cursor")
+                                .filter(|&c| c <= u64::MAX as usize)
+                                .map(|c| c as u64);
+                            let start = if cursor.is_some() {
+                                key_after(&keys, cursor.as_ref())
+                            } else {
+                                usize_param(query, "offset").unwrap_or(0)
+                            };
+                            let limit = effective_limit(usize_param(query, "limit"));
+                            let total = listing.len();
+                            let page = &listing[start..(start + limit).min(total)];
+                            let cur =
+                                last_key(&keys[start..(start + page.len())]).map(|k| k.to_string());
+                            ok_body(
+                                fmt,
+                                &format_page_cursor(
+                                    &format_cnft_listing(page),
+                                    total,
+                                    cur.as_deref(),
+                                ),
+                                &json_page_cursor(&json_cnft_listing(page), total, cur.as_deref()),
                             )
                         }
                         Err(_) => http_response("503 Service Unavailable", "node stopped"),
@@ -13953,6 +14056,47 @@ mod tests {
     }
 
     #[test]
+    fn cnft_listing_renders() {
+        // M184: the empty directory renders `""` (text) / `[]` (json); two cNFTs render one
+        // `key=value` line each (text) and a two-object array (json) with the soulbound
+        // record fields (node_id + contributor + domain + reward_micro + height).
+        assert_eq!(format_cnft_listing(&[]), "");
+        assert_eq!(json_cnft_listing(&[]), "[]");
+
+        let cnfts = vec![
+            (
+                0u64,
+                Cnft {
+                    contributor: 7,
+                    domain: 3,
+                    reward_micro: 500,
+                    height: 2,
+                },
+            ),
+            (
+                1u64,
+                Cnft {
+                    contributor: 7,
+                    domain: 4,
+                    reward_micro: 250,
+                    height: 5,
+                },
+            ),
+        ];
+
+        assert_eq!(
+            format_cnft_listing(&cnfts),
+            "node_id=0 contributor=7 domain=3 reward_micro=500 height=2\n\
+             node_id=1 contributor=7 domain=4 reward_micro=250 height=5",
+        );
+        assert_eq!(
+            json_cnft_listing(&cnfts),
+            "[{\"node_id\":\"0\",\"contributor\":\"7\",\"domain\":\"3\",\"reward_micro\":\"500\",\"height\":\"2\"},\
+             {\"node_id\":\"1\",\"contributor\":\"7\",\"domain\":\"4\",\"reward_micro\":\"250\",\"height\":\"5\"}]",
+        );
+    }
+
+    #[test]
     fn graph_listing_renders() {
         // M86: the empty directory renders `""` (text) / `[]` (json); two graph nodes render
         // one `format_entity`-shaped line each (text) and a two-object array (json), reusing
@@ -14210,6 +14354,14 @@ mod tests {
             route_get("/reviewer/10/proof"),
             GetRoute::Proof(ProofKind::Reviewer, 10)
         ));
+    }
+
+    #[test]
+    fn route_get_parses_cnfts() {
+        // M184: `/cnfts` is a plain directory read — an exact match. There is no `/cnft/`
+        // single-read prefix, so a trailing slash falls through to the health fallback.
+        assert!(matches!(route_get("/cnfts"), GetRoute::Cnfts));
+        assert!(matches!(route_get("/cnfts/"), GetRoute::Health));
     }
 
     #[test]

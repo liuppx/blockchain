@@ -1412,6 +1412,17 @@ M165 保留 3 端点（`/unbonding`/`/stake-ops`/`/evidence`）为 `next=` 是�
 - **测试（+3 → 689）**：`accept_mints_a_cnft_and_reject_does_not`（接受铸 1、记四字段、按 node_id 可查；近重复拒绝不铸）+ `state_root_covers_contributions`（改 cNFT 集合改 state_root、merkle_root 不变）+ `snapshot_round_trips_contributions`（v3 encode→decode 保真 + state_root 复算一致）；M181 demo 守卫测更新为新 state_root（merkle_root 不变即证 cNFT 未入 accounts_root）。
 - **已知边界 / 非目标**：不做 typed SPV 证明（`ProofEntry::Cnft` / RPC 查询端点——像 reviewer 的 SPV 在 M24 才补，本轮 state_root 承诺 + 按 id 查询）；不做 $WATT/$FLOP/time_decay（其他路线图项）；不改 $COG 增发公式（经济不变）。
 
+## cNFT 目录 `GET /cnfts`（Milestone 184 · 白皮书路线图 Phase 2）
+
+M183 把 cNFT 落为认证共识状态 + 库内按 id 的 `cnft(id)` 查询，但**没有网络读面**——客户端无从发现链上有哪些 cNFT。M184 补上：`GET /cnfts`——soulbound 认知贡献证书的明文（未验证）目录，`/reviewers`（M85）的读兄弟。每条记 `node_id`（认知图谱节点）+ `contributor` + `domain` + `reward_micro` + `height`。无单读兄弟（暂不设 `/cnft/{id}`）。**无状态/共识/wire/codec 变更**（纯读面；demo/localnet 头与 state_root 不变）。
+
+- **路由**：`enum GetRoute` 加 `Cnfts`；`route_get` 在 `/reviewers` 臂之后加精确臂 `"/cnfts" => GetRoute::Cnfts`。无 `/cnft/` 单读前缀，故 `/cnfts/`（尾斜杠）简单回落 `Health`（与 `/reviewers/`、`/bonds/` 同）。`/routes` 发现索引补 `/cnfts`（漂移守卫 `advertised_exact_routes_resolve`/`routes_index_lists_endpoints` 自动覆盖）。
+- **查询命令**：`Cmd::QueryCnfts { reply: oneshot::Sender<Vec<(u64, Cnft)>> }`；actor handler 快照 `state.contributions` 为 node_id 有序 `Vec<(u64, Cnft)>`（`BTreeMap` 迭代即有序）。
+- **渲染**：与 M84–M86 复用 `EntityView` 不同（cNFT 非 merkle 证明实体，且避免与 typed-proof 机器耦合），新增一对**独立**列表渲染器：`format_cnft_listing`（grep 友好 `node_id=… contributor=… domain=… reward_micro=… height=…` 行，空集 ⇒ `""`）/`json_cnft_listing`（JSON 对象数组，u64 字段为字符串合房规范，空集 ⇒ `[]`）。
+- **分页**：复用既有分页栈——`?cursor=<node_id>`（稳定单调游标空间）/`?offset`/`?limit` + `format_page_cursor`/`json_page_cursor` + `key_after`/`last_key`/`effective_limit`，逐字复用 `total`/`next` 信封 + `Accept`/`Accept-Charset` 协商，照抄 `/reviewers` handler 臂。
+- **测试（+2 → 691）**：新纯 `route_get_parses_cnfts`（`/cnfts` ⇒ `Cnfts`、`/cnfts/` ⇒ `Health`）+ 新纯 `cnft_listing_renders`（空集 ⇒ `""`/`[]`；两条 cNFT 断言精确文本 `key=value` 行与 JSON 数组逐字节）；`/routes` 漂移守卫自动覆盖新路由。
+- **已知边界 / 非目标**：不做 typed SPV 证明（`ProofEntry::Cnft` 的设计分叉——折 cNFT 入 accounts_root 重基线 vs 新 `contributions_root` 头承诺=wire bump——留待用户定向）；不做 `/cnft/{id}` 单读（本轮只做目录发现）。
+
 ## pending keystore 交互式密码提示（Milestone 181）
 
 收尾 M180 留的小口：M180 的 pending 加密 keystore 只从 `ZHIXING_PENDING_KEYSTORE_PASSWORD` 读密码，缺失即硬失败——与活跃 keystore（M175 `read_keystore_password`：env 优先、否则交互 no-echo 提示）不一致。
