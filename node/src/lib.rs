@@ -231,6 +231,42 @@ impl StakeOp {
     }
 }
 
+/// M179: rotate the ed25519 public key bound to an account. Self-authenticating —
+/// signed by the account's **current** key over [`codec::keyrotation_signing_bytes`]
+/// — and replay-protected by the account's `nonce` (same discipline as
+/// [`SubmissionTx`]). On apply, the account's `pubkey` becomes `new_pubkey` and
+/// its `nonce` advances, so every subsequent op must be signed by the new key.
+///
+/// Because a bonded validator's set entry is derived from its account pubkey,
+/// rotating an account key also rotates its validator identity — therefore the
+/// MVP (M179) **rejects** rotating an account that is a current validator
+/// ([`ChainError::CannotRotateActiveValidator`]); such a validator must unbond
+/// first. This sidesteps the signing-key handoff at the height boundary
+/// (rotation commits under the old set, would take effect next height).
+#[derive(Clone, Debug)]
+pub struct KeyRotation {
+    pub account: u64,
+    pub new_pubkey: PubKey,
+    /// Must equal the account's current `nonce` (strict, like `SubmissionTx`).
+    pub nonce: u64,
+    /// ed25519 signature by the account's **current** key over
+    /// [`codec::keyrotation_signing_bytes`].
+    pub signature: Sig,
+}
+
+impl KeyRotation {
+    /// Sign this rotation's canonical fields with `kp` (the account's current key).
+    pub fn signed(mut self, kp: &Keypair) -> Self {
+        self.signature = kp.sign(&codec::keyrotation_signing_bytes(&self));
+        self
+    }
+
+    /// Content-addressed hash over the full signed encoding (gossip dedup key).
+    pub fn hash(&self) -> Hash {
+        sha256(&codec::encode_key_rotation(self))
+    }
+}
+
 /// Cryptographic proof of validator equivocation: two conflicting precommit
 /// votes from the same validator at the same `(height, round)` but for
 /// *different* block hashes, each carrying a valid ed25519 signature by the
@@ -579,6 +615,14 @@ pub struct Block {
     /// (via the header projection's `bridge_unbondings_commitment`,
     /// M171).
     pub bridge_unbondings: Vec<BridgeUnbond>,
+    /// M179 (B4 wire): account key-rotation ops carried by this block. Each is a
+    /// [`KeyRotation`] signed by an account's **current** key that swaps in a new
+    /// ed25519 pubkey (replay-protected by the account nonce). Applied after all
+    /// other ops so a same-block tx/stake-op (signed with the old key) verifies
+    /// against the pre-rotation key. Rejected for accounts that are current
+    /// validators (MVP). Usually empty. Bodies are part of the block hash via the
+    /// header projection's `key_rotations_commitment`.
+    pub key_rotations: Vec<KeyRotation>,
 }
 
 impl Block {
@@ -844,6 +888,17 @@ pub enum ChainError {
         need: u64,
         have: u64,
     },
+    /// M179: a `KeyRotation` targeted an account that is a current validator.
+    /// The MVP forbids this (it would require a signing-key handoff at the next
+    /// height); the validator must unbond first.
+    CannotRotateActiveValidator {
+        account: u64,
+    },
+    /// M179: a `KeyRotation` whose `new_pubkey` equals the account's current key
+    /// (a no-op rotation — rejected to catch a mis-built op / wrong key file).
+    KeyRotationNoop {
+        account: u64,
+    },
     /// Slashing evidence is malformed, against a non-validator, or carries an
     /// invalid signature. The block is rejected; the offending validator id is
     /// returned for diagnostics.
@@ -1014,6 +1069,13 @@ impl std::fmt::Display for ChainError {
                 f,
                 "account {account} cannot unbond {need} (has {have} bonded)"
             ),
+            ChainError::CannotRotateActiveValidator { account } => write!(
+                f,
+                "account {account} is a current validator; unbond before rotating its key"
+            ),
+            ChainError::KeyRotationNoop { account } => {
+                write!(f, "account {account} key rotation is a no-op (same key)")
+            }
             ChainError::BadEquivocationEvidence(v) => write!(
                 f,
                 "equivocation evidence against validator {v} is malformed, stale, or not signable by that validator"
@@ -1332,6 +1394,7 @@ impl ChainState {
             bridge_headers: Vec::new(),
             bridge_redeems: Vec::new(),
             bridge_unbondings: Vec::new(),
+            key_rotations: Vec::new(),
         }
         .hash();
         // M31: now that the genesis block hash is known, store it on
@@ -1481,6 +1544,17 @@ impl ChainState {
             self.apply_bridge_unbond(op)?;
         }
 
+        // M179: account key rotations. Applied AFTER every other op so a
+        // same-block tx / stake-op (signed with the pre-rotation key) verifies
+        // against the old key; the new key takes effect for subsequent blocks.
+        // A rotation targeting a current validator is rejected (MVP), so this
+        // never perturbs the validator-set derivation below. Validation fully
+        // precedes mutation inside `apply_key_rotation`, so a bad rotation rolls
+        // the whole block back.
+        for op in &block.key_rotations {
+            self.apply_key_rotation(op)?;
+        }
+
         // on-chain validator-set transition: explicit updates PLUS the changes
         // implied by this block's staking ops (power == bonded stake). Both take
         // effect from the NEXT height — this block was certified by the set in
@@ -1616,6 +1690,58 @@ impl ChainState {
                 });
             }
         }
+        Ok(())
+    }
+
+    /// M179: apply one [`KeyRotation`] — swap an account's ed25519 pubkey, proven
+    /// by a signature from its **current** key and gated by the account nonce. All
+    /// checks precede any mutation, so a bad rotation rolls the whole block back
+    /// (same discipline as `apply_stake_op`).
+    ///
+    /// MVP guard: an account that is a **current validator** cannot rotate here —
+    /// its set entry is derived from this pubkey and would need a signing-key
+    /// handoff at the next height. It must unbond first. See the type doc.
+    fn apply_key_rotation(&mut self, op: &KeyRotation) -> Result<(), ChainError> {
+        let acct = self
+            .accounts
+            .get(&op.account)
+            .ok_or(ChainError::UnknownAccount(op.account))?;
+        // 1. authorize against the CURRENT key.
+        if !crypto::verify(
+            &acct.pubkey,
+            &codec::keyrotation_signing_bytes(op),
+            &op.signature,
+        ) {
+            return Err(ChainError::BadSignature(op.account));
+        }
+        // 2. strict nonce (replay protection), same as `SubmissionTx`.
+        if op.nonce != acct.nonce {
+            return Err(ChainError::BadNonce {
+                account: op.account,
+                expected: acct.nonce,
+                got: op.nonce,
+            });
+        }
+        // 3. MVP: refuse to rotate a current validator's key (would require a
+        //    cross-height signing-key handoff). `validators.get` covers both
+        //    genesis and bond-derived validators.
+        if self.validators.get(op.account).is_some() {
+            return Err(ChainError::CannotRotateActiveValidator {
+                account: op.account,
+            });
+        }
+        // 4. reject a no-op rotation (new key == current key) — pointless, and
+        //    catches a mis-built op / wrong key file.
+        if op.new_pubkey == acct.pubkey {
+            return Err(ChainError::KeyRotationNoop {
+                account: op.account,
+            });
+        }
+        // 5. mutate: swap the key and advance the nonce so the old key can't be
+        //    reused and future ops must be signed by the new key.
+        let acct = self.accounts.get_mut(&op.account).unwrap();
+        acct.pubkey = op.new_pubkey;
+        acct.nonce += 1;
         Ok(())
     }
 
@@ -2832,6 +2958,7 @@ mod tests {
             bridge_headers: Vec::new(),
             bridge_redeems: Vec::new(),
             bridge_unbondings: Vec::new(),
+            key_rotations: Vec::new(),
         };
         // best-effort seal: valid blocks get the correct commitments; blocks the
         // negative tests build to fail earlier keep [0;32] and still fail at
@@ -3123,6 +3250,100 @@ mod tests {
         // handed-off set, so recompute the commitment over the final contents.
         let _ = chain.seal(&mut b);
         b
+    }
+
+    /// M179: build a block carrying one `KeyRotation`, signed by `signer`.
+    fn key_rotation_block(
+        chain: &Chain,
+        height: u64,
+        account: u64,
+        new_pubkey: PubKey,
+        nonce: u64,
+        signer: &Keypair,
+    ) -> Block {
+        let op = KeyRotation {
+            account,
+            new_pubkey,
+            nonce,
+            signature: [0u8; 64],
+        }
+        .signed(signer);
+        let mut b = block(chain, height, vec![]);
+        b.key_rotations = vec![op];
+        let _ = chain.seal(&mut b);
+        b
+    }
+
+    #[test]
+    fn key_rotation_swaps_the_account_key_and_retires_the_old() {
+        let mut chain = Chain::new(base_genesis());
+        let new_pub = kp(99).public();
+        let old_root = chain.state.state_root();
+        // Account 1 (a non-validator) rotates, signed by its CURRENT key.
+        let mut b = key_rotation_block(&chain, 1, 1, new_pub, 0, &kp(1));
+        chain.commit(&mut b).expect("rotation commits");
+        assert_eq!(chain.state.accounts[&1].pubkey, new_pub, "key swapped");
+        assert_eq!(chain.state.accounts[&1].nonce, 1, "nonce advanced");
+        assert_ne!(
+            chain.state.state_root(),
+            old_root,
+            "rotation changes state_root"
+        );
+
+        // The OLD key can no longer authorize a rotation (now BadSignature).
+        let mut bad = key_rotation_block(&chain, 2, 1, kp(7).public(), 1, &kp(1));
+        assert!(matches!(
+            chain.commit(&mut bad),
+            Err(ChainError::BadSignature(1))
+        ));
+
+        // The NEW key can (nonce 1).
+        let mut ok = key_rotation_block(&chain, 2, 1, kp(100).public(), 1, &kp(99));
+        chain.commit(&mut ok).expect("new key rotates again");
+        assert_eq!(chain.state.accounts[&1].pubkey, kp(100).public());
+    }
+
+    #[test]
+    fn key_rotation_rejects_bad_signature_and_nonce() {
+        let mut chain = Chain::new(base_genesis());
+        // Signed by the wrong key ⇒ BadSignature.
+        let mut b = key_rotation_block(&chain, 1, 1, kp(99).public(), 0, &kp(2));
+        assert!(matches!(
+            chain.commit(&mut b),
+            Err(ChainError::BadSignature(1))
+        ));
+        // Correct key but wrong nonce ⇒ BadNonce.
+        let mut b = key_rotation_block(&chain, 1, 1, kp(99).public(), 5, &kp(1));
+        assert!(matches!(
+            chain.commit(&mut b),
+            Err(ChainError::BadNonce { account: 1, .. })
+        ));
+    }
+
+    #[test]
+    fn key_rotation_rejects_no_op() {
+        let mut chain = Chain::new(base_genesis());
+        let same = chain.state.accounts[&1].pubkey;
+        let mut b = key_rotation_block(&chain, 1, 1, same, 0, &kp(1));
+        assert!(matches!(
+            chain.commit(&mut b),
+            Err(ChainError::KeyRotationNoop { account: 1 })
+        ));
+    }
+
+    #[test]
+    fn key_rotation_rejects_active_validator() {
+        let mut chain = Chain::new(base_genesis());
+        // Bond account 1 so it becomes a validator (set updated post-commit).
+        let mut bond = stake_block(&chain, 1, 1, BondKind::Bond, 5 * MICRO);
+        chain.commit(&mut bond).expect("bond commits");
+        assert!(chain.state.validators.get(1).is_some(), "now a validator");
+        // Rotating a current validator's key is rejected (MVP guard).
+        let mut b = key_rotation_block(&chain, 2, 1, kp(99).public(), 0, &kp(1));
+        assert!(matches!(
+            chain.commit(&mut b),
+            Err(ChainError::CannotRotateActiveValidator { account: 1 })
+        ));
     }
 
     #[test]
@@ -3485,6 +3706,7 @@ mod tests {
             bridge_headers: Vec::new(),
             bridge_redeems: Vec::new(),
             bridge_unbondings: Vec::new(),
+            key_rotations: Vec::new(),
             proposer: 0,
         };
         live.seal(&mut b2).unwrap();
@@ -4639,6 +4861,7 @@ mod tests {
             bridge_headers: Vec::new(),
             bridge_redeems: Vec::new(),
             bridge_unbondings: Vec::new(),
+            key_rotations: Vec::new(),
         };
         match chain.commit(&mut b2) {
             Err(ChainError::BadNonce {

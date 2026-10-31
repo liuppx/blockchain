@@ -48,8 +48,8 @@ use zhixing_node::store::{BlockLog, CertLog};
 use zhixing_node::validator::{Validator, ValidatorSet, ValidatorUpdate};
 use zhixing_node::{
     hex, unbonding_merkle_leaf, Block, BondKind, BridgeHeader, BridgeLock, BridgeRedeem,
-    BridgeUnbond, Chain, ChainError, ChainState, Genesis, Keypair, Review, SlashEvidence, StakeOp,
-    SubmissionTx, Vote, VoteType, MICRO,
+    BridgeUnbond, Chain, ChainError, ChainState, Genesis, KeyRotation, Keypair, Review,
+    SlashEvidence, StakeOp, SubmissionTx, Vote, VoteType, MICRO,
 };
 
 type Emb = [f32; DIM];
@@ -232,6 +232,7 @@ fn demo_blocks(chain: &Chain) -> Vec<Block> {
         bridge_headers: Vec::new(),
         bridge_redeems: Vec::new(),
         bridge_unbondings: Vec::new(),
+        key_rotations: Vec::new(),
     };
     trial.seal(&mut b1).expect("seal b1");
     trial.commit(&mut b1).expect("commit b1 on trial");
@@ -274,6 +275,7 @@ fn demo_blocks(chain: &Chain) -> Vec<Block> {
         bridge_headers: Vec::new(),
         bridge_redeems: Vec::new(),
         bridge_unbondings: Vec::new(),
+        key_rotations: Vec::new(),
     };
     trial.seal(&mut b2).expect("seal b2");
     vec![b1, b2]
@@ -292,6 +294,7 @@ fn main() {
         "chain" => cmd_chain(),
         "validators" => cmd_validators(),
         "staking" => cmd_staking(),
+        "rotate-key" => cmd_rotate_key(),
         "slashing" => cmd_slashing(),
         "gossip" => cmd_gossip(),
         "light" => cmd_light(),
@@ -390,6 +393,7 @@ fn usage() {
         "  node validators         grow a chain across on-chain validator-set changes (add/remove)"
     );
     eprintln!("  node staking            bond stake to gain validator power; unbond through a delayed withdrawal");
+    eprintln!("  node rotate-key         M179: consensus-level account key rotation — self-authenticating KeyRotation op swaps an account's ed25519 key (old key signs, nonce-protected); rejected for current validators (unbond first)");
     eprintln!(
         "  node slashing           slash an equivocating validator's bonded stake to the treasury"
     );
@@ -1174,6 +1178,135 @@ fn cmd_staking() {
         short(&chain.head)
     );
     debug_assert_eq!(chain.state.state_root(), d.chain.state.state_root());
+}
+
+/// M179 demo: consensus-level account key rotation. Shows a `KeyRotation` op
+/// swapping an account's ed25519 key (authorized by the OLD key, nonce-gated),
+/// that the old key is dead afterward and the new key is live, and that a
+/// current validator's key cannot be rotated (the safe-MVP guard).
+fn cmd_rotate_key() {
+    println!("M179 — consensus-level account key rotation (KeyRotation, B4 wire)");
+    println!();
+
+    let seeds: BTreeMap<u64, [u8; 32]> = [1u64, 2, 3, 21, 22, 23, 24]
+        .iter()
+        .map(|&id| {
+            let mut s = [0u8; 32];
+            s[..8].copy_from_slice(&id.to_le_bytes());
+            (id, s)
+        })
+        .collect();
+    let mut d = ChainDriver::new(demo_genesis(), seeds, 1);
+
+    // The new key: a fresh keypair not previously bound to any account.
+    let new_kp = kp(99);
+    let new_pub = new_kp.public();
+    println!(
+        "account #1 current key {}…  →  rotating to {}…",
+        &hex(&d.chain.state.accounts[&1].pubkey)[..16],
+        &hex(&new_pub)[..16],
+    );
+
+    // height 1: account #1 rotates its key, signed by its CURRENT key (kp(1)),
+    // nonce 0. The op rides a block; apply swaps the pubkey and bumps the nonce.
+    d.stage_key_rotation(
+        KeyRotation {
+            account: 1,
+            new_pubkey: new_pub,
+            nonce: 0,
+            signature: [0u8; 64],
+        }
+        .signed(&kp(1)),
+    );
+    d.produce(1.0, &BTreeSet::new())
+        .unwrap()
+        .expect("rotation block commits");
+    assert_eq!(d.chain.state.accounts[&1].pubkey, new_pub, "key swapped");
+    assert_eq!(d.chain.state.accounts[&1].nonce, 1, "nonce advanced");
+    println!("  height 1: KeyRotation (signed by OLD key, nonce 0) committed → account #1 key is now the new key, nonce=1");
+
+    // The OLD key is dead: a rotation signed by kp(1) (no longer account #1's
+    // key) is rejected with BadSignature. Try it on a clone so the live chain is
+    // untouched.
+    let mut probe = d.chain.clone();
+    let mut blk = empty_next_block(&probe, 2.0);
+    blk.key_rotations.push(
+        KeyRotation {
+            account: 1,
+            new_pubkey: kp(7).public(),
+            nonce: 1,
+            signature: [0u8; 64],
+        }
+        .signed(&kp(1)), // OLD key — no longer authoritative
+    );
+    let err = probe
+        .commit(&mut blk)
+        .expect_err("old key must no longer authorize a rotation");
+    assert!(matches!(err, ChainError::BadSignature(1)), "got {err:?}");
+    println!("  negative: a rotation signed by the OLD key → rejected ({err})");
+
+    // The NEW key is live: it can rotate again (to kp(100)), nonce 1.
+    let newer = kp(100).public();
+    d.stage_key_rotation(
+        KeyRotation {
+            account: 1,
+            new_pubkey: newer,
+            nonce: 1,
+            signature: [0u8; 64],
+        }
+        .signed(&new_kp), // NEW key signs
+    );
+    d.produce(2.0, &BTreeSet::new())
+        .unwrap()
+        .expect("second rotation commits");
+    assert_eq!(
+        d.chain.state.accounts[&1].pubkey, newer,
+        "new key rotated again"
+    );
+    println!("  height 2: the NEW key authorizes a further rotation (nonce 1) → committed");
+
+    // Safe-MVP guard: a current validator's key cannot be rotated. Bond account
+    // #2 so it becomes a validator next height, then attempt to rotate it.
+    d.stage_stake_op(
+        StakeOp {
+            account: 2,
+            kind: BondKind::Bond,
+            amount: 6 * MICRO,
+            signature: [0u8; 64],
+        }
+        .signed(&kp(2)),
+    );
+    d.produce(3.0, &BTreeSet::new())
+        .unwrap()
+        .expect("bond commits");
+    // account #2 is now an active validator (power == bond). Rotation must fail.
+    assert!(
+        d.chain.state.validators.get(2).is_some(),
+        "account #2 should be a validator now"
+    );
+    let mut probe = d.chain.clone();
+    let mut blk = empty_next_block(&probe, 4.0);
+    blk.key_rotations.push(
+        KeyRotation {
+            account: 2,
+            new_pubkey: kp(101).public(),
+            nonce: 0,
+            signature: [0u8; 64],
+        }
+        .signed(&kp(2)),
+    );
+    let err = probe
+        .commit(&mut blk)
+        .expect_err("a current validator's key cannot be rotated");
+    assert!(
+        matches!(err, ChainError::CannotRotateActiveValidator { account: 2 }),
+        "got {err:?}"
+    );
+    println!(
+        "  negative: rotating a CURRENT validator (#2) → rejected ({err}); it must unbond first"
+    );
+    println!();
+    println!("Ok: account key rotation is self-authenticating (old key signs), nonce-protected, and consensus-enforced; the new key supersedes the old; active validators are protected.");
 }
 
 /// Produce one height (all validators honest) and report the set that certified
@@ -3486,6 +3619,7 @@ fn empty_next_block(chain: &Chain, timestamp_days: f32) -> Block {
         bridge_headers: Vec::new(),
         bridge_redeems: Vec::new(),
         bridge_unbondings: Vec::new(),
+        key_rotations: Vec::new(),
     }
 }
 
@@ -6460,6 +6594,7 @@ mod tests {
             bridge_headers: vec![],
             bridge_redeems: vec![],
             bridge_unbondings: vec![],
+            key_rotations: vec![],
             proposer: 0,
         }
     }

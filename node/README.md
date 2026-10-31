@@ -21,6 +21,7 @@ cargo run --release --bin node -- gossip           # P2P：反熵同步（新节
 cargo run --release --bin node -- light            # 轻客户端：只凭创世+(块,证书)对，逐高度跟随验证人集，不执行交易
 cargo run --release --bin node -- vprove           # 验证人 Merkle 证明：对 cert 签名的区块头证明单个验证人在下一集合中；伪造叶被拒
 cargo run --release --bin node -- staking          # 质押：绑定 $COG 获得验证人权重；解绑经时间锁提款到期返还
+cargo run --release --bin node -- rotate-key       # M179：账户密钥轮换——自认证 KeyRotation op 换账户 ed25519 密钥（旧密钥签、nonce 防重放）；当前验证人被拒（须先解绑）
 cargo run --release --bin node -- slashing         # 罚没：验证人双签 → 提交证据 → 绑定质押罚没入 treasury、移出验证人集
 cargo run --release --bin node -- certs  --dir DIR # 证书落盘：产出认证链→落盘 blocks/certs→重放复验最终性
 cargo run --release --bin node -- mirror-unbond    # M172：共识级跨链解绑镜像——A 解绑 → B 跟随 A 的头并 ingest BridgeUnbond 把同一解绑条目拼入 B 自己的队列，两链成熟各自返还
@@ -1393,6 +1394,35 @@ M165 保留 3 端点（`/unbonding`/`/stake-ops`/`/evidence`）为 `next=` 是�
 - **不碰** 共识/codec/wire（`UnbondingEntry::hash` 纯本地）/分页基础原语；localnet 头仍 wire v1 `a045426e…3b87bc`。
 - **测试（+1 → 631）**：新 `unbonding_entry_hash_is_stable_and_collision_safe`（4 断言：clone 等、改任一字段 hash 不同、32 字节长）；扩展 `rpc_unbonding_list_over_tcp`/`rpc_stake_ops_list_over_tcp`/`rpc_evidence_list_over_tcp` in-process 测改 `next`→`cursor`。
 - **已知边界**：`UnbondingEntry` 字段顺序（account/amount/mature_height）+ LE 字节序 = hash 格式的隐性契约；改字段顺序或加字段 = 改 hash 格式 = 旧 cursor 解析失败（文档说明）。`encode_unbonding` 真正的 codec 入口（若未来要把 UnbondingEntry 入 wire/快照/跨链）属后续篮子。
+
+## 账户密钥轮换（Milestone 179 · KeyRotation, B4 wire）
+
+审计前预备的最后一块大的。此前账户/验证人的 ed25519 密钥一旦设定就无法更换——密钥泄露或例行轮换都没有链上手段。本轮加一个自认证、nonce 防重放、共识强制的 `KeyRotation` op。
+
+**架构（与用户确认）**：
+- **耦合模型**：验证人 pubkey = 账户 pubkey（`apply_block_inner` 从 `account.pubkey` 派生验证人集条目），所以轮换账户密钥即轮换验证人身份——无需给 `Validator` 加独立共识密钥字段（避免更大的 wire 改动）。
+- **安全 MVP，不含活跃验证人**：`apply_key_rotation` 拒绝轮换**当前在验证人集里**的账户（`self.validators.get(account).is_some()` → `CannotRotateActiveValidator`）。这彻底绕开"轮换在高度 N 由旧集认证、新密钥下一高度生效、守护进程须在高度边界切换签名密钥"的交接定时难题。活跃验证人要轮换：先 unbond（移出集）、轮换、再 bond。活跃验证人实时轮换 + 守护进程自动交接留作后续。
+
+**`KeyRotation { account, new_pubkey, nonce, signature }`**（`lib.rs`，仿 `StakeOp`）：`signed(kp)` 用账户**当前**密钥签 `keyrotation_signing_bytes`（`{account, new_pubkey, nonce}`）。`apply_key_rotation` 顺序校验全先于变更：账户存在（`UnknownAccount`）→ 签名对**当前** pubkey 验证（`BadSignature`）→ `nonce == account.nonce`（`BadNonce`，复用账户 nonce，与 `SubmissionTx` 同纪律）→ 拒活跃验证人（`CannotRotateActiveValidator`）→ 拒 no-op（`new_pubkey == 当前` → `KeyRotationNoop`）→ 变更 `account.pubkey` + `nonce += 1`。
+
+**state_root 无新字段**：轮换的*效果*（pubkey + nonce）已在 `Account::merkle_leaf` 折进 `state_root`/`accounts_root`；op 本身经头部 `key_rotations_commitment`（cert-signed）承诺，与 txs/stake_ops 同纪律。
+
+**B4 wire bump**（M171 B3 以来首次 Block 布局变更，仿 M171 形状）：
+- `Block.key_rotations: Vec<KeyRotation>`（第 8 个 body op vec，`bridge_unbondings` 之后，尾部追加前缀稳定；B3 解码器读 B4 块在此 `UnexpectedEof`，B4 读 B3 读 `n=0` 继续）。
+- `BlockHeader.key_rotations_commitment`（第 8 个 per-body 承诺，尾部追加）；`encode/decode_header` 各 +32 字节，`from_block` 算之，`decode_certified_header` 固定尾 `224`→`256`。
+- `encode_key_rotation`/`decode_key_rotation` + `keyrotation_signing_bytes`（`codec.rs`，仿 `encode_stakeop`）。布局 `u64 account ‖ 32 new_pubkey ‖ u64 nonce ‖ 64 signature`。
+- `apply_block_inner` 在所有其他 op（txs/stake_ops/evidence/bridge）之后应用 `key_rotations`，保证同块 tx/stake_op（用旧密钥签）先于轮换生效、互不干扰。
+- ~28 处 `Block`/`BlockHeader` 字面量补字段（逐行脚本插入匹配缩进，非正则改字段——避 M171 正则误伤 `[0x..; 32]` 的教训）。
+
+**gossip**（`net.rs`，仿 `GossipMsg::StakeOp` tag 5）：`GossipMsg::KeyRotation` + `TAG_KEYROTATION = 20` + `encode/decode_gossip` 臂 + `seen_key_rotation` dedup + `pending_key_rotations` 池 + `submit_local_key_rotation` / `on_key_rotation` / `take_pending_key_rotations` + `build_candidate` 纳入 + 提交后 prune + `has_pending_work` 纳入。
+
+**驱动 + CLI**：`ChainDriver::stage_key_rotation` + produce/clear（`driver.rs`）。`node rotate-key`（`main.rs`）进程内 demo：账户 #1 轮换 → 旧密钥作废（后续用旧密钥签的轮换被 `BadSignature` 拒）→ 新密钥可再轮换 → bond 账户 #2 后轮换它被 `CannotRotateActiveValidator` 拒。
+
+**head 移动**：B4 新头部承诺槽改变 header hash（即使 `key_rotations` 空），localnet 头 `1215aa75…` → **`33cb2506…a6a426`**（与 M171 同性质的显式 wire bump；4 验证人仍收敛同一头）。
+
+**测试（+6 → 682）**：`codec` `key_rotation_round_trip`（往返 + trailing 拒 + 截断 `UnexpectedEof`）；`lib` 4（`key_rotation_swaps_the_account_key_and_retires_the_old`——换键 + state_root 变 + 旧密钥作废 + 新密钥可用；`..._rejects_bad_signature_and_nonce`；`..._rejects_no_op`；`..._rejects_active_validator`）；`net` `key_rotation_gossip_reaches_every_node_and_dedups`。既有 `header_gossip_shrinks_the_wire_payload_vs_full_blocks` 随 B4 调整——8 个空承诺（256B）会压过空块的 body，故改为在一个装了 3 笔 tx 的块上断言 header < 全块（cert 两侧相消），这是更忠实的"header 省掉 body"不变量。
+
+**已知边界 / 非目标**：不含活跃验证人实时轮换（守护进程签名密钥的高度边界自动交接，需同持新旧两键，风险高，后续）；不解耦 operator/consensus 密钥（Cosmos 式独立共识密钥，用户选了耦合）；不做旧密钥归档签名 / 多 slot keystore（原 M176 候选里的部分）；轮换新密钥来源不限（运维可先 `encrypt-key` 做成 M175 keystore，但本轮不强耦合）。
 
 ## 持久化加密-only TLS 证书（Milestone 178）
 

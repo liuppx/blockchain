@@ -11,7 +11,7 @@ use crate::validator::ValidatorSet;
 use crate::validator::{Validator, ValidatorUpdate};
 use crate::{
     Account, Block, BondKind, BridgeHeader, BridgeRedeem, BridgeSource, BridgeUnbond, ChainState,
-    Embedding, Review, Reviewer, SlashEvidence, StakeOp, SubmissionTx, UnbondingEntry,
+    Embedding, KeyRotation, Review, Reviewer, SlashEvidence, StakeOp, SubmissionTx, UnbondingEntry,
 };
 use zhixing_engine::DIM;
 use zhixing_engine::{CognitiveGraph, DeltaKParams, GraphNode};
@@ -112,6 +112,14 @@ pub fn encode_block(b: &Block) -> Vec<u8> {
     for op in &b.bridge_unbondings {
         enc_bridge_unbond(&mut e, op);
     }
+    // M179 (B4 wire): account key rotations, appended at the tail (prefix-stable
+    // for B3 readers — a B3-encoded block ends after bridge_unbondings, and a B4
+    // decoder reading a B3 block errors `UnexpectedEof` here rather than
+    // silently truncating).
+    e.u64(b.key_rotations.len() as u64);
+    for op in &b.key_rotations {
+        enc_key_rotation(&mut e, op, true);
+    }
     e.0
 }
 
@@ -176,6 +184,9 @@ pub fn encode_header(h: &BlockHeader) -> Vec<u8> {
     // for M168 / M31 / M30 fields is preserved byte-for-byte — only the
     // tail grows.
     e.raw(&h.bridge_unbondings_commitment);
+    // M179 (B4 wire): eighth per-body commitment, appended at the tail — same
+    // prefix-stability discipline as the M171 seventh commitment.
+    e.raw(&h.key_rotations_commitment);
     e.0
 }
 
@@ -231,6 +242,9 @@ pub fn decode_header(buf: &[u8]) -> Result<BlockHeader, CodecError> {
     // M171 (B3 wire): seventh body commitment (bridge-unbond op list).
     let mut bridge_unbondings_commitment = [0u8; 32];
     bridge_unbondings_commitment.copy_from_slice(d.take(32)?);
+    // M179 (B4 wire): eighth body commitment (key-rotation op list).
+    let mut key_rotations_commitment = [0u8; 32];
+    key_rotations_commitment.copy_from_slice(d.take(32)?);
     if d.pos != d.buf.len() {
         return Err(CodecError::TrailingBytes);
     }
@@ -252,6 +266,7 @@ pub fn decode_header(buf: &[u8]) -> Result<BlockHeader, CodecError> {
         bridge_headers_commitment,
         bridge_redeems_commitment,
         bridge_unbondings_commitment,
+        key_rotations_commitment,
     })
 }
 
@@ -275,14 +290,15 @@ pub fn decode_certified_header(buf: &[u8]) -> Result<CertifiedHeader, CodecError
     //   + 32 (next_validators_root) + 32 (state_root) + 32 (accounts_root)
     //   + 32 (graph_root, M27) + 32 (bridge_root, M30) + 8 (n_updates u64) =
     //   220-byte fixed prefix ‖ n_updates * 48 bytes (u64 id ‖ 32-byte pubkey ‖
-    //   u64 power) ‖ 7 * 32-byte commitments = 224 bytes tail (M30 adds
+    //   u64 power) ‖ 8 * 32-byte commitments = 256 bytes tail (M30 adds
     //   bridge_locks_commitment; M31 adds bridge_headers_commitment +
-    //   bridge_redeems_commitment; M171 B3 wire adds bridge_unbondings_commitment).
+    //   bridge_redeems_commitment; M171 B3 adds bridge_unbondings_commitment;
+    //   M179 B4 adds key_rotations_commitment).
     if buf.len() < 220 {
         return Err(CodecError::UnexpectedEof);
     }
     let n_updates = u64::from_be_bytes(buf[212..220].try_into().unwrap());
-    let header_len = 220 + (n_updates as usize) * 48 + 224; // 444 base + 48 per update
+    let header_len = 220 + (n_updates as usize) * 48 + 256; // 476 base + 48 per update
     if buf.len() < header_len {
         return Err(CodecError::UnexpectedEof);
     }
@@ -400,6 +416,10 @@ pub struct BlockHeader {
     /// here, but the *B3* decoding path reads the additional 32 bytes
     /// — see the migration note in the M171 README).
     pub bridge_unbondings_commitment: crate::Hash,
+    /// M179 (B4 wire): SHA-256 over the canonical encoding of the key-rotation op
+    /// list (`Block::key_rotations`). Eighth and last per-body commitment,
+    /// appended at the tail so B3 and earlier prefixes stay byte-stable.
+    pub key_rotations_commitment: crate::Hash,
 }
 
 impl BlockHeader {
@@ -463,6 +483,14 @@ impl BlockHeader {
                     .map(encode_bridge_unbond)
                     .collect::<Vec<_>>(),
             ),
+            // M179 (B4 wire): eighth per-body commitment, binding the
+            // key-rotation op list — same discipline as the others.
+            key_rotations_commitment: list_commitment(
+                &b.key_rotations
+                    .iter()
+                    .map(encode_key_rotation)
+                    .collect::<Vec<_>>(),
+            ),
         }
     }
 
@@ -490,6 +518,7 @@ impl BlockHeader {
         bridge_headers: Vec<BridgeHeader>,
         bridge_redeems: Vec<BridgeRedeem>,
         bridge_unbondings: Vec<BridgeUnbond>,
+        key_rotations: Vec<KeyRotation>,
     ) -> Block {
         Block {
             height: self.height,
@@ -509,6 +538,7 @@ impl BlockHeader {
             bridge_headers,
             bridge_redeems,
             bridge_unbondings,
+            key_rotations,
         }
     }
 }
@@ -636,6 +666,59 @@ fn enc_stakeop(e: &mut Enc, op: &StakeOp, include_sig: bool) {
     if include_sig {
         e.raw(&op.signature);
     }
+}
+
+// --- key rotation (M179, account key swap) -----------------------------------
+
+/// The exact bytes an account signs (with its CURRENT key) to authorize a key
+/// rotation: all fields EXCEPT the signature. Layout: `u64 account ‖ 32
+/// new_pubkey ‖ u64 nonce`.
+pub fn keyrotation_signing_bytes(op: &KeyRotation) -> Vec<u8> {
+    let mut e = Enc(Vec::new());
+    enc_key_rotation(&mut e, op, false);
+    e.0
+}
+
+/// Canonical bytes of a full (signed) key rotation, used for its content hash.
+pub fn encode_key_rotation(op: &KeyRotation) -> Vec<u8> {
+    let mut e = Enc(Vec::new());
+    enc_key_rotation(&mut e, op, true);
+    e.0
+}
+
+/// Decode exactly one signed key rotation (inverse of [`encode_key_rotation`]);
+/// trailing bytes are an error.
+pub fn decode_key_rotation(buf: &[u8]) -> Result<KeyRotation, CodecError> {
+    let mut d = Dec { buf, pos: 0 };
+    let op = dec_key_rotation(&mut d)?;
+    if d.pos != d.buf.len() {
+        return Err(CodecError::TrailingBytes);
+    }
+    Ok(op)
+}
+
+fn enc_key_rotation(e: &mut Enc, op: &KeyRotation, include_sig: bool) {
+    e.u64(op.account);
+    e.raw(&op.new_pubkey);
+    e.u64(op.nonce);
+    if include_sig {
+        e.raw(&op.signature);
+    }
+}
+
+fn dec_key_rotation(d: &mut Dec) -> Result<KeyRotation, CodecError> {
+    let account = d.u64()?;
+    let mut new_pubkey = [0u8; 32];
+    new_pubkey.copy_from_slice(d.take(32)?);
+    let nonce = d.u64()?;
+    let mut signature = [0u8; 64];
+    signature.copy_from_slice(d.take(64)?);
+    Ok(KeyRotation {
+        account,
+        new_pubkey,
+        nonce,
+        signature,
+    })
 }
 
 // --- bridge locks (M30, cross-chain) -----------------------------------------
@@ -1930,6 +2013,14 @@ pub fn decode_block(buf: &[u8]) -> Result<Block, CodecError> {
     for _ in 0..n_unbonds {
         bridge_unbondings.push(dec_bridge_unbond(&mut d)?);
     }
+    // M179 (B4 wire): key-rotation op list, appended at the tail. A B3 decoder
+    // reading a B4 block errors `UnexpectedEof` here; a B4 decoder reading a B3
+    // block reads `n = 0` and continues (same compatibility shape as B2→B3).
+    let n_rotations = d.count()?;
+    let mut key_rotations = Vec::with_capacity(n_rotations as usize);
+    for _ in 0..n_rotations {
+        key_rotations.push(dec_key_rotation(&mut d)?);
+    }
     if d.pos != d.buf.len() {
         return Err(CodecError::TrailingBytes);
     }
@@ -1951,6 +2042,7 @@ pub fn decode_block(buf: &[u8]) -> Result<Block, CodecError> {
         bridge_headers,
         bridge_redeems,
         bridge_unbondings,
+        key_rotations,
     })
 }
 
@@ -2160,6 +2252,7 @@ mod tests {
             bridge_headers: Vec::new(),
             bridge_redeems: Vec::new(),
             bridge_unbondings: Vec::new(),
+            key_rotations: Vec::new(),
             proposer: 0,
         }
     }
@@ -2322,6 +2415,36 @@ mod tests {
         assert!(matches!(
             decode_stakeop(&extra),
             Err(CodecError::TrailingBytes)
+        ));
+    }
+
+    #[test]
+    fn key_rotation_round_trip() {
+        let op = KeyRotation {
+            account: 7,
+            new_pubkey: [0x5a; 32],
+            nonce: 42,
+            signature: [9u8; 64],
+        };
+        let bytes = encode_key_rotation(&op);
+        let back = decode_key_rotation(&bytes).unwrap();
+        assert_eq!(encode_key_rotation(&back), bytes);
+        assert_eq!(back.account, 7);
+        assert_eq!(back.new_pubkey, [0x5a; 32]);
+        assert_eq!(back.nonce, 42);
+        // signing bytes exclude the 64-byte signature.
+        assert_eq!(keyrotation_signing_bytes(&op).len() + 64, bytes.len());
+        // trailing bytes are rejected.
+        let mut extra = bytes.clone();
+        extra.push(0);
+        assert!(matches!(
+            decode_key_rotation(&extra),
+            Err(CodecError::TrailingBytes)
+        ));
+        // a truncated buffer is an UnexpectedEof, not a panic.
+        assert!(matches!(
+            decode_key_rotation(&bytes[..bytes.len() - 1]),
+            Err(CodecError::UnexpectedEof)
         ));
     }
 
@@ -2974,6 +3097,7 @@ mod tests {
                 bridge_headers_commitment: [0u8; 32],
                 bridge_redeems_commitment: [0u8; 32],
                 bridge_unbondings_commitment: [0u8; 32],
+                key_rotations_commitment: [0u8; 32],
                 proposer: 0,
             },
             cert_prev: crate::consensus::Commit {
@@ -2999,6 +3123,7 @@ mod tests {
                 bridge_headers_commitment: [0u8; 32],
                 bridge_redeems_commitment: [0u8; 32],
                 bridge_unbondings_commitment: [0u8; 32],
+                key_rotations_commitment: [0u8; 32],
                 proposer: 0,
             },
             cert_new: crate::consensus::Commit {
@@ -3124,6 +3249,7 @@ mod tests {
                         bridge_headers_commitment: [0u8; 32],
                         bridge_redeems_commitment: [0u8; 32],
                         bridge_unbondings_commitment: [0u8; 32],
+                        key_rotations_commitment: [0u8; 32],
                         proposer: 0,
                     },
                     cert_prev: crate::consensus::Commit {
@@ -3149,6 +3275,7 @@ mod tests {
                         bridge_headers_commitment: [0u8; 32],
                         bridge_redeems_commitment: [0u8; 32],
                         bridge_unbondings_commitment: [0u8; 32],
+                        key_rotations_commitment: [0u8; 32],
                         proposer: 0,
                     },
                     cert_new: crate::consensus::Commit {

@@ -412,6 +412,7 @@ impl Mempool {
             bridge_headers: Vec::new(),
             bridge_redeems: Vec::new(),
             bridge_unbondings: Vec::new(),
+            key_rotations: Vec::new(),
         })
     }
 

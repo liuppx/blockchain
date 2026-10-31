@@ -49,7 +49,7 @@ use crate::light::ValidatorTracker;
 use crate::mempool::Mempool;
 use crate::merkle;
 use crate::validator::ValidatorSet;
-use crate::{Block, Chain, Genesis, Hash, SlashEvidence, StakeOp, SubmissionTx};
+use crate::{Block, Chain, Genesis, Hash, KeyRotation, SlashEvidence, StakeOp, SubmissionTx};
 
 /// Maximum certified blocks returned in a single [`GossipMsg::Blocks`] batch — a
 /// lagging peer that needs more re-requests from the new height.
@@ -77,6 +77,11 @@ pub enum GossipMsg {
     /// admits it into a staking block. Full validation in
     /// `chain.commit.apply_stake_op`.
     StakeOp(StakeOp),
+    /// M179: gossip one signed account key-rotation op — same flood/dedup pattern
+    /// as `StakeOp`. Floods into every node's pending pool; the next proposer
+    /// admits it into a block. Full validation in `chain.commit.apply_key_rotation`
+    /// (signature by the current key, nonce, and the active-validator guard).
+    KeyRotation(KeyRotation),
     /// "Send me cert-signed BLOCK HEADERS (no bodies) from this height onward."
     /// The light-sync analogue of `GetBlocks` (M22). A light client announces
     /// its height with `Status`; on seeing a peer ahead, it sends `GetHeaders`
@@ -248,6 +253,8 @@ pub const TAG_PEERS: u8 = 17;
 pub const TAG_GETHEADERS_SETS: u8 = 18;
 /// M147: response to `GetHeadersWithSets` — `(header, next_validator_set)` pairs.
 pub const TAG_HEADERS_SETS: u8 = 19;
+/// M179: account key-rotation op gossip.
+pub const TAG_KEYROTATION: u8 = 20;
 
 /// M29: maximum items in a single heterogeneous batched
 /// request/response. Mirrors `MAX_PROOF_BATCH = 32` so the bus caps
@@ -360,11 +367,15 @@ pub struct GossipNode {
     seen_evidence: SeenSet,
     /// Content hashes of stake ops already seen — dedup for `StakeOp`.
     seen_stake_op: SeenSet,
+    /// M179: content hashes of key-rotation ops already seen — dedup for `KeyRotation`.
+    seen_key_rotation: SeenSet,
     /// Evidence staged to be carried by the next block this node proposes
     /// (drained by the driver via [`Self::take_pending_evidence`]).
     pending_evidence: Vec<SlashEvidence>,
     /// Stake ops staged to be carried by the next block this node proposes.
     pending_stake_ops: Vec<StakeOp>,
+    /// M179: key-rotation ops staged for the next block this node proposes.
+    pending_key_rotations: Vec<KeyRotation>,
     /// Known peer ids (iterated in sorted order for deterministic output).
     peers: BTreeSet<u64>,
 }
@@ -390,8 +401,10 @@ impl GossipNode {
             seen_tx: SeenSet::new(),
             seen_evidence: SeenSet::new(),
             seen_stake_op: SeenSet::new(),
+            seen_key_rotation: SeenSet::new(),
             pending_evidence: Vec::new(),
             pending_stake_ops: Vec::new(),
+            pending_key_rotations: Vec::new(),
             peers: peers.into_iter().filter(|&p| p != id).collect(),
         }
     }
@@ -428,8 +441,10 @@ impl GossipNode {
             seen_tx: SeenSet::new(),
             seen_evidence: SeenSet::new(),
             seen_stake_op: SeenSet::new(),
+            seen_key_rotation: SeenSet::new(),
             pending_evidence: Vec::new(),
             pending_stake_ops: Vec::new(),
+            pending_key_rotations: Vec::new(),
             peers: peers.into_iter().filter(|&p| p != id).collect(),
         }
     }
@@ -512,6 +527,11 @@ impl GossipNode {
         &self.pending_stake_ops
     }
 
+    /// M179: key-rotation ops staged for the next proposed block (read-only view).
+    pub fn pending_key_rotations(&self) -> &[KeyRotation] {
+        &self.pending_key_rotations
+    }
+
     /// M35: is there any block-worthy pending work — mempool txs or staged
     /// block-level ops (stake ops / slashing evidence)? Used by the daemon to
     /// suppress empty heartbeat blocks when `create_empty_blocks=false`.
@@ -523,6 +543,7 @@ impl GossipNode {
         !self.mempool.is_empty()
             || !self.pending_stake_ops.is_empty()
             || !self.pending_evidence.is_empty()
+            || !self.pending_key_rotations.is_empty()
     }
 
     /// Drain staged evidence, transferring it to a block builder (e.g. a
@@ -536,6 +557,11 @@ impl GossipNode {
     /// Drain staged stake ops, transferring them to a block builder.
     pub fn take_pending_stake_ops(&mut self) -> Vec<StakeOp> {
         std::mem::take(&mut self.pending_stake_ops)
+    }
+
+    /// M179: drain staged key-rotation ops, transferring them to a block builder.
+    pub fn take_pending_key_rotations(&mut self) -> Vec<KeyRotation> {
+        std::mem::take(&mut self.pending_key_rotations)
     }
 
     /// Preload an already-certified chain (e.g. a seed node handing out history).
@@ -1189,6 +1215,12 @@ impl GossipNode {
             self.pending_stake_ops
                 .retain(|op| !committed.contains(&op.hash()));
         }
+        if !block.key_rotations.is_empty() {
+            let committed: std::collections::HashSet<[u8; 32]> =
+                block.key_rotations.iter().map(|op| op.hash()).collect();
+            self.pending_key_rotations
+                .retain(|op| !committed.contains(&op.hash()));
+        }
         self.blocks.push(block);
         self.certs.push(cert);
         true
@@ -1227,9 +1259,11 @@ impl GossipNode {
                 bridge_headers: Vec::new(),
                 bridge_redeems: Vec::new(),
                 bridge_unbondings: Vec::new(),
+                key_rotations: Vec::new(),
             });
         candidate.stake_ops = self.pending_stake_ops.clone();
         candidate.slashing_evidence = self.pending_evidence.clone();
+        candidate.key_rotations = self.pending_key_rotations.clone();
         // M122: this node is the proposer of the block it builds — credit its own
         // validator id so the tx fees route to it. Only a block actually elected and
         // committed keeps this; a losing candidate is discarded.
@@ -1351,6 +1385,19 @@ impl GossipNode {
         self.broadcast(GossipMsg::StakeOp(op), None)
     }
 
+    /// M179: submit a locally-originated key-rotation op: stage it for the next
+    /// block and flood it to peers. As with stake ops, there is nothing to
+    /// validate structurally here — the signature (by the account's current
+    /// key), nonce, and active-validator guard are checked at apply time in
+    /// `chain.commit.apply_key_rotation`, which rolls back the whole block on
+    /// any failure.
+    pub fn submit_local_key_rotation(&mut self, op: KeyRotation) -> Vec<(u64, GossipMsg)> {
+        let h = op.hash();
+        self.seen_key_rotation.insert(h);
+        self.pending_key_rotations.push(op.clone());
+        self.broadcast(GossipMsg::KeyRotation(op), None)
+    }
+
     /// The gossip a node emits to announce its current height (anti-entropy tick).
     pub fn announce(&self) -> Vec<(u64, GossipMsg)> {
         self.broadcast(
@@ -1393,6 +1440,7 @@ impl GossipNode {
             GossipMsg::Tx(tx) => self.on_tx(from, tx),
             GossipMsg::Evidence(ev) => self.on_evidence(from, ev),
             GossipMsg::StakeOp(op) => self.on_stake_op(from, op),
+            GossipMsg::KeyRotation(op) => self.on_key_rotation(from, op),
             // M22: a full node answers `GetHeaders` with its retained
             // cert-signed headers. If we receive `Headers(...)` directly
             // (e.g. from a peer that pushes), drop them — full nodes don't
@@ -1565,6 +1613,15 @@ impl GossipNode {
         self.broadcast(GossipMsg::StakeOp(op), Some(from))
     }
 
+    fn on_key_rotation(&mut self, from: u64, op: KeyRotation) -> Vec<(u64, GossipMsg)> {
+        if !self.seen_key_rotation.insert(op.hash()) {
+            return Vec::new(); // already flooded through us
+        }
+        // stage; signature / nonce / active-validator checks live in apply_key_rotation
+        self.pending_key_rotations.push(op.clone());
+        self.broadcast(GossipMsg::KeyRotation(op), Some(from))
+    }
+
     /// Address `msg` to every peer, optionally excluding one (the sender), in
     /// sorted order for deterministic output.
     fn broadcast(&self, msg: GossipMsg, except: Option<u64>) -> Vec<(u64, GossipMsg)> {
@@ -1634,6 +1691,16 @@ impl Network {
     /// Submit a locally-originated stake op at node `id` and flood it.
     pub fn submit_stake_op(&mut self, id: u64, op: StakeOp) {
         let out = self.nodes.get_mut(&id).unwrap().submit_local_stake_op(op);
+        self.enqueue(id, out);
+    }
+
+    /// M179: submit a locally-originated key-rotation op at node `id` and flood it.
+    pub fn submit_key_rotation(&mut self, id: u64, op: KeyRotation) {
+        let out = self
+            .nodes
+            .get_mut(&id)
+            .unwrap()
+            .submit_local_key_rotation(op);
         self.enqueue(id, out);
     }
 
@@ -2000,6 +2067,8 @@ impl LightGossipNode {
             | GossipMsg::Tx(_)
             | GossipMsg::Evidence(_)
             | GossipMsg::StakeOp(_)
+            // M179: key rotations are a full-node block concern; light clients ignore.
+            | GossipMsg::KeyRotation(_)
             // M33: consensus is an Actor concern; light clients never vote.
             | GossipMsg::Consensus(_)
             // M39: peer discovery is an Actor concern; the pure core does no I/O.
@@ -2237,6 +2306,10 @@ pub fn encode_gossip(m: &GossipMsg) -> Vec<u8> {
             out.push(TAG_STAKEOP);
             put_bytes(&mut out, &encode_stakeop(op));
         }
+        GossipMsg::KeyRotation(op) => {
+            out.push(TAG_KEYROTATION);
+            put_bytes(&mut out, &crate::codec::encode_key_rotation(op));
+        }
         GossipMsg::GetHeaders { from } => {
             out.push(TAG_GETHEADERS);
             out.extend_from_slice(&from.to_be_bytes());
@@ -2385,6 +2458,9 @@ pub fn decode_gossip(buf: &[u8]) -> Result<GossipMsg, CodecError> {
         TAG_TX => GossipMsg::Tx(decode_tx(take_bytes(&mut rest)?)?),
         TAG_EVIDENCE => GossipMsg::Evidence(decode_evidence(take_bytes(&mut rest)?)?),
         TAG_STAKEOP => GossipMsg::StakeOp(decode_stakeop(take_bytes(&mut rest)?)?),
+        TAG_KEYROTATION => {
+            GossipMsg::KeyRotation(crate::codec::decode_key_rotation(take_bytes(&mut rest)?)?)
+        }
         TAG_GETHEADERS => GossipMsg::GetHeaders {
             from: take_u64(&mut rest)?,
         },
@@ -3805,6 +3881,46 @@ mod tests {
         }
     }
 
+    #[test]
+    fn key_rotation_gossip_reaches_every_node_and_dedups() {
+        // M179: a locally-submitted key rotation floods to every node's pending
+        // pool (one copy each), and a duplicate does not re-flood.
+        let ids = [1u64, 2, 3];
+        let nodes: Vec<GossipNode> = ids
+            .iter()
+            .map(|&id| GossipNode::new(id, genesis(), 16, ids.iter().copied()))
+            .collect();
+        let mut net = Network::new(nodes);
+
+        let op = KeyRotation {
+            account: 1,
+            new_pubkey: kp(99).public(),
+            nonce: 0,
+            signature: [0u8; 64],
+        }
+        .signed(&kp(1));
+        let h = op.hash();
+        net.submit_key_rotation(1, op.clone());
+        net.run();
+        for id in ids {
+            let pending = net.node(id).pending_key_rotations();
+            assert_eq!(pending.len(), 1, "node {id} staged one rotation");
+            assert_eq!(pending[0].hash(), h);
+        }
+
+        // A re-flood from a peer (receive path) is deduped: node 2 already saw
+        // this rotation, so re-delivering it stages nothing new and emits nothing.
+        let out = net
+            .node_mut(2)
+            .on_message(1, GossipMsg::KeyRotation(op.clone()));
+        assert!(out.is_empty(), "a seen rotation is not re-flooded");
+        assert_eq!(
+            net.node(2).pending_key_rotations().len(),
+            1,
+            "node 2 did not re-stage the duplicate rotation"
+        );
+    }
+
     /// End-to-end: gossip an evidence through the network to a node, drain
     /// the gossip node's pending pool into a `ChainDriver`, then `produce`
     /// — the resulting block carries the evidence and the offender is
@@ -4326,30 +4442,34 @@ mod tests {
 
     #[test]
     fn header_gossip_shrinks_the_wire_payload_vs_full_blocks() {
-        // The whole point of M22: a header-only gossip batch is smaller than a
-        // block batch because bodies (txs, stake ops, evidence) are not carried.
+        // The whole point of M22: a header-only gossip item omits the bodies
+        // (txs, stake ops, evidence, …), so for a block that actually carries a
+        // body it is smaller than shipping the full block + cert. M179 (B4 wire)
+        // grew the header by one 32-byte body commitment (eight total = 256 B of
+        // commitments), so the saving only materializes once a block's raw body
+        // exceeds that commitment overhead — which it does for any real block.
+        // We therefore assert the invariant on the single block that carries the
+        // transactions (3 txs ≈ 600 B of body ≫ 256 B of commitments), rather
+        // than summing over a chain padded with empty heartbeat blocks whose
+        // commitments would dominate their (empty) bodies.
         let (blocks, certs) = certified_chain(3);
-        let full_batch: Vec<(Block, Commit)> =
-            blocks.iter().cloned().zip(certs.iter().cloned()).collect();
-        let header_batch: Vec<CertifiedHeader> = blocks
-            .iter()
-            .zip(certs.iter())
-            .map(|(b, c)| CertifiedHeader::from_certified(b, c))
-            .collect();
+        // Put three real txs into one block so the body unambiguously exceeds the
+        // 8×32 B of header commitments (one tx ≈ 200 B, so three ≈ 600 B ≫ 256 B).
+        // The mempool spreads txs across blocks, so we stuff one block directly;
+        // the cert is identical on both sides of the inequality and cancels out,
+        // so any cert works for a pure size comparison.
+        let mut b = blocks[0].clone();
+        b.txs = vec![tx(1, 1, 1), tx(2, 2, 2), tx(3, 3, 3)];
+        let c = &certs[0];
 
-        let full_bytes: usize = full_batch
-            .iter()
-            .map(|(b, c)| encode_block(b).len() + encode_commit(c).len())
-            .sum();
-        let header_bytes: usize = header_batch
-            .iter()
-            .map(|ch| encode_certified_header(ch).len())
-            .sum();
+        let full_bytes = encode_block(&b).len() + encode_commit(c).len();
+        let header_bytes = encode_certified_header(&CertifiedHeader::from_certified(&b, c)).len();
 
         assert!(
             header_bytes < full_bytes,
-            "header-only payload ({header_bytes} B) must be strictly smaller than full-block payload ({full_bytes} B) — \
-             bodies were never carried over the wire"
+            "header-only item ({header_bytes} B) must be strictly smaller than the full \
+             block+cert ({full_bytes} B) for a block with a body — bodies are never carried \
+             in header gossip"
         );
     }
 
