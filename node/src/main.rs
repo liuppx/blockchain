@@ -5605,6 +5605,35 @@ fn demo_driver_seeds() -> std::collections::BTreeMap<u64, [u8; 32]> {
 mod tests {
     use super::*;
 
+    /// M179 (doc-integrity guard): the `demo` chain's cert-signed STATE roots are
+    /// the canonical wire-v1 values the READMEs / whitepaper cite
+    /// (`state_root 64184dab…0070e6`, `merkle_root 5312ecf6…ee8c6b`). They are NOT
+    /// supposed to move on a header-only wire bump: M171 (B3) and M179 (B4) grew
+    /// the block *header* with per-body commitments, which changes the block
+    /// *hash* (the demo `head`) but leaves `state_root` / `accounts_root` untouched
+    /// for a chain with no bridge/rotation state. Pinning the two state roots here
+    /// means an accidental change to the demo's *state* — the kind that would
+    /// silently falsify the documented invariants — fails a test instead of
+    /// drifting unnoticed. The head (block hash) is deliberately NOT pinned; it
+    /// legitimately moves with every wire bump (see each wire-bump milestone's
+    /// README note).
+    #[test]
+    fn demo_chain_state_roots_match_the_documented_canon() {
+        let mut chain = Chain::new(demo_genesis());
+        for blk in demo_blocks(&chain) {
+            let mut blk = blk;
+            chain.commit(&mut blk).expect("demo block commits");
+        }
+        assert_eq!(
+            hex(&chain.state.state_root()),
+            "64184dab08a3cac22d172378999fc5b7dc65cf7bb6251c8ff98f36601b0070e6"
+        );
+        assert_eq!(
+            hex(&chain.state.merkle_root()),
+            "5312ecf68856cfe031bc9e2478017170b15422f153ab260a4e81719f58ee8c6b"
+        );
+    }
+
     fn seed_for(id: u64) -> [u8; 32] {
         let mut s = [0u8; 32];
         s[..8].copy_from_slice(&id.to_le_bytes());
