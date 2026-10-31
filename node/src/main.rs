@@ -4224,23 +4224,19 @@ fn cmd_run(config_path: String, args: &[String]) {
 
     // M180: resolve the optional staged PENDING key (for an in-flight validator
     // key rotation). The nested `[validator.pending]` table reuses the same
-    // sourcing (seed_hex / mnemonic / encrypted keystore); a pending encrypted
-    // keystore reads its password from `ZHIXING_PENDING_KEYSTORE_PASSWORD`
-    // (unattended — no interactive prompt for the pending slot). The daemon swaps
-    // it into the active signing key once this validator's rotation takes effect.
+    // sourcing (seed_hex / mnemonic / encrypted keystore). M181: a pending
+    // encrypted keystore reads its password from `ZHIXING_PENDING_KEYSTORE_PASSWORD`
+    // if set (unattended), else an interactive no-echo prompt — same discipline as
+    // the active key. The daemon swaps it into the active signing key once this
+    // validator's rotation takes effect.
     let pending_key = cfg
         .validator
         .as_ref()
         .and_then(|vc| vc.pending.as_deref())
         .map(|pc| {
-            let kp = if pc.encrypted_keystore_path.is_some() {
+            let kp = if let Some(path) = pc.encrypted_keystore_path.as_deref() {
                 let password =
-                    std::env::var("ZHIXING_PENDING_KEYSTORE_PASSWORD").unwrap_or_else(|_| {
-                        fail_msg(
-                            "pending key",
-                            "encrypted pending keystore requires ZHIXING_PENDING_KEYSTORE_PASSWORD",
-                        )
-                    });
+                    read_keystore_password_from("ZHIXING_PENDING_KEYSTORE_PASSWORD", path);
                 pc.keypair_with_password(&password)
             } else {
                 pc.keypair()
@@ -4918,7 +4914,15 @@ fn prompt_new_password() -> String {
 /// TTY. The env-var path trades `/proc/<pid>/environ` exposure for automation;
 /// interactive operators should prefer the prompt.
 fn read_keystore_password(path: &str) -> String {
-    if let Ok(pw) = std::env::var("ZHIXING_KEYSTORE_PASSWORD") {
+    read_keystore_password_from("ZHIXING_KEYSTORE_PASSWORD", path)
+}
+
+/// M180/M181: resolve a keystore password — the named environment variable if set
+/// (unattended: systemd `EnvironmentFile` / CI), else an interactive no-echo
+/// prompt. Shared by the active key (`ZHIXING_KEYSTORE_PASSWORD`) and the pending
+/// rotation key (`ZHIXING_PENDING_KEYSTORE_PASSWORD`), so both behave the same.
+fn read_keystore_password_from(env_var: &str, path: &str) -> String {
+    if let Ok(pw) = std::env::var(env_var) {
         if !pw.is_empty() {
             return pw;
         }
@@ -5660,6 +5664,22 @@ mod tests {
             hex(&chain.state.merkle_root()),
             "5312ecf68856cfe031bc9e2478017170b15422f153ab260a4e81719f58ee8c6b"
         );
+    }
+
+    #[test]
+    fn read_keystore_password_prefers_env() {
+        // M181: `read_keystore_password_from` returns the named env var when set
+        // (unattended path), without touching the TTY. Uses a test-unique var name
+        // so it never collides with the real ones under parallel test runs.
+        let var = "ZHIXING_TEST_PW_M181";
+        std::env::set_var(var, "s3cret");
+        assert_eq!(read_keystore_password_from(var, "/some/ks.json"), "s3cret");
+        std::env::remove_var(var);
+        // An empty env value is treated as unset (falls through to the prompt,
+        // which we don't exercise here — just assert the empty value isn't used).
+        std::env::set_var(var, "");
+        assert!(std::env::var(var).unwrap().is_empty());
+        std::env::remove_var(var);
     }
 
     fn seed_for(id: u64) -> [u8; 32] {

@@ -1395,6 +1395,15 @@ M165 保留 3 端点（`/unbonding`/`/stake-ops`/`/evidence`）为 `next=` 是�
 - **测试（+1 → 631）**：新 `unbonding_entry_hash_is_stable_and_collision_safe`（4 断言：clone 等、改任一字段 hash 不同、32 字节长）；扩展 `rpc_unbonding_list_over_tcp`/`rpc_stake_ops_list_over_tcp`/`rpc_evidence_list_over_tcp` in-process 测改 `next`→`cursor`。
 - **已知边界**：`UnbondingEntry` 字段顺序（account/amount/mature_height）+ LE 字节序 = hash 格式的隐性契约；改字段顺序或加字段 = 改 hash 格式 = 旧 cursor 解析失败（文档说明）。`encode_unbonding` 真正的 codec 入口（若未来要把 UnbondingEntry 入 wire/快照/跨链）属后续篮子。
 
+## pending keystore 交互式密码提示（Milestone 181）
+
+收尾 M180 留的小口：M180 的 pending 加密 keystore 只从 `ZHIXING_PENDING_KEYSTORE_PASSWORD` 读密码，缺失即硬失败——与活跃 keystore（M175 `read_keystore_password`：env 优先、否则交互 no-echo 提示）不一致。
+
+- **`read_keystore_password_from(env_var, path)`**（`main.rs`）：把 M175 的 `read_keystore_password` 泛化——先读指定的环境变量（无人值守），否则 `rpassword` no-echo 交互提示。`read_keystore_password` 变成 `read_keystore_password_from("ZHIXING_KEYSTORE_PASSWORD", path)` 的薄封装；活跃键与 pending 键共用同一套逻辑。
+- `cmd_run` 的 pending-key 解析改调 `read_keystore_password_from("ZHIXING_PENDING_KEYSTORE_PASSWORD", path)`——env 优先，否则交互提示，不再硬失败。
+- 纯 CLI 收尾：无 wire / 共识 / config 结构变更，localnet/demo 头不动。
+- **测试（+1 → 686）**：`read_keystore_password_prefers_env`（env 设置时返回其值、不碰 TTY；用测试专用 env 名 `ZHIXING_TEST_PW_M181` 避并行冲突）。交互 no-echo 分支需 TTY，不在自动化测试里走（与 M175 的 `encrypt-key`/`run` 提示同样情况）。
+
 ## 活跃验证人密钥轮换 + 守护进程自动交接（Milestone 180）
 
 M179 刻意排除活跃验证人（`apply_key_rotation` 以 `CannotRotateActiveValidator` 拒绝），因为验证人轮换涉及守护进程签名密钥在高度边界的交接定时难题。M180 合上这个篮子：允许活跃验证人轮换，守护进程**自动交接**签名密钥（用户选"自动交接"，非"运维重启"）。**纯逻辑，无 wire 变更**——`KeyRotation` op 与 B4 布局 M179 已定；localnet/demo 头不动（`33cb2506…`/`a186d72d…`），demo state 根守卫测仍绿。
