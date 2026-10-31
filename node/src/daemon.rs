@@ -1026,6 +1026,11 @@ struct Actor {
     outbound: HashMap<u64, mpsc::UnboundedSender<GossipMsg>>,
     /// This process's signing key, or `None` for a pure follower (never votes).
     kp: Option<Keypair>,
+    /// M180: a staged **pending** signing key for an in-flight key rotation. When
+    /// this validator's own `KeyRotation` takes effect (the active set's pubkey
+    /// for our id changes to this key), `reconcile_signing_key` swaps it into
+    /// `kp`. `None` when no rotation is staged.
+    pending_kp: Option<Keypair>,
     /// Self-scheduling channel (consensus timeouts + next-height starts).
     self_tx: mpsc::UnboundedSender<Cmd>,
     /// Live consensus for `node.height()+1`, if this validator is running one.
@@ -1410,6 +1415,9 @@ impl Actor {
             self.blocks_committed += 1; // M52
             self.persist();
             self.broadcast_status();
+            // M180: our own key rotation may have just taken effect — align the
+            // signing key with the set before starting the next height.
+            self.reconcile_signing_key();
         }
         self.cons = None;
         self.schedule_start(self.node.height() + 1, self.timing.block_interval_ms);
@@ -1451,6 +1459,84 @@ impl Actor {
         if stale {
             self.cons = None;
             self.schedule_start(self.node.height() + 1, self.timing.block_interval_ms);
+        }
+    }
+
+    /// M180: after a block commits (self-decided OR synced), keep this node's
+    /// signing key aligned with the active validator set. If our own key rotation
+    /// has taken effect — the set's pubkey for our id no longer matches the key we
+    /// hold — adopt the staged pending key when it matches, so the next height is
+    /// signed with the key the set now expects. If no pending key matches, keep
+    /// the old one and warn: this validator will miss votes until restarted with
+    /// the new key (a local liveness gap, never a safety or whole-mesh problem).
+    /// A stateless invariant ("signing key == set pubkey for our id") rather than
+    /// height tracking, so it covers both commit paths uniformly.
+    fn reconcile_signing_key(&mut self) {
+        let Some(kp) = self.kp.as_ref() else {
+            return; // pure follower
+        };
+        let expected = self
+            .node
+            .chain
+            .state
+            .validators
+            .get(self.node.id)
+            .map(|v| v.pubkey);
+        let decision = resolve_signing_key(
+            kp.public(),
+            self.pending_kp.as_ref().map(|k| k.public()),
+            expected,
+        );
+        match decision {
+            SigningKeyDecision::Keep => {}
+            SigningKeyDecision::Adopt => {
+                self.kp = self.pending_kp.take();
+                info!(
+                    node = self.node.id,
+                    "adopted rotated signing key (own KeyRotation took effect)"
+                );
+            }
+            SigningKeyDecision::Stale => {
+                warn!(
+                    node = self.node.id,
+                    "active set expects a signing key this node does not hold \
+                     (no matching pending key staged) — this validator will miss \
+                     votes until restarted with the new key"
+                );
+            }
+        }
+    }
+}
+
+/// M180: what to do with this node's signing key after a commit, given the key it
+/// currently holds, an optionally-staged pending key, and the pubkey the active
+/// set now expects for this node's id (`None` ⇒ not in the set). Pure so it is
+/// unit-testable without constructing an `Actor`.
+#[derive(Debug, PartialEq, Eq)]
+enum SigningKeyDecision {
+    /// Current key still matches the set (or we're not in the set) — no change.
+    Keep,
+    /// Current key no longer matches, but the pending key does — swap it in.
+    Adopt,
+    /// Current key no longer matches and no pending key matches — degraded.
+    Stale,
+}
+
+fn resolve_signing_key(
+    current: PubKey,
+    pending: Option<PubKey>,
+    expected: Option<PubKey>,
+) -> SigningKeyDecision {
+    match expected {
+        // Not in the active set, or the set still expects our current key.
+        None => SigningKeyDecision::Keep,
+        Some(exp) if exp == current => SigningKeyDecision::Keep,
+        Some(exp) => {
+            if pending == Some(exp) {
+                SigningKeyDecision::Adopt
+            } else {
+                SigningKeyDecision::Stale
+            }
         }
     }
 }
@@ -1504,6 +1590,7 @@ async fn run_actor(mut actor: Actor, mut rx: mpsc::UnboundedReceiver<Cmd>) {
                 actor.persist();
                 if actor.node.height() > before {
                     actor.broadcast_status();
+                    actor.reconcile_signing_key(); // M180: rotation may have landed via sync
                     actor.reconcile_after_sync();
                 }
             }
@@ -6955,6 +7042,7 @@ impl Node {
         cfg: NodeConfig,
         genesis: Genesis,
         validator_key: Option<Keypair>,
+        pending_key: Option<Keypair>,
     ) -> io::Result<Node> {
         let my_id = cfg.node.id;
         let listen = cfg.listen_addr().map_err(cfg_io)?;
@@ -7262,6 +7350,7 @@ impl Node {
             node,
             outbound: HashMap::new(),
             kp: validator_key,
+            pending_kp: pending_key,
             self_tx: cmd_tx.clone(),
             cons: None,
             blog,
@@ -7394,8 +7483,9 @@ pub async fn run(
     cfg: NodeConfig,
     genesis: Genesis,
     validator_key: Option<Keypair>,
+    pending_key: Option<Keypair>,
 ) -> io::Result<()> {
-    let _node = Node::start(cfg, genesis, validator_key).await?;
+    let _node = Node::start(cfg, genesis, validator_key, pending_key).await?;
     tokio::signal::ctrl_c().await?;
     info!("shutdown requested — exiting (logs are fsync'd per append)");
     Ok(())
@@ -8326,6 +8416,44 @@ mod tests {
     }
 
     #[test]
+    fn resolve_signing_key_three_way_decision() {
+        // M180: the pure handoff decision. `expected` is the set's pubkey for this
+        // node's id; `None` = not in the set.
+        let a = [1u8; 32];
+        let b = [2u8; 32];
+        let c = [3u8; 32];
+        // Not in the set → keep (nothing to vote with anyway).
+        assert_eq!(resolve_signing_key(a, None, None), SigningKeyDecision::Keep);
+        assert_eq!(
+            resolve_signing_key(a, Some(b), None),
+            SigningKeyDecision::Keep
+        );
+        // Set still expects our current key → keep.
+        assert_eq!(
+            resolve_signing_key(a, None, Some(a)),
+            SigningKeyDecision::Keep
+        );
+        assert_eq!(
+            resolve_signing_key(a, Some(b), Some(a)),
+            SigningKeyDecision::Keep
+        );
+        // Our key no longer matches, pending matches the new expected → adopt.
+        assert_eq!(
+            resolve_signing_key(a, Some(b), Some(b)),
+            SigningKeyDecision::Adopt
+        );
+        // Our key no longer matches and no/other pending → stale (degraded).
+        assert_eq!(
+            resolve_signing_key(a, None, Some(b)),
+            SigningKeyDecision::Stale
+        );
+        assert_eq!(
+            resolve_signing_key(a, Some(c), Some(b)),
+            SigningKeyDecision::Stale
+        );
+    }
+
+    #[test]
     fn admit_inbound_enforces_the_concurrency_cap() {
         // M177: the admission gate hands out exactly `cap` permits; past that it
         // returns None (the accept loop then drops the new connection). Freeing a
@@ -8855,7 +8983,7 @@ mod tests {
             let dir = tmp_dir(&format!("conv-n{id}"));
             data_dirs.insert(id, dir.clone());
             let cfg = node_config(id, port_base, &ids, dir);
-            let node = Node::start(cfg, genesis.clone(), Some(kp(id)))
+            let node = Node::start(cfg, genesis.clone(), Some(kp(id)), None)
                 .await
                 .expect("start node");
             nodes.push((id, node));
@@ -8902,7 +9030,7 @@ mod tests {
             let dir = tmp_dir(&format!("crash1-n{id}"));
             data_dirs.insert(id, dir.clone());
             let cfg = node_config(id, port_base, &ids, dir); // peers still list 24
-            let node = Node::start(cfg, genesis.clone(), Some(kp(id)))
+            let node = Node::start(cfg, genesis.clone(), Some(kp(id)), None)
                 .await
                 .expect("start node");
             nodes.push((id, node));
@@ -8941,7 +9069,7 @@ mod tests {
             let dir = tmp_dir(&format!("crash2-n{id}"));
             data_dirs.insert(id, dir.clone());
             let cfg = node_config(id, port_base, &ids, dir);
-            let node = Node::start(cfg, genesis.clone(), Some(kp(id)))
+            let node = Node::start(cfg, genesis.clone(), Some(kp(id)), None)
                 .await
                 .expect("start node");
             nodes.push((id, node));
@@ -8971,7 +9099,7 @@ mod tests {
             let dir = tmp_dir(&format!("late-n{id}"));
             data_dirs.insert(id, dir.clone());
             let cfg = node_config(id, port_base, &ids, dir);
-            let node = Node::start(cfg, genesis.clone(), Some(kp(id)))
+            let node = Node::start(cfg, genesis.clone(), Some(kp(id)), None)
                 .await
                 .expect("start node");
             nodes.push((id, node));
@@ -8985,7 +9113,7 @@ mod tests {
         let dir = tmp_dir("late-n24");
         data_dirs.insert(24, dir.clone());
         let cfg = node_config(24, port_base, &ids, dir);
-        let node24 = Node::start(cfg, genesis.clone(), Some(kp(24)))
+        let node24 = Node::start(cfg, genesis.clone(), Some(kp(24)), None)
             .await
             .expect("start late node");
         nodes.push((24, node24));
@@ -9022,7 +9150,7 @@ mod tests {
             let cfg = node_config(id, port_base, &all, dir);
             // id 25 has no key ⇒ pure follower.
             let key = vids.contains(&id).then(|| kp(id));
-            let node = Node::start(cfg, genesis.clone(), key)
+            let node = Node::start(cfg, genesis.clone(), key, None)
                 .await
                 .expect("start node");
             nodes.push((id, node));
@@ -9064,7 +9192,7 @@ mod tests {
             let dir = tmp_dir(&format!("equiv-n{id}"));
             data_dirs.insert(id, dir.clone());
             let cfg = node_config(id, port_base, &live, dir);
-            let node = Node::start(cfg, genesis.clone(), Some(kp(id)))
+            let node = Node::start(cfg, genesis.clone(), Some(kp(id)), None)
                 .await
                 .expect("start node");
             nodes.push((id, node));
@@ -9190,7 +9318,7 @@ mod tests {
             data_dirs.insert(id, dir.clone());
             let mut cfg = node_config(id, port_base, &ids, dir);
             cfg.consensus.create_empty_blocks = false;
-            let node = Node::start(cfg, genesis.clone(), Some(kp(id)))
+            let node = Node::start(cfg, genesis.clone(), Some(kp(id)), None)
                 .await
                 .expect("start node");
             nodes.push((id, node));
@@ -9454,7 +9582,7 @@ mod tests {
         // A single fresh validator: genesis height 0, no peers dialed, has a key.
         let dir = tmp_dir("metrics-handle");
         let cfg = node_config(21, 19671, &[21], dir.clone());
-        let node = Node::start(cfg, test_genesis(), Some(kp(21)))
+        let node = Node::start(cfg, test_genesis(), Some(kp(21)), None)
             .await
             .expect("start node");
 
@@ -9477,7 +9605,7 @@ mod tests {
         let cfg = node_config(21, 19681, &[21], dir.clone());
         let mut genesis = test_genesis();
         genesis.validators = vec![(21, kp(21).public(), 1)];
-        let node = Node::start(cfg, genesis, Some(kp(21)))
+        let node = Node::start(cfg, genesis, Some(kp(21)), None)
             .await
             .expect("start node");
 
@@ -9512,7 +9640,7 @@ mod tests {
             auth_token: String::new(),
             enable_tls: false,
         });
-        let _node = Node::start(cfg, test_genesis(), Some(kp(21)))
+        let _node = Node::start(cfg, test_genesis(), Some(kp(21)), None)
             .await
             .expect("start node");
 
@@ -9557,7 +9685,7 @@ mod tests {
             auth_token: "scrape-key".into(),
             enable_tls: false,
         });
-        let _node = Node::start(cfg, test_genesis(), Some(kp(21)))
+        let _node = Node::start(cfg, test_genesis(), Some(kp(21)), None)
             .await
             .expect("start node");
         tokio::time::sleep(Duration::from_millis(200)).await;
@@ -9627,7 +9755,7 @@ mod tests {
             auth_token: String::new(),
             enable_tls: true,
         });
-        let _node = Node::start(cfg, test_genesis(), Some(kp(21)))
+        let _node = Node::start(cfg, test_genesis(), Some(kp(21)), None)
             .await
             .expect("start node");
         tokio::time::sleep(Duration::from_millis(200)).await;
@@ -9713,7 +9841,7 @@ mod tests {
         });
         let mut genesis = test_genesis();
         genesis.validators = vec![(21, kp(21).public(), 1)];
-        let _node = Node::start(cfg, genesis, Some(kp(21)))
+        let _node = Node::start(cfg, genesis, Some(kp(21)), None)
             .await
             .expect("start node");
         tokio::time::sleep(Duration::from_millis(200)).await;
@@ -9793,7 +9921,7 @@ mod tests {
         let cfg = node_config(21, 19701, &[21], dir.clone());
         let mut genesis = test_genesis();
         genesis.validators = vec![(21, kp(21).public(), 1)];
-        let node = Node::start(cfg, genesis, Some(kp(21)))
+        let node = Node::start(cfg, genesis, Some(kp(21)), None)
             .await
             .expect("start node");
 
@@ -9833,7 +9961,7 @@ mod tests {
         });
         let mut genesis = test_genesis();
         genesis.validators = vec![(21, kp(21).public(), 1)];
-        let node = Node::start(cfg, genesis, Some(kp(21)))
+        let node = Node::start(cfg, genesis, Some(kp(21)), None)
             .await
             .expect("start node");
 
@@ -9909,7 +10037,7 @@ mod tests {
         });
         let mut genesis = test_genesis();
         genesis.validators = vec![(21, kp(21).public(), 1)];
-        let node = Node::start(cfg, genesis, Some(kp(21)))
+        let node = Node::start(cfg, genesis, Some(kp(21)), None)
             .await
             .expect("start node");
         tokio::time::sleep(Duration::from_millis(200)).await;
@@ -10086,7 +10214,7 @@ mod tests {
         });
         let mut genesis = test_genesis();
         genesis.validators = vec![(21, kp(21).public(), 1)];
-        let _node = Node::start(cfg, genesis, Some(kp(21)))
+        let _node = Node::start(cfg, genesis, Some(kp(21)), None)
             .await
             .expect("start node");
 
@@ -10170,7 +10298,7 @@ mod tests {
         let cfg = node_config(21, 19781, &[21], dir.clone());
         let mut genesis = test_genesis();
         genesis.validators = vec![(21, kp(21).public(), 1)]; // quorum 1 ⇒ node self-commits
-        let node = Node::start(cfg, genesis.clone(), Some(kp(21)))
+        let node = Node::start(cfg, genesis.clone(), Some(kp(21)), None)
             .await
             .expect("start node");
 
@@ -10231,7 +10359,7 @@ mod tests {
         });
         let mut genesis = test_genesis();
         genesis.validators = vec![(21, kp(21).public(), 1)];
-        let node = Node::start(cfg, genesis, Some(kp(21)))
+        let node = Node::start(cfg, genesis, Some(kp(21)), None)
             .await
             .expect("start node");
 
@@ -10296,7 +10424,7 @@ mod tests {
         });
         let mut genesis = test_genesis();
         genesis.validators = vec![(21, kp(21).public(), 1)];
-        let node = Node::start(cfg, genesis, Some(kp(21)))
+        let node = Node::start(cfg, genesis, Some(kp(21)), None)
             .await
             .expect("start node");
 
@@ -10380,7 +10508,7 @@ mod tests {
         });
         let mut genesis = test_genesis();
         genesis.validators = vec![(21, kp(21).public(), 1)];
-        let node = Node::start(cfg, genesis, Some(kp(21)))
+        let node = Node::start(cfg, genesis, Some(kp(21)), None)
             .await
             .expect("start node");
 
@@ -10457,7 +10585,7 @@ mod tests {
         });
         let mut genesis = test_genesis();
         genesis.validators = vec![(21, kp(21).public(), 1)];
-        let node = Node::start(cfg, genesis, Some(kp(21)))
+        let node = Node::start(cfg, genesis, Some(kp(21)), None)
             .await
             .expect("start node");
 
@@ -10616,7 +10744,7 @@ mod tests {
         });
         let mut genesis = test_genesis();
         genesis.validators = vec![(21, kp(21).public(), 1)];
-        let node = Node::start(cfg, genesis, Some(kp(21)))
+        let node = Node::start(cfg, genesis, Some(kp(21)), None)
             .await
             .expect("start node");
 
@@ -10671,7 +10799,7 @@ mod tests {
         });
         let mut genesis = test_genesis();
         genesis.validators = vec![(21, kp(21).public(), 1)];
-        let node = Node::start(cfg, genesis, Some(kp(21)))
+        let node = Node::start(cfg, genesis, Some(kp(21)), None)
             .await
             .expect("start node");
 
@@ -10763,7 +10891,7 @@ mod tests {
         });
         let mut genesis = test_genesis();
         genesis.validators = vec![(24, kp(24).public(), 1)]; // quorum 1 ⇒ self-commit
-        let node = Node::start(cfg, genesis, Some(kp(24)))
+        let node = Node::start(cfg, genesis, Some(kp(24)), None)
             .await
             .expect("start node");
 
@@ -10875,7 +11003,7 @@ mod tests {
         genesis.validators = vec![(25, kp(25).public(), 1)]; // quorum 1 ⇒ self-commit
         genesis.accounts = vec![(1, 50 * crate::MICRO, kp(1).public())];
         genesis.reviewers = vec![];
-        let node = Node::start(cfg, genesis, Some(kp(25)))
+        let node = Node::start(cfg, genesis, Some(kp(25)), None)
             .await
             .expect("start node");
 
@@ -10992,7 +11120,7 @@ mod tests {
         });
         let mut genesis = test_genesis();
         genesis.validators = vec![(26, kp(26).public(), 1)]; // quorum 1 ⇒ self-commit
-        let node = Node::start(cfg, genesis, Some(kp(26)))
+        let node = Node::start(cfg, genesis, Some(kp(26)), None)
             .await
             .expect("start node");
 
@@ -11112,7 +11240,7 @@ mod tests {
         });
         let mut genesis = test_genesis();
         genesis.validators = vec![(27, kp(27).public(), 1)]; // quorum 1 ⇒ self-commit
-        let node = Node::start(cfg, genesis, Some(kp(27)))
+        let node = Node::start(cfg, genesis, Some(kp(27)), None)
             .await
             .expect("start node");
 
@@ -11210,7 +11338,7 @@ mod tests {
         });
         let mut genesis = test_genesis();
         genesis.validators = vec![(28, kp(28).public(), 1)]; // quorum 1 ⇒ self-commit
-        let node = Node::start(cfg, genesis, Some(kp(28)))
+        let node = Node::start(cfg, genesis, Some(kp(28)), None)
             .await
             .expect("start node");
 
@@ -11289,7 +11417,7 @@ mod tests {
         });
         let mut genesis = test_genesis();
         genesis.validators = vec![(29, kp(29).public(), 1)]; // quorum 1 ⇒ self-commit
-        let node = Node::start(cfg, genesis, Some(kp(29)))
+        let node = Node::start(cfg, genesis, Some(kp(29)), None)
             .await
             .expect("start node");
 
@@ -11371,7 +11499,7 @@ mod tests {
         });
         let mut genesis = test_genesis();
         genesis.validators = vec![(30, kp(30).public(), 1)]; // quorum 1 ⇒ self-commit
-        let node = Node::start(cfg, genesis, Some(kp(30)))
+        let node = Node::start(cfg, genesis, Some(kp(30)), None)
             .await
             .expect("start node");
 
@@ -11453,7 +11581,7 @@ mod tests {
         });
         let mut genesis = test_genesis();
         genesis.validators = vec![(31, kp(31).public(), 1)]; // quorum 1 ⇒ self-commit
-        let node = Node::start(cfg, genesis, Some(kp(31)))
+        let node = Node::start(cfg, genesis, Some(kp(31)), None)
             .await
             .expect("start node");
 
@@ -11536,7 +11664,7 @@ mod tests {
         });
         let mut genesis = test_genesis();
         genesis.validators = vec![(32, kp(32).public(), 1)]; // quorum 1 ⇒ self-commit
-        let node = Node::start(cfg, genesis, Some(kp(32)))
+        let node = Node::start(cfg, genesis, Some(kp(32)), None)
             .await
             .expect("start node");
 
@@ -11606,7 +11734,7 @@ mod tests {
         });
         let mut genesis = test_genesis();
         genesis.validators = vec![(36, kp(36).public(), 1)]; // quorum 1 ⇒ self-commit
-        let node = Node::start(cfg, genesis, Some(kp(36)))
+        let node = Node::start(cfg, genesis, Some(kp(36)), None)
             .await
             .expect("start node");
 
@@ -11677,7 +11805,7 @@ mod tests {
         });
         let mut genesis = test_genesis();
         genesis.validators = vec![(44, kp(44).public(), 1)]; // quorum 1 ⇒ self-commit
-        let node = Node::start(cfg, genesis, Some(kp(44)))
+        let node = Node::start(cfg, genesis, Some(kp(44)), None)
             .await
             .expect("start node");
 
@@ -11750,7 +11878,7 @@ mod tests {
         });
         let mut genesis = test_genesis();
         genesis.validators = vec![(45, kp(45).public(), 1)]; // quorum 1 ⇒ self-commit
-        let node = Node::start(cfg, genesis, Some(kp(45)))
+        let node = Node::start(cfg, genesis, Some(kp(45)), None)
             .await
             .expect("start node");
 
@@ -11836,7 +11964,7 @@ mod tests {
         });
         let mut genesis = test_genesis();
         genesis.validators = vec![(46, kp(46).public(), 1)]; // quorum 1 ⇒ self-commit
-        let node = Node::start(cfg, genesis, Some(kp(46)))
+        let node = Node::start(cfg, genesis, Some(kp(46)), None)
             .await
             .expect("start node");
 
@@ -11921,7 +12049,7 @@ mod tests {
         });
         let mut genesis = test_genesis();
         genesis.validators = vec![(47, kp(47).public(), 1)]; // quorum 1 ⇒ self-commit
-        let node = Node::start(cfg, genesis, Some(kp(47)))
+        let node = Node::start(cfg, genesis, Some(kp(47)), None)
             .await
             .expect("start node");
 
@@ -12007,7 +12135,7 @@ mod tests {
         });
         let mut genesis = test_genesis();
         genesis.validators = vec![(48, kp(48).public(), 1)]; // quorum 1 ⇒ self-commit
-        let _node = Node::start(cfg, genesis, Some(kp(48)))
+        let _node = Node::start(cfg, genesis, Some(kp(48)), None)
             .await
             .expect("start node");
 
@@ -12079,7 +12207,7 @@ mod tests {
         });
         let mut genesis = test_genesis();
         genesis.validators = vec![(49, kp(49).public(), 1)]; // quorum 1 ⇒ self-commit
-        let _node = Node::start(cfg, genesis, Some(kp(49)))
+        let _node = Node::start(cfg, genesis, Some(kp(49)), None)
             .await
             .expect("start node");
 
@@ -12123,7 +12251,7 @@ mod tests {
         });
         let mut genesis = test_genesis();
         genesis.validators = vec![(50, kp(50).public(), 1)]; // quorum 1 ⇒ self-commit
-        let _node = Node::start(cfg, genesis, Some(kp(50)))
+        let _node = Node::start(cfg, genesis, Some(kp(50)), None)
             .await
             .expect("start node");
 
@@ -12164,7 +12292,7 @@ mod tests {
         });
         let mut genesis = test_genesis();
         genesis.validators = vec![(37, kp(37).public(), 1)]; // quorum 1 ⇒ self-commit
-        let node = Node::start(cfg, genesis, Some(kp(37)))
+        let node = Node::start(cfg, genesis, Some(kp(37)), None)
             .await
             .expect("start node");
 
@@ -12243,7 +12371,7 @@ mod tests {
         });
         let mut genesis = test_genesis();
         genesis.validators = vec![(38, kp(38).public(), 1)]; // quorum 1 ⇒ self-commit
-        let node = Node::start(cfg, genesis, Some(kp(38)))
+        let node = Node::start(cfg, genesis, Some(kp(38)), None)
             .await
             .expect("start node");
 
@@ -12338,7 +12466,7 @@ mod tests {
         });
         let mut genesis = test_genesis();
         genesis.validators = vec![(51, kp(51).public(), 1)]; // quorum 1 ⇒ self-commit
-        let _node = Node::start(cfg, genesis, Some(kp(51)))
+        let _node = Node::start(cfg, genesis, Some(kp(51)), None)
             .await
             .expect("start node");
 
@@ -12399,7 +12527,7 @@ mod tests {
         });
         let mut genesis = test_genesis();
         genesis.validators = vec![(52, kp(52).public(), 1)]; // quorum 1 ⇒ self-commit
-        let _node = Node::start(cfg, genesis, Some(kp(52)))
+        let _node = Node::start(cfg, genesis, Some(kp(52)), None)
             .await
             .expect("start node");
 
@@ -12453,7 +12581,7 @@ mod tests {
         genesis.validators = vec![(39, kp(39).public(), 1)]; // quorum 1 ⇒ self-commit
                                                              // Independently stamp the same genesis to know the expected identity.
         let (_state, expected_gh) = crate::ChainState::genesis(genesis.clone());
-        let node = Node::start(cfg, genesis, Some(kp(39)))
+        let node = Node::start(cfg, genesis, Some(kp(39)), None)
             .await
             .expect("start node");
 
@@ -12526,7 +12654,7 @@ mod tests {
         let mut genesis = test_genesis();
         genesis.validators = vec![(40, kp(40).public(), 1)]; // quorum 1 ⇒ self-commit
         let (_state, expected_gh) = crate::ChainState::genesis(genesis.clone());
-        let node = Node::start(cfg, genesis, Some(kp(40)))
+        let node = Node::start(cfg, genesis, Some(kp(40)), None)
             .await
             .expect("start node");
 
@@ -12606,7 +12734,7 @@ mod tests {
         });
         let mut genesis = test_genesis();
         genesis.validators = vec![(43, kp(43).public(), 1)]; // quorum 1 ⇒ self-commit
-        let _node = Node::start(cfg, genesis, Some(kp(43)))
+        let _node = Node::start(cfg, genesis, Some(kp(43)), None)
             .await
             .expect("start node");
 
@@ -12661,7 +12789,7 @@ mod tests {
         });
         let mut genesis = test_genesis();
         genesis.validators = vec![(41, kp(41).public(), 1)]; // quorum 1 ⇒ self-commit
-        let _node = Node::start(cfg, genesis, Some(kp(41)))
+        let _node = Node::start(cfg, genesis, Some(kp(41)), None)
             .await
             .expect("start node");
 
@@ -12748,7 +12876,7 @@ mod tests {
         });
         let mut genesis = test_genesis();
         genesis.validators = vec![(33, kp(33).public(), 1)]; // quorum 1 ⇒ self-commit
-        let node = Node::start(cfg, genesis, Some(kp(33)))
+        let node = Node::start(cfg, genesis, Some(kp(33)), None)
             .await
             .expect("start node");
 
@@ -12825,7 +12953,7 @@ mod tests {
         });
         let mut genesis = test_genesis();
         genesis.validators = vec![(34, kp(34).public(), 1)]; // quorum 1 ⇒ self-commit
-        let node = Node::start(cfg, genesis, Some(kp(34)))
+        let node = Node::start(cfg, genesis, Some(kp(34)), None)
             .await
             .expect("start node");
 
@@ -12907,7 +13035,7 @@ mod tests {
         });
         let mut genesis = test_genesis();
         genesis.validators = vec![(35, kp(35).public(), 1)]; // quorum 1 ⇒ self-commit
-        let node = Node::start(cfg, genesis, Some(kp(35)))
+        let node = Node::start(cfg, genesis, Some(kp(35)), None)
             .await
             .expect("start node");
 
@@ -12963,7 +13091,7 @@ mod tests {
         });
         let mut genesis = test_genesis();
         genesis.validators = vec![(21, kp(21).public(), 1)];
-        let node = Node::start(cfg, genesis, Some(kp(21)))
+        let node = Node::start(cfg, genesis, Some(kp(21)), None)
             .await
             .expect("start node");
 
@@ -15090,7 +15218,7 @@ vote_b.validator=5 vote_b.height=9 vote_b.round=2 vote_b.block_hash={b_h} vote_b
         let cfg = node_config(21, 20011, &[21], dir.clone());
         let mut genesis = test_genesis();
         genesis.validators = vec![(21, kp(21).public(), 1)]; // quorum 1 ⇒ node self-commits
-        let node = Node::start(cfg, genesis.clone(), Some(kp(21)))
+        let node = Node::start(cfg, genesis.clone(), Some(kp(21)), None)
             .await
             .expect("start node");
 
@@ -15168,7 +15296,7 @@ vote_b.validator=5 vote_b.height=9 vote_b.round=2 vote_b.block_hash={b_h} vote_b
         });
         let mut genesis = test_genesis();
         genesis.validators = vec![(21, kp(21).public(), 1)];
-        let node = Node::start(cfg, genesis, Some(kp(21)))
+        let node = Node::start(cfg, genesis, Some(kp(21)), None)
             .await
             .expect("start node");
 
@@ -15242,7 +15370,7 @@ vote_b.validator=5 vote_b.height=9 vote_b.round=2 vote_b.block_hash={b_h} vote_b
         });
         let mut genesis = test_genesis();
         genesis.validators = vec![(21, kp(21).public(), 1)]; // quorum 1 ⇒ self-commit
-        let node = Node::start(cfg, genesis, Some(kp(21)))
+        let node = Node::start(cfg, genesis, Some(kp(21)), None)
             .await
             .expect("start node");
 
@@ -15367,7 +15495,7 @@ vote_b.validator=5 vote_b.height=9 vote_b.round=2 vote_b.block_hash={b_h} vote_b
         });
         let mut genesis = test_genesis();
         genesis.validators = vec![(21, kp(21).public(), 1)]; // quorum 1 ⇒ self-commit
-        let node = Node::start(cfg, genesis, Some(kp(21)))
+        let node = Node::start(cfg, genesis, Some(kp(21)), None)
             .await
             .expect("start node");
 
@@ -15472,7 +15600,7 @@ vote_b.validator=5 vote_b.height=9 vote_b.round=2 vote_b.block_hash={b_h} vote_b
         });
         let mut genesis = test_genesis();
         genesis.validators = vec![(21, kp(21).public(), 1)]; // quorum 1 ⇒ self-commit
-        let node = Node::start(cfg, genesis, Some(kp(21)))
+        let node = Node::start(cfg, genesis, Some(kp(21)), None)
             .await
             .expect("start node");
 
@@ -15603,7 +15731,7 @@ vote_b.validator=5 vote_b.height=9 vote_b.round=2 vote_b.block_hash={b_h} vote_b
         });
         let mut genesis = test_genesis();
         genesis.validators = vec![(23, kp(23).public(), 1)]; // quorum 1 ⇒ self-commit
-        let node = Node::start(cfg, genesis, Some(kp(23)))
+        let node = Node::start(cfg, genesis, Some(kp(23)), None)
             .await
             .expect("start node");
 
@@ -15704,7 +15832,7 @@ vote_b.validator=5 vote_b.height=9 vote_b.round=2 vote_b.block_hash={b_h} vote_b
         });
         let mut genesis = test_genesis();
         genesis.validators = vec![(42, kp(42).public(), 1)]; // quorum 1 ⇒ self-commit
-        let node = Node::start(cfg, genesis, Some(kp(42)))
+        let node = Node::start(cfg, genesis, Some(kp(42)), None)
             .await
             .expect("start node");
 
@@ -15792,7 +15920,7 @@ vote_b.validator=5 vote_b.height=9 vote_b.round=2 vote_b.block_hash={b_h} vote_b
         });
         let mut genesis = test_genesis();
         genesis.validators = vec![(21, kp(21).public(), 1)]; // quorum 1 ⇒ self-commit
-        let node = Node::start(cfg, genesis, Some(kp(21)))
+        let node = Node::start(cfg, genesis, Some(kp(21)), None)
             .await
             .expect("start node");
 
@@ -15942,7 +16070,7 @@ vote_b.validator=5 vote_b.height=9 vote_b.round=2 vote_b.block_hash={b_h} vote_b
         let cfg = node_config(21, 20012, &[21], dir.clone());
         let mut genesis = test_genesis();
         genesis.validators = vec![(21, kp(21).public(), 1)]; // quorum 1 ⇒ node self-commits
-        let node = Node::start(cfg, genesis.clone(), Some(kp(21)))
+        let node = Node::start(cfg, genesis.clone(), Some(kp(21)), None)
             .await
             .expect("start node");
 
@@ -16050,7 +16178,7 @@ vote_b.validator=5 vote_b.height=9 vote_b.round=2 vote_b.block_hash={b_h} vote_b
         });
         let mut genesis = test_genesis();
         genesis.validators = vec![(21, kp(21).public(), 1)];
-        let node = Node::start(cfg, genesis, Some(kp(21)))
+        let node = Node::start(cfg, genesis, Some(kp(21)), None)
             .await
             .expect("start node");
 
@@ -16137,7 +16265,7 @@ vote_b.validator=5 vote_b.height=9 vote_b.round=2 vote_b.block_hash={b_h} vote_b
         });
         let mut genesis = test_genesis();
         genesis.validators = vec![(21, kp(21).public(), 1)];
-        let node = Node::start(cfg, genesis, Some(kp(21)))
+        let node = Node::start(cfg, genesis, Some(kp(21)), None)
             .await
             .expect("start node");
 
@@ -16244,7 +16372,7 @@ vote_b.validator=5 vote_b.height=9 vote_b.round=2 vote_b.block_hash={b_h} vote_b
         let dir = tmp_dir("submit-tx-full");
         let mut cfg = node_config(21, 19741, &[21], dir.clone());
         cfg.mempool.capacity = 1;
-        let node = Node::start(cfg, test_genesis(), None)
+        let node = Node::start(cfg, test_genesis(), None, None)
             .await
             .expect("start node");
 
@@ -16317,7 +16445,7 @@ vote_b.validator=5 vote_b.height=9 vote_b.round=2 vote_b.block_hash={b_h} vote_b
             let dir = tmp_dir(&format!("disc-n{id}"));
             data_dirs.insert(id, dir.clone());
             let cfg = discovery_config(id, port_base, &peers, dir, true);
-            let node = Node::start(cfg, genesis.clone(), Some(kp(id)))
+            let node = Node::start(cfg, genesis.clone(), Some(kp(id)), None)
                 .await
                 .expect("start node");
             nodes.push((id, node));
@@ -16359,7 +16487,7 @@ vote_b.validator=5 vote_b.height=9 vote_b.round=2 vote_b.block_hash={b_h} vote_b
             let dir = tmp_dir(&format!("noexch-n{id}"));
             data_dirs.insert(id, dir.clone());
             let cfg = discovery_config(id, port_base, &peers, dir, false);
-            let node = Node::start(cfg, genesis.clone(), Some(kp(id)))
+            let node = Node::start(cfg, genesis.clone(), Some(kp(id)), None)
                 .await
                 .expect("start node");
             nodes.push((id, node));
@@ -16396,7 +16524,7 @@ vote_b.validator=5 vote_b.height=9 vote_b.round=2 vote_b.block_hash={b_h} vote_b
             data_dirs.insert(id, dir.clone());
             let mut cfg = node_config(id, port_base, &ids, dir);
             cfg.network.require_peer_auth = true;
-            let node = Node::start(cfg, genesis.clone(), Some(kp(id)))
+            let node = Node::start(cfg, genesis.clone(), Some(kp(id)), None)
                 .await
                 .expect("start node");
             nodes.push((id, node));
@@ -16427,7 +16555,7 @@ vote_b.validator=5 vote_b.height=9 vote_b.round=2 vote_b.block_hash={b_h} vote_b
 
         let mut cfg = node_config(21, port_base, &[21], dir);
         cfg.network.require_peer_auth = true;
-        let node = Node::start(cfg, genesis.clone(), Some(kp(21)))
+        let node = Node::start(cfg, genesis.clone(), Some(kp(21)), None)
             .await
             .expect("start node");
 
@@ -16485,7 +16613,7 @@ vote_b.validator=5 vote_b.height=9 vote_b.round=2 vote_b.block_hash={b_h} vote_b
             data_dirs.insert(id, dir.clone());
             let mut cfg = node_config(id, port_base, &ids, dir);
             cfg.network.enable_tls = true;
-            let node = Node::start(cfg, genesis.clone(), Some(kp(id)))
+            let node = Node::start(cfg, genesis.clone(), Some(kp(id)), None)
                 .await
                 .expect("start node");
             nodes.push((id, node));
@@ -16517,7 +16645,7 @@ vote_b.validator=5 vote_b.height=9 vote_b.round=2 vote_b.block_hash={b_h} vote_b
             let mut cfg = node_config(id, port_base, &ids, dir);
             cfg.network.enable_tls = true;
             cfg.network.require_peer_auth = true;
-            let node = Node::start(cfg, genesis.clone(), Some(kp(id)))
+            let node = Node::start(cfg, genesis.clone(), Some(kp(id)), None)
                 .await
                 .expect("start node");
             nodes.push((id, node));
@@ -16546,7 +16674,7 @@ vote_b.validator=5 vote_b.height=9 vote_b.round=2 vote_b.block_hash={b_h} vote_b
 
         let mut cfg = node_config(21, port_base, &[21], dir);
         cfg.network.enable_tls = true;
-        let node = Node::start(cfg, genesis.clone(), Some(kp(21)))
+        let node = Node::start(cfg, genesis.clone(), Some(kp(21)), None)
             .await
             .expect("start node");
 
@@ -16587,7 +16715,7 @@ vote_b.validator=5 vote_b.height=9 vote_b.round=2 vote_b.block_hash={b_h} vote_b
             cfg.network.enable_tls = true;
             cfg.network.require_peer_auth = true;
             cfg.network.bind_channel = true;
-            let node = Node::start(cfg, genesis.clone(), Some(kp(id)))
+            let node = Node::start(cfg, genesis.clone(), Some(kp(id)), None)
                 .await
                 .expect("start node");
             nodes.push((id, node));
@@ -16616,7 +16744,7 @@ vote_b.validator=5 vote_b.height=9 vote_b.round=2 vote_b.block_hash={b_h} vote_b
         // bind_channel on, but enable_tls left off (require_peer_auth also off).
         let mut cfg = node_config(21, 19931, &[21], dir);
         cfg.network.bind_channel = true;
-        let err = Node::start(cfg, genesis.clone(), Some(kp(21))).await;
+        let err = Node::start(cfg, genesis.clone(), Some(kp(21)), None).await;
         assert!(
             err.is_err(),
             "bind_channel without enable_tls must fail fast"
@@ -16707,7 +16835,7 @@ vote_b.validator=5 vote_b.height=9 vote_b.round=2 vote_b.block_hash={b_h} vote_b
             cfg.network.enable_tls = true;
             cfg.network.require_peer_certs = true;
             cfg.network.require_peer_auth = true;
-            let node = Node::start(cfg, genesis.clone(), Some(kp(id)))
+            let node = Node::start(cfg, genesis.clone(), Some(kp(id)), None)
                 .await
                 .expect("start node");
             nodes.push((id, node));
@@ -16741,13 +16869,13 @@ vote_b.validator=5 vote_b.height=9 vote_b.round=2 vote_b.block_hash={b_h} vote_b
         let mut cfg22 = node_config(22, port_base, &[22, 23], dir22);
         cfg22.network.enable_tls = true;
         cfg22.network.require_peer_certs = true;
-        let node22 = Node::start(cfg22, genesis.clone(), Some(kp(22)))
+        let node22 = Node::start(cfg22, genesis.clone(), Some(kp(22)), None)
             .await
             .expect("start mtls node");
 
         let mut cfg23 = node_config(23, port_base, &[22, 23], dir23);
         cfg23.network.enable_tls = true; // encryption-only, no mTLS
-        let _node23 = Node::start(cfg23, genesis.clone(), Some(kp(23)))
+        let _node23 = Node::start(cfg23, genesis.clone(), Some(kp(23)), None)
             .await
             .expect("start tls node");
 
@@ -16770,7 +16898,7 @@ vote_b.validator=5 vote_b.height=9 vote_b.round=2 vote_b.block_hash={b_h} vote_b
 
         let mut cfg = node_config(21, 19991, &[21], dir);
         cfg.network.require_peer_certs = true; // but enable_tls left off
-        let err = Node::start(cfg, genesis.clone(), Some(kp(21))).await;
+        let err = Node::start(cfg, genesis.clone(), Some(kp(21)), None).await;
         assert!(
             err.is_err(),
             "require_peer_certs without enable_tls must fail fast"
@@ -17484,7 +17612,7 @@ vote_b.validator=5 vote_b.height=9 vote_b.round=2 vote_b.block_hash={b_h} vote_b
         });
 
         // 4. boot the node from the snapshot.
-        let node = Node::start(cfg, genesis.clone(), Some(kp(21)))
+        let node = Node::start(cfg, genesis.clone(), Some(kp(21)), None)
             .await
             .expect("snapshot boot");
 
@@ -17857,7 +17985,7 @@ vote_b.validator=5 vote_b.height=9 vote_b.round=2 vote_b.block_hash={b_h} vote_b
             cert_hex: None,
             trusted_validators: vec![],
         });
-        let node = Node::start(cfg, genesis, Some(kp(21)))
+        let node = Node::start(cfg, genesis, Some(kp(21)), None)
             .await
             .expect("snapshot reboot");
 
@@ -17921,7 +18049,7 @@ vote_b.validator=5 vote_b.height=9 vote_b.round=2 vote_b.block_hash={b_h} vote_b
             cert_hex: None,
             trusted_validators: vec![],
         });
-        let node = Node::start(cfg, genesis, Some(kp(21)))
+        let node = Node::start(cfg, genesis, Some(kp(21)), None)
             .await
             .expect("snapshot boot truncates genesis-era log");
 
@@ -17959,7 +18087,7 @@ vote_b.validator=5 vote_b.height=9 vote_b.round=2 vote_b.block_hash={b_h} vote_b
 
         // Full validator node (id 21) — binds port_base+0, dials peer 22 (the light node).
         let full_cfg = node_config(21, 20620, &[21, 22], format!("{dir}/full"));
-        let full = Node::start(full_cfg, genesis.clone(), Some(kp(21)))
+        let full = Node::start(full_cfg, genesis.clone(), Some(kp(21)), None)
             .await
             .expect("start full node");
 

@@ -1395,6 +1395,30 @@ M165 保留 3 端点（`/unbonding`/`/stake-ops`/`/evidence`）为 `next=` 是�
 - **测试（+1 → 631）**：新 `unbonding_entry_hash_is_stable_and_collision_safe`（4 断言：clone 等、改任一字段 hash 不同、32 字节长）；扩展 `rpc_unbonding_list_over_tcp`/`rpc_stake_ops_list_over_tcp`/`rpc_evidence_list_over_tcp` in-process 测改 `next`→`cursor`。
 - **已知边界**：`UnbondingEntry` 字段顺序（account/amount/mature_height）+ LE 字节序 = hash 格式的隐性契约；改字段顺序或加字段 = 改 hash 格式 = 旧 cursor 解析失败（文档说明）。`encode_unbonding` 真正的 codec 入口（若未来要把 UnbondingEntry 入 wire/快照/跨链）属后续篮子。
 
+## 活跃验证人密钥轮换 + 守护进程自动交接（Milestone 180）
+
+M179 刻意排除活跃验证人（`apply_key_rotation` 以 `CannotRotateActiveValidator` 拒绝），因为验证人轮换涉及守护进程签名密钥在高度边界的交接定时难题。M180 合上这个篮子：允许活跃验证人轮换，守护进程**自动交接**签名密钥（用户选"自动交接"，非"运维重启"）。**纯逻辑，无 wire 变更**——`KeyRotation` op 与 B4 布局 M179 已定；localnet/demo 头不动（`33cb2506…`/`a186d72d…`），demo state 根守卫测仍绿。
+
+**链上**（`lib.rs`）：
+- `apply_key_rotation` **删除**活跃验证人守卫（保留当前密钥签名 / 严格 nonce / 拒 no-op）。删 `ChainError::CannotRotateActiveValidator`。
+- `apply_block_inner` 的 key_rotations 循环：轮换账户若是当前验证人（`self.validators.get(account).is_some()`）则 `touched.insert(account)`，使验证人集经既有 `touched → validators.apply_updates` 机制在**下一高度**重派生——power 不变（来自 `bonds`）、pubkey = 新 `account.pubkey`。轮换块在高度 N 由**旧** set（旧 pubkey）认证；新 set 在 N+1 生效。
+
+**守护进程自动交接**（`daemon.rs`）——无状态不变量"签名密钥必须等于活跃 set 里本节点 id 的 pubkey"：
+- `Actor` 加 `pending_kp: Option<Keypair>`（预置的待生效新密钥）。
+- 纯决策 helper（可单测，不建 Actor）：`fn resolve_signing_key(current: PubKey, pending: Option<PubKey>, expected: Option<PubKey>) -> SigningKeyDecision`，三态 `Keep`/`Adopt`/`Stale`。`expected` = set 里本节点 id 的 pubkey（`None` = 不在 set）。current==expected 或不在 set → `Keep`；current≠expected 且 pending==expected → `Adopt`；否则 `Stale`。
+- `reconcile_signing_key` 在**每次 commit 后**调用（`on_decided` 自决路径 + `Cmd::Inbound` 同步 commit 路径，都在下一高度 `start_height` 之前）：`Adopt` 则 `self.kp = pending_kp.take()` + `info!`；`Stale` 则 `warn!` 并保留旧键——该验证人漏投票直到运维用新键重启（**仅局部活性缺口，不影响安全、不停摆全网**）；`Keep` 无操作。这个不变量天然覆盖自决/同步两条 commit 路径，不依赖追踪具体轮换高度，故不会漏检。
+- `Node::start` / `daemon::run` 加 `pending_key: Option<Keypair>` 参（光节点传 `None`）。
+
+**配置**（`config.rs`）：`ValidatorKeyConfig` 加 `#[serde(default)] pub pending: Option<Box<ValidatorKeyConfig>>`——嵌套同类型，**零重复**复用现有 `keypair()`/`keypair_with_password()`（pending 键可经 seed_hex / mnemonic / 加密 keystore 任一来源）；嵌套的 `enabled` 忽略。`cmd_run` 解析之：pending 加密 keystore 的密码走 `ZHIXING_PENDING_KEYSTORE_PASSWORD` 环境变量（无人值守；交互式提示留后续）。缺 `[validator.pending]` ⇒ `None` ⇒ 行为与 M179 逐字节一致。
+
+**演示**：`node rotate-key` 原"活跃验证人被拒"段改为——账户 bond 成为验证人 → 轮换其键 → 断言下一高度 set 的该 id pubkey 变新键、power 不变。守护进程自动交接是分布式行为，不在单进程 demo 里演（由 daemon 测覆盖）。
+
+**运维流程**（活跃验证人轮换）：① `keygen`/`encrypt-key` 生成新密钥；② 配置 `[validator.pending]` 指向新密钥（+ 必要时设 `ZHIXING_PENDING_KEYSTORE_PASSWORD`）并热加载/重启守护进程使其持有 pending 键；③ 用**当前**密钥签一个 `KeyRotation`（`new_pubkey` = 新密钥公钥）提交上链；④ 轮换 commit 后，守护进程在下一高度自动把签名密钥切到新键，无漏投票。若步骤②漏做，该验证人在轮换生效后漏投票（warn），补上 pending 键/重启即恢复。
+
+**测试（+2 → 685）**：`resolve_signing_key_three_way_decision`（`daemon.rs`——Keep/Adopt/Stale 七例，含不在 set→Keep、无/错 pending→Stale）+ `pending_validator_key_parses_and_resolves`（`config.rs`——嵌套 `[validator.pending]` 解析 + keypair 解析 + 缺省 None）；M179 的 `key_rotation_rejects_active_validator` 改为 `key_rotation_of_a_validator_rederives_the_set`（bond→轮换→set 新 pubkey、power 不变）。既有 localnet/daemon 集成测在每次 commit 走 `reconcile_signing_key`（无轮换时 no-op `Keep`）、全绿即证 hook 对正常路径无害。
+
+**已知边界 / 非目标**：pending keystore 的交互式 no-echo 密码提示留作后续（无人值守走 env）；一次只排一个 pending 键；不做轮换撤销（提交即生效）；pending 键缺失/不匹配 **降级而非崩溃**（漏投票 + warn，重启可恢复）——这是自动交接的安全网；不解耦 operator/consensus 密钥（Cosmos 式，用户选了耦合模型）。
+
 ## 账户密钥轮换（Milestone 179 · KeyRotation, B4 wire）
 
 审计前预备的最后一块大的。此前账户/验证人的 ed25519 密钥一旦设定就无法更换——密钥泄露或例行轮换都没有链上手段。本轮加一个自认证、nonce 防重放、共识强制的 `KeyRotation` op。

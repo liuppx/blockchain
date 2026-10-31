@@ -238,11 +238,12 @@ impl StakeOp {
 /// its `nonce` advances, so every subsequent op must be signed by the new key.
 ///
 /// Because a bonded validator's set entry is derived from its account pubkey,
-/// rotating an account key also rotates its validator identity — therefore the
-/// MVP (M179) **rejects** rotating an account that is a current validator
-/// ([`ChainError::CannotRotateActiveValidator`]); such a validator must unbond
-/// first. This sidesteps the signing-key handoff at the height boundary
-/// (rotation commits under the old set, would take effect next height).
+/// rotating an account key also rotates its validator identity. M180: this is
+/// now **allowed** for active validators — the set re-derives the validator's
+/// entry with the new pubkey at the next height (the rotation block is certified
+/// by the old set; the daemon hands its signing key over via
+/// `Actor::reconcile_signing_key` once the new set takes effect). M179 had
+/// temporarily rejected validator rotation to defer that handoff.
 #[derive(Clone, Debug)]
 pub struct KeyRotation {
     pub account: u64,
@@ -888,12 +889,6 @@ pub enum ChainError {
         need: u64,
         have: u64,
     },
-    /// M179: a `KeyRotation` targeted an account that is a current validator.
-    /// The MVP forbids this (it would require a signing-key handoff at the next
-    /// height); the validator must unbond first.
-    CannotRotateActiveValidator {
-        account: u64,
-    },
     /// M179: a `KeyRotation` whose `new_pubkey` equals the account's current key
     /// (a no-op rotation — rejected to catch a mis-built op / wrong key file).
     KeyRotationNoop {
@@ -1068,10 +1063,6 @@ impl std::fmt::Display for ChainError {
             ChainError::InsufficientBond { account, need, have } => write!(
                 f,
                 "account {account} cannot unbond {need} (has {have} bonded)"
-            ),
-            ChainError::CannotRotateActiveValidator { account } => write!(
-                f,
-                "account {account} is a current validator; unbond before rotating its key"
             ),
             ChainError::KeyRotationNoop { account } => {
                 write!(f, "account {account} key rotation is a no-op (same key)")
@@ -1544,15 +1535,20 @@ impl ChainState {
             self.apply_bridge_unbond(op)?;
         }
 
-        // M179: account key rotations. Applied AFTER every other op so a
+        // M179/M180: account key rotations. Applied AFTER every other op so a
         // same-block tx / stake-op (signed with the pre-rotation key) verifies
         // against the old key; the new key takes effect for subsequent blocks.
-        // A rotation targeting a current validator is rejected (MVP), so this
-        // never perturbs the validator-set derivation below. Validation fully
-        // precedes mutation inside `apply_key_rotation`, so a bad rotation rolls
-        // the whole block back.
+        // Validation fully precedes mutation inside `apply_key_rotation`, so a
+        // bad rotation rolls the whole block back. M180: a rotation whose account
+        // is a current validator must re-derive that validator's set entry with
+        // the new pubkey — add it to `touched` so the derivation below emits a
+        // `ValidatorUpdate` (power unchanged, pubkey = the new account key),
+        // effective next height (same cross-height rule as any set change).
         for op in &block.key_rotations {
             self.apply_key_rotation(op)?;
+            if self.validators.get(op.account).is_some() {
+                touched.insert(op.account);
+            }
         }
 
         // on-chain validator-set transition: explicit updates PLUS the changes
@@ -1693,14 +1689,17 @@ impl ChainState {
         Ok(())
     }
 
-    /// M179: apply one [`KeyRotation`] — swap an account's ed25519 pubkey, proven
-    /// by a signature from its **current** key and gated by the account nonce. All
-    /// checks precede any mutation, so a bad rotation rolls the whole block back
-    /// (same discipline as `apply_stake_op`).
+    /// M179/M180: apply one [`KeyRotation`] — swap an account's ed25519 pubkey,
+    /// proven by a signature from its **current** key and gated by the account
+    /// nonce. All checks precede any mutation, so a bad rotation rolls the whole
+    /// block back (same discipline as `apply_stake_op`).
     ///
-    /// MVP guard: an account that is a **current validator** cannot rotate here —
-    /// its set entry is derived from this pubkey and would need a signing-key
-    /// handoff at the next height. It must unbond first. See the type doc.
+    /// M180: a **validator's** key may now be rotated too. The caller
+    /// (`apply_block_inner`) adds a rotated validator to `touched`, so the set
+    /// re-derives its entry with the new pubkey at the next height (power
+    /// unchanged, from `bonds`). The block carrying the rotation is still
+    /// certified by the *old* set; the daemon hands its signing key over to the
+    /// new one once the rotation takes effect (`Actor::reconcile_signing_key`).
     fn apply_key_rotation(&mut self, op: &KeyRotation) -> Result<(), ChainError> {
         let acct = self
             .accounts
@@ -1722,22 +1721,14 @@ impl ChainState {
                 got: op.nonce,
             });
         }
-        // 3. MVP: refuse to rotate a current validator's key (would require a
-        //    cross-height signing-key handoff). `validators.get` covers both
-        //    genesis and bond-derived validators.
-        if self.validators.get(op.account).is_some() {
-            return Err(ChainError::CannotRotateActiveValidator {
-                account: op.account,
-            });
-        }
-        // 4. reject a no-op rotation (new key == current key) — pointless, and
+        // 3. reject a no-op rotation (new key == current key) — pointless, and
         //    catches a mis-built op / wrong key file.
         if op.new_pubkey == acct.pubkey {
             return Err(ChainError::KeyRotationNoop {
                 account: op.account,
             });
         }
-        // 5. mutate: swap the key and advance the nonce so the old key can't be
+        // 4. mutate: swap the key and advance the nonce so the old key can't be
         //    reused and future ops must be signed by the new key.
         let acct = self.accounts.get_mut(&op.account).unwrap();
         acct.pubkey = op.new_pubkey;
@@ -3332,18 +3323,30 @@ mod tests {
     }
 
     #[test]
-    fn key_rotation_rejects_active_validator() {
+    fn key_rotation_of_a_validator_rederives_the_set() {
+        // M180: a bonded validator CAN rotate its key; the set re-derives its
+        // entry with the new pubkey at the next height, power unchanged.
         let mut chain = Chain::new(base_genesis());
         // Bond account 1 so it becomes a validator (set updated post-commit).
         let mut bond = stake_block(&chain, 1, 1, BondKind::Bond, 5 * MICRO);
         chain.commit(&mut bond).expect("bond commits");
-        assert!(chain.state.validators.get(1).is_some(), "now a validator");
-        // Rotating a current validator's key is rejected (MVP guard).
-        let mut b = key_rotation_block(&chain, 2, 1, kp(99).public(), 0, &kp(1));
-        assert!(matches!(
-            chain.commit(&mut b),
-            Err(ChainError::CannotRotateActiveValidator { account: 1 })
-        ));
+        let v = chain.state.validators.get(1).expect("now a validator");
+        assert_eq!(v.pubkey, kp(1).public(), "set holds the old key");
+        assert_eq!(v.power, 5 * MICRO);
+
+        // Account 1 (nonce 0 still — bonding doesn't touch account nonce) rotates
+        // its key, signed by the CURRENT key (kp(1)).
+        let new_pub = kp(99).public();
+        let mut b = key_rotation_block(&chain, 2, 1, new_pub, 0, &kp(1));
+        chain.commit(&mut b).expect("validator rotation commits");
+        assert_eq!(
+            chain.state.accounts[&1].pubkey, new_pub,
+            "account key swapped"
+        );
+        // The set re-derived: same id, same power, NEW pubkey.
+        let v = chain.state.validators.get(1).expect("still a validator");
+        assert_eq!(v.pubkey, new_pub, "set re-derived to the new key");
+        assert_eq!(v.power, 5 * MICRO, "power unchanged by a key rotation");
     }
 
     #[test]

@@ -336,6 +336,16 @@ pub struct ValidatorKeyConfig {
     /// [`ValidatorKeyConfig::keypair`].
     #[serde(default)]
     pub encrypted_keystore_path: Option<String>,
+    /// M180: an optional **pending** signing key for an in-flight validator key
+    /// rotation, as a nested `[validator.pending]` table of this same shape (it
+    /// reuses `keypair()` / `keypair_with_password()`, so the pending key can come
+    /// from `seed_hex`, `mnemonic`, or an encrypted keystore just like the active
+    /// one). The nested `enabled` is ignored. When set, `node run` resolves it and
+    /// hands it to the daemon, which swaps it into the active key once this
+    /// validator's own `KeyRotation` takes effect (`Actor::reconcile_signing_key`).
+    /// Unset (default) ⇒ no pending key (M179 behavior).
+    #[serde(default)]
+    pub pending: Option<Box<ValidatorKeyConfig>>,
 }
 
 impl ValidatorKeyConfig {
@@ -430,6 +440,7 @@ impl Default for ValidatorKeyConfig {
             mnemonic: None,
             passphrase: None,
             encrypted_keystore_path: None,
+            pending: None,
         }
     }
 }
@@ -2451,6 +2462,7 @@ mod tests {
             ),
             passphrase: None,
             encrypted_keystore_path: None,
+            pending: None,
         }
         .keypair()
         .unwrap();
@@ -2460,6 +2472,7 @@ mod tests {
             mnemonic: None,
             passphrase: None,
             encrypted_keystore_path: None,
+            pending: None,
         }
         .keypair()
         .unwrap();
@@ -2482,6 +2495,7 @@ mod tests {
             ),
             passphrase: None,
             encrypted_keystore_path: None,
+            pending: None,
         };
         match bad.keypair() {
             Err(ConfigError::BadMnemonic { detail }) => {
@@ -2516,6 +2530,7 @@ mod tests {
             mnemonic: None,
             passphrase: None,
             encrypted_keystore_path: Some("/nonexistent/keystore.json".to_string()),
+            pending: None,
         };
         match vc.keypair() {
             Err(ConfigError::KeystoreDecrypt { detail }) => {
@@ -2545,6 +2560,7 @@ mod tests {
             mnemonic: None,
             passphrase: None,
             encrypted_keystore_path: Some(path.to_string_lossy().to_string()),
+            pending: None,
         };
         let from_keystore = vc.keypair_with_password("s3cret-pass").unwrap();
         let direct = crate::Keypair::from_seed(seed);
@@ -2580,6 +2596,7 @@ mod tests {
             mnemonic: None,
             passphrase: None,
             encrypted_keystore_path: Some(path.to_string_lossy().to_string()),
+            pending: None,
         };
         let resolved = vc.keypair_with_password("pw").unwrap();
         assert_eq!(
@@ -2603,11 +2620,38 @@ mod tests {
             mnemonic: None,
             passphrase: None,
             encrypted_keystore_path: None,
+            pending: None,
         };
         let a = vc.keypair().unwrap();
         let b = vc.keypair_with_password("ignored").unwrap();
         assert_eq!(a.public(), b.public());
         assert_eq!(a.public(), crate::Keypair::from_seed(seed).public());
+    }
+
+    #[test]
+    fn pending_validator_key_parses_and_resolves() {
+        // M180: a nested `[validator.pending]` table resolves to its own keypair
+        // via the same sourcing as the active key (here seed_hex). Default (no
+        // `pending`) is None, preserving M179 behavior.
+        let seed = [0x7eu8; 32];
+        let toml = format!(
+            "genesis = \"g.toml\"\n[node]\nid = 21\nlisten = \"0.0.0.0:9021\"\ndata_dir = \"./d\"\n\
+             [validator]\nenabled = true\nseed_hex = \"{}\"\n\
+             [validator.pending]\nseed_hex = \"{}\"\n",
+            hex(&[0x11u8; 32]),
+            hex(&seed),
+        );
+        let cfg: NodeConfig = toml::from_str(&toml).unwrap();
+        let vc = cfg.validator.as_ref().unwrap();
+        let pending = vc.pending.as_deref().expect("pending present");
+        assert_eq!(
+            pending.keypair().unwrap().public(),
+            crate::Keypair::from_seed(seed).public()
+        );
+        // A config without [validator.pending] has None.
+        let bare = "genesis = \"g.toml\"\n[node]\nid = 21\nlisten = \"0.0.0.0:9021\"\ndata_dir = \"./d\"\n[validator]\nenabled = true\nseed_hex = \"0000000000000000000000000000000000000000000000000000000000000001\"\n";
+        let cfg: NodeConfig = toml::from_str(bare).unwrap();
+        assert!(cfg.validator.unwrap().pending.is_none());
     }
 
     fn unit_vec(dim: usize) -> Vec<f32> {

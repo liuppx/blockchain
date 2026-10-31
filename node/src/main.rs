@@ -1265,8 +1265,9 @@ fn cmd_rotate_key() {
     );
     println!("  height 2: the NEW key authorizes a further rotation (nonce 1) → committed");
 
-    // Safe-MVP guard: a current validator's key cannot be rotated. Bond account
-    // #2 so it becomes a validator next height, then attempt to rotate it.
+    // M180: an active validator's key CAN be rotated — the set re-derives its
+    // entry with the new key at the next height (power unchanged). Bond account
+    // #2 so it becomes a validator, then rotate its key.
     d.stage_stake_op(
         StakeOp {
             account: 2,
@@ -1279,34 +1280,35 @@ fn cmd_rotate_key() {
     d.produce(3.0, &BTreeSet::new())
         .unwrap()
         .expect("bond commits");
-    // account #2 is now an active validator (power == bond). Rotation must fail.
-    assert!(
-        d.chain.state.validators.get(2).is_some(),
-        "account #2 should be a validator now"
-    );
-    let mut probe = d.chain.clone();
-    let mut blk = empty_next_block(&probe, 4.0);
-    blk.key_rotations.push(
+    let v = d
+        .chain
+        .state
+        .validators
+        .get(2)
+        .expect("account #2 should be a validator now");
+    let power_before = v.power;
+    assert_eq!(v.pubkey, kp(2).public(), "set holds #2's old key");
+    let v2_new = kp(102).public();
+    d.stage_key_rotation(
         KeyRotation {
             account: 2,
-            new_pubkey: kp(101).public(),
+            new_pubkey: v2_new,
             nonce: 0,
             signature: [0u8; 64],
         }
         .signed(&kp(2)),
     );
-    let err = probe
-        .commit(&mut blk)
-        .expect_err("a current validator's key cannot be rotated");
-    assert!(
-        matches!(err, ChainError::CannotRotateActiveValidator { account: 2 }),
-        "got {err:?}"
-    );
+    d.produce(4.0, &BTreeSet::new())
+        .unwrap()
+        .expect("validator rotation commits");
+    let v = d.chain.state.validators.get(2).expect("still a validator");
+    assert_eq!(v.pubkey, v2_new, "set re-derived to #2's new key");
+    assert_eq!(v.power, power_before, "power unchanged by the rotation");
     println!(
-        "  negative: rotating a CURRENT validator (#2) → rejected ({err}); it must unbond first"
+        "  height 3–4: active validator #2 BONDs then ROTATEs its key → set re-derives to the new key, power unchanged (the daemon hands its signing key over at the boundary — see Actor::reconcile_signing_key)"
     );
     println!();
-    println!("Ok: account key rotation is self-authenticating (old key signs), nonce-protected, and consensus-enforced; the new key supersedes the old; active validators are protected.");
+    println!("Ok: account key rotation is self-authenticating (old key signs), nonce-protected, consensus-enforced; the new key supersedes the old; a validator's rotation re-derives the set at the next height.");
 }
 
 /// Produce one height (all validators honest) and report the set that certified
@@ -4220,9 +4222,35 @@ fn cmd_run(config_path: String, args: &[String]) {
         _ => None,
     };
 
+    // M180: resolve the optional staged PENDING key (for an in-flight validator
+    // key rotation). The nested `[validator.pending]` table reuses the same
+    // sourcing (seed_hex / mnemonic / encrypted keystore); a pending encrypted
+    // keystore reads its password from `ZHIXING_PENDING_KEYSTORE_PASSWORD`
+    // (unattended — no interactive prompt for the pending slot). The daemon swaps
+    // it into the active signing key once this validator's rotation takes effect.
+    let pending_key = cfg
+        .validator
+        .as_ref()
+        .and_then(|vc| vc.pending.as_deref())
+        .map(|pc| {
+            let kp = if pc.encrypted_keystore_path.is_some() {
+                let password =
+                    std::env::var("ZHIXING_PENDING_KEYSTORE_PASSWORD").unwrap_or_else(|_| {
+                        fail_msg(
+                            "pending key",
+                            "encrypted pending keystore requires ZHIXING_PENDING_KEYSTORE_PASSWORD",
+                        )
+                    });
+                pc.keypair_with_password(&password)
+            } else {
+                pc.keypair()
+            };
+            kp.unwrap_or_else(|e| fail_msg("pending validator key", &e))
+        });
+
     let rt = tokio::runtime::Runtime::new().unwrap_or_else(|e| fail("tokio runtime", e));
     rt.block_on(async move {
-        if let Err(e) = daemon::run(cfg, genesis, validator_key).await {
+        if let Err(e) = daemon::run(cfg, genesis, validator_key, pending_key).await {
             fail("daemon", e);
         }
     });
@@ -4952,7 +4980,7 @@ fn cmd_localnet() {
     rt.block_on(async move {
         let mut nodes = Vec::new();
         for &id in &ids {
-            let node = daemon::Node::start(node_cfg(id), genesis.clone(), Some(kp(id)))
+            let node = daemon::Node::start(node_cfg(id), genesis.clone(), Some(kp(id)), None)
                 .await
                 .unwrap_or_else(|e| fail("start node", e));
             nodes.push((id, node));
