@@ -1480,6 +1480,16 @@ M185 把 cNFT SPV 的 wire 根（`contributions_root`）+ 证明类型（`ProofE
 - **测试（+1 → 702）**：上面的 fuzz-lite 测（M188 的两个位锚点在 M189 的跨架构矩阵里获得真正的多架构执行）。
 - **已知边界 / 非目标**：GitHub Actions 与 nightly `cargo-fuzz` 无法在本地环境验证——CI 在 GitHub 上跑；其底层命令（`fmt --check`、`test`、`-D warnings` 编译）已本地逐一验证通过。深度 `cargo-fuzz` 持久语料、clippy 14 lint 清理、`cargo-audit` 升门禁、CI 缓存调优均另行。生产评估剩余项：**#2** 外部审计（排期长，宜并行启动）、#4 wire 版本协商、#5 SIGTERM、#6 治理、#7 经济参数校准。
 
+## SIGTERM 优雅关闭（Milestone 190 · 生产就绪评估 #5）
+
+部署硬伤：`node run` / `node light-run` 此前只用 `tokio::signal::ctrl_c()` 等关闭，而那只捕 **SIGINT**（Ctrl-C）。Docker（`docker stop`）、Kubernetes（Pod 终止）、systemd（`systemctl stop`）停服发的都是 **SIGTERM**——会被忽略，进程挂到宽限期结束后被 `SIGKILL` 强杀（非优雅、日志里只看到被杀、给运维错误信号）。
+
+- **`wait_for_shutdown_signal()`**（`daemon.rs`，跨平台）：Unix 上 `tokio::select!` 同时等 `signal(SignalKind::terminate())`（SIGTERM）与 `signal(SignalKind::interrupt())`（SIGINT），哪个先到就返回其名字（`"SIGTERM"`/`"SIGINT"`）写进关闭日志；`#[cfg(not(unix))]` 回退 `ctrl_c()`（SIGTERM 在非 Unix 不存在）。
+- **两个入口**（`run` 全节点 + `light_run` 轻节点）改用它：`let sig = wait_for_shutdown_signal().await?; info!("{sig} received — shutting down …")`。
+- **为何干净返回即优雅**：节点 teardown 本就平凡——`blocks.log`/`certs.log` 逐条 fsync（无内存写缓冲要 flush），轻节点无盘上状态。所以捕获信号后从 run 循环干净返回、drop actor/监听器，即完成优雅退出；无需主动 drain。
+- **为何无自动化测试**：在进程内触发真实信号验证是**竞态**的——tokio 的信号 handler 必须在 `raise()` 之前注册好，否则 SIGTERM 直接杀掉整个测试二进制（所有测试连带失败）。这与 M182「消除 flaky 测试」的方向冲突，得不偿失。故本轮只靠 `-D warnings` 干净编译 + 标准 `tokio::signal::unix` API 作保证，不引入不稳定的信号测。tokio 的 `signal` feature 本就已启用。
+- **已知边界 / 非目标**：连接优雅排空 / 主动 drain（teardown 平凡，暂不需要）；Windows 的 `CTRL_CLOSE_EVENT`/`CTRL_SHUTDOWN_EVENT` 等额外控制台信号（部署目标是 Unix 容器）。
+
 ## pending keystore 交互式密码提示（Milestone 181）
 
 收尾 M180 留的小口：M180 的 pending 加密 keystore 只从 `ZHIXING_PENDING_KEYSTORE_PASSWORD` 读密码，缺失即硬失败——与活跃 keystore（M175 `read_keystore_password`：env 优先、否则交互 no-echo 提示）不一致。

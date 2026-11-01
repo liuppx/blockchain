@@ -7617,7 +7617,32 @@ impl Node {
     }
 }
 
-/// CLI entry point for `node run`: start the daemon and block until Ctrl-C.
+/// M190: block until a shutdown signal, returning its name for the log line. On
+/// Unix this waits on **both** `SIGTERM` (what Docker/Kubernetes/systemd send to
+/// stop a container/service) and `SIGINT` (Ctrl-C) — before M190 only Ctrl-C was
+/// handled, so an orchestrator's `SIGTERM` was ignored and the process was later
+/// `SIGKILL`ed (ungraceful). Teardown is trivial (logs fsync per append, no
+/// in-memory write buffer), so a clean return from the run loop is all that's
+/// needed. On non-Unix, falls back to Ctrl-C only (`SIGTERM` doesn't exist).
+#[cfg(unix)]
+async fn wait_for_shutdown_signal() -> io::Result<&'static str> {
+    use tokio::signal::unix::{signal, SignalKind};
+    let mut sigterm = signal(SignalKind::terminate())?;
+    let mut sigint = signal(SignalKind::interrupt())?;
+    tokio::select! {
+        _ = sigterm.recv() => Ok("SIGTERM"),
+        _ = sigint.recv() => Ok("SIGINT"),
+    }
+}
+
+#[cfg(not(unix))]
+async fn wait_for_shutdown_signal() -> io::Result<&'static str> {
+    tokio::signal::ctrl_c().await?;
+    Ok("Ctrl-C")
+}
+
+/// CLI entry point for `node run`: start the daemon and block until a shutdown
+/// signal (`SIGTERM`/`SIGINT` on Unix, Ctrl-C elsewhere).
 pub async fn run(
     cfg: NodeConfig,
     genesis: Genesis,
@@ -7625,8 +7650,8 @@ pub async fn run(
     pending_key: Option<Keypair>,
 ) -> io::Result<()> {
     let _node = Node::start(cfg, genesis, validator_key, pending_key).await?;
-    tokio::signal::ctrl_c().await?;
-    info!("shutdown requested — exiting (logs are fsync'd per append)");
+    let sig = wait_for_shutdown_signal().await?;
+    info!("{sig} received — shutting down (logs are fsync'd per append)");
     Ok(())
 }
 
@@ -8069,11 +8094,12 @@ impl LightNode {
     }
 }
 
-/// CLI entry point for `node light-run`: start the light daemon and block until Ctrl-C.
+/// CLI entry point for `node light-run`: start the light daemon and block until a
+/// shutdown signal (`SIGTERM`/`SIGINT` on Unix, Ctrl-C elsewhere).
 pub async fn light_run(cfg: NodeConfig, genesis: Genesis) -> io::Result<()> {
     let _node = LightNode::start(cfg, genesis).await?;
-    tokio::signal::ctrl_c().await?;
-    info!("shutdown requested — exiting (light node holds no on-disk state)");
+    let sig = wait_for_shutdown_signal().await?;
+    info!("{sig} received — shutting down (light node holds no on-disk state)");
     Ok(())
 }
 
