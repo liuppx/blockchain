@@ -1543,6 +1543,18 @@ M193 落了纯治理核心（tally + 执行）。M194 把它**接进共识**—�
 - **测试（+7 → 717）**：`lib` `governance_end_to_end_passes_and_executes`（propose h1 → vote h2 → 到期 h3 执行、提案移除）+ `governance_fails_without_both_quorums`（零票→不改但仍移除）+ `gov_vote_rejects_unknown_and_closed_proposal`（`UnknownProposal`/`ProposalClosed`）+ `governance_bad_nonce_and_signature_rejected` + `state_root_covers_proposals`（折入改根、merkle_root 不变）；`codec` `gov_proposal_and_vote_round_trip`（含 `GovParam` 三 tag + 签名 vs signing-bytes）+ `snapshot_round_trips_proposals`（v5 保真 + state_root 复算）。
 - **已知边界 / 非目标（本片）**：gossip 传播（`TAG_GOVPROPOSAL`/`TAG_GOVVOTE` flood/dedup）+ daemon/driver 暂存池 + RPC 读端点（本轮 ops 经**区块同步**或测试构造入块；mempool 式预传播是 M195）；`DeltaKParams` 参数寻址（M196）。
 
+## 治理 gossip 传播 + 暂存池（Milestone 195 · 生产就绪评估 #6 第三片）
+
+M194 的 gov op 此前只经**区块同步**传播——只有本地持有该 op 的提议人能把它放进块。M195 加**预传播**：任意节点收到的提案/投票 flood 到全网每个节点的暂存池，于是任意提议人都能把它纳入下一块。照抄 M179 key-rotation 的 flood/dedup 模式（成熟且对称）。
+
+- **gossip 消息**（`net.rs`）：`GossipMsg::GovProposal(Box<GovProposal>)` / `GovVote(Box<GovVote>)`（Box 避免撑大 enum）+ wire tag `TAG_GOVPROPOSAL = 21` / `TAG_GOVVOTE = 22`；`encode_gossip`/`decode_gossip` 对应分支（复用 M194 的 `encode_gov_proposal`/`decode_gov_vote` 等）。
+- **`GossipNode`**：`seen_gov_proposal`/`seen_gov_vote`（内容哈希 `SeenSet` 去重）+ `pending_gov_proposals`/`pending_gov_votes` 暂存池；getters + `take_pending_gov_*`（排空给 block builder）+ `has_pending_work` 纳入。`submit_local_gov_*`（本地发起：记 seen + 暂存 + 向所有 peer flood）；`on_gov_*`（收到：内容哈希去重——已见则不再 flood——否则暂存 + 向除来源外的 peer 再 flood）。`build_candidate` 把两暂存池 clone 进下一候选块。
+- **`LightGossipNode`**：这两类归为"全节点块务"忽略（同 key rotation——轻客户端不投票/不出块）。
+- **`ChainDriver`**（`driver.rs`）：对称加 `pending_gov_proposals`/`pending_gov_votes` + `stage_gov_proposal`/`stage_gov_vote` + produce 纳入 + has-pending 守卫 + 提交后清空（离线/demo 出块路径）。
+- **daemon**：对入站 gov gossip 经既有 `on_message` 委托，自动去重 + 再 flood（与 key rotation 完全同路径，无需新 Cmd 分支）。
+- **测试（+2 → 719）**：`gov_op_gossip_reaches_every_node_and_dedups`（在 3 节点 `Network` 上 `submit_gov_proposal` + `submit_gov_vote` → `run` 到静默 → 每节点暂存恰一份且哈希相符；对端重投已见 op → 返回空、不再暂存）+ `gov_op_gossip_wire_round_trips`（两类 op 经 `encode_gossip`→`decode_gossip` 保真）。
+- **已知边界 / 非目标（本片）**：RPC/CLI **发起** gov op（当前经 `submit_local_gov_*` 程序化发起 + 区块同步；HTTP 提交与 `GET /proposals` 查询端点另行，像 M184 之于 M183 的读面）；daemon 专用 Cmd（入站 flood 已自动，发起端点才需要）；`DeltaKParams` 参数（M196）。
+
 ## pending keystore 交互式密码提示（Milestone 181）
 
 收尾 M180 留的小口：M180 的 pending 加密 keystore 只从 `ZHIXING_PENDING_KEYSTORE_PASSWORD` 读密码，缺失即硬失败——与活跃 keystore（M175 `read_keystore_password`：env 优先、否则交互 no-echo 提示）不一致。

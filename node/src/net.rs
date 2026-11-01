@@ -49,7 +49,10 @@ use crate::light::ValidatorTracker;
 use crate::mempool::Mempool;
 use crate::merkle;
 use crate::validator::ValidatorSet;
-use crate::{Block, Chain, Genesis, Hash, KeyRotation, SlashEvidence, StakeOp, SubmissionTx};
+use crate::{
+    Block, Chain, Genesis, GovProposal, GovVote, Hash, KeyRotation, SlashEvidence, StakeOp,
+    SubmissionTx,
+};
 
 /// Maximum certified blocks returned in a single [`GossipMsg::Blocks`] batch — a
 /// lagging peer that needs more re-requests from the new height.
@@ -82,6 +85,13 @@ pub enum GossipMsg {
     /// admits it into a block. Full validation in `chain.commit.apply_key_rotation`
     /// (signature by the current key, nonce, and the active-validator guard).
     KeyRotation(KeyRotation),
+    /// M195: gossip one signed governance proposal — same flood/dedup pattern as
+    /// `KeyRotation`. Floods into every node's pending pool; the next proposer admits
+    /// it into a block (where `apply_gov_proposal` checks sig + nonce).
+    GovProposal(Box<GovProposal>),
+    /// M195: gossip one signed governance vote — same flood/dedup pattern. Admitted
+    /// into a block where `apply_gov_vote` checks sig + nonce + the open window.
+    GovVote(Box<GovVote>),
     /// "Send me cert-signed BLOCK HEADERS (no bodies) from this height onward."
     /// The light-sync analogue of `GetBlocks` (M22). A light client announces
     /// its height with `Status`; on seeing a peer ahead, it sends `GetHeaders`
@@ -255,6 +265,10 @@ pub const TAG_GETHEADERS_SETS: u8 = 18;
 pub const TAG_HEADERS_SETS: u8 = 19;
 /// M179: account key-rotation op gossip.
 pub const TAG_KEYROTATION: u8 = 20;
+/// M195: governance proposal op gossip.
+pub const TAG_GOVPROPOSAL: u8 = 21;
+/// M195: governance vote op gossip.
+pub const TAG_GOVVOTE: u8 = 22;
 
 /// M29: maximum items in a single heterogeneous batched
 /// request/response. Mirrors `MAX_PROOF_BATCH = 32` so the bus caps
@@ -369,6 +383,9 @@ pub struct GossipNode {
     seen_stake_op: SeenSet,
     /// M179: content hashes of key-rotation ops already seen — dedup for `KeyRotation`.
     seen_key_rotation: SeenSet,
+    /// M195: content hashes of governance proposals / votes already seen — dedup.
+    seen_gov_proposal: SeenSet,
+    seen_gov_vote: SeenSet,
     /// Evidence staged to be carried by the next block this node proposes
     /// (drained by the driver via [`Self::take_pending_evidence`]).
     pending_evidence: Vec<SlashEvidence>,
@@ -376,6 +393,9 @@ pub struct GossipNode {
     pending_stake_ops: Vec<StakeOp>,
     /// M179: key-rotation ops staged for the next block this node proposes.
     pending_key_rotations: Vec<KeyRotation>,
+    /// M195: governance proposals / votes staged for the next block this node proposes.
+    pending_gov_proposals: Vec<GovProposal>,
+    pending_gov_votes: Vec<GovVote>,
     /// Known peer ids (iterated in sorted order for deterministic output).
     peers: BTreeSet<u64>,
 }
@@ -402,9 +422,13 @@ impl GossipNode {
             seen_evidence: SeenSet::new(),
             seen_stake_op: SeenSet::new(),
             seen_key_rotation: SeenSet::new(),
+            seen_gov_proposal: SeenSet::new(),
+            seen_gov_vote: SeenSet::new(),
             pending_evidence: Vec::new(),
             pending_stake_ops: Vec::new(),
             pending_key_rotations: Vec::new(),
+            pending_gov_proposals: Vec::new(),
+            pending_gov_votes: Vec::new(),
             peers: peers.into_iter().filter(|&p| p != id).collect(),
         }
     }
@@ -442,9 +466,13 @@ impl GossipNode {
             seen_evidence: SeenSet::new(),
             seen_stake_op: SeenSet::new(),
             seen_key_rotation: SeenSet::new(),
+            seen_gov_proposal: SeenSet::new(),
+            seen_gov_vote: SeenSet::new(),
             pending_evidence: Vec::new(),
             pending_stake_ops: Vec::new(),
             pending_key_rotations: Vec::new(),
+            pending_gov_proposals: Vec::new(),
+            pending_gov_votes: Vec::new(),
             peers: peers.into_iter().filter(|&p| p != id).collect(),
         }
     }
@@ -532,6 +560,14 @@ impl GossipNode {
         &self.pending_key_rotations
     }
 
+    /// M195: governance proposals / votes staged for the next proposed block.
+    pub fn pending_gov_proposals(&self) -> &[GovProposal] {
+        &self.pending_gov_proposals
+    }
+    pub fn pending_gov_votes(&self) -> &[GovVote] {
+        &self.pending_gov_votes
+    }
+
     /// M35: is there any block-worthy pending work — mempool txs or staged
     /// block-level ops (stake ops / slashing evidence)? Used by the daemon to
     /// suppress empty heartbeat blocks when `create_empty_blocks=false`.
@@ -544,6 +580,8 @@ impl GossipNode {
             || !self.pending_stake_ops.is_empty()
             || !self.pending_evidence.is_empty()
             || !self.pending_key_rotations.is_empty()
+            || !self.pending_gov_proposals.is_empty()
+            || !self.pending_gov_votes.is_empty()
     }
 
     /// Drain staged evidence, transferring it to a block builder (e.g. a
@@ -562,6 +600,14 @@ impl GossipNode {
     /// M179: drain staged key-rotation ops, transferring them to a block builder.
     pub fn take_pending_key_rotations(&mut self) -> Vec<KeyRotation> {
         std::mem::take(&mut self.pending_key_rotations)
+    }
+
+    /// M195: drain staged governance proposals / votes, transferring them to a builder.
+    pub fn take_pending_gov_proposals(&mut self) -> Vec<GovProposal> {
+        std::mem::take(&mut self.pending_gov_proposals)
+    }
+    pub fn take_pending_gov_votes(&mut self) -> Vec<GovVote> {
+        std::mem::take(&mut self.pending_gov_votes)
     }
 
     /// Preload an already-certified chain (e.g. a seed node handing out history).
@@ -1280,6 +1326,8 @@ impl GossipNode {
         candidate.stake_ops = self.pending_stake_ops.clone();
         candidate.slashing_evidence = self.pending_evidence.clone();
         candidate.key_rotations = self.pending_key_rotations.clone();
+        candidate.gov_proposals = self.pending_gov_proposals.clone();
+        candidate.gov_votes = self.pending_gov_votes.clone();
         // M122: this node is the proposer of the block it builds — credit its own
         // validator id so the tx fees route to it. Only a block actually elected and
         // committed keeps this; a losing candidate is discarded.
@@ -1414,6 +1462,21 @@ impl GossipNode {
         self.broadcast(GossipMsg::KeyRotation(op), None)
     }
 
+    /// M195: stage a locally-created governance proposal and flood it. Validation
+    /// (sig / nonce) happens at apply time in `apply_gov_proposal`.
+    pub fn submit_local_gov_proposal(&mut self, op: GovProposal) -> Vec<(u64, GossipMsg)> {
+        self.seen_gov_proposal.insert(op.hash());
+        self.pending_gov_proposals.push(op.clone());
+        self.broadcast(GossipMsg::GovProposal(Box::new(op)), None)
+    }
+
+    /// M195: stage a locally-created governance vote and flood it.
+    pub fn submit_local_gov_vote(&mut self, op: GovVote) -> Vec<(u64, GossipMsg)> {
+        self.seen_gov_vote.insert(op.hash());
+        self.pending_gov_votes.push(op.clone());
+        self.broadcast(GossipMsg::GovVote(Box::new(op)), None)
+    }
+
     /// The gossip a node emits to announce its current height (anti-entropy tick).
     pub fn announce(&self) -> Vec<(u64, GossipMsg)> {
         self.broadcast(
@@ -1457,6 +1520,8 @@ impl GossipNode {
             GossipMsg::Evidence(ev) => self.on_evidence(from, ev),
             GossipMsg::StakeOp(op) => self.on_stake_op(from, op),
             GossipMsg::KeyRotation(op) => self.on_key_rotation(from, op),
+            GossipMsg::GovProposal(op) => self.on_gov_proposal(from, *op),
+            GossipMsg::GovVote(op) => self.on_gov_vote(from, *op),
             // M22: a full node answers `GetHeaders` with its retained
             // cert-signed headers. If we receive `Headers(...)` directly
             // (e.g. from a peer that pushes), drop them — full nodes don't
@@ -1638,6 +1703,24 @@ impl GossipNode {
         self.broadcast(GossipMsg::KeyRotation(op), Some(from))
     }
 
+    /// M195: dedup + stage + re-flood a gossiped governance proposal.
+    fn on_gov_proposal(&mut self, from: u64, op: GovProposal) -> Vec<(u64, GossipMsg)> {
+        if !self.seen_gov_proposal.insert(op.hash()) {
+            return Vec::new();
+        }
+        self.pending_gov_proposals.push(op.clone());
+        self.broadcast(GossipMsg::GovProposal(Box::new(op)), Some(from))
+    }
+
+    /// M195: dedup + stage + re-flood a gossiped governance vote.
+    fn on_gov_vote(&mut self, from: u64, op: GovVote) -> Vec<(u64, GossipMsg)> {
+        if !self.seen_gov_vote.insert(op.hash()) {
+            return Vec::new();
+        }
+        self.pending_gov_votes.push(op.clone());
+        self.broadcast(GossipMsg::GovVote(Box::new(op)), Some(from))
+    }
+
     /// Address `msg` to every peer, optionally excluding one (the sender), in
     /// sorted order for deterministic output.
     fn broadcast(&self, msg: GossipMsg, except: Option<u64>) -> Vec<(u64, GossipMsg)> {
@@ -1717,6 +1800,20 @@ impl Network {
             .get_mut(&id)
             .unwrap()
             .submit_local_key_rotation(op);
+        self.enqueue(id, out);
+    }
+
+    /// M195: submit a governance proposal / vote at `id` and flood it.
+    pub fn submit_gov_proposal(&mut self, id: u64, op: GovProposal) {
+        let out = self
+            .nodes
+            .get_mut(&id)
+            .unwrap()
+            .submit_local_gov_proposal(op);
+        self.enqueue(id, out);
+    }
+    pub fn submit_gov_vote(&mut self, id: u64, op: GovVote) {
+        let out = self.nodes.get_mut(&id).unwrap().submit_local_gov_vote(op);
         self.enqueue(id, out);
     }
 
@@ -2085,6 +2182,9 @@ impl LightGossipNode {
             | GossipMsg::StakeOp(_)
             // M179: key rotations are a full-node block concern; light clients ignore.
             | GossipMsg::KeyRotation(_)
+            // M195: governance ops are a full-node block concern; light clients ignore.
+            | GossipMsg::GovProposal(_)
+            | GossipMsg::GovVote(_)
             // M33: consensus is an Actor concern; light clients never vote.
             | GossipMsg::Consensus(_)
             // M39: peer discovery is an Actor concern; the pure core does no I/O.
@@ -2326,6 +2426,14 @@ pub fn encode_gossip(m: &GossipMsg) -> Vec<u8> {
             out.push(TAG_KEYROTATION);
             put_bytes(&mut out, &crate::codec::encode_key_rotation(op));
         }
+        GossipMsg::GovProposal(op) => {
+            out.push(TAG_GOVPROPOSAL);
+            put_bytes(&mut out, &crate::codec::encode_gov_proposal(op));
+        }
+        GossipMsg::GovVote(op) => {
+            out.push(TAG_GOVVOTE);
+            put_bytes(&mut out, &crate::codec::encode_gov_vote(op));
+        }
         GossipMsg::GetHeaders { from } => {
             out.push(TAG_GETHEADERS);
             out.extend_from_slice(&from.to_be_bytes());
@@ -2477,6 +2585,12 @@ pub fn decode_gossip(buf: &[u8]) -> Result<GossipMsg, CodecError> {
         TAG_KEYROTATION => {
             GossipMsg::KeyRotation(crate::codec::decode_key_rotation(take_bytes(&mut rest)?)?)
         }
+        TAG_GOVPROPOSAL => GossipMsg::GovProposal(Box::new(crate::codec::decode_gov_proposal(
+            take_bytes(&mut rest)?,
+        )?)),
+        TAG_GOVVOTE => GossipMsg::GovVote(Box::new(crate::codec::decode_gov_vote(take_bytes(
+            &mut rest,
+        )?)?)),
         TAG_GETHEADERS => GossipMsg::GetHeaders {
             from: take_u64(&mut rest)?,
         },
@@ -3383,6 +3497,35 @@ mod tests {
         }
     }
 
+    #[test]
+    fn gov_op_gossip_wire_round_trips() {
+        // M195: GovProposal / GovVote survive encode_gossip → decode_gossip.
+        let prop = crate::GovProposal {
+            proposer: 3,
+            param: crate::GovParam::DecayHalfLife(7),
+            voting_period: 20,
+            nonce: 2,
+            signature: [5u8; 64],
+        };
+        let bytes = encode_gossip(&GossipMsg::GovProposal(Box::new(prop.clone())));
+        match decode_gossip(&bytes) {
+            Ok(GossipMsg::GovProposal(back)) => assert_eq!(*back, prop),
+            other => panic!("expected GovProposal, got {other:?}"),
+        }
+        let vote = crate::GovVote {
+            proposal_id: 9,
+            voter: 4,
+            approve: false,
+            nonce: 0,
+            signature: [6u8; 64],
+        };
+        let vb = encode_gossip(&GossipMsg::GovVote(Box::new(vote.clone())));
+        match decode_gossip(&vb) {
+            Ok(GossipMsg::GovVote(back)) => assert_eq!(*back, vote),
+            other => panic!("expected GovVote, got {other:?}"),
+        }
+    }
+
     /// Build a real cert-signed `LockEnvelope` for round-trip testing. We
     /// spin up a single-validator chain, stage one lock, and serve it via
     /// `GossipNode::serve_lock` — same shape as the production path, just
@@ -3938,6 +4081,66 @@ mod tests {
             1,
             "node 2 did not re-stage the duplicate rotation"
         );
+    }
+
+    #[test]
+    fn gov_op_gossip_reaches_every_node_and_dedups() {
+        // M195: a locally-submitted proposal + vote each flood to every node's pending
+        // pool (one copy each), and a duplicate does not re-flood.
+        let ids = [1u64, 2, 3];
+        let nodes: Vec<GossipNode> = ids
+            .iter()
+            .map(|&id| GossipNode::new(id, genesis(), 16, ids.iter().copied()))
+            .collect();
+        let mut net = Network::new(nodes);
+
+        let prop = crate::GovProposal {
+            proposer: 1,
+            param: crate::GovParam::BaseEmission(42),
+            voting_period: 10,
+            nonce: 0,
+            signature: [0u8; 64],
+        }
+        .signed(&kp(1));
+        let vote = crate::GovVote {
+            proposal_id: 0,
+            voter: 1,
+            approve: true,
+            nonce: 1,
+            signature: [0u8; 64],
+        }
+        .signed(&kp(1));
+        let ph = prop.hash();
+        let vh = vote.hash();
+        net.submit_gov_proposal(1, prop.clone());
+        net.submit_gov_vote(1, vote.clone());
+        net.run();
+        for id in ids {
+            assert_eq!(
+                net.node(id).pending_gov_proposals().len(),
+                1,
+                "node {id} one proposal"
+            );
+            assert_eq!(net.node(id).pending_gov_proposals()[0].hash(), ph);
+            assert_eq!(
+                net.node(id).pending_gov_votes().len(),
+                1,
+                "node {id} one vote"
+            );
+            assert_eq!(net.node(id).pending_gov_votes()[0].hash(), vh);
+        }
+
+        // Re-delivering a seen proposal/vote stages nothing and emits nothing.
+        let out = net
+            .node_mut(2)
+            .on_message(1, GossipMsg::GovProposal(Box::new(prop)));
+        assert!(out.is_empty(), "a seen proposal is not re-flooded");
+        let out2 = net
+            .node_mut(2)
+            .on_message(1, GossipMsg::GovVote(Box::new(vote)));
+        assert!(out2.is_empty(), "a seen vote is not re-flooded");
+        assert_eq!(net.node(2).pending_gov_proposals().len(), 1);
+        assert_eq!(net.node(2).pending_gov_votes().len(), 1);
     }
 
     /// End-to-end: gossip an evidence through the network to a node, drain
