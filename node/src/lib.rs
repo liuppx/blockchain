@@ -312,6 +312,56 @@ pub struct Proposal {
 pub const GOV_STAKE_QUORUM_NUM: u128 = 2;
 pub const GOV_STAKE_QUORUM_DEN: u128 = 3;
 
+/// M194: a block op that **registers** a governance proposal. The chain assigns the
+/// proposal's monotonic `id` on apply (from `next_proposal_id`); the proposer only
+/// states the target param and the voting window. `nonce` is strict against the
+/// proposer account's nonce (replay protection, like [`SubmissionTx`]/[`KeyRotation`]).
+#[derive(Clone, Debug, PartialEq)]
+pub struct GovProposal {
+    pub proposer: u64,
+    pub param: GovParam,
+    pub voting_period: u64,
+    pub nonce: u64,
+    /// ed25519 signature by `proposer`'s key over [`codec::govproposal_signing_bytes`].
+    pub signature: Sig,
+}
+
+impl GovProposal {
+    pub fn signed(mut self, kp: &Keypair) -> Self {
+        self.signature = kp.sign(&codec::govproposal_signing_bytes(&self));
+        self
+    }
+    /// Content-addressed hash over the full signed encoding (gossip dedup key, M195).
+    pub fn hash(&self) -> Hash {
+        sha256(&codec::encode_gov_proposal(self))
+    }
+}
+
+/// M194: a block op that **records a vote** on an open proposal. `voter` is an
+/// account id; its stake weight (`bonds`) and reputation weight (`reviewers`) are
+/// read at tally time ([`ChainState::gov_tally`]). `nonce` is strict against the
+/// voter account's nonce, which both prevents replay and orders re-votes
+/// (last-write-wins by apply order).
+#[derive(Clone, Debug, PartialEq)]
+pub struct GovVote {
+    pub proposal_id: u64,
+    pub voter: u64,
+    pub approve: bool,
+    pub nonce: u64,
+    /// ed25519 signature by `voter`'s key over [`codec::govvote_signing_bytes`].
+    pub signature: Sig,
+}
+
+impl GovVote {
+    pub fn signed(mut self, kp: &Keypair) -> Self {
+        self.signature = kp.sign(&codec::govvote_signing_bytes(&self));
+        self
+    }
+    pub fn hash(&self) -> Hash {
+        sha256(&codec::encode_gov_vote(self))
+    }
+}
+
 /// Cryptographic proof of validator equivocation: two conflicting precommit
 /// votes from the same validator at the same `(height, round)` but for
 /// *different* block hashes, each carrying a valid ed25519 signature by the
@@ -679,6 +729,14 @@ pub struct Block {
     /// validators (MVP). Usually empty. Bodies are part of the block hash via the
     /// header projection's `key_rotations_commitment`.
     pub key_rotations: Vec<KeyRotation>,
+    /// M194 (B6 wire): governance proposals registered by this block. Applied after
+    /// key rotations; each gets a chain-assigned id. Usually empty. Committed via the
+    /// header projection's `gov_proposals_commitment`.
+    pub gov_proposals: Vec<GovProposal>,
+    /// M194 (B6 wire): governance votes recorded by this block, against proposals
+    /// opened in an earlier (or the same) block. Committed via the header
+    /// projection's `gov_votes_commitment`.
+    pub gov_votes: Vec<GovVote>,
 }
 
 impl Block {
@@ -902,6 +960,13 @@ pub struct ChainState {
     pub bridge_lock_heights: BTreeMap<u64, u64>,
     /// M30: next `lock_id` to assign. Monotonic; never reused.
     pub next_lock_id: u64,
+    /// M194: active governance proposals, keyed by monotonic id. A proposal is
+    /// registered by a `GovProposal` op, accumulates `GovVote`s, and is tallied +
+    /// removed at its deadline (`created_height + voting_period`) during block apply.
+    /// Folded into `state_root` so proposal state is authenticated consensus state.
+    pub proposals: BTreeMap<u64, Proposal>,
+    /// M194: monotonic id counter for the next registered proposal.
+    pub next_proposal_id: u64,
     /// M31: cumulative micro-$COG minted on this chain via
     /// [`BridgeRedeem`] ops. Like `bridge_locked`, an audit counter that
     /// mirrors the source-side pool; folds into `state_root` so a wallet
@@ -975,6 +1040,15 @@ pub enum ChainError {
         account: u64,
         expected: u64,
         got: u64,
+    },
+    /// M194: a `GovVote` referenced a proposal id that is not (or no longer) in the
+    /// active proposal set.
+    UnknownProposal(u64),
+    /// M194: a `GovVote` arrived at/after the proposal's deadline
+    /// (`created_height + voting_period`) — the voting window is closed.
+    ProposalClosed {
+        id: u64,
+        height: u64,
     },
     /// M143: the tx's `nonce` is further ahead than the mempool's pipelining window
     /// allows (`got > acct.nonce + nonce_lookahead`). A mempool-admission bound, not
@@ -1176,6 +1250,11 @@ impl std::fmt::Display for ChainError {
             ChainError::BadNonce { account, expected, got } => write!(
                 f,
                 "account {account} nonce mismatch: expected {expected}, got {got}"
+            ),
+            ChainError::UnknownProposal(id) => write!(f, "unknown governance proposal {id}"),
+            ChainError::ProposalClosed { id, height } => write!(
+                f,
+                "governance proposal {id} voting window is closed at height {height}"
             ),
             ChainError::NonceTooFarAhead { account, got, limit } => write!(
                 f,
@@ -1483,6 +1562,8 @@ impl ChainState {
             bridge_locks: BTreeMap::new(),
             bridge_lock_heights: BTreeMap::new(),
             next_lock_id: 0,
+            proposals: BTreeMap::new(),
+            next_proposal_id: 0,
             // M31: bridge-redeem audit counter + follower registry.
             bridge_minted: 0,
             bridge_sources,
@@ -1533,6 +1614,8 @@ impl ChainState {
             bridge_redeems: Vec::new(),
             bridge_unbondings: Vec::new(),
             key_rotations: Vec::new(),
+            gov_proposals: Vec::new(),
+            gov_votes: Vec::new(),
         }
         .hash();
         // M31: now that the genesis block hash is known, store it on
@@ -1698,6 +1781,16 @@ impl ChainState {
             }
         }
 
+        // M194: governance ops — register proposals (chain assigns ids), then record
+        // votes against open proposals. Both strict-nonce + sig checked; a bad op
+        // rolls the whole block back. `new_height` is the height this block commits at.
+        for op in &block.gov_proposals {
+            self.apply_gov_proposal(op, new_height)?;
+        }
+        for op in &block.gov_votes {
+            self.apply_gov_vote(op, new_height)?;
+        }
+
         // on-chain validator-set transition: explicit updates PLUS the changes
         // implied by this block's staking ops (power == bonded stake). Both take
         // effect from the NEXT height — this block was certified by the set in
@@ -1730,6 +1823,11 @@ impl ChainState {
         // block's state_root from a trial that already advanced height. Keeping
         // the old height here would make the cross-check fail spuriously.
         self.height = new_height;
+        // M194: resolve proposals whose voting window closed at this height — tally
+        // (hybrid dual-threshold) and apply the param change for passers, then drop
+        // all matured proposals. Runs before the commitment checks so `state_root`
+        // reflects both the executed param change and the shrunken proposal set.
+        self.resolve_matured_proposals(new_height);
         if enforce_commitment && block.next_validators_root != self.validators.merkle_root() {
             return Err(ChainError::ValidatorRootMismatch { height: new_height });
         }
@@ -1832,6 +1930,102 @@ impl ChainState {
             GovParam::BaseEmission(v) => self.base_emission_micro = *v,
             GovParam::SlashBps(v) => self.slash_bps = *v,
             GovParam::DecayHalfLife(v) => self.decay_half_life_blocks = *v,
+        }
+    }
+
+    /// M194: register a `GovProposal` (checks sig + strict nonce, assigns the next
+    /// monotonic id, opens the voting window at `height`). Validation fully precedes
+    /// mutation so a bad op rolls the whole block back.
+    fn apply_gov_proposal(&mut self, op: &GovProposal, height: u64) -> Result<(), ChainError> {
+        let acct = self
+            .accounts
+            .get(&op.proposer)
+            .ok_or(ChainError::UnknownAccount(op.proposer))?;
+        if !crypto::verify(
+            &acct.pubkey,
+            &codec::govproposal_signing_bytes(op),
+            &op.signature,
+        ) {
+            return Err(ChainError::BadSignature(op.proposer));
+        }
+        if op.nonce != acct.nonce {
+            return Err(ChainError::BadNonce {
+                account: op.proposer,
+                expected: acct.nonce,
+                got: op.nonce,
+            });
+        }
+        let id = self.next_proposal_id;
+        self.next_proposal_id += 1;
+        self.proposals.insert(
+            id,
+            Proposal {
+                id,
+                param: op.param.clone(),
+                created_height: height,
+                voting_period: op.voting_period,
+                votes: BTreeMap::new(),
+            },
+        );
+        self.accounts.get_mut(&op.proposer).unwrap().nonce += 1;
+        Ok(())
+    }
+
+    /// M194: record a `GovVote` on an open proposal (checks sig + strict nonce;
+    /// rejects an unknown or closed proposal). Last-write-wins per voter (keyed by
+    /// account id); the strict nonce both prevents replay and orders re-votes.
+    fn apply_gov_vote(&mut self, op: &GovVote, height: u64) -> Result<(), ChainError> {
+        let acct = self
+            .accounts
+            .get(&op.voter)
+            .ok_or(ChainError::UnknownAccount(op.voter))?;
+        if !crypto::verify(
+            &acct.pubkey,
+            &codec::govvote_signing_bytes(op),
+            &op.signature,
+        ) {
+            return Err(ChainError::BadSignature(op.voter));
+        }
+        if op.nonce != acct.nonce {
+            return Err(ChainError::BadNonce {
+                account: op.voter,
+                expected: acct.nonce,
+                got: op.nonce,
+            });
+        }
+        {
+            let p = self
+                .proposals
+                .get_mut(&op.proposal_id)
+                .ok_or(ChainError::UnknownProposal(op.proposal_id))?;
+            if height >= p.created_height + p.voting_period {
+                return Err(ChainError::ProposalClosed {
+                    id: op.proposal_id,
+                    height,
+                });
+            }
+            p.votes.insert(op.voter, op.approve);
+        }
+        self.accounts.get_mut(&op.voter).unwrap().nonce += 1;
+        Ok(())
+    }
+
+    /// M194: at `height`, tally every proposal that has reached its deadline
+    /// (`created_height + voting_period`), apply the parameter change for those that
+    /// pass [`Self::gov_tally`], and remove all matured proposals (passed or not).
+    /// Deterministic: matured ids are processed in sorted (BTreeMap) order.
+    fn resolve_matured_proposals(&mut self, height: u64) {
+        let matured: Vec<u64> = self
+            .proposals
+            .iter()
+            .filter(|(_, p)| height >= p.created_height + p.voting_period)
+            .map(|(&id, _)| id)
+            .collect();
+        for id in matured {
+            let p = self.proposals.remove(&id).expect("id came from the map");
+            if self.gov_tally(&p) {
+                self.apply_gov_param(&p.param);
+            }
         }
     }
 
@@ -2587,6 +2781,23 @@ impl ChainState {
                 e.u64(*index);
             }
         }
+        // M194: fold the governance proposal set + id counter into the digest so
+        // proposal/vote state is authenticated consensus state (a snapshot-synced
+        // node recovers the identical set and tallies identically). BTreeMaps iterate
+        // sorted, so the bytes are canonical. Param is tag-encoded via the codec.
+        e.u64(self.proposals.len() as u64);
+        for (id, p) in &self.proposals {
+            e.u64(*id);
+            e.raw(&codec::encode_gov_param(&p.param));
+            e.u64(p.created_height);
+            e.u64(p.voting_period);
+            e.u64(p.votes.len() as u64);
+            for (voter, approve) in &p.votes {
+                e.u64(*voter);
+                e.u8(*approve as u8);
+            }
+        }
+        e.u64(self.next_proposal_id);
         sha256(&e.0)
     }
 
@@ -3239,6 +3450,8 @@ mod tests {
             bridge_redeems: Vec::new(),
             bridge_unbondings: Vec::new(),
             key_rotations: Vec::new(),
+            gov_proposals: Vec::new(),
+            gov_votes: Vec::new(),
         };
         // best-effort seal: valid blocks get the correct commitments; blocks the
         // negative tests build to fail earlier keep [0;32] and still fail at
@@ -3470,6 +3683,210 @@ mod tests {
         assert!(s.gov_tally(&p));
         p.votes.insert(1, false); // account 1 flips to no
         assert!(!s.gov_tally(&p));
+    }
+
+    // ---- M194: governance wired into blocks (propose → vote → execute) ----
+
+    /// Give account 1 enough stake + reputation to pass both quorums alone, so a
+    /// single yes-vote decides a proposal. Returns a chain ready to carry gov ops.
+    fn gov_chain() -> Chain {
+        let mut chain = Chain::new(base_genesis());
+        chain.state.bonds = [(1u64, 100u64)].into_iter().collect();
+        chain.state.bonded = 100;
+        chain.state.reviewers = [(1u64, 1.0f32)].into_iter().collect();
+        chain
+    }
+
+    #[test]
+    fn governance_end_to_end_passes_and_executes() {
+        // M194: propose at h1, vote yes at h2, mature+execute at h3. Account 1 alone
+        // clears both bars (100/100 stake, 1.0/1.0 reputation).
+        let mut chain = gov_chain();
+        let before = chain.state.base_emission_micro;
+
+        let prop = GovProposal {
+            proposer: 1,
+            param: GovParam::BaseEmission(before + 999),
+            voting_period: 2, // created at h1 ⇒ matures at h3
+            nonce: 0,
+            signature: [0u8; 64],
+        }
+        .signed(&kp(1));
+        let mut b1 = block(&chain, 1, vec![]);
+        b1.gov_proposals = vec![prop];
+        chain.seal(&mut b1).unwrap();
+        chain.commit(&mut b1).unwrap();
+        assert_eq!(chain.state.proposals.len(), 1, "proposal registered");
+        assert!(chain.state.proposals.contains_key(&0), "id 0 assigned");
+
+        let vote = GovVote {
+            proposal_id: 0,
+            voter: 1,
+            approve: true,
+            nonce: 1, // account 1's nonce advanced to 1 by the proposal
+            signature: [0u8; 64],
+        }
+        .signed(&kp(1));
+        let mut b2 = block(&chain, 2, vec![]);
+        b2.gov_votes = vec![vote];
+        chain.seal(&mut b2).unwrap();
+        chain.commit(&mut b2).unwrap();
+        assert_eq!(
+            chain.state.base_emission_micro, before,
+            "not executed before deadline"
+        );
+
+        // h3: deadline reached ⇒ tally + execute + drop.
+        let mut b3 = block(&chain, 3, vec![]);
+        chain.commit(&mut b3).unwrap();
+        assert_eq!(
+            chain.state.base_emission_micro,
+            before + 999,
+            "executed at deadline"
+        );
+        assert!(chain.state.proposals.is_empty(), "matured proposal removed");
+    }
+
+    #[test]
+    fn governance_fails_without_both_quorums() {
+        // Zero votes ⇒ neither bar met ⇒ no change, but the proposal is still dropped
+        // at its deadline.
+        let mut chain = gov_chain();
+        let slash_before = chain.state.slash_bps;
+        let prop = GovProposal {
+            proposer: 1,
+            param: GovParam::SlashBps(1234),
+            voting_period: 1,
+            nonce: 0,
+            signature: [0u8; 64],
+        }
+        .signed(&kp(1));
+        let mut b1 = block(&chain, 1, vec![]);
+        b1.gov_proposals = vec![prop];
+        chain.seal(&mut b1).unwrap();
+        chain.commit(&mut b1).unwrap();
+        // h2: deadline (1+1) reached with zero votes ⇒ fails, dropped, slash_bps intact.
+        let mut b2 = block(&chain, 2, vec![]);
+        chain.commit(&mut b2).unwrap();
+        assert!(
+            chain.state.proposals.is_empty(),
+            "failed proposal still removed"
+        );
+        assert_eq!(chain.state.slash_bps, slash_before, "param not applied");
+        assert_ne!(chain.state.slash_bps, 1234);
+    }
+
+    #[test]
+    fn gov_vote_rejects_unknown_and_closed_proposal() {
+        let mut chain = gov_chain();
+        // Unknown proposal id ⇒ UnknownProposal (rolls the block back).
+        let vote = GovVote {
+            proposal_id: 999,
+            voter: 1,
+            approve: true,
+            nonce: 0,
+            signature: [0u8; 64],
+        }
+        .signed(&kp(1));
+        let mut b = block(&chain, 1, vec![]);
+        b.gov_votes = vec![vote];
+        assert!(matches!(
+            chain.commit(&mut b).unwrap_err(),
+            ChainError::UnknownProposal(999)
+        ));
+
+        // Register a proposal with voting_period 1 (created h1 ⇒ closed at h2).
+        let prop = GovProposal {
+            proposer: 1,
+            param: GovParam::DecayHalfLife(7),
+            voting_period: 1,
+            nonce: 0,
+            signature: [0u8; 64],
+        }
+        .signed(&kp(1));
+        let mut b1 = block(&chain, 1, vec![]);
+        b1.gov_proposals = vec![prop];
+        chain.seal(&mut b1).unwrap();
+        chain.commit(&mut b1).unwrap();
+        // The proposal matures at h2, so a vote AT h2 is both closed and (post-apply)
+        // gone — but the window check fires first: ProposalClosed... except the
+        // proposal is tallied+removed at h2's end. A vote in the SAME h2 block is
+        // applied BEFORE maturity resolution, and h2 >= created(1)+period(1) ⇒ closed.
+        let vote2 = GovVote {
+            proposal_id: 0,
+            voter: 1,
+            approve: true,
+            nonce: 1,
+            signature: [0u8; 64],
+        }
+        .signed(&kp(1));
+        let mut b2 = block(&chain, 2, vec![]);
+        b2.gov_votes = vec![vote2];
+        assert!(matches!(
+            chain.commit(&mut b2).unwrap_err(),
+            ChainError::ProposalClosed { id: 0, height: 2 }
+        ));
+    }
+
+    #[test]
+    fn governance_bad_nonce_and_signature_rejected() {
+        let mut chain = gov_chain();
+        // Wrong signer (kp(2) signing account 1's proposal) ⇒ BadSignature.
+        let bad_sig = GovProposal {
+            proposer: 1,
+            param: GovParam::BaseEmission(1),
+            voting_period: 1,
+            nonce: 0,
+            signature: [0u8; 64],
+        }
+        .signed(&kp(2));
+        let mut b = block(&chain, 1, vec![]);
+        b.gov_proposals = vec![bad_sig];
+        assert!(matches!(
+            chain.commit(&mut b).unwrap_err(),
+            ChainError::BadSignature(1)
+        ));
+        // Wrong nonce ⇒ BadNonce.
+        let bad_nonce = GovProposal {
+            proposer: 1,
+            param: GovParam::BaseEmission(1),
+            voting_period: 1,
+            nonce: 5,
+            signature: [0u8; 64],
+        }
+        .signed(&kp(1));
+        let mut b2 = block(&chain, 1, vec![]);
+        b2.gov_proposals = vec![bad_nonce];
+        assert!(matches!(
+            chain.commit(&mut b2).unwrap_err(),
+            ChainError::BadNonce {
+                account: 1,
+                expected: 0,
+                got: 5
+            }
+        ));
+    }
+
+    #[test]
+    fn state_root_covers_proposals() {
+        // M194: proposals fold into state_root — two states differing only by a
+        // proposal produce different roots; merkle_root (accounts tree) is unaffected.
+        let base = gov_chain();
+        let r0 = base.state.state_root();
+        let mut more = base.state.clone();
+        more.proposals.insert(
+            0,
+            Proposal {
+                id: 0,
+                param: GovParam::BaseEmission(5),
+                created_height: 1,
+                voting_period: 3,
+                votes: BTreeMap::new(),
+            },
+        );
+        more.next_proposal_id = 1;
+        assert_ne!(r0, more.state_root(), "a proposal changes state_root");
+        assert_eq!(base.state.merkle_root(), more.merkle_root());
     }
 
     #[test]
@@ -4213,6 +4630,8 @@ mod tests {
             bridge_redeems: Vec::new(),
             bridge_unbondings: Vec::new(),
             key_rotations: Vec::new(),
+            gov_proposals: Vec::new(),
+            gov_votes: Vec::new(),
             proposer: 0,
         };
         live.seal(&mut b2).unwrap();
@@ -5408,6 +5827,8 @@ mod tests {
             bridge_redeems: Vec::new(),
             bridge_unbondings: Vec::new(),
             key_rotations: Vec::new(),
+            gov_proposals: Vec::new(),
+            gov_votes: Vec::new(),
         };
         match chain.commit(&mut b2) {
             Err(ChainError::BadNonce {

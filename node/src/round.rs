@@ -741,6 +741,8 @@ mod tests {
             bridge_redeems: Vec::new(),
             bridge_unbondings: Vec::new(),
             key_rotations: Vec::new(),
+            gov_proposals: Vec::new(),
+            gov_votes: Vec::new(),
             proposer: 0,
         }
     }

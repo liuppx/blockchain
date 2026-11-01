@@ -17269,6 +17269,8 @@ vote_b.validator=5 vote_b.height=9 vote_b.round=2 vote_b.block_hash={b_h} vote_b
             bridge_redeems_commitment: [0x0b; 32],
             bridge_unbondings_commitment: [0u8; 32],
             key_rotations_commitment: [0u8; 32],
+            gov_proposals_commitment: [0u8; 32],
+            gov_votes_commitment: [0u8; 32],
             proposer: 0,
         };
         let cert = Commit {
@@ -17496,6 +17498,8 @@ vote_b.validator=5 vote_b.height=9 vote_b.round=2 vote_b.block_hash={b_h} vote_b
             bridge_redeems_commitment: [0u8; 32],
             bridge_unbondings_commitment: [0u8; 32],
             key_rotations_commitment: [0u8; 32],
+            gov_proposals_commitment: [0u8; 32],
+            gov_votes_commitment: [0u8; 32],
             proposer: 0,
         };
         let cert = |height: u64| Commit {
@@ -17633,6 +17637,8 @@ vote_b.validator=5 vote_b.height=9 vote_b.round=2 vote_b.block_hash={b_h} vote_b
             bridge_redeems_commitment: [0u8; 32],
             bridge_unbondings_commitment: [0u8; 32],
             key_rotations_commitment: [0u8; 32],
+            gov_proposals_commitment: [0u8; 32],
+            gov_votes_commitment: [0u8; 32],
             proposer: 0,
         };
         let cert = |height: u64| Commit {
@@ -17733,6 +17739,8 @@ vote_b.validator=5 vote_b.height=9 vote_b.round=2 vote_b.block_hash={b_h} vote_b
             bridge_redeems_commitment: [0u8; 32],
             bridge_unbondings_commitment: [0u8; 32],
             key_rotations_commitment: [0u8; 32],
+            gov_proposals_commitment: [0u8; 32],
+            gov_votes_commitment: [0u8; 32],
             proposer: 0,
         };
         let cert = |height: u64| Commit {
@@ -17839,6 +17847,8 @@ vote_b.validator=5 vote_b.height=9 vote_b.round=2 vote_b.block_hash={b_h} vote_b
             }],
             bridge_unbondings: vec![],
             key_rotations: vec![],
+            gov_proposals: Vec::new(),
+            gov_votes: Vec::new(),
             proposer: 0,
         };
         let j = json_range_blocks(&[(block, cert(7))]);

@@ -11,7 +11,8 @@ use crate::validator::ValidatorSet;
 use crate::validator::{Validator, ValidatorUpdate};
 use crate::{
     Account, Block, BondKind, BridgeHeader, BridgeRedeem, BridgeSource, BridgeUnbond, ChainState,
-    Embedding, KeyRotation, Review, Reviewer, SlashEvidence, StakeOp, SubmissionTx, UnbondingEntry,
+    Embedding, GovParam, GovProposal, GovVote, KeyRotation, Proposal, Review, Reviewer,
+    SlashEvidence, StakeOp, SubmissionTx, UnbondingEntry,
 };
 use zhixing_engine::DIM;
 use zhixing_engine::{CognitiveGraph, DeltaKParams, GraphNode};
@@ -125,6 +126,16 @@ pub fn encode_block(b: &Block) -> Vec<u8> {
     for op in &b.key_rotations {
         enc_key_rotation(&mut e, op, true);
     }
+    // M194 (B6 wire): governance op bodies, appended at the tail (prefix-stable for
+    // B5 readers — a B5 block ends after key_rotations).
+    e.u64(b.gov_proposals.len() as u64);
+    for op in &b.gov_proposals {
+        enc_gov_proposal(&mut e, op, true);
+    }
+    e.u64(b.gov_votes.len() as u64);
+    for op in &b.gov_votes {
+        enc_gov_vote(&mut e, op, true);
+    }
     e.0
 }
 
@@ -196,6 +207,10 @@ pub fn encode_header(h: &BlockHeader) -> Vec<u8> {
     // M179 (B4 wire): eighth per-body commitment, appended at the tail — same
     // prefix-stability discipline as the M171 seventh commitment.
     e.raw(&h.key_rotations_commitment);
+    // M194 (B6 wire): ninth + tenth per-body commitments (governance proposals /
+    // votes), appended at the tail — same prefix-stability discipline.
+    e.raw(&h.gov_proposals_commitment);
+    e.raw(&h.gov_votes_commitment);
     e.0
 }
 
@@ -258,6 +273,11 @@ pub fn decode_header(buf: &[u8]) -> Result<BlockHeader, CodecError> {
     // M179 (B4 wire): eighth body commitment (key-rotation op list).
     let mut key_rotations_commitment = [0u8; 32];
     key_rotations_commitment.copy_from_slice(d.take(32)?);
+    // M194 (B6 wire): ninth + tenth body commitments (governance proposals / votes).
+    let mut gov_proposals_commitment = [0u8; 32];
+    gov_proposals_commitment.copy_from_slice(d.take(32)?);
+    let mut gov_votes_commitment = [0u8; 32];
+    gov_votes_commitment.copy_from_slice(d.take(32)?);
     if d.pos != d.buf.len() {
         return Err(CodecError::TrailingBytes);
     }
@@ -281,6 +301,8 @@ pub fn decode_header(buf: &[u8]) -> Result<BlockHeader, CodecError> {
         bridge_redeems_commitment,
         bridge_unbondings_commitment,
         key_rotations_commitment,
+        gov_proposals_commitment,
+        gov_votes_commitment,
     })
 }
 
@@ -304,17 +326,18 @@ pub fn decode_certified_header(buf: &[u8]) -> Result<CertifiedHeader, CodecError
     //   + 32 (next_validators_root) + 32 (state_root) + 32 (accounts_root)
     //   + 32 (graph_root, M27) + 32 (bridge_root, M30) + 32 (contributions_root,
     //   M185 B5) + 8 (n_updates u64) = 252-byte fixed prefix ‖ n_updates * 48
-    //   bytes (u64 id ‖ 32-byte pubkey ‖ u64 power) ‖ 8 * 32-byte commitments =
-    //   256 bytes tail (M30 adds bridge_locks_commitment; M31 adds
+    //   bytes (u64 id ‖ 32-byte pubkey ‖ u64 power) ‖ 10 * 32-byte commitments =
+    //   320 bytes tail (M30 adds bridge_locks_commitment; M31 adds
     //   bridge_headers_commitment + bridge_redeems_commitment; M171 B3 adds
-    //   bridge_unbondings_commitment; M179 B4 adds key_rotations_commitment).
+    //   bridge_unbondings_commitment; M179 B4 adds key_rotations_commitment; M194 B6
+    //   adds gov_proposals_commitment + gov_votes_commitment).
     //   M185 B5 adds contributions_root as a *prefix* root (not a tail
     //   commitment), so the fixed prefix grows 220 → 252 and n_updates shifts.
     if buf.len() < 252 {
         return Err(CodecError::UnexpectedEof);
     }
     let n_updates = u64::from_be_bytes(buf[244..252].try_into().unwrap());
-    let header_len = 252 + (n_updates as usize) * 48 + 256; // 508 base + 48 per update
+    let header_len = 252 + (n_updates as usize) * 48 + 320; // 572 base + 48 per update
     if buf.len() < header_len {
         return Err(CodecError::UnexpectedEof);
     }
@@ -443,6 +466,12 @@ pub struct BlockHeader {
     /// list (`Block::key_rotations`). Eighth and last per-body commitment,
     /// appended at the tail so B3 and earlier prefixes stay byte-stable.
     pub key_rotations_commitment: crate::Hash,
+    /// M194 (B6 wire): SHA-256 over the canonical encoding of the governance
+    /// proposal op list (`Block::gov_proposals`). Ninth per-body commitment.
+    pub gov_proposals_commitment: crate::Hash,
+    /// M194 (B6 wire): SHA-256 over the canonical encoding of the governance vote
+    /// op list (`Block::gov_votes`). Tenth and last per-body commitment.
+    pub gov_votes_commitment: crate::Hash,
 }
 
 impl BlockHeader {
@@ -515,6 +544,17 @@ impl BlockHeader {
                     .map(encode_key_rotation)
                     .collect::<Vec<_>>(),
             ),
+            // M194 (B6 wire): ninth + tenth per-body commitments, binding the
+            // governance proposal / vote op lists — same discipline as the others.
+            gov_proposals_commitment: list_commitment(
+                &b.gov_proposals
+                    .iter()
+                    .map(encode_gov_proposal)
+                    .collect::<Vec<_>>(),
+            ),
+            gov_votes_commitment: list_commitment(
+                &b.gov_votes.iter().map(encode_gov_vote).collect::<Vec<_>>(),
+            ),
         }
     }
 
@@ -533,7 +573,7 @@ impl BlockHeader {
     /// (in canonical order). Used by full nodes; light clients never call it.
     /// Each body MUST match its committed root — otherwise the cert-signed
     /// commitment is broken.
-    // The 8 body vectors are the chain's canonical block bodies — grouping them into
+    // The 10 body vectors are the chain's canonical block bodies — grouping them into
     // a struct would just move the arity, not reduce it.
     #[allow(clippy::too_many_arguments)]
     pub fn to_block(
@@ -546,6 +586,8 @@ impl BlockHeader {
         bridge_redeems: Vec<BridgeRedeem>,
         bridge_unbondings: Vec<BridgeUnbond>,
         key_rotations: Vec<KeyRotation>,
+        gov_proposals: Vec<GovProposal>,
+        gov_votes: Vec<GovVote>,
     ) -> Block {
         Block {
             height: self.height,
@@ -567,6 +609,8 @@ impl BlockHeader {
             bridge_redeems,
             bridge_unbondings,
             key_rotations,
+            gov_proposals,
+            gov_votes,
         }
     }
 }
@@ -744,6 +788,140 @@ fn dec_key_rotation(d: &mut Dec) -> Result<KeyRotation, CodecError> {
     Ok(KeyRotation {
         account,
         new_pubkey,
+        nonce,
+        signature,
+    })
+}
+
+// --- governance (M194) -------------------------------------------------------
+
+/// M194: tag-encode a [`GovParam`] (tag byte + native value). The single wire
+/// representation shared by signing bytes, op encoding, and the `state_root` fold.
+pub fn encode_gov_param(param: &GovParam) -> Vec<u8> {
+    let mut e = Enc(Vec::new());
+    enc_gov_param(&mut e, param);
+    e.0
+}
+
+fn enc_gov_param(e: &mut Enc, param: &GovParam) {
+    match param {
+        GovParam::BaseEmission(v) => {
+            e.u8(0);
+            e.u64(*v);
+        }
+        GovParam::SlashBps(v) => {
+            e.u8(1);
+            e.u32(*v);
+        }
+        GovParam::DecayHalfLife(v) => {
+            e.u8(2);
+            e.u64(*v);
+        }
+    }
+}
+
+fn dec_gov_param(d: &mut Dec) -> Result<GovParam, CodecError> {
+    match d.u8()? {
+        0 => Ok(GovParam::BaseEmission(d.u64()?)),
+        1 => Ok(GovParam::SlashBps(d.u32()?)),
+        2 => Ok(GovParam::DecayHalfLife(d.u64()?)),
+        other => Err(CodecError::BadEnum(other as u32)),
+    }
+}
+
+/// M194: the exact bytes a proposer signs (all fields except the signature).
+pub fn govproposal_signing_bytes(op: &GovProposal) -> Vec<u8> {
+    let mut e = Enc(Vec::new());
+    enc_gov_proposal(&mut e, op, false);
+    e.0
+}
+
+/// M194: canonical bytes of a full (signed) governance proposal (content hash).
+pub fn encode_gov_proposal(op: &GovProposal) -> Vec<u8> {
+    let mut e = Enc(Vec::new());
+    enc_gov_proposal(&mut e, op, true);
+    e.0
+}
+
+pub fn decode_gov_proposal(buf: &[u8]) -> Result<GovProposal, CodecError> {
+    let mut d = Dec { buf, pos: 0 };
+    let op = dec_gov_proposal(&mut d)?;
+    if d.pos != d.buf.len() {
+        return Err(CodecError::TrailingBytes);
+    }
+    Ok(op)
+}
+
+fn enc_gov_proposal(e: &mut Enc, op: &GovProposal, include_sig: bool) {
+    e.u64(op.proposer);
+    enc_gov_param(e, &op.param);
+    e.u64(op.voting_period);
+    e.u64(op.nonce);
+    if include_sig {
+        e.raw(&op.signature);
+    }
+}
+
+fn dec_gov_proposal(d: &mut Dec) -> Result<GovProposal, CodecError> {
+    let proposer = d.u64()?;
+    let param = dec_gov_param(d)?;
+    let voting_period = d.u64()?;
+    let nonce = d.u64()?;
+    let mut signature = [0u8; 64];
+    signature.copy_from_slice(d.take(64)?);
+    Ok(GovProposal {
+        proposer,
+        param,
+        voting_period,
+        nonce,
+        signature,
+    })
+}
+
+/// M194: the exact bytes a voter signs (all fields except the signature).
+pub fn govvote_signing_bytes(op: &GovVote) -> Vec<u8> {
+    let mut e = Enc(Vec::new());
+    enc_gov_vote(&mut e, op, false);
+    e.0
+}
+
+/// M194: canonical bytes of a full (signed) governance vote (content hash).
+pub fn encode_gov_vote(op: &GovVote) -> Vec<u8> {
+    let mut e = Enc(Vec::new());
+    enc_gov_vote(&mut e, op, true);
+    e.0
+}
+
+pub fn decode_gov_vote(buf: &[u8]) -> Result<GovVote, CodecError> {
+    let mut d = Dec { buf, pos: 0 };
+    let op = dec_gov_vote(&mut d)?;
+    if d.pos != d.buf.len() {
+        return Err(CodecError::TrailingBytes);
+    }
+    Ok(op)
+}
+
+fn enc_gov_vote(e: &mut Enc, op: &GovVote, include_sig: bool) {
+    e.u64(op.proposal_id);
+    e.u64(op.voter);
+    e.u8(op.approve as u8);
+    e.u64(op.nonce);
+    if include_sig {
+        e.raw(&op.signature);
+    }
+}
+
+fn dec_gov_vote(d: &mut Dec) -> Result<GovVote, CodecError> {
+    let proposal_id = d.u64()?;
+    let voter = d.u64()?;
+    let approve = d.u8()? != 0;
+    let nonce = d.u64()?;
+    let mut signature = [0u8; 64];
+    signature.copy_from_slice(d.take(64)?);
+    Ok(GovVote {
+        proposal_id,
+        voter,
+        approve,
         nonce,
         signature,
     })
@@ -1315,7 +1493,11 @@ pub fn decode_account(buf: &[u8]) -> Result<Account, CodecError> {
 /// §6.2 emission time-decay knob), a governance constant alongside
 /// `base_emission_micro`. A v3 snapshot lacks the field, so v3 is now rejected —
 /// regenerate.
-pub const SNAPSHOT_VERSION: u32 = 4;
+///
+/// v5 (M194): the snapshot now also serializes the governance `proposals` map +
+/// `next_proposal_id` (M194 folds them into `state_root`). A v4 snapshot lacks
+/// them, so v4 is now rejected — regenerate.
+pub const SNAPSHOT_VERSION: u32 = 5;
 
 /// Write the account's state fields into the shared stream (same layout as
 /// [`encode_account`], inlined so the snapshot controls framing).
@@ -1426,6 +1608,20 @@ pub fn encode_snapshot(s: &ChainState) -> Vec<u8> {
         e.u32(c.domain);
         e.u64(c.reward_micro);
         e.u64(c.height);
+    }
+    // M194: governance proposals + id counter (v5).
+    e.u64(s.next_proposal_id);
+    e.u64(s.proposals.len() as u64);
+    for (id, p) in &s.proposals {
+        e.u64(*id);
+        enc_gov_param(&mut e, &p.param);
+        e.u64(p.created_height);
+        e.u64(p.voting_period);
+        e.u64(p.votes.len() as u64);
+        for (voter, approve) in &p.votes {
+            e.u64(*voter);
+            e.u8(*approve as u8);
+        }
     }
     // bonds
     e.u64(s.bonds.len() as u64);
@@ -1556,6 +1752,33 @@ pub fn decode_snapshot(buf: &[u8]) -> Result<ChainState, CodecError> {
             },
         );
     }
+    // M194 (v5): governance proposals + id counter.
+    let next_proposal_id = d.u64()?;
+    let n_proposals = d.count()?;
+    let mut proposals = std::collections::BTreeMap::new();
+    for _ in 0..n_proposals {
+        let id = d.u64()?;
+        let param = dec_gov_param(&mut d)?;
+        let created_height = d.u64()?;
+        let voting_period = d.u64()?;
+        let n_votes = d.count()?;
+        let mut votes = std::collections::BTreeMap::new();
+        for _ in 0..n_votes {
+            let voter = d.u64()?;
+            let approve = d.u8()? != 0;
+            votes.insert(voter, approve);
+        }
+        proposals.insert(
+            id,
+            Proposal {
+                id,
+                param,
+                created_height,
+                voting_period,
+                votes,
+            },
+        );
+    }
     // bonds
     let n = d.count()?;
     let mut bonds = std::collections::BTreeMap::new();
@@ -1648,6 +1871,8 @@ pub fn decode_snapshot(buf: &[u8]) -> Result<ChainState, CodecError> {
         bridge_locks,
         bridge_lock_heights,
         next_lock_id,
+        proposals,
+        next_proposal_id,
         bridge_minted,
         bridge_sources,
         genesis_hash,
@@ -2010,6 +2235,10 @@ impl Enc {
     pub fn raw(&mut self, b: &[u8]) {
         self.0.extend_from_slice(b);
     }
+    /// M194: a single byte (bool flags, enum tags).
+    pub fn u8(&mut self, v: u8) {
+        self.0.push(v);
+    }
     pub fn u32(&mut self, v: u32) {
         self.0.extend_from_slice(&v.to_be_bytes());
     }
@@ -2120,6 +2349,19 @@ pub fn decode_block(buf: &[u8]) -> Result<Block, CodecError> {
     for _ in 0..n_rotations {
         key_rotations.push(dec_key_rotation(&mut d)?);
     }
+    // M194 (B6 wire): governance proposal + vote op lists, appended at the tail. A B5
+    // decoder reading a B6 block errors `UnexpectedEof` here; a B6 decoder reading a B5
+    // block reads `n = 0` and continues (same compatibility shape as prior gens).
+    let n_proposals = d.count()?;
+    let mut gov_proposals = Vec::with_capacity(n_proposals as usize);
+    for _ in 0..n_proposals {
+        gov_proposals.push(dec_gov_proposal(&mut d)?);
+    }
+    let n_votes = d.count()?;
+    let mut gov_votes = Vec::with_capacity(n_votes as usize);
+    for _ in 0..n_votes {
+        gov_votes.push(dec_gov_vote(&mut d)?);
+    }
     if d.pos != d.buf.len() {
         return Err(CodecError::TrailingBytes);
     }
@@ -2143,6 +2385,8 @@ pub fn decode_block(buf: &[u8]) -> Result<Block, CodecError> {
         bridge_redeems,
         bridge_unbondings,
         key_rotations,
+        gov_proposals,
+        gov_votes,
     })
 }
 
@@ -2354,6 +2598,8 @@ mod tests {
             bridge_redeems: Vec::new(),
             bridge_unbondings: Vec::new(),
             key_rotations: Vec::new(),
+            gov_proposals: Vec::new(),
+            gov_votes: Vec::new(),
             proposer: 0,
         }
     }
@@ -3226,6 +3472,8 @@ mod tests {
                 bridge_redeems_commitment: [0u8; 32],
                 bridge_unbondings_commitment: [0u8; 32],
                 key_rotations_commitment: [0u8; 32],
+                gov_proposals_commitment: [0u8; 32],
+                gov_votes_commitment: [0u8; 32],
                 proposer: 0,
             },
             cert_prev: crate::consensus::Commit {
@@ -3253,6 +3501,8 @@ mod tests {
                 bridge_redeems_commitment: [0u8; 32],
                 bridge_unbondings_commitment: [0u8; 32],
                 key_rotations_commitment: [0u8; 32],
+                gov_proposals_commitment: [0u8; 32],
+                gov_votes_commitment: [0u8; 32],
                 proposer: 0,
             },
             cert_new: crate::consensus::Commit {
@@ -3380,6 +3630,8 @@ mod tests {
                         bridge_redeems_commitment: [0u8; 32],
                         bridge_unbondings_commitment: [0u8; 32],
                         key_rotations_commitment: [0u8; 32],
+                        gov_proposals_commitment: [0u8; 32],
+                        gov_votes_commitment: [0u8; 32],
                         proposer: 0,
                     },
                     cert_prev: crate::consensus::Commit {
@@ -3407,6 +3659,8 @@ mod tests {
                         bridge_redeems_commitment: [0u8; 32],
                         bridge_unbondings_commitment: [0u8; 32],
                         key_rotations_commitment: [0u8; 32],
+                        gov_proposals_commitment: [0u8; 32],
+                        gov_votes_commitment: [0u8; 32],
                         proposer: 0,
                     },
                     cert_new: crate::consensus::Commit {
@@ -3839,6 +4093,73 @@ mod tests {
         assert_eq!(back.cnft(4).unwrap().reward_micro, 11 * MICRO);
         assert_eq!(encode_snapshot(&back), bytes, "re-encode stable");
         // state_root is reproduced (the cross-check a snapshot boot relies on).
+        assert_eq!(back.state_root(), s.state_root());
+    }
+
+    #[test]
+    fn gov_proposal_and_vote_round_trip() {
+        // M194: both governance ops survive encode→decode byte-for-byte, incl. each
+        // `GovParam` tag; re-encode is stable.
+        for param in [
+            GovParam::BaseEmission(8 * MICRO),
+            GovParam::SlashBps(4321),
+            GovParam::DecayHalfLife(13),
+        ] {
+            let p = GovProposal {
+                proposer: 7,
+                param: param.clone(),
+                voting_period: 100,
+                nonce: 3,
+                signature: [9u8; 64],
+            };
+            let bytes = encode_gov_proposal(&p);
+            let back = decode_gov_proposal(&bytes).expect("proposal round-trips");
+            assert_eq!(back, p);
+            assert_eq!(encode_gov_proposal(&back), bytes);
+            // Signing bytes exclude the signature (shorter than the full encoding).
+            assert!(govproposal_signing_bytes(&p).len() < bytes.len());
+        }
+        let v = GovVote {
+            proposal_id: 42,
+            voter: 5,
+            approve: true,
+            nonce: 1,
+            signature: [3u8; 64],
+        };
+        let vb = encode_gov_vote(&v);
+        assert_eq!(decode_gov_vote(&vb).expect("vote round-trips"), v);
+        // The approve bool flips a byte: a false vote decodes as false.
+        let vno = GovVote {
+            approve: false,
+            ..v.clone()
+        };
+        assert!(!decode_gov_vote(&encode_gov_vote(&vno)).unwrap().approve);
+    }
+
+    #[test]
+    fn snapshot_round_trips_proposals() {
+        // M194 (v5): the governance proposal set + id counter survive snapshot
+        // encode→decode and reproduce state_root (snapshot-boot cross-check).
+        let mut s = sample_state();
+        let mut votes = std::collections::BTreeMap::new();
+        votes.insert(1u64, true);
+        votes.insert(2u64, false);
+        s.proposals.insert(
+            0,
+            Proposal {
+                id: 0,
+                param: GovParam::SlashBps(9999),
+                created_height: 2,
+                voting_period: 10,
+                votes,
+            },
+        );
+        s.next_proposal_id = 1;
+        let bytes = encode_snapshot(&s);
+        let back = decode_snapshot(&bytes).expect("round-trips");
+        assert_eq!(back.proposals, s.proposals);
+        assert_eq!(back.next_proposal_id, 1);
+        assert_eq!(encode_snapshot(&back), bytes, "re-encode stable");
         assert_eq!(back.state_root(), s.state_root());
     }
 

@@ -1530,6 +1530,19 @@ M189 建了 CI，但因为有 ~19 条既有 clippy lint，把 clippy 步设成�
 - **分片路线**：**M194** 接线——`gov_proposals`/`gov_votes` 区块 vec（wire **B6**）+ 投票/提案 ed25519 签名认证 + `ChainState.proposals` 入 `state_root`/snapshot + 过期高度 tally 调度 + gossip tag；**M195** `GovParam` 扩 `DeltaKParams` 字段（含 usize/f32 混合字段的寻址）。
 - **已知边界 / 非目标（本片）**：区块携带 / 签名认证 / 过期 tally 自动执行 / gossip 传播 / `DeltaKParams` 参数——都在后续片。
 
+## 治理接线：区块携带 + 过期自动执行（Milestone 194 · 生产就绪评估 #6 第二片 · wire B5→B6）
+
+M193 落了纯治理核心（tally + 执行）。M194 把它**接进共识**——提案与投票成为区块携带的 op，到期自动结算。这是 ~M179 量级的 wire-bump 里程碑。
+
+- **两个区块 op**（`lib.rs`）：`GovProposal { proposer, param, voting_period, nonce, signature }`（链在 apply 时从 `next_proposal_id` 分配单调 id——提案者不预知 id，同 bridge lock）+ `GovVote { proposal_id, voter, approve, nonce, signature }`。均 ed25519 签名 + **严格 nonce 反重放**（`== acct.nonce`，复用 `SubmissionTx`/`KeyRotation` 纪律）；nonce 还给同一投票者的 re-vote **定序**（apply 顺序 last-write-wins，旧票重放因 nonce 已推进而被拒）。
+- **状态**：`Block` 加 `gov_proposals`/`gov_votes` 两 vec；`ChainState` 加 `proposals: BTreeMap<u64, Proposal>` + `next_proposal_id`，**折入 `state_root`**（proposal/vote 状态成为认证共识状态，快照同步节点同样 tally）。
+- **apply 流程**（`apply_block_inner`，key_rotations 之后）：`apply_gov_proposal`（注册，`created_height = 本块高度`）→ `apply_gov_vote`（查提案存在且 `height < created+voting_period`，否则 `UnknownProposal`/`ProposalClosed`；记 `votes[voter]=approve`）→ 块末（height 推进后、承诺校验前）`resolve_matured_proposals(height)`：对到期提案跑 M193 `gov_tally` 双门槛，过则 `apply_gov_param` 执行、**无论过否都移除**。执行在根校验前，故 `state_root` 反映执行后的参数 + 收缩的提案集。参数变更下一块生效（同 validator-update 的跨高度纪律）。
+- **wire B6**（`codec.rs`）：`gov_proposals`/`gov_votes` 作**第 9/10 条尾部 per-body 承诺**（前缀稳定，B5 reader 读到 key_rotations 即止——同 M171/M179 尾追加）；`BlockHeader` 加 `gov_proposals_commitment`/`gov_votes_commitment`；`decode_certified_header` 尾承诺 256→320 字节（固定前缀 252 **不变**，因 gov 是尾承诺非前缀根）；`encode/decode_block`、`encode/decode_header`、`from_block`（算两承诺）/`to_block`（+2 参数）同步；新 `encode_gov_param`/`govproposal_signing_bytes`/`encode_gov_proposal`/`encode_gov_vote` 等 codec + `Enc::u8`。
+- **snapshot**：`SNAPSHOT_VERSION` 4→5（序列化 `proposals` + `next_proposal_id`，紧随 contributions）；旧 v4 被拒，重新 snap。
+- **re-baseline**：proposals 折入 digest（**空集也加长度字**）→ demo `state_root` `1db88ef6…`→`fc0535603e23bc9ce1ff7a18850ca63b5355d3ac80c642bd765717ed02d391ca`；每块头 +2 承诺 → demo/localnet head 移位（demo head 现 `9b9683f5…`）；**`merkle_root 5312ecf6…` 不变**（proposals 不入账户树）——`demo_chain_state_roots_match_the_documented_canon` 更新 state_root。
+- **测试（+7 → 717）**：`lib` `governance_end_to_end_passes_and_executes`（propose h1 → vote h2 → 到期 h3 执行、提案移除）+ `governance_fails_without_both_quorums`（零票→不改但仍移除）+ `gov_vote_rejects_unknown_and_closed_proposal`（`UnknownProposal`/`ProposalClosed`）+ `governance_bad_nonce_and_signature_rejected` + `state_root_covers_proposals`（折入改根、merkle_root 不变）；`codec` `gov_proposal_and_vote_round_trip`（含 `GovParam` 三 tag + 签名 vs signing-bytes）+ `snapshot_round_trips_proposals`（v5 保真 + state_root 复算）。
+- **已知边界 / 非目标（本片）**：gossip 传播（`TAG_GOVPROPOSAL`/`TAG_GOVVOTE` flood/dedup）+ daemon/driver 暂存池 + RPC 读端点（本轮 ops 经**区块同步**或测试构造入块；mempool 式预传播是 M195）；`DeltaKParams` 参数寻址（M196）。
+
 ## pending keystore 交互式密码提示（Milestone 181）
 
 收尾 M180 留的小口：M180 的 pending 加密 keystore 只从 `ZHIXING_PENDING_KEYSTORE_PASSWORD` 读密码，缺失即硬失败——与活跃 keystore（M175 `read_keystore_password`：env 优先、否则交互 no-echo 提示）不一致。

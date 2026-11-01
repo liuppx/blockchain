@@ -235,6 +235,8 @@ fn demo_blocks(chain: &Chain) -> Vec<Block> {
         bridge_redeems: Vec::new(),
         bridge_unbondings: Vec::new(),
         key_rotations: Vec::new(),
+        gov_proposals: Vec::new(),
+        gov_votes: Vec::new(),
     };
     trial.seal(&mut b1).expect("seal b1");
     trial.commit(&mut b1).expect("commit b1 on trial");
@@ -279,6 +281,8 @@ fn demo_blocks(chain: &Chain) -> Vec<Block> {
         bridge_redeems: Vec::new(),
         bridge_unbondings: Vec::new(),
         key_rotations: Vec::new(),
+        gov_proposals: Vec::new(),
+        gov_votes: Vec::new(),
     };
     trial.seal(&mut b2).expect("seal b2");
     vec![b1, b2]
@@ -3626,6 +3630,8 @@ fn empty_next_block(chain: &Chain, timestamp_days: f32) -> Block {
         bridge_redeems: Vec::new(),
         bridge_unbondings: Vec::new(),
         key_rotations: Vec::new(),
+        gov_proposals: Vec::new(),
+        gov_votes: Vec::new(),
     }
 }
 
@@ -5648,12 +5654,13 @@ mod tests {
     /// (`5312ecf6…ee8c6b`) and must stay put — a header-only wire bump (M171 B3 /
     /// M179 B4) changes the block *hash* (demo `head`), not the state roots, for a
     /// chain with no bridge/rotation state. `state_root` is re-baselined by M183
-    /// (`1db88ef6…`): folding the cNFT contribution certificates into the digest
-    /// legitimately moved it (the demo accepts submissions → mints cNFTs). cNFTs
-    /// do NOT enter `accounts_root`, so `merkle_root` is unchanged — pinning both
-    /// catches an accidental, undocumented change to demo *state*. The head (block
-    /// hash) is deliberately NOT pinned; it moves with wire bumps and with this
-    /// state re-baseline.
+    /// (`1db88ef6…`, cNFT fold) and again by M194 (`fc053560…`): folding the
+    /// governance proposal set + `next_proposal_id` into the digest legitimately
+    /// moved it (even an empty set adds length words). Proposals do NOT enter
+    /// `accounts_root`, so `merkle_root` is unchanged — pinning both catches an
+    /// accidental, undocumented change to demo *state*. The head (block hash) is
+    /// deliberately NOT pinned; it moves with wire bumps (M194 B6 adds two per-body
+    /// commitments) and with this state re-baseline.
     #[test]
     fn demo_chain_state_roots_match_the_documented_canon() {
         let mut chain = Chain::new(demo_genesis());
@@ -5663,7 +5670,7 @@ mod tests {
         }
         assert_eq!(
             hex(&chain.state.state_root()),
-            "1db88ef6b1a6ff7088f547cf36d9b88b828eaf5fed2f2093207eea339d2f28cc"
+            "fc0535603e23bc9ce1ff7a18850ca63b5355d3ac80c642bd765717ed02d391ca"
         );
         assert_eq!(
             hex(&chain.state.merkle_root()),
@@ -6678,6 +6685,8 @@ mod tests {
             bridge_redeems: vec![],
             bridge_unbondings: vec![],
             key_rotations: vec![],
+            gov_proposals: Vec::new(),
+            gov_votes: Vec::new(),
             proposer: 0,
         }
     }
