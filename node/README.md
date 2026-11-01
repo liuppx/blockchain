@@ -1513,6 +1513,23 @@ M189 建了 CI，但因为有 ~19 条既有 clippy lint，把 clippy 步设成�
 - **测试（+2 → 704）**：`version_negotiation_accepts_matching_peers`（同版本，双向 `tokio::io::duplex` 两端均 Ok）+ `version_negotiation_rejects_mismatch`（冒充者报 `PROTOCOL_VERSION + 1` → 本端 `InvalidData` 拒，且本端确实对外 announce 了真实版本）。两测纯内存 duplex，无 socket/端口（不引入 M182 那类 flaky）。localnet/daemon 集成测经 `handle_conn` 实跑双向协商、仍收敛同一 head。
 - **已知边界 / 非目标**：min/max 区间协商 + 多 wire 解码器并存（真·滚动升级，需先能"多讲 wire"）；把版本折进 auth transcript 的防篡改；RPC 版本化（HTTP，走路径/头，不经此握手）。
 
+## 混合治理核心：双门槛 tally + 参数执行（Milestone 193 · 生产就绪评估 #6 第一片）
+
+白皮书「评议人治理 DAO」。**用户定**投票权为**混合双门槛**（验证人质押 + 评议人声誉都要过），首期开放全部 4 组参数。这是本系列**最大的功能**，故分片交付；M193 落**纯共识核心**——类型 + tally + 执行——**完全不接线**（无区块携带、无 wire、无 re-baseline），先把最危险的"双门槛判定 + 参数应用"逻辑在隔离中做对、测透。
+
+- **关键设计 · 评议人非 keyed 实体**：genesis `reviewers` 只有 `(id, reputation)`，**没有 pubkey**——评议人无法直接签名投票。解法：一票由投票者的**账户**密钥认证（M194 做签名），而**一个账户同时携带两种权重**——质押权重 `bonds[id]`（非验证人则 0）+ 声誉权重 `reviewers[id]`（非评议人则 0）。于是"混合"统一在账户/密钥之下，无需给评议人新增密钥体系。
+- **类型**（`lib.rs`）：`GovParam`（`BaseEmission(u64)` / `SlashBps(u32)` / `DecayHalfLife(u64)`——穷尽 enum，M195 扩到 `DeltaKParams` 浮点字段，这是唯一扩展点）+ `Proposal { id, param, created_height, voting_period, votes: BTreeMap<u64, bool> }`（votes 按账户 id 键，同账户改票是 last-write-wins）。
+- **`ChainState::gov_tally(&proposal) -> bool`**：**两边都过才通过**——
+  - 质押侧：`yes_stake` 严格 **> 2/3** 总 bonded（`yes_stake * 3 > 2 * bonded`，`GOV_STAKE_QUORUM_*`；对齐 BFT 的 >2/3，使**治理集 == 安全集**）；
+  - 声誉侧：`yes_reputation` 严格 **> 1/2** 总声誉（`yes_rep * 2.0 > total_rep`）；
+  - 空选区（无 bonded 或无评议人）**永不过门**，所以不可能单边或零参与通过。
+- **确定性**：`total_reputation()` 按 `BTreeMap`（id 有序）求和 f32，IEEE-754 加法、无超越函数 → 每节点同值（与 M188 的确定性纪律一致）。质押侧用 u128 整数算，无浮点。
+- **`apply_gov_param(&mut self, &GovParam)`**：穷尽 match 改对应标量，加参数即编译期强制补分支。
+- **纯逻辑**：`gov_tally` 只读、`apply_gov_param` 只改既有字段——**无新 `ChainState` 字段、无 `state_root` 变更、无 snapshot bump、无 wire 变更、无 re-baseline**。proposals 的持久存储与区块携带是 M194。
+- **测试（+6 → 710）**：双门槛需两边同过；只一边同意则拒（全质押零声誉 / 全声誉零质押各一例）；`严格 2/3` 边界（恰好 2/3 不过、3/4 过）；空选区（无质押 / 无评议人）均不过；`apply_gov_param` 改三标量各一；投票 last-write-wins（翻票即翻结果）。
+- **分片路线**：**M194** 接线——`gov_proposals`/`gov_votes` 区块 vec（wire **B6**）+ 投票/提案 ed25519 签名认证 + `ChainState.proposals` 入 `state_root`/snapshot + 过期高度 tally 调度 + gossip tag；**M195** `GovParam` 扩 `DeltaKParams` 字段（含 usize/f32 混合字段的寻址）。
+- **已知边界 / 非目标（本片）**：区块携带 / 签名认证 / 过期 tally 自动执行 / gossip 传播 / `DeltaKParams` 参数——都在后续片。
+
 ## pending keystore 交互式密码提示（Milestone 181）
 
 收尾 M180 留的小口：M180 的 pending 加密 keystore 只从 `ZHIXING_PENDING_KEYSTORE_PASSWORD` 读密码，缺失即硬失败——与活跃 keystore（M175 `read_keystore_password`：env 优先、否则交互 no-echo 提示）不一致。

@@ -268,6 +268,50 @@ impl KeyRotation {
     }
 }
 
+/// M193: a governable on-chain parameter and the value a proposal would set it to.
+/// The economic/policy scalars currently fixed at genesis (see [`ChainState`]).
+/// Each variant carries its target's native type so [`ChainState::apply_gov_param`]
+/// is a total, exhaustive match. (M195 will extend this to the `DeltaKParams`
+/// fields; the enum is the single extension point.)
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum GovParam {
+    /// Set [`ChainState::base_emission_micro`] (micro-$COG minted per unit ΔK).
+    BaseEmission(u64),
+    /// Set [`ChainState::slash_bps`] (reject-slash fraction, basis points).
+    SlashBps(u32),
+    /// Set [`ChainState::decay_half_life_blocks`] (M187 emission decay; 0 = off).
+    DecayHalfLife(u64),
+}
+
+/// M193: a parameter-change proposal and the votes recorded against it. **Hybrid
+/// governance**: a proposal passes only if BOTH constituencies approve —
+/// stake-weighted validators (>2/3 of total bonded stake) AND reputation-weighted
+/// reviewers (>1/2 of total reviewer reputation). A single account can carry both
+/// weights (its `bonds` entry and its `reviewers` entry); an account in neither set
+/// has zero weight on both axes. Authentication (vote signatures) and block
+/// carriage land in M194 — M193 is the pure tally/execution core.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Proposal {
+    /// Monotonic id (assigned by the chain when the proposal is registered, M194).
+    pub id: u64,
+    /// The parameter and target value this proposal would apply if it passes.
+    pub param: GovParam,
+    /// Height at which the proposal was registered.
+    pub created_height: u64,
+    /// Voting window length in blocks; the proposal is tallied at
+    /// `created_height + voting_period`.
+    pub voting_period: u64,
+    /// Recorded votes: voter **account** id → approve. A later vote from the same
+    /// account overwrites an earlier one (last-write-wins up to the deadline).
+    pub votes: BTreeMap<u64, bool>,
+}
+
+/// M193: numerator/denominator of the stake-side quorum — strictly greater than
+/// two-thirds of total bonded stake must approve (mirrors the BFT >2/3 rule the
+/// consensus layer already uses, so the governing set == the securing set).
+pub const GOV_STAKE_QUORUM_NUM: u128 = 2;
+pub const GOV_STAKE_QUORUM_DEN: u128 = 3;
+
 /// Cryptographic proof of validator equivocation: two conflicting precommit
 /// votes from the same validator at the same `(height, round)` but for
 /// *different* block hashes, each carrying a valid ed25519 signature by the
@@ -1737,6 +1781,58 @@ impl ChainState {
             slashed_to_treasury: slashed_to_treasury_total,
             txs: receipts,
         })
+    }
+
+    /// M193: total reviewer reputation (sum of all reviewers' reputations) — the
+    /// denominator of the reputation-side governance quorum. Deterministic: summed
+    /// in `BTreeMap` (id-sorted) order, and f32 addition is IEEE-754 (no
+    /// transcendental), so every node computes the identical value.
+    pub fn total_reputation(&self) -> f32 {
+        self.reviewers.values().copied().sum()
+    }
+
+    /// M193: evaluate the **hybrid** outcome of a proposal against the *current*
+    /// stake and reputation distributions. Passes iff BOTH:
+    ///   * stake-weighted validators: `yes_stake` strictly exceeds 2/3 of total
+    ///     bonded stake (`GOV_STAKE_QUORUM_*`), mirroring the BFT consensus rule, and
+    ///   * reputation-weighted reviewers: `yes_reputation` strictly exceeds 1/2 of
+    ///     total reviewer reputation.
+    ///
+    /// An account's stake weight is its `bonds` entry (0 if not a validator) and its
+    /// reputation weight is its `reviewers` entry (0 if not a reviewer); the same
+    /// account can contribute to both. An empty constituency (no bonded stake, or no
+    /// reviewers) can never exceed its threshold, so a proposal cannot pass without
+    /// genuine approval on *both* axes. Pure (reads state, mutates nothing).
+    pub fn gov_tally(&self, proposal: &Proposal) -> bool {
+        let mut yes_stake: u128 = 0;
+        let mut yes_rep: f32 = 0.0;
+        for (&voter, &approve) in &proposal.votes {
+            if !approve {
+                continue;
+            }
+            yes_stake += *self.bonds.get(&voter).unwrap_or(&0) as u128;
+            yes_rep += *self.reviewers.get(&voter).unwrap_or(&0.0);
+        }
+        let total_stake = self.bonded as u128;
+        let total_rep = self.total_reputation();
+        // Strict > 2/3 of stake: yes_stake * DEN > NUM * total_stake.
+        let stake_ok = yes_stake * GOV_STAKE_QUORUM_DEN > GOV_STAKE_QUORUM_NUM * total_stake
+            && total_stake > 0;
+        // Strict > 1/2 of reputation.
+        let rep_ok = yes_rep * 2.0 > total_rep && total_rep > 0.0;
+        stake_ok && rep_ok
+    }
+
+    /// M193: apply a passed proposal's parameter change to live state. Total
+    /// (exhaustive) match over [`GovParam`], so adding a governable parameter is a
+    /// compile-time-checked extension. Changes take effect immediately on the state
+    /// it mutates; the caller gates this on [`Self::gov_tally`] + expiry (M194).
+    pub fn apply_gov_param(&mut self, param: &GovParam) {
+        match param {
+            GovParam::BaseEmission(v) => self.base_emission_micro = *v,
+            GovParam::SlashBps(v) => self.slash_bps = *v,
+            GovParam::DecayHalfLife(v) => self.decay_half_life_blocks = *v,
+        }
     }
 
     /// Apply one bond/unbond op at `height` (the height of the block carrying it).
@@ -3288,6 +3384,92 @@ mod tests {
         assert_eq!(r1.minted, expected);
         // Supply is still conserved under decay (mint credited to both sides).
         assert!(c1.state.supply_conserved());
+    }
+
+    // ---- M193: hybrid governance core (tally + execution) ----
+
+    /// Build a bare state with explicit stake and reputation distributions so the
+    /// hybrid tally can be exercised in isolation.
+    fn gov_state(bonds: &[(u64, u64)], reviewers: &[(u64, f32)]) -> ChainState {
+        let mut s = Chain::new(base_genesis()).state;
+        s.bonds = bonds.iter().copied().collect();
+        s.bonded = bonds.iter().map(|&(_, a)| a).sum();
+        s.reviewers = reviewers.iter().copied().collect();
+        s
+    }
+
+    fn proposal_with(votes: &[(u64, bool)]) -> Proposal {
+        Proposal {
+            id: 1,
+            param: GovParam::BaseEmission(42),
+            created_height: 1,
+            voting_period: 10,
+            votes: votes.iter().copied().collect(),
+        }
+    }
+
+    #[test]
+    fn gov_tally_needs_both_stake_supermajority_and_reputation_majority() {
+        // Account 1 holds both stake and reputation; a lone yes from it clears both
+        // bars (stake 70/100 > 2/3, reputation 0.6/1.0 > 1/2) ⇒ passes.
+        let s = gov_state(&[(1, 70), (2, 30)], &[(1, 0.6), (2, 0.4)]);
+        assert!(s.gov_tally(&proposal_with(&[(1, true)])));
+        // A `no` (or absence) from account 1 fails both ⇒ rejected.
+        assert!(!s.gov_tally(&proposal_with(&[(1, false)])));
+        assert!(!s.gov_tally(&proposal_with(&[(2, true)]))); // 30/100 stake, 0.4 rep
+    }
+
+    #[test]
+    fn gov_tally_rejects_when_only_one_constituency_approves() {
+        // Voters 1,2 carry ALL the stake but NO reputation (reviewer is account 3).
+        let s = gov_state(&[(1, 70), (2, 30)], &[(3, 1.0)]);
+        // Full stake approval, zero reputation approval ⇒ reject (reputation bar unmet).
+        assert!(!s.gov_tally(&proposal_with(&[(1, true), (2, true)])));
+        // Full reputation approval, zero stake approval ⇒ reject (stake bar unmet).
+        assert!(!s.gov_tally(&proposal_with(&[(3, true)])));
+        // Both together ⇒ passes (stake 100/100, reputation 1.0/1.0).
+        assert!(s.gov_tally(&proposal_with(&[(1, true), (2, true), (3, true)])));
+    }
+
+    #[test]
+    fn gov_tally_is_strict_at_exactly_two_thirds() {
+        // Exactly 2/3 stake must NOT pass (strict `>`). bonds 2:1 ⇒ yes=2, total=3.
+        let s = gov_state(&[(1, 2), (2, 1)], &[(1, 1.0)]);
+        assert!(!s.gov_tally(&proposal_with(&[(1, true)]))); // 2/3 stake, not > 2/3
+                                                             // One more unit of yes-stake crosses it.
+        let s2 = gov_state(&[(1, 3), (2, 1)], &[(1, 1.0)]);
+        assert!(s2.gov_tally(&proposal_with(&[(1, true)]))); // 3/4 > 2/3, rep 1.0 > 1/2
+    }
+
+    #[test]
+    fn gov_tally_empty_constituency_never_passes() {
+        // No bonded stake at all ⇒ stake bar unreachable even with reputation.
+        let s = gov_state(&[], &[(1, 1.0)]);
+        assert!(!s.gov_tally(&proposal_with(&[(1, true)])));
+        // No reviewers at all ⇒ reputation bar unreachable even with full stake.
+        let s2 = gov_state(&[(1, 100)], &[]);
+        assert!(!s2.gov_tally(&proposal_with(&[(1, true)])));
+    }
+
+    #[test]
+    fn apply_gov_param_sets_each_scalar() {
+        let mut s = Chain::new(base_genesis()).state;
+        s.apply_gov_param(&GovParam::BaseEmission(123));
+        assert_eq!(s.base_emission_micro, 123);
+        s.apply_gov_param(&GovParam::SlashBps(777));
+        assert_eq!(s.slash_bps, 777);
+        s.apply_gov_param(&GovParam::DecayHalfLife(9));
+        assert_eq!(s.decay_half_life_blocks, 9);
+    }
+
+    #[test]
+    fn gov_last_write_wins_within_the_vote_map() {
+        // The votes map is keyed by voter, so a changed vote overwrites (not stacks).
+        let s = gov_state(&[(1, 100)], &[(1, 1.0)]);
+        let mut p = proposal_with(&[(1, true)]);
+        assert!(s.gov_tally(&p));
+        p.votes.insert(1, false); // account 1 flips to no
+        assert!(!s.gov_tally(&p));
     }
 
     #[test]
