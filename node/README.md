@@ -1555,6 +1555,19 @@ M194 的 gov op 此前只经**区块同步**传播——只有本地持有该 op
 - **测试（+2 → 719）**：`gov_op_gossip_reaches_every_node_and_dedups`（在 3 节点 `Network` 上 `submit_gov_proposal` + `submit_gov_vote` → `run` 到静默 → 每节点暂存恰一份且哈希相符；对端重投已见 op → 返回空、不再暂存）+ `gov_op_gossip_wire_round_trips`（两类 op 经 `encode_gossip`→`decode_gossip` 保真）。
 - **已知边界 / 非目标（本片）**：RPC/CLI **发起** gov op（当前经 `submit_local_gov_*` 程序化发起 + 区块同步；HTTP 提交与 `GET /proposals` 查询端点另行，像 M184 之于 M183 的读面）；daemon 专用 Cmd（入站 flood 已自动，发起端点才需要）；`DeltaKParams` 参数（M196）。
 
+## 治理扩至 DeltaKParams 参数（Milestone 196 · 生产就绪评估 #6 第四片）
+
+M193–M195 把治理做到 3 个标量旋钮（`base_emission_micro` / `slash_bps` / `decay_half_life_blocks`）。M196 补齐**第 4 组**——ΔK 引擎的 9 个字段——兑现 M193 选定的「全部 4 组参数」。
+
+- **`DeltaKParam` 子枚举**（`lib.rs`）：每字段一个变体，**保留原生类型**——7 个 `f32`（`TauDup`/`CCap`/`Lam`/`BonusMax`/`Decay`/`FreshMin`/`DeltaKMin`）+ 2 个 `usize`（`NReviewMin`/`NMin`，在 wire 与 `state_root` digest 上以 `u64` 走）。`GovParam` 加 `DeltaK(DeltaKParam)` 变体（tag 3）。
+- **执行**：`apply_gov_param` 加穷尽 `DeltaK` 臂，改 `self.params.<field>`（usize 由 u64 cast）——加字段即编译期强制补分支。
+- **codec**：`enc/dec_gov_param` 加 `tag 3 ‖ 字段子-tag(0–8) ‖ 原生值`（f32 旋钮 / u64 计数）。
+- **无 wire 变更、无 re-baseline**：`GovParam` 本就是 tag 编码，`DeltaK` 是**新增** tag——现有 B6 上还没有任何 DeltaK 提案，加新 enum 值纯加性（旧值的编码逐字节不变 → demo state_root/head 不动）。`GovParam` 因内含 f32 去掉 `Eq` 派生（改 `PartialEq`）。
+- **确定性**：治理设定的 f32 值存进 proposal、折入 `state_root`（f32 位确定）；应用后进入 `compute_delta_k`（M188 的 libm 路径），仍确定。
+- **测试（+2 → 721）**：`apply_gov_param_sets_each_deltak_field`（9 字段逐一可治）+ `governance_executes_a_deltak_change_end_to_end`（DeltaK 提案过混合双门槛 → 改 `params.delta_k_min`）；`codec` round-trip 扩覆盖 DeltaK 的三类 tag（f32 旋钮 + u64 计数）。
+- **里程碑收束**：至此 M193 选定的「**混合双门槛 + 全部 4 组参数**」治理目标**全部兑现**——提案/投票可全网 gossip 预传播（M195）、区块携带（M194）、到期按质押>2/3 且声誉>1/2 自动执行（M193），可改 4 组全部参数（M196）。
+- **已知边界 / 非目标**：RPC/CLI **发起** gov op（`GET /proposals` 查询 + HTTP 提交端点另行，像 M184 之于 M183 的读/写面）。
+
 ## pending keystore 交互式密码提示（Milestone 181）
 
 收尾 M180 留的小口：M180 的 pending 加密 keystore 只从 `ZHIXING_PENDING_KEYSTORE_PASSWORD` 读密码，缺失即硬失败——与活跃 keystore（M175 `read_keystore_password`：env 优先、否则交互 no-echo 提示）不一致。

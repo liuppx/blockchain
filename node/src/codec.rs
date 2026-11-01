@@ -11,8 +11,8 @@ use crate::validator::ValidatorSet;
 use crate::validator::{Validator, ValidatorUpdate};
 use crate::{
     Account, Block, BondKind, BridgeHeader, BridgeRedeem, BridgeSource, BridgeUnbond, ChainState,
-    Embedding, GovParam, GovProposal, GovVote, KeyRotation, Proposal, Review, Reviewer,
-    SlashEvidence, StakeOp, SubmissionTx, UnbondingEntry,
+    DeltaKParam, Embedding, GovParam, GovProposal, GovVote, KeyRotation, Proposal, Review,
+    Reviewer, SlashEvidence, StakeOp, SubmissionTx, UnbondingEntry,
 };
 use zhixing_engine::DIM;
 use zhixing_engine::{CognitiveGraph, DeltaKParams, GraphNode};
@@ -817,6 +817,49 @@ fn enc_gov_param(e: &mut Enc, param: &GovParam) {
             e.u8(2);
             e.u64(*v);
         }
+        // M196: tag 3 ‖ field sub-tag ‖ native value (f32 for the knobs, u64 for the
+        // two usize counters).
+        GovParam::DeltaK(dp) => {
+            e.u8(3);
+            match dp {
+                DeltaKParam::TauDup(v) => {
+                    e.u8(0);
+                    e.f32(*v);
+                }
+                DeltaKParam::NReviewMin(v) => {
+                    e.u8(1);
+                    e.u64(*v);
+                }
+                DeltaKParam::CCap(v) => {
+                    e.u8(2);
+                    e.f32(*v);
+                }
+                DeltaKParam::NMin(v) => {
+                    e.u8(3);
+                    e.u64(*v);
+                }
+                DeltaKParam::Lam(v) => {
+                    e.u8(4);
+                    e.f32(*v);
+                }
+                DeltaKParam::BonusMax(v) => {
+                    e.u8(5);
+                    e.f32(*v);
+                }
+                DeltaKParam::Decay(v) => {
+                    e.u8(6);
+                    e.f32(*v);
+                }
+                DeltaKParam::FreshMin(v) => {
+                    e.u8(7);
+                    e.f32(*v);
+                }
+                DeltaKParam::DeltaKMin(v) => {
+                    e.u8(8);
+                    e.f32(*v);
+                }
+            }
+        }
     }
 }
 
@@ -825,6 +868,21 @@ fn dec_gov_param(d: &mut Dec) -> Result<GovParam, CodecError> {
         0 => Ok(GovParam::BaseEmission(d.u64()?)),
         1 => Ok(GovParam::SlashBps(d.u32()?)),
         2 => Ok(GovParam::DecayHalfLife(d.u64()?)),
+        3 => {
+            let dp = match d.u8()? {
+                0 => DeltaKParam::TauDup(d.f32()?),
+                1 => DeltaKParam::NReviewMin(d.u64()?),
+                2 => DeltaKParam::CCap(d.f32()?),
+                3 => DeltaKParam::NMin(d.u64()?),
+                4 => DeltaKParam::Lam(d.f32()?),
+                5 => DeltaKParam::BonusMax(d.f32()?),
+                6 => DeltaKParam::Decay(d.f32()?),
+                7 => DeltaKParam::FreshMin(d.f32()?),
+                8 => DeltaKParam::DeltaKMin(d.f32()?),
+                other => return Err(CodecError::BadEnum(other as u32)),
+            };
+            Ok(GovParam::DeltaK(dp))
+        }
         other => Err(CodecError::BadEnum(other as u32)),
     }
 }
@@ -4104,6 +4162,9 @@ mod tests {
             GovParam::BaseEmission(8 * MICRO),
             GovParam::SlashBps(4321),
             GovParam::DecayHalfLife(13),
+            GovParam::DeltaK(crate::DeltaKParam::Lam(0.37)),
+            GovParam::DeltaK(crate::DeltaKParam::NMin(5)),
+            GovParam::DeltaK(crate::DeltaKParam::DeltaKMin(0.02)),
         ] {
             let p = GovProposal {
                 proposer: 7,

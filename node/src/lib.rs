@@ -273,7 +273,7 @@ impl KeyRotation {
 /// Each variant carries its target's native type so [`ChainState::apply_gov_param`]
 /// is a total, exhaustive match. (M195 will extend this to the `DeltaKParams`
 /// fields; the enum is the single extension point.)
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum GovParam {
     /// Set [`ChainState::base_emission_micro`] (micro-$COG minted per unit ΔK).
     BaseEmission(u64),
@@ -281,6 +281,26 @@ pub enum GovParam {
     SlashBps(u32),
     /// Set [`ChainState::decay_half_life_blocks`] (M187 emission decay; 0 = off).
     DecayHalfLife(u64),
+    /// M196: set one field of the ΔK engine parameters ([`ChainState::params`]).
+    /// Addressed per-field so each governable knob keeps its native type.
+    DeltaK(DeltaKParam),
+}
+
+/// M196: a single governable field of [`zhixing_engine::DeltaKParams`] and the value
+/// a proposal would set it to. Each variant carries the field's native type (the two
+/// `usize` counters travel as `u64` on the wire / in the digest). Completing the
+/// "all four param groups" governance target chosen in M193.
+#[derive(Clone, Debug, PartialEq)]
+pub enum DeltaKParam {
+    TauDup(f32),
+    NReviewMin(u64),
+    CCap(f32),
+    NMin(u64),
+    Lam(f32),
+    BonusMax(f32),
+    Decay(f32),
+    FreshMin(f32),
+    DeltaKMin(f32),
 }
 
 /// M193: a parameter-change proposal and the votes recorded against it. **Hybrid
@@ -1930,6 +1950,18 @@ impl ChainState {
             GovParam::BaseEmission(v) => self.base_emission_micro = *v,
             GovParam::SlashBps(v) => self.slash_bps = *v,
             GovParam::DecayHalfLife(v) => self.decay_half_life_blocks = *v,
+            // M196: one ΔK-engine field. `usize` knobs are carried as `u64`.
+            GovParam::DeltaK(dp) => match dp {
+                DeltaKParam::TauDup(v) => self.params.tau_dup = *v,
+                DeltaKParam::NReviewMin(v) => self.params.n_review_min = *v as usize,
+                DeltaKParam::CCap(v) => self.params.c_cap = *v,
+                DeltaKParam::NMin(v) => self.params.n_min = *v as usize,
+                DeltaKParam::Lam(v) => self.params.lam = *v,
+                DeltaKParam::BonusMax(v) => self.params.bonus_max = *v,
+                DeltaKParam::Decay(v) => self.params.decay = *v,
+                DeltaKParam::FreshMin(v) => self.params.fresh_min = *v,
+                DeltaKParam::DeltaKMin(v) => self.params.delta_k_min = *v,
+            },
         }
     }
 
@@ -3673,6 +3705,63 @@ mod tests {
         assert_eq!(s.slash_bps, 777);
         s.apply_gov_param(&GovParam::DecayHalfLife(9));
         assert_eq!(s.decay_half_life_blocks, 9);
+    }
+
+    #[test]
+    fn apply_gov_param_sets_each_deltak_field() {
+        // M196: every ΔK-engine knob is governable via GovParam::DeltaK(..).
+        let mut s = Chain::new(base_genesis()).state;
+        s.apply_gov_param(&GovParam::DeltaK(DeltaKParam::TauDup(0.11)));
+        assert_eq!(s.params.tau_dup, 0.11);
+        s.apply_gov_param(&GovParam::DeltaK(DeltaKParam::NReviewMin(4)));
+        assert_eq!(s.params.n_review_min, 4);
+        s.apply_gov_param(&GovParam::DeltaK(DeltaKParam::CCap(0.22)));
+        assert_eq!(s.params.c_cap, 0.22);
+        s.apply_gov_param(&GovParam::DeltaK(DeltaKParam::NMin(6)));
+        assert_eq!(s.params.n_min, 6);
+        s.apply_gov_param(&GovParam::DeltaK(DeltaKParam::Lam(0.33)));
+        assert_eq!(s.params.lam, 0.33);
+        s.apply_gov_param(&GovParam::DeltaK(DeltaKParam::BonusMax(2.5)));
+        assert_eq!(s.params.bonus_max, 2.5);
+        s.apply_gov_param(&GovParam::DeltaK(DeltaKParam::Decay(0.44)));
+        assert_eq!(s.params.decay, 0.44);
+        s.apply_gov_param(&GovParam::DeltaK(DeltaKParam::FreshMin(0.55)));
+        assert_eq!(s.params.fresh_min, 0.55);
+        s.apply_gov_param(&GovParam::DeltaK(DeltaKParam::DeltaKMin(0.66)));
+        assert_eq!(s.params.delta_k_min, 0.66);
+    }
+
+    #[test]
+    fn governance_executes_a_deltak_change_end_to_end() {
+        // M196: a DeltaK proposal passes both quorums and mutates ChainState.params.
+        let mut chain = gov_chain();
+        let prop = GovProposal {
+            proposer: 1,
+            param: GovParam::DeltaK(DeltaKParam::DeltaKMin(0.9)),
+            voting_period: 2,
+            nonce: 0,
+            signature: [0u8; 64],
+        }
+        .signed(&kp(1));
+        let mut b1 = block(&chain, 1, vec![]);
+        b1.gov_proposals = vec![prop];
+        chain.seal(&mut b1).unwrap();
+        chain.commit(&mut b1).unwrap();
+        let vote = GovVote {
+            proposal_id: 0,
+            voter: 1,
+            approve: true,
+            nonce: 1,
+            signature: [0u8; 64],
+        }
+        .signed(&kp(1));
+        let mut b2 = block(&chain, 2, vec![]);
+        b2.gov_votes = vec![vote];
+        chain.seal(&mut b2).unwrap();
+        chain.commit(&mut b2).unwrap();
+        let mut b3 = block(&chain, 3, vec![]);
+        chain.commit(&mut b3).unwrap();
+        assert_eq!(chain.state.params.delta_k_min, 0.9, "ΔK knob governed");
     }
 
     #[test]
