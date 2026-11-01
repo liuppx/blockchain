@@ -5656,8 +5656,11 @@ mod tests {
     /// chain with no bridge/rotation state. `state_root` is re-baselined by M183
     /// (`1db88ef6…`, cNFT fold) and again by M194 (`fc053560…`): folding the
     /// governance proposal set + `next_proposal_id` into the digest legitimately
-    /// moved it (even an empty set adds length words). Proposals do NOT enter
-    /// `accounts_root`, so `merkle_root` is unchanged — pinning both catches an
+    /// moved it (even an empty set adds length words). SEC-02 (`01c163ce…`)
+    /// re-baselined it once more by folding the execution params
+    /// (`base_emission_micro`/`decay_half_life_blocks`/`slash_bps`/ΔK) so a tampered
+    /// snapshot/genesis param can't match a cert-signed root. Proposals/params do NOT
+    /// enter `accounts_root`, so `merkle_root` is unchanged — pinning both catches an
     /// accidental, undocumented change to demo *state*. The head (block hash) is
     /// deliberately NOT pinned; it moves with wire bumps (M194 B6 adds two per-body
     /// commitments) and with this state re-baseline.
@@ -5670,7 +5673,7 @@ mod tests {
         }
         assert_eq!(
             hex(&chain.state.state_root()),
-            "fc0535603e23bc9ce1ff7a18850ca63b5355d3ac80c642bd765717ed02d391ca"
+            "01c163cec782b5022db9993b822c1d0b9a1defb5c90875306a4073b2a98d296b"
         );
         assert_eq!(
             hex(&chain.state.merkle_root()),

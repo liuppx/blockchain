@@ -2571,7 +2571,7 @@ pub fn decode_gossip(buf: &[u8]) -> Result<GossipMsg, CodecError> {
             if n > MAX_BATCH as u64 {
                 return Err(CodecError::TooManyItems(n));
             }
-            let mut batch = Vec::with_capacity(n as usize);
+            let mut batch = Vec::with_capacity(crate::codec::prealloc_usize(n as usize));
             for _ in 0..n {
                 let block = decode_block(take_bytes(&mut rest)?)?;
                 let commit = decode_commit(take_bytes(&mut rest)?)?;
@@ -2599,7 +2599,7 @@ pub fn decode_gossip(buf: &[u8]) -> Result<GossipMsg, CodecError> {
             if n > MAX_BATCH as u64 {
                 return Err(CodecError::TooManyItems(n));
             }
-            let mut batch = Vec::with_capacity(n as usize);
+            let mut batch = Vec::with_capacity(crate::codec::prealloc_usize(n as usize));
             for _ in 0..n {
                 batch.push(decode_certified_header(take_bytes(&mut rest)?)?);
             }
@@ -2611,7 +2611,7 @@ pub fn decode_gossip(buf: &[u8]) -> Result<GossipMsg, CodecError> {
             if n as usize > MAX_PROOF_BATCH {
                 return Err(CodecError::TooManyItems(n as u64));
             }
-            let mut items = Vec::with_capacity(n as usize);
+            let mut items = Vec::with_capacity(crate::codec::prealloc_usize(n as usize));
             for _ in 0..n {
                 let kind_byte = rest.first().copied().ok_or(CodecError::UnexpectedEof)?;
                 rest = &rest[1..];
@@ -2626,7 +2626,7 @@ pub fn decode_gossip(buf: &[u8]) -> Result<GossipMsg, CodecError> {
             if n as usize > MAX_PROOF_BATCH {
                 return Err(CodecError::TooManyItems(n as u64));
             }
-            let mut items = Vec::with_capacity(n as usize);
+            let mut items = Vec::with_capacity(crate::codec::prealloc_usize(n as usize));
             for _ in 0..n {
                 let present = rest.first().copied().ok_or(CodecError::UnexpectedEof)?;
                 rest = &rest[1..];
@@ -2667,7 +2667,7 @@ pub fn decode_gossip(buf: &[u8]) -> Result<GossipMsg, CodecError> {
             if n as usize > MAX_BATCH_ITEMS {
                 return Err(CodecError::TooManyItems(n as u64));
             }
-            let mut items = Vec::with_capacity(n as usize);
+            let mut items = Vec::with_capacity(crate::codec::prealloc_usize(n as usize));
             for _ in 0..n {
                 let kind = crate::codec::decode_batch_response_kind(
                     rest.first().copied().ok_or(CodecError::UnexpectedEof)?,
@@ -2721,7 +2721,7 @@ pub fn decode_gossip(buf: &[u8]) -> Result<GossipMsg, CodecError> {
             if n as usize > MAX_PEERS {
                 return Err(CodecError::TooManyItems(n as u64));
             }
-            let mut entries = Vec::with_capacity(n as usize);
+            let mut entries = Vec::with_capacity(crate::codec::prealloc_usize(n as usize));
             for _ in 0..n {
                 let id = take_u64(&mut rest)?;
                 let addr = String::from_utf8_lossy(take_bytes(&mut rest)?).into_owned();
@@ -2738,7 +2738,7 @@ pub fn decode_gossip(buf: &[u8]) -> Result<GossipMsg, CodecError> {
             if n > MAX_BATCH as u64 {
                 return Err(CodecError::TooManyItems(n));
             }
-            let mut batch = Vec::with_capacity(n as usize);
+            let mut batch = Vec::with_capacity(crate::codec::prealloc_usize(n as usize));
             for _ in 0..n {
                 let ch = decode_certified_header(take_bytes(&mut rest)?)?;
                 // M150: 1 presence byte, then the set when present.
@@ -2803,7 +2803,7 @@ pub fn encode_diff_envelope(env: &crate::light::DiffEnvelope) -> Vec<u8> {
 pub fn decode_diff_envelope(buf: &[u8]) -> Result<crate::light::DiffEnvelope, CodecError> {
     let mut p = buf;
     let n_added = take_u32(&mut p)? as usize;
-    let mut added = Vec::with_capacity(n_added);
+    let mut added = Vec::with_capacity(crate::codec::prealloc_usize(n_added));
     for _ in 0..n_added {
         let gn = crate::codec::decode_graph_node(take_bytes(&mut p)?)?;
         let proof = crate::codec::decode_proof(take_bytes(&mut p)?)?;
@@ -2815,7 +2815,7 @@ pub fn decode_diff_envelope(buf: &[u8]) -> Result<crate::light::DiffEnvelope, Co
         });
     }
     let n_dropped = take_u32(&mut p)? as usize;
-    let mut dropped = Vec::with_capacity(n_dropped);
+    let mut dropped = Vec::with_capacity(crate::codec::prealloc_usize(n_dropped));
     for _ in 0..n_dropped {
         let gn = crate::codec::decode_graph_node(take_bytes(&mut p)?)?;
         let proof = crate::codec::decode_proof(take_bytes(&mut p)?)?;
@@ -2975,7 +2975,7 @@ pub fn decode_batch_request(buf: &[u8]) -> Result<Vec<crate::light::BatchItem>, 
     if n > MAX_BATCH_ITEMS {
         return Err(CodecError::TooManyItems(n as u64));
     }
-    let mut items = Vec::with_capacity(n);
+    let mut items = Vec::with_capacity(crate::codec::prealloc_usize(n));
     for _ in 0..n {
         let kind = crate::codec::decode_batch_response_kind(
             rest.first().copied().ok_or(CodecError::UnexpectedEof)?,
@@ -3061,7 +3061,7 @@ pub fn decode_batch_envelope(
     if n > MAX_BATCH_ITEMS {
         return Err(CodecError::TooManyItems(n as u64));
     }
-    let mut items = Vec::with_capacity(n);
+    let mut items = Vec::with_capacity(crate::codec::prealloc_usize(n));
     for _ in 0..n {
         let kind = crate::codec::decode_batch_response_kind(
             p.first().copied().ok_or(CodecError::UnexpectedEof)?,
@@ -3133,7 +3133,7 @@ fn encode_validator_set(out: &mut Vec<u8>, vs: &crate::validator::ValidatorSet) 
 
 fn decode_validator_set(p: &mut &[u8]) -> Result<crate::validator::ValidatorSet, CodecError> {
     let n = take_u32(p)? as usize;
-    let mut vs = Vec::with_capacity(n);
+    let mut vs = Vec::with_capacity(crate::codec::prealloc_usize(n));
     for _ in 0..n {
         vs.push(crate::codec::decode_validator(take_bytes(p)?)?);
     }
@@ -3162,7 +3162,7 @@ pub fn encode_knn_claim(c: &crate::light::KnnClaim) -> Vec<u8> {
 pub fn decode_knn_claim(buf: &[u8]) -> Result<crate::light::KnnClaim, CodecError> {
     let mut p = buf;
     let n = take_u32(&mut p)? as usize;
-    let mut neighbours = Vec::with_capacity(n);
+    let mut neighbours = Vec::with_capacity(crate::codec::prealloc_usize(n));
     for _ in 0..n {
         let gn = crate::codec::decode_graph_node(take_bytes(&mut p)?)?;
         let proof = crate::codec::decode_proof(take_bytes(&mut p)?)?;
@@ -3201,7 +3201,7 @@ pub fn encode_range_claim(c: &crate::light::RangeClaim) -> Vec<u8> {
 pub fn decode_range_claim(buf: &[u8]) -> Result<crate::light::RangeClaim, CodecError> {
     let mut p = buf;
     let n = take_u32(&mut p)? as usize;
-    let mut nodes = Vec::with_capacity(n);
+    let mut nodes = Vec::with_capacity(crate::codec::prealloc_usize(n));
     for _ in 0..n {
         let gn = crate::codec::decode_graph_node(take_bytes(&mut p)?)?;
         let proof = crate::codec::decode_proof(take_bytes(&mut p)?)?;

@@ -45,6 +45,9 @@ pub enum ConfigError {
     /// M177: a `[network]` tuning value was out of range (e.g. zero
     /// `max_inbound_connections`).
     BadNetwork { detail: String },
+    /// SEC-04: a genesis consensus parameter is outside its safe range (e.g.
+    /// `slash_bps > 10000` or an over-large `base_emission_micro`).
+    BadGenesis { detail: String },
     /// M141: a `[snapshot]` boot config was internally incoherent (e.g. a cert
     /// without a trusted validator set, or vice versa).
     BadSnapshot { detail: String },
@@ -84,6 +87,7 @@ impl std::fmt::Display for ConfigError {
             }
             ConfigError::BadMempool { detail } => write!(f, "config bad mempool: {detail}"),
             ConfigError::BadNetwork { detail } => write!(f, "config bad network: {detail}"),
+            ConfigError::BadGenesis { detail } => write!(f, "config bad genesis: {detail}"),
             ConfigError::BadSnapshot { detail } => write!(f, "config bad snapshot: {detail}"),
             ConfigError::BadMnemonic { detail } => {
                 write!(f, "config bad mnemonic: {detail}")
@@ -1072,6 +1076,18 @@ impl GenesisConfig {
                 v.power,
             ));
         }
+
+        // SEC-04: reject out-of-safe-range genesis params (same bounds the governance
+        // path enforces). ΔK params are the validated defaults; base_emission/slash_bps
+        // come from TOML.
+        crate::validate_consensus_params(
+            self.base_emission_micro,
+            self.slash_bps,
+            &DeltaKParams::default(),
+        )
+        .map_err(|e| ConfigError::BadGenesis {
+            detail: e.to_string(),
+        })?;
 
         Ok(Genesis {
             accounts,

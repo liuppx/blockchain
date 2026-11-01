@@ -41,6 +41,21 @@ impl std::error::Error for CodecError {}
 // Guards against a corrupt length prefix forcing a huge allocation.
 const MAX_ITEMS: u64 = 1_000_000;
 
+/// SEC-06: cap the up-front capacity reservation for a decoded list. The item count
+/// is already bounded by `MAX_ITEMS`, but reserving the *full* claimed count lets a
+/// tiny truncated frame request a huge allocation (e.g. a ~20-byte frame claiming 1M
+/// txs would reserve ~176 MB). We reserve a modest ceiling and let the `Vec` grow as
+/// elements are actually decoded (amortized, and each element read is bounds-checked).
+const PREALLOC_CAP: usize = 1024;
+fn prealloc(n: u64) -> usize {
+    (n as usize).min(PREALLOC_CAP)
+}
+
+/// SEC-06: crate-visible variant for `net.rs` gossip decoders.
+pub(crate) fn prealloc_usize(n: usize) -> usize {
+    n.min(PREALLOC_CAP)
+}
+
 // --- encode ------------------------------------------------------------------
 
 pub fn encode_block(b: &Block) -> Vec<u8> {
@@ -245,7 +260,7 @@ pub fn decode_header(buf: &[u8]) -> Result<BlockHeader, CodecError> {
     let mut contributions_root = [0u8; 32];
     contributions_root.copy_from_slice(d.take(32)?);
     let n_upd = d.count()?;
-    let mut validator_updates = Vec::with_capacity(n_upd as usize);
+    let mut validator_updates = Vec::with_capacity(prealloc(n_upd));
     for _ in 0..n_upd {
         let id = d.u64()?;
         let mut pubkey = [0u8; 32];
@@ -371,7 +386,7 @@ pub fn encode_validator_set(vs: &ValidatorSet) -> Vec<u8> {
 pub fn decode_validator_set(buf: &[u8]) -> Result<ValidatorSet, CodecError> {
     let mut d = Dec { buf, pos: 0 };
     let n = d.count()?;
-    let mut vals = Vec::with_capacity(n as usize);
+    let mut vals = Vec::with_capacity(prealloc(n));
     for _ in 0..n {
         let id = d.u64()?;
         let mut pubkey = [0u8; 32];
@@ -1461,7 +1476,7 @@ pub fn decode_commit(buf: &[u8]) -> Result<Commit, CodecError> {
     let mut block_hash = [0u8; 32];
     block_hash.copy_from_slice(d.take(32)?);
     let n = d.count()?;
-    let mut precommits = Vec::with_capacity(n as usize);
+    let mut precommits = Vec::with_capacity(prealloc(n));
     for _ in 0..n {
         precommits.push(dec_vote(&mut d)?);
     }
@@ -1600,7 +1615,7 @@ fn enc_validator_set(e: &mut Enc, vs: &ValidatorSet) {
 /// Inverse of [`enc_validator_set`].
 fn dec_validator_set(d: &mut Dec) -> Result<ValidatorSet, CodecError> {
     let n = d.count()?;
-    let mut vals = Vec::with_capacity(n as usize);
+    let mut vals = Vec::with_capacity(prealloc(n));
     for _ in 0..n {
         let id = d.u64()?;
         let mut pubkey = [0u8; 32];
@@ -1779,7 +1794,7 @@ pub fn decode_snapshot(buf: &[u8]) -> Result<ChainState, CodecError> {
     }
     // graph nodes
     let n = d.count()?;
-    let mut nodes = Vec::with_capacity(n as usize);
+    let mut nodes = Vec::with_capacity(prealloc(n));
     for _ in 0..n {
         let node_id = d.u64()?;
         let embedding = d.emb()?;
@@ -1846,7 +1861,7 @@ pub fn decode_snapshot(buf: &[u8]) -> Result<ChainState, CodecError> {
     }
     // unbonding
     let n = d.count()?;
-    let mut unbonding = Vec::with_capacity(n as usize);
+    let mut unbonding = Vec::with_capacity(prealloc(n));
     for _ in 0..n {
         unbonding.push(UnbondingEntry {
             account: d.u64()?,
@@ -1963,7 +1978,7 @@ pub fn decode_proof(buf: &[u8]) -> Result<Proof, CodecError> {
     let key = d.u64()?; // M173
     let leaf_count = d.u64()?; // M173
     let n = d.count()?;
-    let mut steps = Vec::with_capacity(n as usize);
+    let mut steps = Vec::with_capacity(prealloc(n));
     for _ in 0..n {
         let tag = d.u32()?;
         let mut h = [0u8; 32];
@@ -2345,7 +2360,7 @@ pub fn decode_block(buf: &[u8]) -> Result<Block, CodecError> {
     let mut contributions_root = [0u8; 32];
     contributions_root.copy_from_slice(d.take(32)?);
     let n_upd = d.count()?;
-    let mut validator_updates = Vec::with_capacity(n_upd as usize);
+    let mut validator_updates = Vec::with_capacity(prealloc(n_upd));
     for _ in 0..n_upd {
         let id = d.u64()?;
         let mut pubkey = [0u8; 32];
@@ -2354,35 +2369,35 @@ pub fn decode_block(buf: &[u8]) -> Result<Block, CodecError> {
         validator_updates.push(ValidatorUpdate { id, pubkey, power });
     }
     let n_txs = d.count()?;
-    let mut txs = Vec::with_capacity(n_txs as usize);
+    let mut txs = Vec::with_capacity(prealloc(n_txs));
     for _ in 0..n_txs {
         txs.push(dec_tx(&mut d)?);
     }
     let n_ops = d.count()?;
-    let mut stake_ops = Vec::with_capacity(n_ops as usize);
+    let mut stake_ops = Vec::with_capacity(prealloc(n_ops));
     for _ in 0..n_ops {
         stake_ops.push(dec_stakeop(&mut d)?);
     }
     let n_ev = d.count()?;
-    let mut slashing_evidence = Vec::with_capacity(n_ev as usize);
+    let mut slashing_evidence = Vec::with_capacity(prealloc(n_ev));
     for _ in 0..n_ev {
         slashing_evidence.push(dec_evidence(&mut d)?);
     }
     // M30: bridge-lock op list.
     let n_locks = d.count()?;
-    let mut bridge_locks = Vec::with_capacity(n_locks as usize);
+    let mut bridge_locks = Vec::with_capacity(prealloc(n_locks));
     for _ in 0..n_locks {
         bridge_locks.push(dec_bridge_lock(&mut d)?);
     }
     // M31: bridge-follow op list.
     let n_headers = d.count()?;
-    let mut bridge_headers = Vec::with_capacity(n_headers as usize);
+    let mut bridge_headers = Vec::with_capacity(prealloc(n_headers));
     for _ in 0..n_headers {
         bridge_headers.push(dec_bridge_header(&mut d)?);
     }
     // M31: bridge-redeem op list.
     let n_redeems = d.count()?;
-    let mut bridge_redeems = Vec::with_capacity(n_redeems as usize);
+    let mut bridge_redeems = Vec::with_capacity(prealloc(n_redeems));
     for _ in 0..n_redeems {
         bridge_redeems.push(dec_bridge_redeem(&mut d)?);
     }
@@ -2395,7 +2410,7 @@ pub fn decode_block(buf: &[u8]) -> Result<Block, CodecError> {
     // state). Conversely, an M171 decoder reading an M168 B2 block
     // reads `n = 0` here and continues.
     let n_unbonds = d.count()?;
-    let mut bridge_unbondings = Vec::with_capacity(n_unbonds as usize);
+    let mut bridge_unbondings = Vec::with_capacity(prealloc(n_unbonds));
     for _ in 0..n_unbonds {
         bridge_unbondings.push(dec_bridge_unbond(&mut d)?);
     }
@@ -2403,7 +2418,7 @@ pub fn decode_block(buf: &[u8]) -> Result<Block, CodecError> {
     // reading a B4 block errors `UnexpectedEof` here; a B4 decoder reading a B3
     // block reads `n = 0` and continues (same compatibility shape as B2→B3).
     let n_rotations = d.count()?;
-    let mut key_rotations = Vec::with_capacity(n_rotations as usize);
+    let mut key_rotations = Vec::with_capacity(prealloc(n_rotations));
     for _ in 0..n_rotations {
         key_rotations.push(dec_key_rotation(&mut d)?);
     }
@@ -2411,12 +2426,12 @@ pub fn decode_block(buf: &[u8]) -> Result<Block, CodecError> {
     // decoder reading a B6 block errors `UnexpectedEof` here; a B6 decoder reading a B5
     // block reads `n = 0` and continues (same compatibility shape as prior gens).
     let n_proposals = d.count()?;
-    let mut gov_proposals = Vec::with_capacity(n_proposals as usize);
+    let mut gov_proposals = Vec::with_capacity(prealloc(n_proposals));
     for _ in 0..n_proposals {
         gov_proposals.push(dec_gov_proposal(&mut d)?);
     }
     let n_votes = d.count()?;
-    let mut gov_votes = Vec::with_capacity(n_votes as usize);
+    let mut gov_votes = Vec::with_capacity(prealloc(n_votes));
     for _ in 0..n_votes {
         gov_votes.push(dec_gov_vote(&mut d)?);
     }
@@ -2463,7 +2478,7 @@ fn dec_tx(d: &mut Dec) -> Result<SubmissionTx, CodecError> {
     let fee = d.u64()?; // M122 (wire v1)
     let nonce = d.u64()?; // M122 (wire v1)
     let n_rev = d.count()?;
-    let mut reviews = Vec::with_capacity(n_rev as usize);
+    let mut reviews = Vec::with_capacity(prealloc(n_rev));
     for _ in 0..n_rev {
         reviews.push(Review {
             reviewer: d.u64()?,
@@ -4251,6 +4266,18 @@ mod tests {
     /// random, and forged-huge-length inputs; any panic fails the test (the panic
     /// propagates). A deterministic xorshift PRNG keeps it reproducible (no dep, no
     /// nightly — runs on every target in CI, complementing the `cargo-fuzz` targets).
+    #[test]
+    fn prealloc_caps_reservation() {
+        // SEC-06: the up-front reservation is capped regardless of the claimed count,
+        // so a tiny truncated frame can't force a huge allocation.
+        assert_eq!(prealloc(0), 0);
+        assert_eq!(prealloc(10), 10);
+        assert_eq!(prealloc(PREALLOC_CAP as u64), PREALLOC_CAP);
+        assert_eq!(prealloc(MAX_ITEMS), PREALLOC_CAP);
+        assert_eq!(prealloc(u64::MAX), PREALLOC_CAP);
+        assert_eq!(prealloc_usize(usize::MAX), PREALLOC_CAP);
+    }
+
     #[test]
     fn decoders_reject_adversarial_bytes_without_panicking() {
         // Deterministic xorshift64* — reproducible across runs/targets.

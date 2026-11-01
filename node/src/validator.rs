@@ -113,7 +113,12 @@ impl ValidatorSet {
     }
 
     pub fn total_power(&self) -> u64 {
-        self.validators.iter().map(|v| v.power).sum()
+        // SEC-03: saturating sum so a pathological set can never wrap the u64 total
+        // (which would feed a bogus quorum). Combined with the u128 math in
+        // `quorum()`, the >2/3 threshold is correct for any input.
+        self.validators
+            .iter()
+            .fold(0u64, |acc, v| acc.saturating_add(v.power))
     }
 
     /// Apply on-chain [`ValidatorUpdate`]s in order, returning the evolved set.
@@ -142,8 +147,14 @@ impl ValidatorSet {
 
     /// Minimum voting power for a decision: strictly more than 2/3 of total,
     /// i.e. `floor(2*total/3) + 1`.
+    ///
+    /// SEC-03: the `2*total` product is computed in `u128` so it can never wrap a
+    /// `u64` (a wrapped product once collapsed the quorum to `1`, letting a <1/3
+    /// minority certify conflicting blocks and break BFT finality). The result
+    /// `floor(2T/3)+1 ≤ T+1` fits `u64` for any `u64` total.
     pub fn quorum(&self) -> u64 {
-        self.total_power() * 2 / 3 + 1
+        let total = self.total_power() as u128;
+        ((total * 2) / 3 + 1) as u64
     }
 
     /// Deterministic proposer for `height` via the proposer-priority accumulator.
@@ -214,6 +225,27 @@ mod tests {
         assert_eq!(vset(&[(1, 1), (2, 1), (3, 1), (4, 1)]).quorum(), 3); // 3 of 4
                                                                          // stake-weighted: total 100, quorum 67
         assert_eq!(vset(&[(1, 50), (2, 30), (3, 20)]).quorum(), 67);
+    }
+
+    #[test]
+    fn quorum_does_not_overflow_at_large_power() {
+        // SEC-03 regression: total power 2^63 once wrapped `2*total` to 0, collapsing
+        // the quorum to 1 and letting a <1/3 minority certify conflicting blocks.
+        // With u128 math the quorum is the real floor(2T/3)+1, and no single
+        // 1/4-power validator can meet it.
+        let p = 1u64 << 61; // four of these sum to exactly 2^63
+        let vs = vset(&[(1, p), (2, p), (3, p), (4, p)]);
+        let total = vs.total_power();
+        assert_eq!(total, 1u64 << 63);
+        let q = vs.quorum();
+        // floor(2*2^63/3)+1
+        assert_eq!(q, ((1u128 << 63) * 2 / 3 + 1) as u64);
+        assert!(q > 1, "quorum must not collapse to 1");
+        assert!(p < q, "a single 1/4-power validator is below quorum");
+        // total_power saturates instead of wrapping on an absurd set.
+        let sat = vset(&[(1, u64::MAX), (2, u64::MAX)]);
+        assert_eq!(sat.total_power(), u64::MAX);
+        assert!(sat.quorum() > 1);
     }
 
     #[test]

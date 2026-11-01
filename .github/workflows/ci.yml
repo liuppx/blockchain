@@ -78,12 +78,12 @@ jobs:
           rustup default stable
       - name: Install cargo-audit
         run: cargo install cargo-audit --locked
-      - name: audit engine + node (advisory)
-        # Advisory (reported, non-blocking) on first landing: the dependency tree
-        # hasn't been confirmed advisory-clean in this environment, so a surprise
-        # RUSTSEC would otherwise red-fail every run. Promote to a hard gate (drop
-        # `continue-on-error`) once a clean baseline is confirmed.
-        continue-on-error: true
+      - name: audit engine + node (gate)
+        # SEC-07: promoted from advisory to a hard gate after the P0 audit cleared the
+        # flagged RUSTSEC advisories (rustls >= 0.23.46, rustls-webpki >= 0.103.16,
+        # tokio 1.54.x). A newly-published advisory will now fail CI — triage it
+        # (upgrade, or document a reviewed mitigation) rather than re-adding
+        # `continue-on-error`.
         run: |
           (cd engine && cargo audit)
           (cd node && cargo audit)

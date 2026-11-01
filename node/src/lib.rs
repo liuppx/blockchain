@@ -303,6 +303,91 @@ pub enum DeltaKParam {
     DeltaKMin(f32),
 }
 
+/// SEC-04: safe-domain bounds for governable parameters. Governance (M193–198)
+/// decides *economics*, but these are hard *safety* bounds so a passed proposal can
+/// never drive overflow / broken supply conservation / platform-divergent state.
+pub const MAX_SLASH_BPS: u32 = 10_000; // 100%; `stake - stake*bps/10000` must not underflow
+pub const MAX_BASE_EMISSION_MICRO: u64 = 1_000 * MICRO; // ample vs the ~8*MICRO default
+pub const MAX_GOV_COUNT: u64 = 10_000; // bound for usize-typed ΔK counts (fits usize on 32/64-bit)
+
+/// SEC-04: validate a single governable parameter value against its safe domain.
+/// Called at proposal **registration** (so only valid values ever enter the proposal
+/// set → only valid values ever execute) and at genesis load.
+pub fn validate_gov_param(param: &GovParam) -> Result<(), ChainError> {
+    let unit = |v: f32, name: &'static str| {
+        if v.is_finite() && (0.0..=1.0).contains(&v) {
+            Ok(())
+        } else {
+            Err(ChainError::GovParamOutOfRange(name))
+        }
+    };
+    let nonneg = |v: f32, name: &'static str| {
+        if v.is_finite() && v >= 0.0 {
+            Ok(())
+        } else {
+            Err(ChainError::GovParamOutOfRange(name))
+        }
+    };
+    match param {
+        GovParam::BaseEmission(v) => {
+            if *v <= MAX_BASE_EMISSION_MICRO {
+                Ok(())
+            } else {
+                Err(ChainError::GovParamOutOfRange("base_emission_micro"))
+            }
+        }
+        GovParam::SlashBps(v) => {
+            if *v <= MAX_SLASH_BPS {
+                Ok(())
+            } else {
+                Err(ChainError::GovParamOutOfRange("slash_bps"))
+            }
+        }
+        GovParam::DecayHalfLife(_) => Ok(()), // any u64 is valid (0 = disabled)
+        GovParam::DeltaK(d) => match d {
+            DeltaKParam::TauDup(v) => unit(*v, "tau_dup"),
+            DeltaKParam::CCap(v) => unit(*v, "c_cap"),
+            DeltaKParam::FreshMin(v) => unit(*v, "fresh_min"),
+            DeltaKParam::Lam(v) => nonneg(*v, "lam"),
+            DeltaKParam::BonusMax(v) => nonneg(*v, "bonus_max"),
+            DeltaKParam::Decay(v) => nonneg(*v, "decay"),
+            DeltaKParam::DeltaKMin(v) => nonneg(*v, "delta_k_min"),
+            DeltaKParam::NReviewMin(v) | DeltaKParam::NMin(v) => {
+                if *v <= MAX_GOV_COUNT {
+                    Ok(())
+                } else {
+                    Err(ChainError::GovParamOutOfRange("deltak_count"))
+                }
+            }
+        },
+    }
+}
+
+/// SEC-04: validate the full consensus-parameter set (genesis or post-apply). Checks
+/// every field through the same [`validate_gov_param`] domain the governance path uses.
+pub fn validate_consensus_params(
+    base_emission_micro: u64,
+    slash_bps: u32,
+    p: &DeltaKParams,
+) -> Result<(), ChainError> {
+    validate_gov_param(&GovParam::BaseEmission(base_emission_micro))?;
+    validate_gov_param(&GovParam::SlashBps(slash_bps))?;
+    for dp in [
+        DeltaKParam::TauDup(p.tau_dup),
+        DeltaKParam::CCap(p.c_cap),
+        DeltaKParam::FreshMin(p.fresh_min),
+        DeltaKParam::Lam(p.lam),
+        DeltaKParam::BonusMax(p.bonus_max),
+        DeltaKParam::Decay(p.decay),
+        DeltaKParam::DeltaKMin(p.delta_k_min),
+        DeltaKParam::NReviewMin(p.n_review_min as u64),
+        DeltaKParam::NMin(p.n_min as u64),
+    ] {
+        validate_gov_param(&GovParam::DeltaK(dp))?;
+    }
+    Ok(())
+}
+
 /// M193: a parameter-change proposal and the votes recorded against it. **Hybrid
 /// governance**: a proposal passes only if BOTH constituencies approve —
 /// stake-weighted validators (>2/3 of total bonded stake) AND reputation-weighted
@@ -1070,6 +1155,12 @@ pub enum ChainError {
         id: u64,
         height: u64,
     },
+    /// SEC-04: a governance parameter value is outside its safe domain (e.g.
+    /// `slash_bps > 10000`, a non-finite ΔK float, or an out-of-range count). The
+    /// `&str` names the offending field. Enforced at proposal registration and
+    /// genesis so an unsafe value can never reach execution (where it would break
+    /// supply conservation / overflow).
+    GovParamOutOfRange(&'static str),
     /// M143: the tx's `nonce` is further ahead than the mempool's pipelining window
     /// allows (`got > acct.nonce + nonce_lookahead`). A mempool-admission bound, not
     /// a consensus rule — it keeps per-account buffering finite.
@@ -1276,6 +1367,9 @@ impl std::fmt::Display for ChainError {
                 f,
                 "governance proposal {id} voting window is closed at height {height}"
             ),
+            ChainError::GovParamOutOfRange(field) => {
+                write!(f, "governance parameter out of safe range: {field}")
+            }
             ChainError::NonceTooFarAhead { account, got, limit } => write!(
                 f,
                 "account {account} nonce {got} exceeds the mempool pipelining window (max {limit})"
@@ -1987,6 +2081,9 @@ impl ChainState {
                 got: op.nonce,
             });
         }
+        // SEC-04: reject an out-of-safe-range param at registration, so an unsafe
+        // value can never reach `resolve_matured_proposals` → `apply_gov_param`.
+        validate_gov_param(&op.param)?;
         let id = self.next_proposal_id;
         self.next_proposal_id += 1;
         self.proposals.insert(
@@ -2830,6 +2927,23 @@ impl ChainState {
             }
         }
         e.u64(self.next_proposal_id);
+        // SEC-02: fold the execution parameters into the digest. These drive ΔK /
+        // emission / slashing and are governance-mutable, so a snapshot (or genesis)
+        // with tampered params must NOT match a cert-signed state_root — otherwise
+        // two nodes agree on the root yet execute the same block differently (fork).
+        e.u64(self.base_emission_micro);
+        e.u64(self.decay_half_life_blocks);
+        e.u32(self.slash_bps);
+        let p = &self.params;
+        e.f32(p.tau_dup);
+        e.u64(p.n_review_min as u64);
+        e.f32(p.c_cap);
+        e.u64(p.n_min as u64);
+        e.f32(p.lam);
+        e.f32(p.bonus_max);
+        e.f32(p.decay);
+        e.f32(p.fresh_min);
+        e.f32(p.delta_k_min);
         sha256(&e.0)
     }
 
@@ -3957,6 +4071,59 @@ mod tests {
     }
 
     #[test]
+    fn gov_param_validation_rejects_unsafe_values() {
+        // SEC-04: safe-domain bounds.
+        assert!(validate_gov_param(&GovParam::SlashBps(10_000)).is_ok());
+        assert!(matches!(
+            validate_gov_param(&GovParam::SlashBps(10_001)),
+            Err(ChainError::GovParamOutOfRange("slash_bps"))
+        ));
+        assert!(validate_gov_param(&GovParam::BaseEmission(MAX_BASE_EMISSION_MICRO)).is_ok());
+        assert!(matches!(
+            validate_gov_param(&GovParam::BaseEmission(MAX_BASE_EMISSION_MICRO + 1)),
+            Err(ChainError::GovParamOutOfRange("base_emission_micro"))
+        ));
+        assert!(validate_gov_param(&GovParam::DecayHalfLife(u64::MAX)).is_ok());
+        // ΔK floats: unit-range, finite, non-negative.
+        assert!(validate_gov_param(&GovParam::DeltaK(DeltaKParam::TauDup(0.9))).is_ok());
+        assert!(validate_gov_param(&GovParam::DeltaK(DeltaKParam::TauDup(1.5))).is_err());
+        assert!(validate_gov_param(&GovParam::DeltaK(DeltaKParam::TauDup(f32::NAN))).is_err());
+        assert!(validate_gov_param(&GovParam::DeltaK(DeltaKParam::Lam(2.0))).is_ok()); // nonneg, no upper
+        assert!(validate_gov_param(&GovParam::DeltaK(DeltaKParam::Lam(-1.0))).is_err());
+        assert!(validate_gov_param(&GovParam::DeltaK(DeltaKParam::Decay(f32::INFINITY))).is_err());
+        assert!(validate_gov_param(&GovParam::DeltaK(DeltaKParam::NMin(MAX_GOV_COUNT))).is_ok());
+        assert!(
+            validate_gov_param(&GovParam::DeltaK(DeltaKParam::NMin(MAX_GOV_COUNT + 1))).is_err()
+        );
+    }
+
+    #[test]
+    fn gov_proposal_with_unsafe_param_is_rejected_at_registration() {
+        // SEC-04: a SlashBps(20000) proposal is rejected when the op applies, so the
+        // unsafe value never enters the proposal set / executes (which would make a
+        // reject slash exceed the stake and break supply conservation).
+        let mut chain = gov_chain();
+        let prop = GovProposal {
+            proposer: 1,
+            param: GovParam::SlashBps(20_000),
+            voting_period: 10,
+            nonce: 0,
+            signature: [0u8; 64],
+        }
+        .signed(&kp(1));
+        let mut b = block(&chain, 1, vec![]);
+        b.gov_proposals = vec![prop];
+        assert!(matches!(
+            chain.commit(&mut b).unwrap_err(),
+            ChainError::GovParamOutOfRange("slash_bps")
+        ));
+        assert!(
+            chain.state.proposals.is_empty(),
+            "unsafe proposal not registered"
+        );
+    }
+
+    #[test]
     fn state_root_covers_proposals() {
         // M194: proposals fold into state_root — two states differing only by a
         // proposal produce different roots; merkle_root (accounts tree) is unaffected.
@@ -3976,6 +4143,41 @@ mod tests {
         more.next_proposal_id = 1;
         assert_ne!(r0, more.state_root(), "a proposal changes state_root");
         assert_eq!(base.state.merkle_root(), more.merkle_root());
+    }
+
+    #[test]
+    fn state_root_covers_execution_params() {
+        // SEC-02: execution params fold into state_root, so a tampered snapshot/genesis
+        // param can't match a cert-signed root (which would fork execution). Each field
+        // independently moves the root; merkle_root (accounts tree) is unaffected.
+        let base = Chain::new(base_genesis());
+        let r0 = base.state.state_root();
+        let m0 = base.state.merkle_root();
+
+        let mut a = base.state.clone();
+        a.slash_bps += 1;
+        assert_ne!(r0, a.state_root(), "slash_bps changes state_root");
+
+        let mut b = base.state.clone();
+        b.base_emission_micro += 1;
+        assert_ne!(r0, b.state_root(), "base_emission_micro changes state_root");
+
+        let mut c = base.state.clone();
+        c.decay_half_life_blocks += 1;
+        assert_ne!(
+            r0,
+            c.state_root(),
+            "decay_half_life_blocks changes state_root"
+        );
+
+        let mut d = base.state.clone();
+        d.params.delta_k_min += 0.01;
+        assert_ne!(r0, d.state_root(), "a ΔK param changes state_root");
+
+        // None of these touch the accounts/reviewers Merkle tree.
+        for s in [&a, &b, &c, &d] {
+            assert_eq!(m0, s.merkle_root());
+        }
     }
 
     #[test]
