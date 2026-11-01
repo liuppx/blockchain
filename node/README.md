@@ -1568,6 +1568,17 @@ M193–M195 把治理做到 3 个标量旋钮（`base_emission_micro` / `slash_b
 - **里程碑收束**：至此 M193 选定的「**混合双门槛 + 全部 4 组参数**」治理目标**全部兑现**——提案/投票可全网 gossip 预传播（M195）、区块携带（M194）、到期按质押>2/3 且声誉>1/2 自动执行（M193），可改 4 组全部参数（M196）。
 - **已知边界 / 非目标**：RPC/CLI **发起** gov op（`GET /proposals` 查询 + HTTP 提交端点另行，像 M184 之于 M183 的读/写面）。
 
+## 治理读面 `GET /proposals`（Milestone 197 · 生产就绪评估 #6 收尾·读面）
+
+治理此前对 HTTP 钱包不可见——客户端无从查链上有哪些提案、票数如何。M197 补上读面：`GET /proposals`——活跃提案的明文目录，M194 链上治理状态的读兄弟。照抄 M184 `/cnfts` 模式（纯读、无状态/共识/wire 变更，demo/localnet 头与 state_root 不变）。
+
+- **路由**：`enum GetRoute` 加 `Proposals`；route_get `"/proposals"` 精确臂（无 `/proposal/` 单读前缀，`/proposals/` 落 `Health`）。`/routes` 发现索引补 `/proposals`（漂移守卫自动覆盖）。
+- **查询**：`Cmd::QueryProposals { reply: oneshot::Sender<Vec<Proposal>> }`；actor 快照 `state.proposals` 为 id 有序 `Vec<Proposal>`（`BTreeMap::values()` 即有序）。
+- **渲染**：`format_proposal_listing`（grep 友好 `id= param= value= created_height= voting_period= votes= yes=` 行）/`json_proposal_listing`（JSON 对象数组）。新 `gov_param_describe(&GovParam) -> (param_name, value)`：标量映射为 `base_emission_micro`/`slash_bps`/`decay_half_life_blocks`，DeltaK 旋钮命名空间化为 `deltak.<field>`（`deltak.lam` 等）；f32 值走 `json_f32` 使 text 与 JSON **逐字节一致**。`votes`/`yes` 给原始票数（加权双门槛在到期时由 `gov_tally` 算）。
+- **分页**：复用既有分页栈——`?cursor=<proposal_id>`/`?offset`/`?limit` + `format_page_cursor`/`json_page_cursor`，照抄 `/cnfts` handler 臂。
+- **测试（+2 → 723）**：`route_get_parses_proposals`（`/proposals` ⇒ `Proposals`、`/proposals/` ⇒ `Health`）+ `proposal_listing_renders`（空目录 ⇒ `""`/`[]`；一个标量提案 + 一个 DeltaK 提案的 text `key=value` 行与 JSON 逐字节，含 `votes=3 yes=2` 票数）；`/routes` 漂移守卫自动覆盖。
+- **已知边界 / 非目标**：HTTP `POST` **发起** gov op（写面，需 tx-submission 式 POST 处理器 + daemon 发起 Cmd + flood，另行）；`/proposal/{id}` 单读（`/proposals` 已是明文视图）。
+
 ## pending keystore 交互式密码提示（Milestone 181）
 
 收尾 M180 留的小口：M180 的 pending 加密 keystore 只从 `ZHIXING_PENDING_KEYSTORE_PASSWORD` 读密码，缺失即硬失败——与活跃 keystore（M175 `read_keystore_password`：env 优先、否则交互 no-echo 提示）不一致。

@@ -70,7 +70,10 @@ use crate::light::{BatchItem, BatchResponseEnvelope, ProofEntry, ProofKind};
 use crate::net::{decode_gossip, encode_gossip, GossipMsg, GossipNode};
 use crate::round::{Action, Msg, RoundState, Step};
 use crate::store::{BlockLog, CertLog};
-use crate::{Account, Block, Cnft, Genesis, Hash, Keypair, PubKey, SlashEvidence, SubmissionTx};
+use crate::{
+    Account, Block, Cnft, Genesis, GovParam, Hash, Keypair, Proposal, PubKey, SlashEvidence,
+    SubmissionTx,
+};
 
 /// Hard cap on a single wire frame (16 MiB). The blocking `read_msg` has no cap
 /// (a hostile `u32` length would allocate up to 4 GiB); a real transport must.
@@ -532,6 +535,10 @@ enum Cmd {
     /// certificates. Always a (possibly empty) node_id-sorted list.
     QueryCnfts {
         reply: oneshot::Sender<Vec<(u64, Cnft)>>,
+    },
+    /// M197: list every active governance proposal (id-sorted) for the directory read.
+    QueryProposals {
+        reply: oneshot::Sender<Vec<Proposal>>,
     },
     /// M86: list all cognitive-graph nodes (node_id + domain + embedding) for the plain
     /// read-class RPC directory — the list sibling of the single `/graph/{id}` plain read.
@@ -1790,6 +1797,11 @@ async fn run_actor(mut actor: Actor, mut rx: mpsc::UnboundedReceiver<Cmd>) {
                     .map(|(&id, c)| (id, c.clone()))
                     .collect();
                 let _ = reply.send(cnfts);
+            }
+            Cmd::QueryProposals { reply } => {
+                // M197: snapshot the id-sorted governance proposals for the directory.
+                let proposals = actor.node.chain.state.proposals.values().cloned().collect();
+                let _ = reply.send(proposals);
             }
             Cmd::QueryGraphNodes { reply } => {
                 // M86: snapshot the insertion-ordered graph node vector (node_id == index).
@@ -3327,6 +3339,10 @@ enum GetRoute {
     /// cognitive-contribution certificate bound to each accepted submission. No single-read
     /// sibling yet.
     Cnfts,
+    /// M197: `GET /proposals` — the governance directory (active proposals: id + param +
+    /// target value + created_height + voting_period + vote tally). The read sibling of
+    /// the M194 on-chain governance state. No single-read sibling yet.
+    Proposals,
     /// M86: `GET /graph` — the plain (unverified) cognitive-graph directory (node_id +
     /// domain + embedding), the list sibling of `Plain(GraphNode, id)`.
     GraphNodes,
@@ -3742,6 +3758,9 @@ fn route_get(path: &str) -> GetRoute {
         // M184: the plain cNFT directory. Exact-match; there is no `/cnft/` single-read
         // prefix, so `/cnfts/` simply falls through to `Health`.
         "/cnfts" => GetRoute::Cnfts,
+        // M197: the governance proposal directory. Exact-match; no `/proposal/` single-read
+        // prefix, so `/proposals/` simply falls through to `Health`.
+        "/proposals" => GetRoute::Proposals,
         // M86: the plain cognitive-graph directory. Exact-match; the `/graph/` prefix
         // (single reads/proofs) is handled in the fallthrough arm below, where `/graph/`
         // with an empty id already resolves to `NotFound`.
@@ -4347,6 +4366,7 @@ const READ_ROUTES: &[&str] = &[
     "/accounts",
     "/reviewers",
     "/cnfts",
+    "/proposals",
     "/graph",
     "/bonds",
     "/unbonding",
@@ -4578,6 +4598,78 @@ fn json_cnft_listing(cnfts: &[(u64, Cnft)]) -> String {
                 json_u64(c.domain as u64),
                 json_u64(c.reward_micro),
                 json_u64(c.height),
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+    format!("[{items}]")
+}
+
+/// M197: describe a [`GovParam`] as `(param_name, value_string)` for the proposal
+/// directory. `DeltaK` knobs are namespaced `deltak.<field>`. Floats render via the
+/// house `json_f32` so text and JSON agree byte-for-byte.
+fn gov_param_describe(p: &GovParam) -> (String, String) {
+    use crate::DeltaKParam as D;
+    match p {
+        GovParam::BaseEmission(v) => ("base_emission_micro".into(), v.to_string()),
+        GovParam::SlashBps(v) => ("slash_bps".into(), v.to_string()),
+        GovParam::DecayHalfLife(v) => ("decay_half_life_blocks".into(), v.to_string()),
+        GovParam::DeltaK(d) => {
+            let (f, val) = match d {
+                D::TauDup(v) => ("tau_dup", json_f32(*v)),
+                D::NReviewMin(v) => ("n_review_min", v.to_string()),
+                D::CCap(v) => ("c_cap", json_f32(*v)),
+                D::NMin(v) => ("n_min", v.to_string()),
+                D::Lam(v) => ("lam", json_f32(*v)),
+                D::BonusMax(v) => ("bonus_max", json_f32(*v)),
+                D::Decay(v) => ("decay", json_f32(*v)),
+                D::FreshMin(v) => ("fresh_min", json_f32(*v)),
+                D::DeltaKMin(v) => ("delta_k_min", json_f32(*v)),
+            };
+            (format!("deltak.{f}"), val)
+        }
+    }
+}
+
+/// M197: render the governance proposal directory as grep-friendly `key=value` lines,
+/// one per active proposal (empty string when there are none). `yes`/`votes` give the
+/// current approve-count / total-vote-count (raw tallies; the weighted dual-threshold
+/// is computed at the deadline, see [`crate::ChainState::gov_tally`]).
+fn format_proposal_listing(proposals: &[Proposal]) -> String {
+    proposals
+        .iter()
+        .map(|p| {
+            let (param, value) = gov_param_describe(&p.param);
+            let yes = p.votes.values().filter(|&&a| a).count();
+            format!(
+                "id={} param={param} value={value} created_height={} voting_period={} votes={} yes={}",
+                p.id,
+                p.created_height,
+                p.voting_period,
+                p.votes.len(),
+                yes,
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// M197: `GET /proposals?format=json` — the JSON sibling of [`format_proposal_listing`].
+fn json_proposal_listing(proposals: &[Proposal]) -> String {
+    let items = proposals
+        .iter()
+        .map(|p| {
+            let (param, value) = gov_param_describe(&p.param);
+            let yes = p.votes.values().filter(|&&a| a).count();
+            format!(
+                "{{\"id\":{},\"param\":{},\"value\":{},\"created_height\":{},\"voting_period\":{},\"votes\":{},\"yes\":{}}}",
+                json_u64(p.id),
+                json_str(&param),
+                json_str(&value),
+                json_u64(p.created_height),
+                json_u64(p.voting_period),
+                json_u64(p.votes.len() as u64),
+                json_u64(yes as u64),
             )
         })
         .collect::<Vec<_>>()
@@ -6417,6 +6509,47 @@ async fn serve_rpc_conn(
                                     cur.as_deref(),
                                 ),
                                 &json_page_cursor(&json_cnft_listing(page), total, cur.as_deref()),
+                            )
+                        }
+                        Err(_) => http_response("503 Service Unavailable", "node stopped"),
+                    }
+                }
+            }
+            GetRoute::Proposals => {
+                // M197: governance proposal directory — always a (possibly empty) `200`.
+                // Same pagination stack, cursor keyed by proposal id.
+                let (reply, rx) = oneshot::channel();
+                if cmd.send(Cmd::QueryProposals { reply }).is_err() {
+                    http_response("503 Service Unavailable", "node stopped")
+                } else {
+                    match rx.await {
+                        Ok(listing) => {
+                            let keys: Vec<u64> = listing.iter().map(|p| p.id).collect();
+                            let cursor = usize_param(query, "cursor")
+                                .filter(|&c| c <= u64::MAX as usize)
+                                .map(|c| c as u64);
+                            let start = if cursor.is_some() {
+                                key_after(&keys, cursor.as_ref())
+                            } else {
+                                usize_param(query, "offset").unwrap_or(0)
+                            };
+                            let limit = effective_limit(usize_param(query, "limit"));
+                            let total = listing.len();
+                            let page = &listing[start..(start + limit).min(total)];
+                            let cur =
+                                last_key(&keys[start..(start + page.len())]).map(|k| k.to_string());
+                            ok_body(
+                                fmt,
+                                &format_page_cursor(
+                                    &format_proposal_listing(page),
+                                    total,
+                                    cur.as_deref(),
+                                ),
+                                &json_page_cursor(
+                                    &json_proposal_listing(page),
+                                    total,
+                                    cur.as_deref(),
+                                ),
                             )
                         }
                         Err(_) => http_response("503 Service Unavailable", "node stopped"),
@@ -14534,6 +14667,59 @@ mod tests {
         // single-read prefix, so a trailing slash falls through to the health fallback.
         assert!(matches!(route_get("/cnfts"), GetRoute::Cnfts));
         assert!(matches!(route_get("/cnfts/"), GetRoute::Health));
+    }
+
+    #[test]
+    fn route_get_parses_proposals() {
+        // M197: `/proposals` is a plain directory read — exact match; trailing slash → health.
+        assert!(matches!(route_get("/proposals"), GetRoute::Proposals));
+        assert!(matches!(route_get("/proposals/"), GetRoute::Health));
+    }
+
+    #[test]
+    fn proposal_listing_renders() {
+        // M197: empty ⇒ ""/[]; a proposal renders its param label + value + tally. Covers a
+        // scalar param and a DeltaK (namespaced `deltak.<field>`) param.
+        use crate::{DeltaKParam, GovParam};
+        assert_eq!(format_proposal_listing(&[]), "");
+        assert_eq!(json_proposal_listing(&[]), "[]");
+
+        let mut votes = std::collections::BTreeMap::new();
+        votes.insert(1u64, true);
+        votes.insert(2u64, false);
+        votes.insert(3u64, true);
+        let ps = vec![
+            Proposal {
+                id: 0,
+                param: GovParam::BaseEmission(500),
+                created_height: 1,
+                voting_period: 10,
+                votes: votes.clone(),
+            },
+            Proposal {
+                id: 1,
+                param: GovParam::DeltaK(DeltaKParam::Lam(0.5)),
+                created_height: 2,
+                voting_period: 5,
+                votes: std::collections::BTreeMap::new(),
+            },
+        ];
+        let text = format_proposal_listing(&ps);
+        assert_eq!(
+            text,
+            "id=0 param=base_emission_micro value=500 created_height=1 voting_period=10 votes=3 yes=2\n\
+             id=1 param=deltak.lam value=0.5 created_height=2 voting_period=5 votes=0 yes=0",
+        );
+        let json = json_proposal_listing(&ps);
+        assert!(
+            json.contains("\"param\":\"base_emission_micro\",\"value\":\"500\""),
+            "{json}"
+        );
+        assert!(
+            json.contains("\"param\":\"deltak.lam\",\"value\":\"0.5\""),
+            "{json}"
+        );
+        assert!(json.contains("\"votes\":\"3\",\"yes\":\"2\""), "{json}");
     }
 
     #[test]
