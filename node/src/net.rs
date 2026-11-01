@@ -5039,6 +5039,72 @@ mod tests {
         }
     }
 
+    /// M186: a full node serves a `ProofEntry::Cnft` in response to a `GetProof`
+    /// for `ProofKind::Cnft` — the serve-side path behind `GET /cnft/{id}/proof`.
+    /// The entry verifies against the chain's `contributions_root` (M185), which
+    /// the cert-signed header commits to.
+    #[test]
+    fn full_node_serves_a_cnft_proof_in_response_to_get_proof() {
+        let (blocks, certs) = certified_chain(2);
+        let mut full = GossipNode::new(1, genesis(), 8, [1]);
+        full.load_certified(&blocks, &certs);
+
+        // The two accepted submissions in `certified_chain(2)` each mint a cNFT.
+        assert!(
+            !full.chain.state.contributions.is_empty(),
+            "accepted submissions must mint cNFTs"
+        );
+        let (node_id, expected_cnft) = {
+            let (id, c) = full.chain.state.contributions.iter().next().unwrap();
+            (*id, c.clone())
+        };
+
+        let request = GossipMsg::GetProof {
+            items: vec![(crate::light::ProofKind::Cnft, node_id)],
+        };
+        let mut out = full.on_message(99, request);
+        let (_dst, msg) = out.pop().unwrap();
+        let entries = match msg {
+            GossipMsg::Proof { items } => items,
+            other => panic!("expected Proof, got {other:?}"),
+        };
+        assert_eq!(entries.len(), 1);
+        let entry = entries[0].as_ref().expect("cNFT proof must be Some");
+        match entry {
+            crate::light::ProofEntry::Cnft {
+                node_id: nid, cnft, ..
+            } => {
+                assert_eq!(*nid, node_id);
+                assert_eq!(*cnft, expected_cnft);
+            }
+            other => panic!("expected Cnft, got {other:?}"),
+        }
+
+        // Verifies locally against the cert-signed `contributions_root`.
+        let last_block = blocks.last().unwrap();
+        let header = crate::codec::BlockHeader::from_block(last_block);
+        let leaf = crate::merkle::leaf_hash(&entry.leaf());
+        let root = &full.chain.state.contributions_merkle_root();
+        assert!(
+            crate::merkle::verify(root, &leaf, entry.proof()),
+            "cNFT proof must verify against contributions_root"
+        );
+        assert_eq!(root.as_slice(), header.contributions_root.as_slice());
+
+        // An unknown node_id yields a verified `None` slot.
+        let miss = GossipMsg::GetProof {
+            items: vec![(crate::light::ProofKind::Cnft, node_id + 9999)],
+        };
+        let mut out2 = full.on_message(99, miss);
+        let (_d, m2) = out2.pop().unwrap();
+        if let GossipMsg::Proof { items } = m2 {
+            assert_eq!(items.len(), 1);
+            assert!(items[0].is_none(), "unknown cNFT id must be a None slot");
+        } else {
+            panic!("expected Proof");
+        }
+    }
+
     /// M25: mixing GraphNode into a batched `GetProof` alongside Account +
     /// Reviewer + Validator must still work — same bus, same dispatcher.
     /// Mirrors `full_node_serves_a_batch_of_proofs_in_response_to_get_proof`

@@ -1435,6 +1435,15 @@ M183 把 cNFT 落为认证共识状态（折入 `state_root`），M184 加明文
 - **测试（+5 → 696）**：`lib` `cnft_proof_verifies_against_header_contributions_root`（接受提交铸 cNFT → 包含证明对 `b.contributions_root` 验证通过；未知 id → `None`）+ `contributions_root_mismatch_is_rejected_on_apply`（seal 后只篡 `contributions_root` → `ContributionsRootMismatch`）；`codec` `cnft_proof_entry_round_trip`（tag=4 + 36 字节 leaf + 证明，encode→decode 逐字节）；`light` `verify_proof_against_header_accepts_a_cnft_proof`（端到端 driver + cert 签名头）+ `..._rejects_a_tampered_cnft`（改 `reward_micro` → 验证器本地重算 leaf 拒之 `MembershipProofInvalid`，prover 的 leaf 不被信任）。
 - **已知边界 / 非目标**：HTTP `/cnft/{id}/proof` 便捷端点**不在本轮**——gossip `GetProof` 已覆盖轻客户端（SPV 的权威传输），HTTP 便捷读留作后续（像 M184 之于 M183 的读面补齐）；不做 time_decay / $WATT / $FLOP；旧 B4 快照/区块与 B5 不兼容（pre-production，协调升级 + 重新 snap）。
 
+## cNFT 证明 HTTP 读端点 `GET /cnft/{id}/proof`（Milestone 186 · 白皮书路线图 Phase 2）
+
+M185 把 cNFT SPV 的 wire 根（`contributions_root`）+ 证明类型（`ProofEntry::Cnft`）+ gossip `serve_inclusion` + 验证器全备齐，但 **HTTP 钱包还没有便捷读**——只能走 gossip `GetProof`（轻客户端的权威传输）。M186 补上 HTTP 收官：`GET /cnft/{id}/proof`——cNFT 的可验证读，返回 `{certified_header, proof_entry}`（cert 签名头 + `ProofEntry::Cnft`），客户端本地重算 leaf 并对 `header.contributions_root` 验证。**无状态/共识/wire/codec 变更**（纯 HTTP 读面；demo/localnet 头与 state_root 不变）。
+
+- **仅 `/proof` 形**：cNFT 无 `/cnft/{id}` 明文单读——明文视图是 M184 的 `/cnfts` 目录，故 `/cnft/` 前缀臂只认 `{id}/proof`，bare id（无 `/proof`）或非数字 id ⇒ 404。同 `/bridge/lock/{id}/proof` 的 proof-only 形状（而非 reviewer/validator/graph 的 `entity_route` 双形）。
+- **几乎零新代码**：route_get 加 `/cnft/` 前缀臂 → 复用既有 **kind-agnostic** `GetRoute::Proof(ProofKind::Cnft, id)` 整条处理链：`Cmd::QueryInclusion { kind, id }` → `node.inclusion` → `GossipNode::serve_inclusion`（M185 已加 `ProofKind::Cnft` 臂：`cnft_proof` + `contributions.get(&id)`）→ `format_account_proof`/`json_account_proof` → `json_proof_entry`（M185 已加 `ProofEntry::Cnft` 臂）。未知 id → 404（`proof_kind_label(Cnft)` = `"cnft"`）。`/routes` 加 `/cnft/{id}/proof` 模板（漂移守卫自动覆盖）。
+- **测试（+2 → 698）**：新纯 `route_get_parses_cnft_proof`（`/cnft/5/proof` ⇒ `Proof(Cnft, 5)`；`/cnft/5`、`/cnft/x/proof`、`/cnft//proof` ⇒ `NotFound`）+ `net` `full_node_serves_a_cnft_proof_in_response_to_get_proof`（`certified_chain(2)` 两笔接受铸 cNFT → `GossipMsg::GetProof{Cnft}` 返回 `ProofEntry::Cnft` 对 `contributions_root` 验证通过且等于 `header.contributions_root`；未知 id ⇒ 已验证的 `None` 槽——正面覆盖 M185 的 `serve_inclusion` Cnft 臂）。
+- **已知边界 / 非目标**：不做 `/cnft/{id}` 明文单读（`/cnfts` 已是明文视图）；不做 time_decay / $WATT / $FLOP。
+
 ## pending keystore 交互式密码提示（Milestone 181）
 
 收尾 M180 留的小口：M180 的 pending 加密 keystore 只从 `ZHIXING_PENDING_KEYSTORE_PASSWORD` 读密码，缺失即硬失败——与活跃 keystore（M175 `read_keystore_password`：env 优先、否则交互 no-echo 提示）不一致。

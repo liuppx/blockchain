@@ -3752,6 +3752,20 @@ fn route_get(path: &str) -> GetRoute {
                 entity_route(rest, ProofKind::Validator)
             } else if let Some(rest) = p.strip_prefix("/graph/") {
                 entity_route(rest, ProofKind::GraphNode)
+            } else if let Some(rest) = p.strip_prefix("/cnft/") {
+                // M186: `/cnft/{id}/proof` is the only form — a cNFT has no plain
+                // single read (the `/cnfts` directory, M184, is the plain view), so
+                // a bare id (no `/proof`) or a non-numeric id ⇒ 404. Reuses the
+                // kind-agnostic `GetRoute::Proof` machinery with `ProofKind::Cnft`,
+                // which verifies against `header.contributions_root` (M185). Same
+                // proof-only shape as `/bridge/lock/{id}/proof`.
+                match rest.strip_suffix("/proof") {
+                    Some(idp) => idp
+                        .parse::<u64>()
+                        .map(|id| GetRoute::Proof(ProofKind::Cnft, id))
+                        .unwrap_or(GetRoute::NotFound),
+                    None => GetRoute::NotFound,
+                }
             } else if let Some(rest) = p.strip_prefix("/leaf/") {
                 // M124: `/leaf/{kind}/{id}` — the entity's canonical Merkle leaf bytes. `{kind}`
                 // is one of account|reviewer|validator|graph; a bad kind or non-numeric id ⇒ 404.
@@ -4300,6 +4314,7 @@ const READ_ROUTES: &[&str] = &[
     "/validator/{id}/proof",
     "/graph/{id}",
     "/graph/{id}/proof",
+    "/cnft/{id}/proof",
     "/leaf/account/{id}",
     "/leaf/reviewer/{id}",
     "/leaf/validator/{id}",
@@ -13311,6 +13326,21 @@ mod tests {
         ));
         assert!(matches!(route_get("/account/7"), GetRoute::Account(7)));
         assert!(matches!(route_get("/"), GetRoute::Health));
+    }
+
+    #[test]
+    fn route_get_parses_cnft_proof() {
+        // M186: `/cnft/{id}/proof` is the only cNFT single-read form (proof-only,
+        // like `/bridge/lock/{id}/proof`) — it reuses the kind-agnostic
+        // `Proof(ProofKind::Cnft, id)` machinery. A bare `{id}` (no `/proof`) or a
+        // non-numeric id ⇒ 404, since cNFTs have no plain single read.
+        assert!(matches!(
+            route_get("/cnft/5/proof"),
+            GetRoute::Proof(ProofKind::Cnft, 5)
+        ));
+        assert!(matches!(route_get("/cnft/5"), GetRoute::NotFound));
+        assert!(matches!(route_get("/cnft/x/proof"), GetRoute::NotFound));
+        assert!(matches!(route_get("/cnft//proof"), GetRoute::NotFound));
     }
 
     #[test]
