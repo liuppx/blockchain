@@ -2158,6 +2158,71 @@ impl ChainState {
         }
     }
 
+    /// SEC-01: cheap admissibility check for a gossiped `GovProposal` — account exists,
+    /// signature valid, param in safe range. Deliberately does NOT check nonce (a
+    /// pipelined submitter may legitimately be ahead); nonce/ordering are enforced at
+    /// block apply and at candidate-build filtering. Used at gossip ingress so invalid
+    /// ops are neither staged nor re-flooded (no pool pollution, no amplification).
+    pub(crate) fn gov_proposal_admissible(&self, op: &GovProposal) -> bool {
+        match self.accounts.get(&op.proposer) {
+            Some(acct) => {
+                crypto::verify(
+                    &acct.pubkey,
+                    &codec::govproposal_signing_bytes(op),
+                    &op.signature,
+                ) && validate_gov_param(&op.param).is_ok()
+            }
+            None => false,
+        }
+    }
+
+    /// SEC-01: cheap admissibility check for a gossiped `GovVote` — account exists,
+    /// signature valid, and the referenced proposal exists and is still open. No nonce
+    /// check (see [`Self::gov_proposal_admissible`]).
+    pub(crate) fn gov_vote_admissible(&self, op: &GovVote) -> bool {
+        let sig_ok = match self.accounts.get(&op.voter) {
+            Some(acct) => crypto::verify(
+                &acct.pubkey,
+                &codec::govvote_signing_bytes(op),
+                &op.signature,
+            ),
+            None => false,
+        };
+        // Proposal must exist and not yet be closed at the next commit height.
+        let open = self
+            .proposals
+            .get(&op.proposal_id)
+            .is_some_and(|p| self.height + 1 < p.created_height + p.voting_period);
+        sig_ok && open
+    }
+
+    /// SEC-01: from staged governance pools, return the subset that applies cleanly
+    /// (in block order: proposals then votes) against a trial clone at `height`. A
+    /// stale/invalid op (consumed nonce, closed/duplicate proposal, out-of-range param)
+    /// is simply dropped from *this* candidate instead of making the whole sealed
+    /// block unproposable — so a poisoned pending pool can never stall production.
+    pub(crate) fn filter_applicable_gov(
+        &self,
+        height: u64,
+        proposals: &[GovProposal],
+        votes: &[GovVote],
+    ) -> (Vec<GovProposal>, Vec<GovVote>) {
+        let mut trial = self.clone();
+        let mut kept_props = Vec::new();
+        for op in proposals {
+            if trial.apply_gov_proposal(op, height).is_ok() {
+                kept_props.push(op.clone());
+            }
+        }
+        let mut kept_votes = Vec::new();
+        for op in votes {
+            if trial.apply_gov_vote(op, height).is_ok() {
+                kept_votes.push(op.clone());
+            }
+        }
+        (kept_props, kept_votes)
+    }
+
     /// Apply one bond/unbond op at `height` (the height of the block carrying it).
     /// Bond escrows funds from the account balance into the bonded pool; unbond
     /// removes them from the pool and schedules a delayed withdrawal. Never

@@ -1280,6 +1280,21 @@ impl GossipNode {
             self.pending_key_rotations
                 .retain(|op| !committed.contains(&op.hash()));
         }
+        // SEC-01: drop committed governance ops from the pending pools so this node
+        // never re-proposes an already-applied proposal/vote (whose nonce is now
+        // consumed) at the next height.
+        if !block.gov_proposals.is_empty() {
+            let committed: std::collections::HashSet<[u8; 32]> =
+                block.gov_proposals.iter().map(|op| op.hash()).collect();
+            self.pending_gov_proposals
+                .retain(|op| !committed.contains(&op.hash()));
+        }
+        if !block.gov_votes.is_empty() {
+            let committed: std::collections::HashSet<[u8; 32]> =
+                block.gov_votes.iter().map(|op| op.hash()).collect();
+            self.pending_gov_votes
+                .retain(|op| !committed.contains(&op.hash()));
+        }
         self.blocks.push(block);
         self.certs.push(cert);
         true
@@ -1326,8 +1341,16 @@ impl GossipNode {
         candidate.stake_ops = self.pending_stake_ops.clone();
         candidate.slashing_evidence = self.pending_evidence.clone();
         candidate.key_rotations = self.pending_key_rotations.clone();
-        candidate.gov_proposals = self.pending_gov_proposals.clone();
-        candidate.gov_votes = self.pending_gov_votes.clone();
+        // SEC-01: include only governance ops that apply cleanly against current state
+        // (in block order), so a stale/invalid staged op can't make the whole candidate
+        // unproposable and stall production.
+        let (gp, gv) = self.chain.state.filter_applicable_gov(
+            self.chain.state.height + 1,
+            &self.pending_gov_proposals,
+            &self.pending_gov_votes,
+        );
+        candidate.gov_proposals = gp;
+        candidate.gov_votes = gv;
         // M122: this node is the proposer of the block it builds — credit its own
         // validator id so the tx fees route to it. Only a block actually elected and
         // committed keeps this; a losing candidate is discarded.
@@ -1708,6 +1731,12 @@ impl GossipNode {
         if !self.seen_gov_proposal.insert(op.hash()) {
             return Vec::new();
         }
+        // SEC-01: reject invalid ops at ingress (bad sig / unknown account / out-of-range
+        // param) — never stage or re-flood garbage. Full nonce/ordering is enforced at
+        // apply + candidate-build filtering.
+        if !self.chain.state.gov_proposal_admissible(&op) {
+            return Vec::new();
+        }
         self.pending_gov_proposals.push(op.clone());
         self.broadcast(GossipMsg::GovProposal(Box::new(op)), Some(from))
     }
@@ -1715,6 +1744,11 @@ impl GossipNode {
     /// M195: dedup + stage + re-flood a gossiped governance vote.
     fn on_gov_vote(&mut self, from: u64, op: GovVote) -> Vec<(u64, GossipMsg)> {
         if !self.seen_gov_vote.insert(op.hash()) {
+            return Vec::new();
+        }
+        // SEC-01: reject invalid ops at ingress (bad sig / unknown account / unknown or
+        // closed proposal) — never stage or re-flood garbage.
+        if !self.chain.state.gov_vote_admissible(&op) {
             return Vec::new();
         }
         self.pending_gov_votes.push(op.clone());
@@ -4085,8 +4119,10 @@ mod tests {
 
     #[test]
     fn gov_op_gossip_reaches_every_node_and_dedups() {
-        // M195: a locally-submitted proposal + vote each flood to every node's pending
-        // pool (one copy each), and a duplicate does not re-flood.
+        // M195/SEC-01: an admissible proposal floods to every node's pending pool (one
+        // copy each) and a duplicate does not re-flood. (Votes require a *committed*
+        // proposal to be admissible — see `gov_gossip_rejects_inadmissible_ops` — so
+        // the flood/dedup mechanic is exercised here with two distinct proposals.)
         let ids = [1u64, 2, 3];
         let nodes: Vec<GossipNode> = ids
             .iter()
@@ -4094,7 +4130,7 @@ mod tests {
             .collect();
         let mut net = Network::new(nodes);
 
-        let prop = crate::GovProposal {
+        let p1 = crate::GovProposal {
             proposer: 1,
             param: crate::GovParam::BaseEmission(42),
             voting_period: 10,
@@ -4102,45 +4138,120 @@ mod tests {
             signature: [0u8; 64],
         }
         .signed(&kp(1));
-        let vote = crate::GovVote {
-            proposal_id: 0,
-            voter: 1,
-            approve: true,
-            nonce: 1,
+        let p2 = crate::GovProposal {
+            proposer: 2,
+            param: crate::GovParam::SlashBps(5000),
+            voting_period: 10,
+            nonce: 0,
+            signature: [0u8; 64],
+        }
+        .signed(&kp(2));
+        let h1 = p1.hash();
+        let h2 = p2.hash();
+        net.submit_gov_proposal(1, p1.clone());
+        net.submit_gov_proposal(2, p2.clone());
+        net.run();
+        for id in ids {
+            let pending = net.node(id).pending_gov_proposals();
+            assert_eq!(pending.len(), 2, "node {id} has both proposals");
+            let hashes: std::collections::HashSet<_> = pending.iter().map(|p| p.hash()).collect();
+            assert!(
+                hashes.contains(&h1) && hashes.contains(&h2),
+                "node {id} both"
+            );
+        }
+
+        // Re-delivering a seen proposal stages nothing and emits nothing.
+        let out = net
+            .node_mut(2)
+            .on_message(1, GossipMsg::GovProposal(Box::new(p1)));
+        assert!(out.is_empty(), "a seen proposal is not re-flooded");
+        assert_eq!(net.node(2).pending_gov_proposals().len(), 2);
+    }
+
+    #[test]
+    fn gov_gossip_rejects_inadmissible_ops() {
+        // SEC-01: invalid governance gossip is neither staged nor re-flooded, so a
+        // poisoned op can't pollute the candidate pool or amplify across the mesh.
+        let ids = [1u64, 2];
+        let nodes: Vec<GossipNode> = ids
+            .iter()
+            .map(|&id| GossipNode::new(id, genesis(), 16, ids.iter().copied()))
+            .collect();
+        let mut net = Network::new(nodes);
+
+        // Bad signature (kp(2) signing account 1's proposal).
+        let bad_sig = crate::GovProposal {
+            proposer: 1,
+            param: crate::GovParam::BaseEmission(42),
+            voting_period: 10,
+            nonce: 0,
+            signature: [0u8; 64],
+        }
+        .signed(&kp(2));
+        let out = net
+            .node_mut(2)
+            .on_message(1, GossipMsg::GovProposal(Box::new(bad_sig)));
+        assert!(out.is_empty(), "bad-sig proposal not re-flooded");
+        assert_eq!(net.node(2).pending_gov_proposals().len(), 0, "not staged");
+
+        // Out-of-range param (slash_bps > 10000).
+        let bad_param = crate::GovProposal {
+            proposer: 1,
+            param: crate::GovParam::SlashBps(20_000),
+            voting_period: 10,
+            nonce: 0,
             signature: [0u8; 64],
         }
         .signed(&kp(1));
-        let ph = prop.hash();
-        let vh = vote.hash();
-        net.submit_gov_proposal(1, prop.clone());
-        net.submit_gov_vote(1, vote.clone());
-        net.run();
-        for id in ids {
-            assert_eq!(
-                net.node(id).pending_gov_proposals().len(),
-                1,
-                "node {id} one proposal"
-            );
-            assert_eq!(net.node(id).pending_gov_proposals()[0].hash(), ph);
-            assert_eq!(
-                net.node(id).pending_gov_votes().len(),
-                1,
-                "node {id} one vote"
-            );
-            assert_eq!(net.node(id).pending_gov_votes()[0].hash(), vh);
-        }
+        net.node_mut(2)
+            .on_message(1, GossipMsg::GovProposal(Box::new(bad_param)));
+        assert_eq!(
+            net.node(2).pending_gov_proposals().len(),
+            0,
+            "out-of-range not staged"
+        );
 
-        // Re-delivering a seen proposal/vote stages nothing and emits nothing.
-        let out = net
-            .node_mut(2)
-            .on_message(1, GossipMsg::GovProposal(Box::new(prop)));
-        assert!(out.is_empty(), "a seen proposal is not re-flooded");
-        let out2 = net
-            .node_mut(2)
-            .on_message(1, GossipMsg::GovVote(Box::new(vote)));
-        assert!(out2.is_empty(), "a seen vote is not re-flooded");
-        assert_eq!(net.node(2).pending_gov_proposals().len(), 1);
-        assert_eq!(net.node(2).pending_gov_votes().len(), 1);
+        // Vote for a nonexistent proposal (a real vote's id is only known post-commit).
+        let orphan_vote = crate::GovVote {
+            proposal_id: 999,
+            voter: 1,
+            approve: true,
+            nonce: 0,
+            signature: [0u8; 64],
+        }
+        .signed(&kp(1));
+        net.node_mut(2)
+            .on_message(1, GossipMsg::GovVote(Box::new(orphan_vote)));
+        assert_eq!(
+            net.node(2).pending_gov_votes().len(),
+            0,
+            "orphan vote not staged"
+        );
+    }
+
+    #[test]
+    fn poisoned_gov_pool_does_not_stall_candidate_production() {
+        // SEC-01 core: even if a stale/invalid gov op is in the pending pool (injected
+        // here via the un-checked local-submit path), build_candidate must still produce
+        // a sealable block — the invalid op is filtered out, not allowed to stall.
+        let mut node = GossipNode::new(1, genesis(), 16, [1]);
+        let bogus = crate::GovVote {
+            proposal_id: 999, // no such committed proposal
+            voter: 1,
+            approve: true,
+            nonce: 0,
+            signature: [0u8; 64],
+        }
+        .signed(&kp(1));
+        let _ = node.submit_local_gov_vote(bogus); // pushes straight into the pool
+        assert_eq!(node.pending_gov_votes().len(), 1, "op is in the pool");
+        let cand = node.build_candidate(1.0);
+        assert!(cand.is_some(), "poisoned pool must not stall production");
+        assert!(
+            cand.unwrap().gov_votes.is_empty(),
+            "the stale vote is filtered out of the candidate"
+        );
     }
 
     /// End-to-end: gossip an evidence through the network to a node, drain
