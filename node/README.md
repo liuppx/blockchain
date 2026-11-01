@@ -1501,6 +1501,18 @@ M189 建了 CI，但因为有 ~19 条既有 clippy lint，把 clippy 步设成�
 - **纯清理**：无行为变更、无测试增减（仍 702），全套测试 + `cargo fmt --check` 仍绿。
 - **已知边界 / 非目标**：`cargo-audit` 仍 advisory（待确认干净漏洞基线后另行升门禁）；深度 `cargo-fuzz` 持久语料另行。
 
+## P2P 协议版本协商（Milestone 192 · 生产就绪评估 #4）
+
+生产就绪评估 #4：wire 代际（B2…B5）此前是**无协商的协调式硬断**——两个版本不一致的节点连上后会**静默互相 mis-parse** 帧（解出垃圾 → 无诊断地断开），运维只看到"连上又断"，查不出是版本问题。M192 让不兼容**显式、可观测地**拒绝，并立起未来升级要用的版本字段。
+
+- **`PROTOCOL_VERSION: u32`（`daemon.rs`，起始 `1`）**：每次**任何** wire 破坏（block/header/gossip/snapshot 编码、握手布局…）都须自增。这是以前 "B2…B5" 那些隐式代际的显式化。
+- **`negotiate_version(rd, wr)`**：在**每条 peer 连接的最前 4 字节**（BE u32，id/auth 握手之前）交换——写自己的版本、读对端的，不等即返回 `io::ErrorKind::InvalidData`。4 字节写入落在 socket/TLS 缓冲里，write-then-read 不会死锁（同 `write_hello` 的成熟模式）。注入点是 `handle_conn` 里**明文路径（`write_hello`/`read_hello`）与认证路径（`auth_handshake`）的汇合处**，故两条路径都先过版本门；失败以 `warn!` 记日志后 drop。
+- **为何严格相等、而非 min/max 区间协商**：codec 同一时刻只讲**一个** wire 代际，无法解码更旧/更新 peer 的帧——所以"协商一个共同版本"是表演（协商出来也解不了）。诚实契约：同版本→继续，异版本→干净拒绝。真正的滚动升级（多 wire 解码器并存）是它的前提，不在本轮。
+- **安全注记**：`require_peer_auth` 开时，版本交换在认证握手**之前**，MITM 可篡改这 4 字节——但篡改只会导致**拒连**（绝不降级到弱密码），最坏是等价于"剪断网线"的 DoS。把协商版本折进 auth transcript（`AUTH_DOMAIN` v1→v2）以侦测篡改是后续加固。TLS 开时版本交换本就在加密通道内。
+- **一次性破坏**：加这 4 字节交换本身是一次握手 wire 破坏（旧节点不发 → 被新节点拒）——这正是**引导**未来协商的那一次破；此后每次 wire 破坏都是干净拒连而非 mis-parse。
+- **测试（+2 → 704）**：`version_negotiation_accepts_matching_peers`（同版本，双向 `tokio::io::duplex` 两端均 Ok）+ `version_negotiation_rejects_mismatch`（冒充者报 `PROTOCOL_VERSION + 1` → 本端 `InvalidData` 拒，且本端确实对外 announce 了真实版本）。两测纯内存 duplex，无 socket/端口（不引入 M182 那类 flaky）。localnet/daemon 集成测经 `handle_conn` 实跑双向协商、仍收敛同一 head。
+- **已知边界 / 非目标**：min/max 区间协商 + 多 wire 解码器并存（真·滚动升级，需先能"多讲 wire"）；把版本折进 auth transcript 的防篡改；RPC 版本化（HTTP，走路径/头，不经此握手）。
+
 ## pending keystore 交互式密码提示（Milestone 181）
 
 收尾 M180 留的小口：M180 的 pending 加密 keystore 只从 `ZHIXING_PENDING_KEYSTORE_PASSWORD` 读密码，缺失即硬失败——与活跃 keystore（M175 `read_keystore_password`：env 优先、否则交互 no-echo 提示）不一致。

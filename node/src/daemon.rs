@@ -151,6 +151,49 @@ async fn read_hello<R: AsyncReadExt + Unpin>(r: &mut R) -> io::Result<u64> {
     Ok(u64::from_be_bytes(b))
 }
 
+/// M192: the P2P protocol version, exchanged as the **first 4 bytes** on every peer
+/// connection (before the id/auth handshake). It must increment on **any** wire-format
+/// break — block/header/gossip/snapshot encoding, handshake layout, etc. (the "B2…B5"
+/// generations that previously shipped as uncoordinated hard breaks). Before M192 a
+/// version-mismatched peer silently mis-parsed each other's frames (garbage →
+/// disconnect with no diagnosis); now the mismatch is detected and logged up front.
+///
+/// Why strict equality (not min/max range negotiation): the codec speaks exactly one
+/// wire generation at a time — it cannot decode an older/newer peer's frames — so
+/// "negotiating" a common version would be theater. The honest contract is: same
+/// version ⇒ proceed, different ⇒ reject cleanly. Range negotiation becomes meaningful
+/// only once the node maintains multiple simultaneous wire decoders (not today).
+pub const PROTOCOL_VERSION: u32 = 1;
+
+/// M192: exchange and check [`PROTOCOL_VERSION`] at connection open. Writes ours,
+/// reads the peer's, and errors on mismatch. The 4-byte write fits the socket/TLS
+/// buffer so write-then-read can't deadlock (same pattern as [`write_hello`]).
+/// Runs over the already-TLS-wrapped stream when `[network] enable_tls` is on.
+///
+/// Security note: when `require_peer_auth` is on this runs *before* the authenticated
+/// handshake, so a MITM could tamper the version bytes — but a tampered value only
+/// forces a *reject* (disconnect), never a downgrade to weaker crypto, so the worst
+/// case is a DoS equivalent to cutting the wire. Folding the negotiated version into
+/// the auth transcript (to detect tampering when authed) is a follow-up hardening.
+async fn negotiate_version<R, W>(rd: &mut R, wr: &mut W) -> io::Result<()>
+where
+    R: AsyncReadExt + Unpin,
+    W: AsyncWriteExt + Unpin,
+{
+    wr.write_all(&PROTOCOL_VERSION.to_be_bytes()).await?;
+    wr.flush().await?;
+    let mut b = [0u8; 4];
+    rd.read_exact(&mut b).await?;
+    let peer = u32::from_be_bytes(b);
+    if peer != PROTOCOL_VERSION {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("peer protocol version {peer} != local {PROTOCOL_VERSION}"),
+        ));
+    }
+    Ok(())
+}
+
 // ----------------------------------------------------------------------------
 // M40: authenticated handshake (opt-in `[network] require_peer_auth`)
 // ----------------------------------------------------------------------------
@@ -1981,6 +2024,13 @@ async fn handle_conn<C: TransportCmd>(
 ) {
     let my_id = ctx.my_id;
     let (mut rd, mut wr) = tokio::io::split(stream);
+
+    // M192: negotiate the protocol version first, on both the plain and authenticated
+    // paths — a wire-gen mismatch now rejects explicitly instead of mis-parsing frames.
+    if let Err(e) = negotiate_version(&mut rd, &mut wr).await {
+        warn!(node = my_id, error = %e, "protocol version negotiation failed — dropping peer");
+        return;
+    }
 
     let peer_id = if ctx.require {
         match auth_handshake(&mut rd, &mut wr, &ctx, binding.as_ref()).await {
@@ -8868,6 +8918,44 @@ mod tests {
         writer.await.unwrap();
     }
 
+    #[tokio::test]
+    async fn version_negotiation_accepts_matching_peers() {
+        // M192: two nodes on the same PROTOCOL_VERSION complete negotiation. Both sides
+        // write-then-read over a duplex pipe (mirrors the real `handle_conn` convergence
+        // point); each must see Ok.
+        let (a, b) = tokio::io::duplex(64);
+        let (mut ar, mut aw) = tokio::io::split(a);
+        let (mut br, mut bw) = tokio::io::split(b);
+        let left = tokio::spawn(async move { negotiate_version(&mut ar, &mut aw).await });
+        let right = tokio::spawn(async move { negotiate_version(&mut br, &mut bw).await });
+        assert!(left.await.unwrap().is_ok());
+        assert!(right.await.unwrap().is_ok());
+    }
+
+    #[tokio::test]
+    async fn version_negotiation_rejects_mismatch() {
+        // M192: a peer announcing a different version is rejected with `InvalidData`
+        // rather than silently proceeding to mis-parse frames. We play the "peer" by
+        // writing a forged version and reading our side's announced version.
+        let (a, b) = tokio::io::duplex(64);
+        let (mut ar, mut aw) = tokio::io::split(a);
+        let (mut br, mut bw) = tokio::io::split(b);
+        // The impostor announces PROTOCOL_VERSION + 1.
+        let impostor = tokio::spawn(async move {
+            bw.write_all(&(PROTOCOL_VERSION + 1).to_be_bytes())
+                .await
+                .unwrap();
+            bw.flush().await.unwrap();
+            let mut got = [0u8; 4];
+            br.read_exact(&mut got).await.unwrap();
+            u32::from_be_bytes(got)
+        });
+        let err = negotiate_version(&mut ar, &mut aw).await.unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        // And our node did announce its real version to the peer.
+        assert_eq!(impostor.await.unwrap(), PROTOCOL_VERSION);
+    }
+
     // --- M40: authenticated handshake (pure core) -------------------------------
 
     #[test]
@@ -9372,6 +9460,10 @@ mod tests {
             let stream = TcpStream::connect(&addr).await.expect("byzantine connect");
             let _ = stream.set_nodelay(true);
             let (mut rd, mut wr) = stream.into_split();
+            // M192: speak the protocol-version handshake first, like a real peer.
+            negotiate_version(&mut rd, &mut wr)
+                .await
+                .expect("version negotiation");
             write_hello(&mut wr, 21).await.expect("hello");
             let _ = read_hello(&mut rd).await;
             // Drain (and discard) everything the honest node sends us.
@@ -16800,6 +16892,12 @@ vote_b.validator=5 vote_b.height=9 vote_b.round=2 vote_b.block_hash={b_h} vote_b
         let stream = TcpStream::connect(&addr).await.expect("connect");
         let _ = stream.set_nodelay(true);
         let (mut rd, mut wr) = stream.into_split();
+
+        // M192: exchange the protocol version first (as a real peer would) so we reach
+        // the authenticated handshake we're actually testing, not the version gate.
+        negotiate_version(&mut rd, &mut wr)
+            .await
+            .expect("version negotiation");
 
         // HelloInit: claim id 22, but present kp(99) — not 22's genesis key.
         let claimed_id = 22u64;
