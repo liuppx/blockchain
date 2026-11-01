@@ -1444,6 +1444,19 @@ M185 把 cNFT SPV 的 wire 根（`contributions_root`）+ 证明类型（`ProofE
 - **测试（+2 → 698）**：新纯 `route_get_parses_cnft_proof`（`/cnft/5/proof` ⇒ `Proof(Cnft, 5)`；`/cnft/5`、`/cnft/x/proof`、`/cnft//proof` ⇒ `NotFound`）+ `net` `full_node_serves_a_cnft_proof_in_response_to_get_proof`（`certified_chain(2)` 两笔接受铸 cNFT → `GossipMsg::GetProof{Cnft}` 返回 `ProofEntry::Cnft` 对 `contributions_root` 验证通过且等于 `header.contributions_root`；未知 id ⇒ 已验证的 `None` 槽——正面覆盖 M185 的 `serve_inclusion` Cnft 臂）。
 - **已知边界 / 非目标**：不做 `/cnft/{id}` 明文单读（`/cnfts` 已是明文视图）；不做 time_decay / $WATT / $FLOP。
 
+## 增发时间衰减因子 time_decay（Milestone 187 · 白皮书 §6.2 增发公式收官）
+
+白皮书 §6.2 定义 $COG 增发 = `base_emission × impact(ΔK) × time_decay`，节点此前只实现前两因子（`apply_tx` 里 `reward = base_emission_micro × ΔK`）。M187 补上**最后一因子 time_decay**——早期（引导期）贡献权重高、随链龄按半衰期衰减，激励"尽早贡献"。
+
+- **治理常量**：`decay_half_life_blocks: u64`（`Genesis` + `ChainState`，与 `base_emission_micro` 同级的政策旋钮）。**默认 `0` = 禁用**（衰减因子恒 `1.0`）——不 opt-in 的链铸量与此前**逐字节一致**，demo 仍设 `0`，**canon 不变**（demo state_root/head、localnet 头均不动）。
+- **纯函数** `time_decay_factor(height, half_life) -> f64`（`lib.rs`）：`half_life == 0 ⇒ 1.0`；否则 `0.5^(height / half_life)`——height 0 时 1.0，一个半衰期 0.5，两个 0.25。两整数的 f64，跨节点确定（与既有 `base × ΔK` 舍入同再现性类）。
+- **铸造**（`apply_tx` 接受分支）：`reward = round(base_emission_micro × ΔK × time_decay_factor(self.height + 1, decay_half_life_blocks))`。衰减按**本块提交高度**（`self.height + 1`，与 cNFT `height` 字段一致）度量；**ΔK 引擎完全不受影响**（衰减是增发侧的后乘因子，不改 novelty/impact 计算）。拒绝分支不涉及。
+- **暴露**：`/params` 读端点 + `ParamsView` 加 `decay_half_life_blocks`（命名与既有 ΔK 时鲜度参数 `decay` 区分）；`format_params`/`json_params` 各加一字段。config `GenesisConfig.decay_half_life_blocks`（`#[serde(default)]` ⇒ TOML 缺省 0）。
+- **快照**：`SNAPSHOT_VERSION` 3→4（`encode/decode_snapshot` 多序列化这个常量，紧跟 `base_emission_micro`）；旧 v3 快照被严格版本校验拒，重新 snap（pre-production）。
+- **不变量**：供应守恒不受影响（衰减后的 `reward` 同时 credit `balance` 与 `supply`）；`state_root`/head **不变**——`decay_half_life_blocks` 是常量，**不折入** `state_root`（同 `base_emission_micro`），只有某链把它设为非零时才会改铸量→余额→state_root。
+- **测试（+2 → 700）**：`time_decay_factor_halves_each_half_life`（0 禁用；height 0→1.0；一/两个半衰期→0.5/0.25；半期内单调递减）+ `emission_time_decay_reduces_mint_with_chain_age`（禁用链 mint == `base × ΔK`；`half_life=4` 的链对同一提交 ΔK 相同但 mint **严格更小** = `round(base × ΔK × 0.5^(1/4))`；供应仍守恒）。
+- **已知边界 / 非目标**：$WATT / $FLOP（需预言机/oracle）；评议人治理 DAO；主网 genesis 是否启用衰减及半衰期取值是**政策决定**（留给上线前），本轮只落机制 + 默认关。
+
 ## pending keystore 交互式密码提示（Milestone 181）
 
 收尾 M180 留的小口：M180 的 pending 加密 keystore 只从 `ZHIXING_PENDING_KEYSTORE_PASSWORD` 读密码，缺失即硬失败——与活跃 keystore（M175 `read_keystore_password`：env 优先、否则交互 no-echo 提示）不一致。

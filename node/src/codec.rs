@@ -1307,7 +1307,12 @@ pub fn decode_account(buf: &[u8]) -> Result<Account, CodecError> {
 /// cognitive-contribution certificates), which M183 folded into `state_root`. A
 /// v2 snapshot would drop them on decode and fail the `state_root` cross-check,
 /// so v2 is now rejected — regenerate.
-pub const SNAPSHOT_VERSION: u32 = 3;
+///
+/// v4 (M187): the snapshot now also serializes `decay_half_life_blocks` (the
+/// §6.2 emission time-decay knob), a governance constant alongside
+/// `base_emission_micro`. A v3 snapshot lacks the field, so v3 is now rejected —
+/// regenerate.
+pub const SNAPSHOT_VERSION: u32 = 4;
 
 /// Write the account's state fields into the shared stream (same layout as
 /// [`encode_account`], inlined so the snapshot controls framing).
@@ -1377,6 +1382,7 @@ pub fn encode_snapshot(s: &ChainState) -> Vec<u8> {
     e.u64(s.bridge_minted);
     e.u64(s.next_lock_id);
     e.u64(s.base_emission_micro);
+    e.u64(s.decay_half_life_blocks); // M187 (§6.2): emission time-decay half-life
     e.u32(s.slash_bps);
     e.raw(&s.genesis_hash);
     // ΔK params
@@ -1485,6 +1491,7 @@ pub fn decode_snapshot(buf: &[u8]) -> Result<ChainState, CodecError> {
     let bridge_minted = d.u64()?;
     let next_lock_id = d.u64()?;
     let base_emission_micro = d.u64()?;
+    let decay_half_life_blocks = d.u64()?; // M187 (§6.2)
     let slash_bps = d.u32()?;
     let mut genesis_hash = [0u8; 32];
     genesis_hash.copy_from_slice(d.take(32)?);
@@ -1624,6 +1631,7 @@ pub fn decode_snapshot(buf: &[u8]) -> Result<ChainState, CodecError> {
         contributions,
         params,
         base_emission_micro,
+        decay_half_life_blocks,
         slash_bps,
         supply,
         treasury,
@@ -3674,6 +3682,7 @@ mod tests {
             seed_nodes: vec![(emb, 0)],
             params: DeltaKParams::default(),
             base_emission_micro: 8 * MICRO,
+            decay_half_life_blocks: 0,
             slash_bps: 10_000,
             timestamp_days: 1.5,
             validators: vec![(21, pk(21), 3), (22, pk(22), 1)],

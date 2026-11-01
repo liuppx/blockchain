@@ -1004,6 +1004,10 @@ pub struct GenesisConfig {
     #[serde(default)]
     pub seed_nodes: Vec<SeedNodeConfig>,
     pub base_emission_micro: u64,
+    /// M187 (§6.2): emission time-decay half-life in blocks. Optional; defaults to
+    /// `0` (decay disabled → mint factor `1.0`, unchanged behavior).
+    #[serde(default)]
+    pub decay_half_life_blocks: u64,
     pub slash_bps: u32,
     #[serde(default)]
     pub timestamp_days: f32,
@@ -1093,6 +1097,7 @@ impl GenesisConfig {
             seed_nodes,
             params: DeltaKParams::default(),
             base_emission_micro: self.base_emission_micro,
+            decay_half_life_blocks: self.decay_half_life_blocks,
             slash_bps: self.slash_bps,
             timestamp_days: self.timestamp_days,
             validators,
@@ -2311,6 +2316,7 @@ mod tests {
                 domain: 0,
             }],
             base_emission_micro: 8 * crate::MICRO,
+            decay_half_life_blocks: 0,
             slash_bps: 10_000,
             timestamp_days: 0.0,
             validators: (21..=24)
@@ -2359,6 +2365,7 @@ mod tests {
             reviewers: vec![],
             seed_nodes: vec![],
             base_emission_micro: 0,
+            decay_half_life_blocks: 0,
             slash_bps: 0,
             timestamp_days: 0.0,
             validators: vec![],
@@ -2687,6 +2694,7 @@ mod tests {
                 domain: 0,
             }],
             base_emission_micro: 8 * crate::MICRO,
+            decay_half_life_blocks: 0,
             slash_bps: 10_000,
             timestamp_days: 0.0,
             validators: (21..=24)

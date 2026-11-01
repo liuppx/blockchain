@@ -496,6 +496,7 @@ mod tests {
             seed_nodes: vec![(unit(0), 0)],
             params: DeltaKParams::default(),
             base_emission_micro: 8 * MICRO,
+            decay_half_life_blocks: 0,
             slash_bps: 10_000,
             timestamp_days: 0.0,
             validators: vec![

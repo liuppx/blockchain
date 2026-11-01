@@ -3197,6 +3197,7 @@ mod tests {
             seed_nodes: vec![(unit(0), 0)],
             params: DeltaKParams::default(),
             base_emission_micro: 8 * MICRO,
+            decay_half_life_blocks: 0,
             slash_bps: 10_000,
             timestamp_days: 0.0,
             validators: [21u64, 22, 23, 24]
@@ -3399,6 +3400,7 @@ mod tests {
             seed_nodes: vec![],
             params: DeltaKParams::default(),
             base_emission_micro: 0,
+            decay_half_life_blocks: 0,
             slash_bps: 10_000,
             timestamp_days: 0.0,
             validators: vec![(21, kp(21).public(), 1)],
@@ -3448,6 +3450,7 @@ mod tests {
             seed_nodes: vec![],
             params: DeltaKParams::default(),
             base_emission_micro: 0,
+            decay_half_life_blocks: 0,
             slash_bps: 10_000,
             timestamp_days: 0.0,
             validators: vec![(21, kp(21).public(), 1)],

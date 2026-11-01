@@ -701,6 +701,21 @@ impl Cnft {
     }
 }
 
+/// M187 (§6.2): the emission time-decay factor at `height` for a given
+/// `half_life` (in blocks). `time_decay = 0.5^(height / half_life)` — a
+/// contribution at height `half_life` earns half the base reward, at `2·half_life`
+/// a quarter, and so on, biasing emission toward early (bootstrap-era)
+/// contributions. `half_life == 0` disables decay and returns exactly `1.0`, so a
+/// chain that doesn't opt in mints unchanged. Pure `f64` of two integers →
+/// deterministic across nodes (same reproducibility class as the existing
+/// `base_emission × ΔK` rounding).
+pub fn time_decay_factor(height: u64, half_life: u64) -> f64 {
+    if half_life == 0 {
+        return 1.0;
+    }
+    0.5_f64.powf(height as f64 / half_life as f64)
+}
+
 /// A withdrawal in flight: `amount` micro-$COG unbonded by `account`, returning
 /// to its balance once the chain reaches `mature_height`. Until then the funds
 /// are neither in a balance nor in the validator's power — they sit here, still
@@ -798,6 +813,14 @@ pub struct ChainState {
     pub params: DeltaKParams,
     /// micro-$COG minted per unit ΔK (governance knob, B.2.3 / §5.1).
     pub base_emission_micro: u64,
+    /// M187 (§6.2): emission time-decay half-life in blocks. The $COG mint
+    /// formula is `base_emission × impact(ΔK) × time_decay`, where
+    /// `time_decay = 0.5^(height / half_life)` rewards early contributions more
+    /// and tapers with chain age. **`0` disables decay** (factor `1.0`), which
+    /// is the default — so a chain that doesn't set it mints exactly as before
+    /// (no re-baseline). A governance constant like `base_emission_micro`; not
+    /// folded into `state_root` (same as the other params).
+    pub decay_half_life_blocks: u64,
     /// Fraction of stake slashed on reject, in basis points (10000 = 100%).
     pub slash_bps: u32,
     pub supply: u64,   // total $COG in existence (micro)
@@ -866,6 +889,9 @@ pub struct Genesis {
     pub seed_nodes: Vec<(Embedding, u32)>, // pre-existing graph nodes
     pub params: DeltaKParams,
     pub base_emission_micro: u64,
+    /// M187 (§6.2): emission time-decay half-life in blocks (`0` = disabled).
+    /// See [`ChainState::decay_half_life_blocks`].
+    pub decay_half_life_blocks: u64,
     pub slash_bps: u32,
     pub timestamp_days: f32,
     /// The initial validator set (id, pubkey, voting power). Consensus over
@@ -1397,6 +1423,7 @@ impl ChainState {
             contributions: BTreeMap::new(),
             params: g.params,
             base_emission_micro: g.base_emission_micro,
+            decay_half_life_blocks: g.decay_half_life_blocks,
             slash_bps: g.slash_bps,
             supply,
             treasury: 0,
@@ -2261,7 +2288,14 @@ impl ChainState {
         // -- finalize: mint or slash ----------------------------------------
         let (minted, slashed, accepted);
         if dk > 0.0 {
-            let reward = ((self.base_emission_micro as f64) * (dk as f64)).round() as u64;
+            // M187 (§6.2): mint = base_emission × impact(ΔK) × time_decay. The
+            // contribution commits at `self.height + 1` (height is bumped at the
+            // end of `apply_block_inner`), so decay is measured at that height —
+            // identical to the cNFT `height` field. `decay_half_life_blocks == 0`
+            // makes the factor exactly `1.0`, so a chain that doesn't opt in mints
+            // precisely as before (no re-baseline).
+            let decay = time_decay_factor(self.height + 1, self.decay_half_life_blocks);
+            let reward = ((self.base_emission_micro as f64) * (dk as f64) * decay).round() as u64;
             {
                 let acct = self.accounts.get_mut(&tx.author).unwrap();
                 acct.balance += tx.stake + reward; // escrow returned + reward
@@ -3028,6 +3062,7 @@ mod tests {
             seed_nodes: vec![(unit(1.0, 0), 0)], // domain 0 already occupied
             params: DeltaKParams::default(),
             base_emission_micro: 8 * MICRO,
+            decay_half_life_blocks: 0,
             slash_bps: 10_000,
             timestamp_days: 0.0,
             validators: vec![
@@ -3186,6 +3221,58 @@ mod tests {
         assert_ne!(r0, more.state_root(), "a cNFT changes state_root");
         // merkle_root (accounts_root) is unaffected — cNFTs are not in it.
         assert_eq!(base.state.merkle_root(), more.merkle_root());
+    }
+
+    #[test]
+    fn time_decay_factor_halves_each_half_life() {
+        // M187 (§6.2): disabled (half_life 0) is always 1.0; otherwise it's
+        // 0.5^(height/half_life) — 1.0 at height 0, 0.5 at one half-life, 0.25 at two.
+        assert_eq!(time_decay_factor(0, 0), 1.0);
+        assert_eq!(time_decay_factor(100, 0), 1.0);
+        assert_eq!(time_decay_factor(0, 10), 1.0);
+        assert!((time_decay_factor(10, 10) - 0.5).abs() < 1e-12);
+        assert!((time_decay_factor(20, 10) - 0.25).abs() < 1e-12);
+        let mid = time_decay_factor(5, 10);
+        assert!(
+            mid < 1.0 && mid > 0.5,
+            "monotone decreasing within a half-life"
+        );
+    }
+
+    #[test]
+    fn emission_time_decay_reduces_mint_with_chain_age() {
+        // M187 (§6.2): mint = base_emission × ΔK × time_decay. With decay disabled
+        // (half_life 0, the default) an accepted submission mints exactly base × ΔK;
+        // with decay enabled the SAME submission (same ΔK) mints strictly less,
+        // scaled by 0.5^(height/half_life).
+        let tx = novel_tx(1, 1, 1, 1.0);
+
+        let mut g0 = base_genesis();
+        g0.decay_half_life_blocks = 0;
+        let mut c0 = Chain::new(g0);
+        let mut b0 = block(&c0, 1, vec![tx.clone()]);
+        let r0 = c0.commit(&mut b0).unwrap();
+        assert_eq!(r0.accepted, 1);
+        assert!(r0.minted > 0);
+        let dk = r0.txs[0].delta_k;
+        // Disabled path mints exactly the un-decayed base × ΔK.
+        let base_x_dk = ((c0.state.base_emission_micro as f64) * (dk as f64)).round() as u64;
+        assert_eq!(r0.minted, base_x_dk);
+
+        let mut g1 = base_genesis();
+        g1.decay_half_life_blocks = 4;
+        let mut c1 = Chain::new(g1);
+        let mut b1 = block(&c1, 1, vec![tx]);
+        let r1 = c1.commit(&mut b1).unwrap();
+        assert_eq!(r1.accepted, 1);
+        assert_eq!(r1.txs[0].delta_k, dk, "decay does not touch the ΔK engine");
+        assert!(r1.minted < r0.minted, "decay reduces the mint");
+        let expected =
+            ((c1.state.base_emission_micro as f64) * (dk as f64) * time_decay_factor(1, 4)).round()
+                as u64;
+        assert_eq!(r1.minted, expected);
+        // Supply is still conserved under decay (mint credited to both sides).
+        assert!(c1.state.supply_conserved());
     }
 
     #[test]

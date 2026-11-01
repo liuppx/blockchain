@@ -1851,6 +1851,7 @@ async fn run_actor(mut actor: Actor, mut rx: mpsc::UnboundedReceiver<Cmd>) {
                 let s = &actor.node.chain.state;
                 let _ = reply.send(ParamsView {
                     base_emission_micro: s.base_emission_micro,
+                    decay_half_life_blocks: s.decay_half_life_blocks,
                     slash_bps: s.slash_bps,
                     tau_dup: s.params.tau_dup,
                     n_review_min: s.params.n_review_min,
@@ -4906,6 +4907,7 @@ fn json_supply(s: &SupplyView) -> String {
 /// policy produced a given chain without diffing the genesis.
 struct ParamsView {
     base_emission_micro: u64,
+    decay_half_life_blocks: u64,
     slash_bps: u32,
     tau_dup: f32,
     n_review_min: usize,
@@ -4922,8 +4924,8 @@ struct ParamsView {
 /// the integer ones lossless and the f32 ones via `json_f32` so NaN/inf can't leak).
 fn format_params(p: &ParamsView) -> String {
     let mut out = format!(
-        "base_emission_micro={}\nslash_bps={}",
-        p.base_emission_micro, p.slash_bps,
+        "base_emission_micro={}\ndecay_half_life_blocks={}\nslash_bps={}",
+        p.base_emission_micro, p.decay_half_life_blocks, p.slash_bps,
     );
     out.push_str(&format!(
         "\ntau_dup={}\nn_review_min={}\nc_cap={}\nn_min={}\nlam={}\nbonus_max={}\ndecay={}\nfresh_min={}\ndelta_k_min={}",
@@ -4944,8 +4946,9 @@ fn format_params(p: &ParamsView) -> String {
 /// object, mirroring the field names of [`ParamsView`].
 fn json_params(p: &ParamsView) -> String {
     format!(
-        "{{\"base_emission_micro\":{},\"slash_bps\":{},\"tau_dup\":{},\"n_review_min\":{},\"c_cap\":{},\"n_min\":{},\"lam\":{},\"bonus_max\":{},\"decay\":{},\"fresh_min\":{},\"delta_k_min\":{}}}",
+        "{{\"base_emission_micro\":{},\"decay_half_life_blocks\":{},\"slash_bps\":{},\"tau_dup\":{},\"n_review_min\":{},\"c_cap\":{},\"n_min\":{},\"lam\":{},\"bonus_max\":{},\"decay\":{},\"fresh_min\":{},\"delta_k_min\":{}}}",
         json_u64(p.base_emission_micro),
+        json_u64(p.decay_half_life_blocks),
         json_u64(p.slash_bps as u64),
         json_f32(p.tau_dup),
         json_u64(p.n_review_min as u64),
@@ -8954,6 +8957,7 @@ mod tests {
             seed_nodes: vec![(unit(0), 0)],
             params: DeltaKParams::default(),
             base_emission_micro: 8 * MICRO,
+            decay_half_life_blocks: 0,
             slash_bps: 10_000,
             timestamp_days: 0.0,
             validators: [21u64, 22, 23, 24]
@@ -10808,6 +10812,7 @@ mod tests {
             seed_nodes: vec![],
             params: DeltaKParams::default(),
             base_emission_micro: 0,
+            decay_half_life_blocks: 0,
             slash_bps: 10_000,
             timestamp_days: 0.0,
             validators: vec![(21, kp(21).public(), 1)],
@@ -14240,6 +14245,7 @@ mod tests {
             seed_nodes: vec![(unit(0), 0)],
             params: DeltaKParams::default(),
             base_emission_micro: 0,
+            decay_half_life_blocks: 0,
             slash_bps: 10_000,
             timestamp_days: 0.0,
             validators: vec![(21, kp(21).public(), 1)],
@@ -14893,6 +14899,7 @@ vote_b.validator=5 vote_b.height=9 vote_b.round=2 vote_b.block_hash={b_h} vote_b
         // field names as a quoted-u64 / JSON-number object.
         let p = ParamsView {
             base_emission_micro: 1_000,
+            decay_half_life_blocks: 0,
             slash_bps: 500,
             tau_dup: 0.95,
             n_review_min: 3,
@@ -14906,7 +14913,7 @@ vote_b.validator=5 vote_b.height=9 vote_b.round=2 vote_b.block_hash={b_h} vote_b
         };
         let text = format_params(&p);
         assert!(
-            text.starts_with("base_emission_micro=1000\nslash_bps=500\n"),
+            text.starts_with("base_emission_micro=1000\ndecay_half_life_blocks=0\nslash_bps=500\n"),
             "{text}"
         );
         assert!(text.contains("tau_dup=0.95\n"), "{text}");
@@ -14916,6 +14923,7 @@ vote_b.validator=5 vote_b.height=9 vote_b.round=2 vote_b.block_hash={b_h} vote_b
 
         let json = json_params(&p);
         assert!(json.contains("\"base_emission_micro\":\"1000\""), "{json}");
+        assert!(json.contains("\"decay_half_life_blocks\":\"0\""), "{json}");
         assert!(json.contains("\"slash_bps\":\"500\""), "{json}");
         assert!(json.contains("\"tau_dup\":0.95"), "{json}");
         assert!(json.contains("\"n_review_min\":\"3\""), "{json}");
@@ -15348,6 +15356,7 @@ vote_b.validator=5 vote_b.height=9 vote_b.round=2 vote_b.block_hash={b_h} vote_b
             seed_nodes: vec![],
             params: DeltaKParams::default(),
             base_emission_micro: 0,
+            decay_half_life_blocks: 0,
             slash_bps: 10_000,
             timestamp_days: 0.0,
             validators: vec![(21, kp(21).public(), 1)],
