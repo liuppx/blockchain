@@ -1,0 +1,92 @@
+name: CI
+
+# M189 (production-readiness #3): fmt / test gates + cross-arch determinism +
+# dependency audit. The `engine/` and `node/` crates are standalone (no workspace),
+# so each step runs in both directories.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+# Cancel superseded runs on the same ref to save CI minutes.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings # deny compiler warnings (not clippy lints — see the clippy step)
+
+jobs:
+  test:
+    name: fmt + clippy + test (${{ matrix.os }})
+    # ubuntu-latest = x86_64, macos-latest = arm64. Running the full suite on both
+    # validates the M188 float-determinism bit-anchors across architectures: the
+    # `*_is_bit_deterministic` tests pin libm's exp/pow bit patterns, so a cross-arch
+    # divergence (the consensus-fork risk) would fail CI here.
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust (stable + rustfmt + clippy)
+        run: |
+          rustup toolchain install stable --profile minimal --component rustfmt clippy
+          rustup default stable
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            engine/target
+            node/target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-
+
+      - name: rustfmt --check (gate)
+        run: |
+          (cd engine && cargo fmt --check)
+          (cd node && cargo fmt --check)
+
+      - name: clippy (advisory — reported, not gated)
+        # 14 pre-existing style lints (is_multiple_of, needless refs, a couple of
+        # intentional too-many-args / large-const-array). Kept non-blocking until a
+        # dedicated clippy-cleanup milestone; `RUSTFLAGS=-D warnings` above still
+        # denies real compiler warnings.
+        continue-on-error: true
+        run: |
+          (cd engine && cargo clippy --release --all-targets)
+          (cd node && cargo clippy --release --all-targets)
+
+      - name: test (gate) — single-threaded to avoid RPC port collisions
+        run: |
+          (cd engine && cargo test --release)
+          (cd node && cargo test --release -- --test-threads=1)
+
+  audit:
+    name: cargo-audit (dependency advisories)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust (stable)
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --locked
+      - name: audit engine + node (advisory)
+        # Advisory (reported, non-blocking) on first landing: the dependency tree
+        # hasn't been confirmed advisory-clean in this environment, so a surprise
+        # RUSTSEC would otherwise red-fail every run. Promote to a hard gate (drop
+        # `continue-on-error`) once a clean baseline is confirmed.
+        continue-on-error: true
+        run: |
+          (cd engine && cargo audit)
+          (cd node && cargo audit)

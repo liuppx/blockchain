@@ -3857,4 +3857,106 @@ mod tests {
             "adding a consumed-unbond entry must change state_root"
         );
     }
+
+    /// M189: codec robustness ("fuzz-lite"). The hand-written decoders parse
+    /// attacker-controlled bytes off the wire/disk, so they must **never panic**
+    /// (index-out-of-bounds, slice overrun, arithmetic overflow) and must **never**
+    /// allocate unboundedly from a forged length prefix — only ever return
+    /// `Ok`/`Err`. This drives every public `decode_*` entry with empty, truncated,
+    /// random, and forged-huge-length inputs; any panic fails the test (the panic
+    /// propagates). A deterministic xorshift PRNG keeps it reproducible (no dep, no
+    /// nightly — runs on every target in CI, complementing the `cargo-fuzz` targets).
+    #[test]
+    fn decoders_reject_adversarial_bytes_without_panicking() {
+        // Deterministic xorshift64* — reproducible across runs/targets.
+        struct Rng(u64);
+        impl Rng {
+            fn next(&mut self) -> u64 {
+                let mut x = self.0;
+                x ^= x >> 12;
+                x ^= x << 25;
+                x ^= x >> 27;
+                self.0 = x;
+                x.wrapping_mul(0x2545F4914F6CDD1D)
+            }
+            fn bytes(&mut self, len: usize) -> Vec<u8> {
+                (0..len).map(|_| (self.next() & 0xff) as u8).collect()
+            }
+        }
+
+        // Each decoder, type-erased to `&[u8] -> ()` (we only care that it returns
+        // rather than panics / hangs / OOMs). `let _ =` swallows the Result.
+        type Dec = fn(&[u8]);
+        let decoders: &[Dec] = &[
+            |b| {
+                let _ = decode_block(b);
+            },
+            |b| {
+                let _ = decode_header(b);
+            },
+            |b| {
+                let _ = decode_certified_header(b);
+            },
+            |b| {
+                let _ = decode_snapshot(b);
+            },
+            |b| {
+                let _ = decode_commit(b);
+            },
+            |b| {
+                let _ = decode_consensus_msg(b);
+            },
+            |b| {
+                let _ = decode_validator_set(b);
+            },
+            |b| {
+                let _ = decode_tx(b);
+            },
+            |b| {
+                let _ = decode_proof_entry(b);
+            },
+            |b| {
+                let _ = decode_proof(b);
+            },
+            |b| {
+                let _ = decode_account(b);
+            },
+            |b| {
+                let _ = decode_bridge_lock(b);
+            },
+            |b| {
+                let _ = decode_key_rotation(b);
+            },
+            |b| {
+                let _ = crate::net::decode_gossip(b);
+            },
+        ];
+
+        let mut rng = Rng(0x9E3779B97F4A7C15);
+        for dec in decoders {
+            // Degenerate inputs.
+            dec(&[]);
+            dec(&[0u8]);
+            // Random buffers of varied lengths (incl. lengths near header/field sizes).
+            for &len in &[1usize, 2, 7, 8, 16, 31, 32, 64, 96, 220, 252, 300, 1024] {
+                for _ in 0..40 {
+                    dec(&rng.bytes(len));
+                }
+            }
+            // Forged length prefixes: a leading big-endian u64 claiming a huge item
+            // count, then a few trailing bytes. Exercises the `Dec::count()`
+            // `MAX_ITEMS` cap (M174) — must `Err`, not try to allocate billions.
+            for &claim in &[u64::MAX, 1 << 40, 10_000_000, MAX_ITEMS + 1] {
+                let mut buf = claim.to_be_bytes().to_vec();
+                buf.extend_from_slice(&rng.bytes(16));
+                dec(&buf);
+                // Also with the claim deeper in the buffer (after a plausible header-ish prefix).
+                let mut buf2 = rng.bytes(64);
+                buf2.extend_from_slice(&claim.to_be_bytes());
+                buf2.extend_from_slice(&rng.bytes(8));
+                dec(&buf2);
+            }
+        }
+        // Reaching here = no decoder panicked on any adversarial input.
+    }
 }

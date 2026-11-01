@@ -17781,7 +17781,6 @@ vote_b.validator=5 vote_b.height=9 vote_b.round=2 vote_b.block_hash={b_h} vote_b
         //     single-validator quorum) serves as 200 with `height=4`.
         // The plan's HTTP safety proof: the snapshot-boot path serves forward but
         // refuses backward.
-        use crate::config::SnapshotBootConfig;
         use crate::driver::ChainDriver;
 
         // 1. offline chain (single validator → node can self-certify post-boot).

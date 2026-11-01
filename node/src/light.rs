@@ -3514,7 +3514,6 @@ mod tests {
     /// A different genesis that produces a validator set the cert at height 1 was NOT signed
     /// by (different ids), so `verify_snapshot_against_header` can fail on the cert step.
     fn alt_genesis() -> Genesis {
-        use crate::validator::Validator;
         let mut g = base_genesis();
         g.validators = vec![(99, kp(99).public(), 1)];
         g.accounts = vec![(99, 30 * crate::MICRO, kp(99).public())];

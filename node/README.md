@@ -1467,6 +1467,19 @@ M185 把 cNFT SPV 的 wire 根（`contributions_root`）+ 证明类型（`ProofE
 - **测试（+1 → 701 node / +1 → 11 engine）**：`node` `time_decay_factor_is_bit_deterministic`（钉死 `pow(0.5,1/4)` = `0x3feae89f995ad3ae`、`pow(0.5,3/7)` = `0x3fe7c6a1f29e2ce6` 的 `.to_bits()`；整数指幂 `0.5^(10/10)`=0.5、`0.5^(20/10)`=0.25 仍精确）+ `engine` `freshness_exp_is_bit_deterministic`（钉死 `libm::expf(-0.3)` = `0x3f3da644`）。这两个**确定性锚点**：任何回退到 std `exp`/`powf`、或 libm 大版本改了结果，都会立刻失败并提示。
 - **已知边界 / 非目标**：std 基础算术 + `.sqrt()` 本就 IEEE 确定性，不动；**多架构交叉验证 CI**（在 aarch64/x86_64 上跑同一向量断言位级一致）是生产评估 **#3** 的一部分，另行；外部审计是 **#2**。本轮只消除共识数学的平台依赖。
 
+## CI 门禁 + codec 鲁棒性 + 跨架构确定性（Milestone 189 · 生产就绪评估 #3）
+
+生产就绪评估 **#3**：仓库此前**无 CI、无依赖审计、无 fuzz**，而手写 codec 解析来自网络/磁盘的攻击者可控字节，是典型的高危面。M189 一次把这三样落地。
+
+- **CI（`.github/workflows/ci.yml`）**：`engine`/`node` 是独立 crate（无 workspace），每步在两个目录各跑。
+  - **跨架构矩阵**：`test` job 跑 `ubuntu-latest`(x86_64) + `macos-latest`(arm64)。这把 M188 的 `*_is_bit_deterministic` 位锚点**跨架构验证**——若 libm 的 `exp`/`pow` 在 arm64 与 x86_64 产出不同位（正是会让共识分叉的那种差异），CI 立刻红。这是 M188 "确定性"从"单机断言"升级为"跨架构保证"的闭环。
+  - **门禁**：`cargo fmt --check` + `cargo test`（node `--test-threads=1` 避 RPC 端口冲突）+ `RUSTFLAGS=-D warnings`（把编译器告警升为错误）。
+  - **advisory（非阻塞）**：`clippy`（14 条既有风格 lint——`is_multiple_of`/needless-ref 等 + 个别有意的 too-many-args/large-const-array——留待专门清理里程碑）；`cargo-audit`（依赖漏洞，待确认干净基线后去掉 `continue-on-error` 升为门禁）。
+- **`-D warnings` 配套清理**：为让门禁真实通过，清掉两个编译器确认的死 import（`daemon.rs` 的 `config::SnapshotBootConfig`——同作用域已有全限定用法；`light.rs` `alt_genesis` 的 `validator::Validator`——该函数只用元组）。engine + node 现以 `-D warnings` 干净编译（本地实测）。
+- **codec 鲁棒性测（fuzz-lite）**：`decoders_reject_adversarial_bytes_without_panicking`（`codec.rs`）——纯 std 的确定性 xorshift64\* PRNG（无 dep、无 nightly，CI 每架构都跑），用空/单字节/多种长度随机/**伪造超长 length-prefix**（`u64::MAX`、`1<<40`、`MAX_ITEMS+1`，置于头部及深处）轰击 **14 个公开 `decode_*` 入口**（block、header、certified_header、snapshot、commit、consensus_msg、validator_set、tx、proof_entry、proof、account、bridge_lock、key_rotation、gossip）。断言：**永不 panic**（越界/溢出）、**永不**因伪造计数无界分配（正面验证 M174 的 `Dec::count()` `MAX_ITEMS` 上限）——只返回 `Ok`/`Err`。跑到结尾 = 无 panic。
+- **测试（+1 → 702）**：上面的 fuzz-lite 测（M188 的两个位锚点在 M189 的跨架构矩阵里获得真正的多架构执行）。
+- **已知边界 / 非目标**：GitHub Actions 与 nightly `cargo-fuzz` 无法在本地环境验证——CI 在 GitHub 上跑；其底层命令（`fmt --check`、`test`、`-D warnings` 编译）已本地逐一验证通过。深度 `cargo-fuzz` 持久语料、clippy 14 lint 清理、`cargo-audit` 升门禁、CI 缓存调优均另行。生产评估剩余项：**#2** 外部审计（排期长，宜并行启动）、#4 wire 版本协商、#5 SIGTERM、#6 治理、#7 经济参数校准。
+
 ## pending keystore 交互式密码提示（Milestone 181）
 
 收尾 M180 留的小口：M180 的 pending 加密 keystore 只从 `ZHIXING_PENDING_KEYSTORE_PASSWORD` 读密码，缺失即硬失败——与活跃 keystore（M175 `read_keystore_password`：env 优先、否则交互 no-echo 提示）不一致。
