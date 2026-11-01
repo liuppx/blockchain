@@ -1579,6 +1579,18 @@ M193–M195 把治理做到 3 个标量旋钮（`base_emission_micro` / `slash_b
 - **测试（+2 → 723）**：`route_get_parses_proposals`（`/proposals` ⇒ `Proposals`、`/proposals/` ⇒ `Health`）+ `proposal_listing_renders`（空目录 ⇒ `""`/`[]`；一个标量提案 + 一个 DeltaK 提案的 text `key=value` 行与 JSON 逐字节，含 `votes=3 yes=2` 票数）；`/routes` 漂移守卫自动覆盖。
 - **已知边界 / 非目标**：HTTP `POST` **发起** gov op（写面，需 tx-submission 式 POST 处理器 + daemon 发起 Cmd + flood，另行）；`/proposal/{id}` 单读（`/proposals` 已是明文视图）。
 
+## 治理写面：HTTP 发起 gov op（Milestone 198 · 生产就绪评估 #6 收尾·写面）
+
+M197 让钱包能**查**提案（`GET /proposals`）；M198 让钱包能**发起**——治理对 HTTP 钱包彻底打通。新增 `POST /gov/proposal` / `POST /gov/vote`：body 为 raw codec 编码的 op，节点验签后暂存 + flood，回 `{"hash":…}`。照抄 tx-submission 路径。
+
+- **actor Cmd**：`Cmd::SubmitGovProposal` / `SubmitGovVote`（`daemon.rs`）。handler 查提交者账户（`state.accounts.get`）+ `verify` 签名——**提交时即拒绝 garbage，不污染 gossip**（比 M179 key-rotation 的"提交不验、apply 才验"更严）；sig ok 则 `submit_local_gov_*`（M195）暂存 + `actor.route` flood，回 op hash。nonce / 窗口 / 双门槛仍在 **apply 时**查（提交时账户 nonce 可能因其他 pending op 而"超前"，不宜在提交时硬查）。未知账户 → `UnknownAccount`，坏签名 → `BadSignature`。
+- **Node 句柄**：`submit_gov_proposal` / `submit_gov_vote`（回 `Option<Result<Hash, ChainError>>`）+ `proposals`（包 `Cmd::QueryProposals`，读句柄）。
+- **serve POST**：在 tx 解码**之前**分 `/gov/proposal` / `/gov/vote` 两路——解码失败 400、坏签名/未知账户 422、成功 200 + `{"hash":…}`。两端点在既有 **bearer-auth 门之后**（写面受保护，与 tx 提交同级；`/batch`/`/validate`/`GET` 仍公开）。
+- **无状态/共识/wire 变更**（纯 ingress 读写面；demo/localnet 头与 state_root 不变）。
+- **测试（+1 → 724）**：`submit_gov_proposal_stages_registers_and_rejects_bad_sig`（单验证人进程内经 `Node::submit_gov_proposal` 提交合法提案 → 轮询 `proposals()` 直到其被出块注册；错误签名者的提案 → `BadSignature`，不入池）。非 socket，不引入 flaky。
+- **里程碑收束 · 治理读写全通**：`GET /proposals` 查（M197）+ `POST /gov/{proposal,vote}` 发起（M198）+ gossip 预传播（M195）+ 区块携带（M194）+ 到期双门槛执行（M193）+ 全 4 组参数（M196）。
+- **已知边界 / 非目标**：`/proposal/{id}` 单读（`/proposals` 已是明文视图）；CLI 子命令（HTTP 已足够，运维可 `curl`）。
+
 ## pending keystore 交互式密码提示（Milestone 181）
 
 收尾 M180 留的小口：M180 的 pending 加密 keystore 只从 `ZHIXING_PENDING_KEYSTORE_PASSWORD` 读密码，缺失即硬失败——与活跃 keystore（M175 `read_keystore_password`：env 优先、否则交互 no-echo 提示）不一致。

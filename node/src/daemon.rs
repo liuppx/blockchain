@@ -440,6 +440,18 @@ enum Cmd {
         tx: Box<SubmissionTx>,
         reply: oneshot::Sender<Result<Hash, crate::ChainError>>,
     },
+    /// M198: a governance proposal / vote submitted via the external ingress RPC.
+    /// Signature + account existence are checked here (cheap, rejects garbage before
+    /// flooding); nonce / window / quorum are enforced at block apply. On success the
+    /// op is staged + flooded and the op hash is returned.
+    SubmitGovProposal {
+        op: Box<crate::GovProposal>,
+        reply: oneshot::Sender<Result<Hash, crate::ChainError>>,
+    },
+    SubmitGovVote {
+        op: Box<crate::GovVote>,
+        reply: oneshot::Sender<Result<Hash, crate::ChainError>>,
+    },
     /// M115: a pre-flight validation — run `validate_tx` against current committed state
     /// WITHOUT admitting the tx to the mempool. A wallet checks acceptability before
     /// actually submitting. `Ok(())` ⇒ would be accepted; `Err` ⇒ would be rejected (reason).
@@ -988,6 +1000,45 @@ impl Node {
                 reply,
             })
             .ok()?;
+        rx.await.ok()
+    }
+
+    /// M198: submit a governance proposal / vote through the external-ingress path.
+    /// `Ok(hash)` once staged + flooded (sig verified); `Err` on bad sig / unknown
+    /// account. `None` if the actor has stopped.
+    pub async fn submit_gov_proposal(
+        &self,
+        op: crate::GovProposal,
+    ) -> Option<Result<Hash, crate::ChainError>> {
+        let (reply, rx) = oneshot::channel();
+        self.cmd
+            .send(Cmd::SubmitGovProposal {
+                op: Box::new(op),
+                reply,
+            })
+            .ok()?;
+        rx.await.ok()
+    }
+
+    pub async fn submit_gov_vote(
+        &self,
+        op: crate::GovVote,
+    ) -> Option<Result<Hash, crate::ChainError>> {
+        let (reply, rx) = oneshot::channel();
+        self.cmd
+            .send(Cmd::SubmitGovVote {
+                op: Box::new(op),
+                reply,
+            })
+            .ok()?;
+        rx.await.ok()
+    }
+
+    /// M198: snapshot the id-sorted active governance proposals (read handle for the
+    /// `GET /proposals` directory + tests). `None` if the actor has stopped.
+    pub async fn proposals(&self) -> Option<Vec<crate::Proposal>> {
+        let (reply, rx) = oneshot::channel();
+        self.cmd.send(Cmd::QueryProposals { reply }).ok()?;
         rx.await.ok()
     }
 
@@ -1675,6 +1726,46 @@ async fn run_actor(mut actor: Actor, mut rx: mpsc::UnboundedReceiver<Cmd>) {
                         let _ = reply.send(Err(e));
                     }
                 }
+            }
+            Cmd::SubmitGovProposal { op, reply } => {
+                // M198: verify sig against the proposer's account key, then stage + flood.
+                let res = match actor.node.chain.state.accounts.get(&op.proposer) {
+                    Some(acct)
+                        if verify(
+                            &acct.pubkey,
+                            &crate::codec::govproposal_signing_bytes(&op),
+                            &op.signature,
+                        ) =>
+                    {
+                        let h = op.hash();
+                        let out = actor.node.submit_local_gov_proposal(*op);
+                        actor.route(out);
+                        Ok(h)
+                    }
+                    Some(_) => Err(crate::ChainError::BadSignature(op.proposer)),
+                    None => Err(crate::ChainError::UnknownAccount(op.proposer)),
+                };
+                let _ = reply.send(res);
+            }
+            Cmd::SubmitGovVote { op, reply } => {
+                // M198: verify sig against the voter's account key, then stage + flood.
+                let res = match actor.node.chain.state.accounts.get(&op.voter) {
+                    Some(acct)
+                        if verify(
+                            &acct.pubkey,
+                            &crate::codec::govvote_signing_bytes(&op),
+                            &op.signature,
+                        ) =>
+                    {
+                        let h = op.hash();
+                        let out = actor.node.submit_local_gov_vote(*op);
+                        actor.route(out);
+                        Ok(h)
+                    }
+                    Some(_) => Err(crate::ChainError::BadSignature(op.voter)),
+                    None => Err(crate::ChainError::UnknownAccount(op.voter)),
+                };
+                let _ = reply.send(res);
             }
             Cmd::ValidateTx { tx, reply } => {
                 // M115: read-only pre-flight — static validation against current state, no
@@ -7294,6 +7385,82 @@ async fn serve_rpc_conn(
     }
     body.truncate(len);
 
+    // M198: governance op submission (writes; already behind the bearer-auth gate above).
+    // `POST /gov/proposal` / `POST /gov/vote` carry a raw codec-encoded op; the actor
+    // verifies the signature, stages, and floods, replying the op hash.
+    if path == "/gov/proposal" {
+        let op = match crate::codec::decode_gov_proposal(&body) {
+            Ok(op) => op,
+            Err(e) => {
+                let _ = stream
+                    .write_all(error_body(fmt, "400 Bad Request", &e.to_string()).as_bytes())
+                    .await;
+                let _ = stream.flush().await;
+                return;
+            }
+        };
+        let (reply, rx) = oneshot::channel();
+        if cmd
+            .send(Cmd::SubmitGovProposal {
+                op: Box::new(op),
+                reply,
+            })
+            .is_err()
+        {
+            let _ = stream
+                .write_all(http_response("503 Service Unavailable", "node stopped").as_bytes())
+                .await;
+            return;
+        }
+        let resp = match rx.await {
+            Ok(Ok(h)) => {
+                let hex = crate::hash::hex(&h);
+                ok_body(fmt, &hex, &format!("{{\"hash\":{}}}", json_str(&hex)))
+            }
+            Ok(Err(e)) => error_body(fmt, "422 Unprocessable Entity", &e.to_string()),
+            Err(_) => http_response("503 Service Unavailable", "node stopped"),
+        };
+        let _ = stream.write_all(resp.as_bytes()).await;
+        let _ = stream.flush().await;
+        return;
+    }
+    if path == "/gov/vote" {
+        let op = match crate::codec::decode_gov_vote(&body) {
+            Ok(op) => op,
+            Err(e) => {
+                let _ = stream
+                    .write_all(error_body(fmt, "400 Bad Request", &e.to_string()).as_bytes())
+                    .await;
+                let _ = stream.flush().await;
+                return;
+            }
+        };
+        let (reply, rx) = oneshot::channel();
+        if cmd
+            .send(Cmd::SubmitGovVote {
+                op: Box::new(op),
+                reply,
+            })
+            .is_err()
+        {
+            let _ = stream
+                .write_all(http_response("503 Service Unavailable", "node stopped").as_bytes())
+                .await;
+            return;
+        }
+        let resp = match rx.await {
+            Ok(Ok(h)) => {
+                let hex = crate::hash::hex(&h);
+                ok_body(fmt, &hex, &format!("{{\"hash\":{}}}", json_str(&hex)))
+            }
+            Ok(Err(e)) => error_body(fmt, "422 Unprocessable Entity", &e.to_string()),
+            Err(_) => http_response("503 Service Unavailable", "node stopped"),
+        };
+        let _ = stream.write_all(resp.as_bytes()).await;
+        let _ = stream.flush().await;
+        return;
+    }
+
     // Decode raw codec bytes into a SubmissionTx.
     let tx = match crate::codec::decode_tx(&body) {
         Ok(tx) => tx,
@@ -10332,6 +10499,68 @@ mod tests {
         let bad = test_tx(99, 1, 2);
         let rejected = node.submit_tx(bad).await.expect("actor alive");
         assert!(rejected.is_err(), "invalid tx is rejected");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn submit_gov_proposal_stages_registers_and_rejects_bad_sig() {
+        // M198: the Node::submit_gov_proposal handle verifies the sig, stages + floods,
+        // and the single validator commits it into `state.proposals` (observable via the
+        // `proposals()` handle). A wrong-signer submit is rejected with BadSignature.
+        let dir = tmp_dir("submit-gov-proposal");
+        let cfg = node_config(21, 21391, &[21], dir.clone());
+        let mut genesis = test_genesis();
+        genesis.validators = vec![(21, kp(21).public(), 1)];
+        let node = Node::start(cfg, genesis, Some(kp(21)), None)
+            .await
+            .expect("start node");
+
+        // Proposer 1 is a genesis account (same one the tx tests use); long voting
+        // window so the proposal stays registered for the poll.
+        let prop = crate::GovProposal {
+            proposer: 1,
+            param: crate::GovParam::BaseEmission(777),
+            voting_period: 100,
+            nonce: 0,
+            signature: [0u8; 64],
+        }
+        .signed(&kp(1));
+        let h = prop.hash();
+        let res = node.submit_gov_proposal(prop).await.expect("actor alive");
+        assert_eq!(res.expect("valid sig admitted"), h);
+
+        // The single validator produces blocks; the proposal gets registered.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let ps = node.proposals().await.expect("actor alive");
+            if ps
+                .iter()
+                .any(|p| matches!(p.param, crate::GovParam::BaseEmission(777)))
+            {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "proposal never registered"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+
+        // Wrong signer (kp(2) signing proposer 1's op) ⇒ BadSignature, not flooded.
+        let bad = crate::GovProposal {
+            proposer: 1,
+            param: crate::GovParam::SlashBps(1),
+            voting_period: 100,
+            nonce: 1,
+            signature: [0u8; 64],
+        }
+        .signed(&kp(2));
+        let rej = node.submit_gov_proposal(bad).await.expect("actor alive");
+        assert!(
+            matches!(rej, Err(crate::ChainError::BadSignature(1))),
+            "got {rej:?}"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
