@@ -533,6 +533,9 @@ impl BlockHeader {
     /// (in canonical order). Used by full nodes; light clients never call it.
     /// Each body MUST match its committed root — otherwise the cert-signed
     /// commitment is broken.
+    // The 8 body vectors are the chain's canonical block bodies — grouping them into
+    // a struct would just move the arity, not reduce it.
+    #[allow(clippy::too_many_arguments)]
     pub fn to_block(
         &self,
         txs: Vec<SubmissionTx>,

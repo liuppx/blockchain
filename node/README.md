@@ -1490,6 +1490,17 @@ M185 把 cNFT SPV 的 wire 根（`contributions_root`）+ 证明类型（`ProofE
 - **为何无自动化测试**：在进程内触发真实信号验证是**竞态**的——tokio 的信号 handler 必须在 `raise()` 之前注册好，否则 SIGTERM 直接杀掉整个测试二进制（所有测试连带失败）。这与 M182「消除 flaky 测试」的方向冲突，得不偿失。故本轮只靠 `-D warnings` 干净编译 + 标准 `tokio::signal::unix` API 作保证，不引入不稳定的信号测。tokio 的 `signal` feature 本就已启用。
 - **已知边界 / 非目标**：连接优雅排空 / 主动 drain（teardown 平凡，暂不需要）；Windows 的 `CTRL_CLOSE_EVENT`/`CTRL_SHUTDOWN_EVENT` 等额外控制台信号（部署目标是 Unix 容器）。
 
+## clippy 清零 + CI clippy 升为门禁（Milestone 191 · 收尾 M189）
+
+M189 建了 CI，但因为有 ~19 条既有 clippy lint，把 clippy 步设成了 advisory（非阻塞）。M191 清零后把它升成硬门禁，让"CI 绿 = 代码干净"名副其实。
+
+- **自动修（`cargo clippy --fix`）**：机械类——`is_multiple_of` ×5（`x % n == 0` → `x.is_multiple_of(n)`）、needless-ref、doc 列表缩进、`const BIP39_WORDLIST: [&str; 2048]` → `static`（查表常量，static 更合适且行为等价）、`ValidatorKeyConfig` 的手写 `impl Default` → `#[derive(Default)]`。**核对**：被删的手写 `default()` 每个字段都等于其类型默认值（`enabled: false`、其余 `None`），所以 derive 产出逐字节一致，纯共识无关的 config 结构，安全。
+- **带理由的 `#[allow]`（有意保留的写法）**：`codec::to_block`（从 8 个 canonical 体向量重组区块，`too_many_arguments` 对它无意义——塞进结构体只是搬运 arity）；`merkle` 测试里的 `for i in 0..n`（`i` 同时喂 `t.proof(i)`、`data[i]`、`bad_key == i`，range 循环比 enumerate 清晰）；两个 `config` 测试的 `field_reassign_with_default`（测试里 `let mut c = Default::default(); c.field = …` 比多字段 struct-update 更易读）。
+- **doc 注释**：两处 `///` 行首的 `+`（`+ signature)` / `+ signature hex)`）被 clippy 当成 markdown 列表项 → 改成逗号，消除 `doc_lazy_continuation`。
+- **结果**：engine + node 现 `cargo clippy --all-targets -- -D warnings` **全绿**（本地实测）。CI 的 clippy 步去掉 `continue-on-error`、加 `-- -D warnings`，成为与 fmt/test 并列的硬门禁。
+- **纯清理**：无行为变更、无测试增减（仍 702），全套测试 + `cargo fmt --check` 仍绿。
+- **已知边界 / 非目标**：`cargo-audit` 仍 advisory（待确认干净漏洞基线后另行升门禁）；深度 `cargo-fuzz` 持久语料另行。
+
 ## pending keystore 交互式密码提示（Milestone 181）
 
 收尾 M180 留的小口：M180 的 pending 加密 keystore 只从 `ZHIXING_PENDING_KEYSTORE_PASSWORD` 读密码，缺失即硬失败——与活跃 keystore（M175 `read_keystore_password`：env 优先、否则交互 no-echo 提示）不一致。

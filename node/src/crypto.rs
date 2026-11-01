@@ -286,7 +286,7 @@ pub fn mnemonic_generate(entropy: &[u8]) -> Result<String, MnemonicError> {
 
 // ---- BIP-39 wordlist (2048 English words, public standard) ---------------
 
-const BIP39_WORDLIST: [&str; 2048] = [
+static BIP39_WORDLIST: [&str; 2048] = [
     "abandon", "ability", "able", "about", "above", "absent", "absorb", "abstract", "absurd",
     "abuse", "access", "accident", "account", "accuse", "achieve", "acid", "acoustic", "acquire",
     "across", "act", "action", "actor", "actress", "actual", "adapt", "add", "addict", "address",
@@ -634,7 +634,7 @@ mod tests {
         // Wrong length.
         let bad_len = "abandon ".repeat(13);
         assert_eq!(
-            validate_mnemonic(&bad_len.trim_end()),
+            validate_mnemonic(bad_len.trim_end()),
             Err(MnemonicError::InvalidLength(13))
         );
         // Unknown word.

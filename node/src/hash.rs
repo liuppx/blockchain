@@ -96,7 +96,7 @@ mod tests {
         assert_eq!(from_hex(&"x".repeat(64)), None);
         // Uppercase hex is rejected (lowercase-only, matching `hex()`'s output).
         assert_eq!(
-            from_hex(&"BA7816BF8F01CFEA414140DE5DAE2223B00361A396177A9CB410FF61F20015AD"),
+            from_hex("BA7816BF8F01CFEA414140DE5DAE2223B00361A396177A9CB410FF61F20015AD"),
             None
         );
     }

@@ -831,7 +831,7 @@ fn snapshot_trusted_set(
 
 /// M140: lowercase/uppercase hex → bytes; `None` on odd length or a non-hex char.
 fn hex_to_bytes(s: &str) -> Option<Vec<u8>> {
-    if s.len() % 2 != 0 {
+    if !s.len().is_multiple_of(2) {
         return None;
     }
     let nib = |b: u8| match b {
@@ -3288,8 +3288,8 @@ enum GetRoute {
     /// height), the withdrawals awaiting return to balances after `UNBONDING_PERIOD`.
     /// A read sibling of `/bonds` on the stake lifecycle; no single-read sibling.
     Unbonding,
-    /// M89: `GET /stake-ops` — the pending stake-op pool (account + bond/unbond + amount
-    /// + signature) staged for the next proposed block. The first *pending-pool* read
+    /// M89: `GET /stake-ops` — the pending stake-op pool (account, bond/unbond, amount,
+    /// signature) staged for the next proposed block. The first *pending-pool* read
     /// (mempool-side, not committed state); no single-read sibling.
     StakeOps,
     /// M90: `GET /evidence` — the pending slashing-evidence pool (pairs of conflicting
@@ -4650,8 +4650,8 @@ fn json_unbonding_listing(queue: &[crate::UnbondingEntry]) -> String {
 }
 
 /// M89: render one pending stake op as a grep-friendly `key=value` line, mirroring the
-/// fields of [`json_stake_op`] (`account` + `kind` bond/unbond discriminator + `amount`
-/// + `signature` hex). Standalone (a stake op is a pending-pool value, not a merkle-proof
+/// fields of [`json_stake_op`] (`account`, `kind` bond/unbond discriminator, `amount`,
+/// `signature` hex). Standalone (a stake op is a pending-pool value, not a merkle-proof
 /// entity). Pure for direct unit testing.
 fn format_stake_op(op: &crate::StakeOp) -> String {
     let kind = match op.kind {

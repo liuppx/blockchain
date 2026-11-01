@@ -392,7 +392,7 @@ fn hex_nibble(b: u8) -> Option<u8> {
 /// length is operator-chosen in principle).
 fn decode_hex_vec(s: &str, field: &str) -> Result<Vec<u8>, KeystoreError> {
     let bytes = s.as_bytes();
-    if bytes.len() % 2 != 0 {
+    if !bytes.len().is_multiple_of(2) {
         return Err(KeystoreError::BadHex(format!("{field}: odd length")));
     }
     let mut out = Vec::with_capacity(bytes.len() / 2);

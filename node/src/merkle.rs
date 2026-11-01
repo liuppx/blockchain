@@ -175,7 +175,7 @@ pub fn verify(root: &Hash, leaf: &Hash, proof: &Proof) -> bool {
         if has_sibling {
             match proof.steps.get(pos) {
                 Some(Step::Left(s)) if idx % 2 == 1 => h = node_hash(s, &h),
-                Some(Step::Right(s)) if idx % 2 == 0 => h = node_hash(&h, s),
+                Some(Step::Right(s)) if idx.is_multiple_of(2) => h = node_hash(&h, s),
                 _ => return false, // missing sibling, or wrong side for idx's parity
             }
             pos += 1;
@@ -183,7 +183,7 @@ pub fn verify(root: &Hash, leaf: &Hash, proof: &Proof) -> bool {
             // No sibling at this width: `idx` must be the lone promoted node
             // (i.e. `idx` is the last index, which is only possible when
             // `idx` is even — the promoted node is always a left child).
-            if idx % 2 != 0 {
+            if !idx.is_multiple_of(2) {
                 return false;
             }
         }
@@ -279,6 +279,9 @@ mod tests {
             let data = leaves(n);
             let t = MerkleTree::from_leaves(&data);
             let root = t.root();
+            // `i` indexes `data` AND feeds `t.proof(i)` / `bad_key == i`, so a bare
+            // range loop is clearer than enumerate here.
+            #[allow(clippy::needless_range_loop)]
             for i in 0..n {
                 let good = t.proof(i).unwrap();
                 assert!(verify(&root, &leaf_hash(&data[i]), &good), "n={n} i={i}");

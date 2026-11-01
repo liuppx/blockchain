@@ -4747,7 +4747,7 @@ fn cmd_keygen(args: &[String]) {
         let words = zhixing_node::crypto::mnemonic_generate(&entropy)
             .unwrap_or_else(|e| fail_msg("mnemonic generate", &e.to_string()));
         let mut seed = [0u8; 32];
-        zhixing_node::crypto::mnemonic_to_seed(&words, &passphrase, &mut seed)
+        zhixing_node::crypto::mnemonic_to_seed(&words, passphrase, &mut seed)
             .unwrap_or_else(|e| fail_msg("mnemonic derive", &e.to_string()));
         (seed, words)
     } else if let Some(words) = supplied_mnemonic {
@@ -4755,7 +4755,7 @@ fn cmd_keygen(args: &[String]) {
         zhixing_node::crypto::validate_mnemonic(words)
             .unwrap_or_else(|e| fail_msg("mnemonic validate", &e.to_string()));
         let mut seed = [0u8; 32];
-        zhixing_node::crypto::mnemonic_to_seed(words, &passphrase, &mut seed)
+        zhixing_node::crypto::mnemonic_to_seed(words, passphrase, &mut seed)
             .unwrap_or_else(|e| fail_msg("mnemonic derive", &e.to_string()));
         (seed, words.to_string())
     } else {
@@ -5373,7 +5373,7 @@ fn cmd_check_snapshot(snapshot_path: String, header_hex: String) {
 /// M135: decode a lowercase/uppercase hex string to bytes; `None` on a non-hex or odd-length
 /// input. (The RPC header reads emit lowercase hex; we accept either case.)
 fn hex_decode(s: &str) -> Option<Vec<u8>> {
-    if s.len() % 2 != 0 {
+    if !s.len().is_multiple_of(2) {
         return None;
     }
     let bytes = s.as_bytes();

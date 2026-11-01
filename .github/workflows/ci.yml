@@ -55,15 +55,12 @@ jobs:
           (cd engine && cargo fmt --check)
           (cd node && cargo fmt --check)
 
-      - name: clippy (advisory — reported, not gated)
-        # 14 pre-existing style lints (is_multiple_of, needless refs, a couple of
-        # intentional too-many-args / large-const-array). Kept non-blocking until a
-        # dedicated clippy-cleanup milestone; `RUSTFLAGS=-D warnings` above still
-        # denies real compiler warnings.
-        continue-on-error: true
+      - name: clippy (gate — denies warnings)
+        # M191 cleared the lint backlog (autofix + a few justified `#[allow]`s), so
+        # clippy is now a hard gate. Run with `--all-targets` so test code is linted too.
         run: |
-          (cd engine && cargo clippy --release --all-targets)
-          (cd node && cargo clippy --release --all-targets)
+          (cd engine && cargo clippy --release --all-targets -- -D warnings)
+          (cd node && cargo clippy --release --all-targets -- -D warnings)
 
       - name: test (gate) — single-threaded to avoid RPC port collisions
         run: |

@@ -299,7 +299,7 @@ pub struct PeerConfig {
     pub addr: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ValidatorKeyConfig {
     /// When false the process still holds a key but does not participate in
     /// consensus (useful to stand a node up as a follower without editing the
@@ -423,24 +423,6 @@ impl ValidatorKeyConfig {
                         .to_string(),
                 })?;
             decode_seed(hex, "validator.seed_hex")
-        }
-    }
-}
-
-impl Default for ValidatorKeyConfig {
-    // M169/M175: all fields are `Option<String>` + `bool`, so `Default` is the
-    // inert all-None shape. A bare `[validator]` table deserializes to this;
-    // `keypair()` then errors out at startup with a "no seed_hex, no mnemonic,
-    // no encrypted_keystore_path" message, which is what an operator who forgot
-    // to configure the key should see.
-    fn default() -> Self {
-        ValidatorKeyConfig {
-            enabled: false,
-            seed_hex: None,
-            mnemonic: None,
-            passphrase: None,
-            encrypted_keystore_path: None,
-            pending: None,
         }
     }
 }
@@ -1387,6 +1369,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::field_reassign_with_default)] // tests mutate one field for clarity
     fn max_inbound_connections_defaults_parses_and_validates() {
         // M177: absent from an older `[network]` section ⇒ the 256 default
         // (serde `default =`), so legacy configs keep working.
@@ -1427,6 +1410,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::field_reassign_with_default)] // tests mutate one field for clarity
     fn tls_persist_paths_are_both_or_neither() {
         // M178: default ⇒ no persistence (None), validate ok.
         let n = NetworkConfig::default();
