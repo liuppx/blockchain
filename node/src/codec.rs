@@ -85,6 +85,9 @@ pub fn encode_block(b: &Block) -> Vec<u8> {
     // on prefix bytes for the same block. Adding a root here (rather than a tail
     // per-body commitment) shifts everything after it — a hard wire break vs B4.
     e.raw(&b.contributions_root);
+    // SEC-05 (B7 wire): unbonding-queue root, in the prefix root region after
+    // contributions_root (a new prefix root → hard break vs B6).
+    e.raw(&b.unbonding_root);
     e.u64(b.validator_updates.len() as u64);
     for u in &b.validator_updates {
         e.u64(u.id);
@@ -193,6 +196,8 @@ pub fn encode_header(h: &BlockHeader) -> Vec<u8> {
     // other cert-signed state commitments so `encode_header` and `encode_block`
     // agree on prefix bytes for the same block.
     e.raw(&h.contributions_root);
+    // SEC-05 (B7 wire): unbonding-queue root, prefix region after contributions_root.
+    e.raw(&h.unbonding_root);
     e.u64(h.validator_updates.len() as u64);
     for u in &h.validator_updates {
         e.u64(u.id);
@@ -259,6 +264,9 @@ pub fn decode_header(buf: &[u8]) -> Result<BlockHeader, CodecError> {
     // in the prefix region — read at the same offset as `decode_block`.
     let mut contributions_root = [0u8; 32];
     contributions_root.copy_from_slice(d.take(32)?);
+    // SEC-05 (B7): unbonding-queue root, read right after contributions_root.
+    let mut unbonding_root = [0u8; 32];
+    unbonding_root.copy_from_slice(d.take(32)?);
     let n_upd = d.count()?;
     let mut validator_updates = Vec::with_capacity(prealloc(n_upd));
     for _ in 0..n_upd {
@@ -307,6 +315,7 @@ pub fn decode_header(buf: &[u8]) -> Result<BlockHeader, CodecError> {
         graph_root,
         bridge_root,
         contributions_root,
+        unbonding_root,
         validator_updates,
         txs_commitment,
         stake_ops_commitment,
@@ -340,19 +349,20 @@ pub fn decode_certified_header(buf: &[u8]) -> Result<CertifiedHeader, CodecError
     // Header layout: 8 (height) + 32 (prev) + 4 (timestamp) + 8 (proposer, M122)
     //   + 32 (next_validators_root) + 32 (state_root) + 32 (accounts_root)
     //   + 32 (graph_root, M27) + 32 (bridge_root, M30) + 32 (contributions_root,
-    //   M185 B5) + 8 (n_updates u64) = 252-byte fixed prefix ‖ n_updates * 48
-    //   bytes (u64 id ‖ 32-byte pubkey ‖ u64 power) ‖ 10 * 32-byte commitments =
-    //   320 bytes tail (M30 adds bridge_locks_commitment; M31 adds
+    //   M185 B5) + 32 (unbonding_root, SEC-05 B7) + 8 (n_updates u64) = 284-byte fixed
+    //   prefix ‖ n_updates * 48 bytes (u64 id ‖ 32-byte pubkey ‖ u64 power) ‖ 10 *
+    //   32-byte commitments = 320 bytes tail (M30 adds bridge_locks_commitment; M31 adds
     //   bridge_headers_commitment + bridge_redeems_commitment; M171 B3 adds
     //   bridge_unbondings_commitment; M179 B4 adds key_rotations_commitment; M194 B6
     //   adds gov_proposals_commitment + gov_votes_commitment).
-    //   M185 B5 adds contributions_root as a *prefix* root (not a tail
-    //   commitment), so the fixed prefix grows 220 → 252 and n_updates shifts.
-    if buf.len() < 252 {
+    //   M185 B5 + SEC-05 B7 add contributions_root / unbonding_root as *prefix* roots
+    //   (not tail commitments), so the fixed prefix grows 220 → 252 → 284 and n_updates
+    //   shifts accordingly.
+    if buf.len() < 284 {
         return Err(CodecError::UnexpectedEof);
     }
-    let n_updates = u64::from_be_bytes(buf[244..252].try_into().unwrap());
-    let header_len = 252 + (n_updates as usize) * 48 + 320; // 572 base + 48 per update
+    let n_updates = u64::from_be_bytes(buf[276..284].try_into().unwrap());
+    let header_len = 284 + (n_updates as usize) * 48 + 320; // 604 base + 48 per update
     if buf.len() < header_len {
         return Err(CodecError::UnexpectedEof);
     }
@@ -455,6 +465,8 @@ pub struct BlockHeader {
     /// soulbound, not accounts-tree members). Placed in the prefix region (a new
     /// state root, not a tail per-body commitment), so B5 is a hard break vs B4.
     pub contributions_root: crate::Hash,
+    /// SEC-05 (B7 wire): Merkle root over the source chain's unbonding queue.
+    pub unbonding_root: crate::Hash,
     pub validator_updates: Vec<ValidatorUpdate>,
     /// SHA-256 over the canonical encoding of the tx list (or zero for empty).
     pub txs_commitment: crate::Hash,
@@ -505,6 +517,7 @@ impl BlockHeader {
             graph_root: b.graph_root,
             bridge_root: b.bridge_root,
             contributions_root: b.contributions_root,
+            unbonding_root: b.unbonding_root,
             validator_updates: b.validator_updates.clone(),
             txs_commitment: list_commitment(&b.txs.iter().map(encode_tx).collect::<Vec<_>>()),
             stake_ops_commitment: list_commitment(
@@ -615,6 +628,7 @@ impl BlockHeader {
             graph_root: self.graph_root,
             bridge_root: self.bridge_root,
             contributions_root: self.contributions_root,
+            unbonding_root: self.unbonding_root,
             txs,
             validator_updates: self.validator_updates.clone(),
             stake_ops,
@@ -2359,6 +2373,9 @@ pub fn decode_block(buf: &[u8]) -> Result<Block, CodecError> {
     // M185 (B5 wire): cNFT directory root, right after `bridge_root`.
     let mut contributions_root = [0u8; 32];
     contributions_root.copy_from_slice(d.take(32)?);
+    // SEC-05 (B7): unbonding-queue root, read right after contributions_root.
+    let mut unbonding_root = [0u8; 32];
+    unbonding_root.copy_from_slice(d.take(32)?);
     let n_upd = d.count()?;
     let mut validator_updates = Vec::with_capacity(prealloc(n_upd));
     for _ in 0..n_upd {
@@ -2449,6 +2466,7 @@ pub fn decode_block(buf: &[u8]) -> Result<Block, CodecError> {
         graph_root,
         bridge_root,
         contributions_root,
+        unbonding_root,
         txs,
         validator_updates,
         stake_ops,
@@ -2608,6 +2626,7 @@ mod tests {
             graph_root: [13u8; 32],
             bridge_root: [14u8; 32],
             contributions_root: [0u8; 32],
+            unbonding_root: [0u8; 32],
             txs: vec![SubmissionTx {
                 author: 1,
                 embedding: emb,
@@ -3536,6 +3555,7 @@ mod tests {
                 graph_root: [0u8; 32],
                 bridge_root: [0u8; 32],
                 contributions_root: [0u8; 32],
+                unbonding_root: [0u8; 32],
                 validator_updates: vec![],
                 txs_commitment: [0u8; 32],
                 stake_ops_commitment: [0u8; 32],
@@ -3565,6 +3585,7 @@ mod tests {
                 graph_root: [0u8; 32],
                 bridge_root: [0u8; 32],
                 contributions_root: [0u8; 32],
+                unbonding_root: [0u8; 32],
                 validator_updates: vec![],
                 txs_commitment: [0u8; 32],
                 stake_ops_commitment: [0u8; 32],
@@ -3694,6 +3715,7 @@ mod tests {
                         graph_root: [0u8; 32],
                         bridge_root: [0u8; 32],
                         contributions_root: [0u8; 32],
+                        unbonding_root: [0u8; 32],
                         validator_updates: vec![],
                         txs_commitment: [0u8; 32],
                         stake_ops_commitment: [0u8; 32],
@@ -3723,6 +3745,7 @@ mod tests {
                         graph_root: [0u8; 32],
                         bridge_root: [0u8; 32],
                         contributions_root: [0u8; 32],
+                        unbonding_root: [0u8; 32],
                         validator_updates: vec![],
                         txs_commitment: [0u8; 32],
                         stake_ops_commitment: [0u8; 32],

@@ -47,9 +47,9 @@ use zhixing_node::round::Sim;
 use zhixing_node::store::{BlockLog, CertLog};
 use zhixing_node::validator::{Validator, ValidatorSet, ValidatorUpdate};
 use zhixing_node::{
-    hex, unbonding_merkle_leaf, Block, BondKind, BridgeHeader, BridgeLock, BridgeRedeem,
-    BridgeUnbond, Chain, ChainError, ChainState, Genesis, KeyRotation, Keypair, Review,
-    SlashEvidence, StakeOp, SubmissionTx, Vote, VoteType, MICRO,
+    hex, Block, BondKind, BridgeHeader, BridgeLock, BridgeRedeem, BridgeUnbond, Chain, ChainError,
+    ChainState, Genesis, KeyRotation, Keypair, Review, SlashEvidence, StakeOp, SubmissionTx, Vote,
+    VoteType, MICRO,
 };
 
 type Emb = [f32; DIM];
@@ -209,6 +209,7 @@ fn demo_blocks(chain: &Chain) -> Vec<Block> {
         graph_root: [0u8; 32],
         bridge_root: [0u8; 32],
         contributions_root: [0u8; 32],
+        unbonding_root: [0u8; 32],
         txs: vec![
             tx(
                 1,
@@ -253,6 +254,7 @@ fn demo_blocks(chain: &Chain) -> Vec<Block> {
         graph_root: [0u8; 32],
         bridge_root: [0u8; 32],
         contributions_root: [0u8; 32],
+        unbonding_root: [0u8; 32],
         txs: vec![
             tx(
                 3,
@@ -3415,36 +3417,16 @@ fn cmd_mirror_unbond() {
         .produce(1.0, &BTreeSet::new())
         .unwrap()
         .expect("A bonds+unbonds in height 1");
-    // Patch A's `bridge_root` slot to the unbonding sub-tree root.
-    // NB: this happens **after** `produce` so the chain's `state.unbonding`
-    // already has the entry (the Unbond StakeOp applied during
-    // `produce`). M170's `unbonding_merkle_leaf` reads the same
-    // `encode_unbonding` 24 BE bytes that the apply path produces.
-    let unbonding_leaves: Vec<_> = driver_a
+    // SEC-05: the sealed block already commits the correct `unbonding_root` over A's
+    // post-apply unbonding queue — no more `bridge_root` patching or re-certifying.
+    // Take the real block, its real cert, and an inclusion proof from the live queue.
+    let unbonding_proof = driver_a
         .chain
         .state
-        .unbonding
-        .iter()
-        .map(unbonding_merkle_leaf)
-        .collect();
-    let unbonding_tree = crate::merkle::MerkleTree::from_leaf_hashes(unbonding_leaves.clone());
-    let unbonding_root = unbonding_tree.root();
-    // M173: real proof from the tree (authenticated `key`/`leaf_count`).
-    let unbonding_proof = unbonding_tree.proof(0).expect("entry 0 exists");
-    // The driver already sealed block 1 with the correct post-apply
-    // commitments (including `next_validators_root`, which now reflects
-    // account 1's new bond). We only overwrite the `bridge_root` slot with
-    // the unbonding sub-tree root (M171 reuse convention) and re-certify
-    // over the patched header. We do NOT re-seal — re-sealing on a fresh
-    // chain would recompute every commitment and is both redundant and
-    // error-prone.
-    let mut a_blocks = driver_a.blocks().to_vec();
-    a_blocks[0].bridge_root = unbonding_root;
-    // Re-certify over the patched header. The set that certifies source
-    // height 1 is the set in force *before* block 1 — the genesis set.
-    let a_cert =
-        rebuild_cert_after_bridge_root_patch(&driver_a.chain, &mut a_blocks[0], &a_genesis_set);
-    let a_header = a_blocks[0].header();
+        .unbonding_proof(0)
+        .expect("entry 0 exists in A's unbonding queue");
+    let a_header = driver_a.blocks()[0].header();
+    let a_cert = driver_a.certificates()[0].clone();
     // The bond+full-unbond nets to zero bonded power, so A's validator set
     // is unchanged — `next_set` is the genesis set, which this one cert
     // (signed by that same set) also certifies for the next height.
@@ -3554,59 +3536,6 @@ fn cmd_mirror_unbond() {
     );
 }
 
-/// M172 helper: re-stamp the patched source block and re-certify it.
-/// The `mirror-unbond` demo patches `bridge_root` after the source's
-/// initial `seal`+`commit`, so the existing cert (bound to the pre-patch
-/// header hash) is no longer a valid quorum-signature over the new
-/// header. We:
-///   1. extract the cert BEFORE the patch (when it's still valid);
-///   2. patch `bridge_root`;
-///   3. re-seal the block (header hash now reflects the patched
-///      `bridge_root` slot);
-///   4. re-certify over the new header by re-running the consensus commit
-///      path with the keypairs of `set` (the set in force for this source
-///      height).
-///
-/// Returns the fresh cert bound to the patched header hash.
-fn rebuild_cert_after_bridge_root_patch(
-    _chain: &Chain,
-    block: &mut Block,
-    set: &ValidatorSet,
-) -> Commit {
-    // Re-derive the cert: the source is a single-validator chain (the
-    // genesis set on this demo), so we can build the cert with a trivial
-    // keypair mapping (1 validator × 1 keypair = the 1 needed signature).
-    use std::collections::BTreeMap;
-    let kps: BTreeMap<u64, Keypair> = set.validators().iter().map(|v| (v.id, kp(v.id))).collect();
-    let voters: Vec<u64> = set.validators().iter().map(|v| v.id).collect();
-    let cert = zhixing_node::consensus::commit_block(set, &kps, block, 0, &voters)
-        .expect("re-certify patched source block");
-    // The cert must be over the **patched** block hash. The destination's
-    // tracked set was initialized to `a_genesis_set` via `dest_chain_b`; if
-    // we instead certified against `chain.state.validators` (which after
-    // `seal` may have the same set), the cert would still be valid — but
-    // only if the *patched* block is what got sealed. `seal` re-stamps the
-    // commitments including the patched `bridge_root`, so `block.hash()`
-    // post-seal IS the patched hash. We re-verify here as a guard.
-    let tracked_pubkeys: std::collections::BTreeSet<_> =
-        set.validators().iter().map(|v| v.pubkey).collect();
-    let cert_pubkeys: std::collections::BTreeSet<_> = cert
-        .precommits
-        .iter()
-        .map(
-            |v| /* recover pubkey from sig is too much; trust the kp set */ {
-            // The cert was built from the same `kps` map → same pubkeys.
-            kps.get(&v.validator).map(|k| k.public()).unwrap_or([0u8; 32])
-        },
-        )
-        .collect();
-    assert_eq!(
-        cert_pubkeys, tracked_pubkeys,
-        "cert signers must equal tracked-set pubkeys"
-    );
-    cert
-}
-
 /// An empty block at `chain`'s next height (all commitments zero — `commit`
 /// stamps them). Used by demos that carry a single body op.
 fn empty_next_block(chain: &Chain, timestamp_days: f32) -> Block {
@@ -3621,6 +3550,7 @@ fn empty_next_block(chain: &Chain, timestamp_days: f32) -> Block {
         graph_root: [0u8; 32],
         bridge_root: [0u8; 32],
         contributions_root: [0u8; 32],
+        unbonding_root: [0u8; 32],
         txs: Vec::new(),
         validator_updates: Vec::new(),
         stake_ops: Vec::new(),
@@ -6679,6 +6609,7 @@ mod tests {
             graph_root: [0u8; 32],
             bridge_root: [0u8; 32],
             contributions_root: [0u8; 32],
+            unbonding_root: [0u8; 32],
             txs,
             validator_updates: vec![],
             stake_ops: vec![],

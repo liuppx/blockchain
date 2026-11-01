@@ -660,9 +660,10 @@ pub struct BridgeRedeem {
 /// distinction from [`BridgeRedeem`]).
 ///
 /// Self-authenticating via cert-binding + Merkle inclusion of an
-/// `unbonding_merkle_leaf(&entry)` against `source_header.state_root`
-/// (not `bridge_root` — the entry lives in the regular state trie, not
-/// the bridge-state trie). The Merkle proof key is the **index** in
+/// `unbonding_merkle_leaf(&entry)` against `source_header.unbonding_root`
+/// (SEC-05 B7: a dedicated cert-signed root over the source's unbonding queue —
+/// before the fix this used `bridge_root`, which an honest source could never
+/// satisfy). The Merkle proof key is the **index** in
 /// the source's `state.unbonding: Vec<UnbondingEntry>` at
 /// `source_header.height`; replay dedup tracks this index per source
 /// (see `BridgeSource::consumed_unbonds`).
@@ -672,7 +673,7 @@ pub struct BridgeUnbond {
     /// present in `ChainState::bridge_sources` — i.e. declared at our
     /// genesis or adopted by a prior `apply_bridge_header`.
     pub source_chain: Hash,
-    /// The source chain's cert-signed header carrying the `state_root`
+    /// The source chain's cert-signed header carrying the `unbonding_root`
     /// the unbonding leaf is opened against. Must have been followed
     /// (height ≤ the follower's frontier).
     pub source_header: codec::BlockHeader,
@@ -687,7 +688,7 @@ pub struct BridgeUnbond {
     /// truth) so the Merkle leaf = `sha256(encode_unbonding(entry))`.
     pub entry: UnbondingEntry,
     /// Merkle proof opening `unbonding_merkle_leaf(&entry)` against
-    /// `source_header.state_root`. Keyed by the **index** in the
+    /// `source_header.unbonding_root`. Keyed by the **index** in the
     /// source's `unbonding: Vec<UnbondingEntry>` at the header height.
     pub proof: merkle::Proof,
 }
@@ -767,6 +768,12 @@ pub struct Block {
     /// [`ChainError::ContributionsRootMismatch`]. (Wire B5: a new state root in
     /// the header prefix, so all block hashes re-baseline from this height.)
     pub contributions_root: Hash,
+    /// SEC-05 (B7 wire): Merkle root of the post-apply unbonding queue (see
+    /// [`ChainState::unbonding_merkle_root`]). Cert-signed alongside the other roots so
+    /// a destination chain opens a single unbonding-entry inclusion proof against a
+    /// normal source header. Stamped by [`Chain::commit`]; mismatches on apply return
+    /// [`ChainError::UnbondingRootMismatch`].
+    pub unbonding_root: Hash,
     pub txs: Vec<SubmissionTx>,
     /// On-chain validator-set changes carried by this block. Applied after the
     /// transactions and taking effect from the *next* height (this block is
@@ -1257,6 +1264,11 @@ pub enum ChainError {
     ContributionsRootMismatch {
         height: u64,
     },
+    /// SEC-05: the block's `unbonding_root` does not equal the post-apply Merkle root
+    /// of the unbonding queue. Cert-signed via `header.unbonding_root`.
+    UnbondingRootMismatch {
+        height: u64,
+    },
     /// M31: a `BridgeHeader` / `BridgeRedeem` op named a source chain
     /// (`source_chain`) that this chain did not declare in
     /// [`Genesis::bridge_sources`]. The trust root is missing — the chain
@@ -1424,6 +1436,10 @@ impl std::fmt::Display for ChainError {
             ChainError::ContributionsRootMismatch { height } => write!(
                 f,
                 "block {height} contributions_root does not match the post-apply cNFT directory (sorted-by-node_id) Merkle root"
+            ),
+            ChainError::UnbondingRootMismatch { height } => write!(
+                f,
+                "block {height} unbonding_root does not match the post-apply unbonding-queue Merkle root"
             ),
             ChainError::UnknownBridgeSource(s) => write!(
                 f,
@@ -1719,6 +1735,8 @@ impl ChainState {
             // empty-tree root) so a light client anchored on the genesis hash
             // finds the cert-signed cNFT commitment already committed at height 0.
             contributions_root: state.contributions_merkle_root(),
+            // SEC-05: stamp the genesis unbonding_root (empty queue → empty-tree root).
+            unbonding_root: state.unbonding_merkle_root(),
             txs: Vec::new(),
             validator_updates: Vec::new(),
             stake_ops: Vec::new(),
@@ -1978,6 +1996,10 @@ impl ChainState {
         // a wallet opens a single cNFT-inclusion proof against this commitment.
         if enforce_commitment && block.contributions_root != self.contributions_merkle_root() {
             return Err(ChainError::ContributionsRootMismatch { height: new_height });
+        }
+        // SEC-05: same seal-then-enforce discipline for the unbonding-queue root.
+        if enforce_commitment && block.unbonding_root != self.unbonding_merkle_root() {
+            return Err(ChainError::UnbondingRootMismatch { height: new_height });
         }
 
         Ok(BlockReceipt {
@@ -2624,12 +2646,13 @@ impl ChainState {
             height: op.source_header.height,
         })?;
         // 4. Merkle inclusion of the unbonding leaf against
-        //    `op.source_header.bridge_root` (M171 convention: the
-        //    `bridge_root` slot is reused for the unbonding sub-tree,
-        //    so the M168 B2 cert-signed commitment layout is preserved
-        //    byte-for-byte).
+        // 4. Merkle inclusion of the unbonding leaf against the source header's
+        //    dedicated `unbonding_root` (SEC-05: before the B7 fix this verified against
+        //    `bridge_root`, which commits the *locks* map — so a normal source chain
+        //    could never produce a valid proof; now a normal sealed source block commits
+        //    the unbonding-queue root directly, verified by the source's own apply).
         let leaf_hash = unbonding_merkle_leaf(&op.entry);
-        if !crate::merkle::verify(&op.source_header.bridge_root, &leaf_hash, &op.proof) {
+        if !crate::merkle::verify(&op.source_header.unbonding_root, &leaf_hash, &op.proof) {
             return Err(ChainError::BridgeInclusionInvalid {
                 source: op.source_chain,
                 // M173: the proof's authenticated leaf index stands in for the
@@ -3180,6 +3203,32 @@ impl ChainState {
         merkle::MerkleTree::from_leaf_hashes(leaves).root()
     }
 
+    /// SEC-05 (B7 wire): Merkle root over this chain's unbonding queue (insertion
+    /// order). Cert-signed in `header.unbonding_root` so a destination chain can open
+    /// a single `UnbondingEntry`-inclusion proof against a *normal* source-chain header
+    /// (before the fix, `apply_bridge_unbond` verified against `bridge_root`, which
+    /// commits the *locks* map — an honest source could never produce a valid proof).
+    pub fn unbonding_merkle_root(&self) -> Hash {
+        let leaves: Vec<Hash> = self.unbonding.iter().map(unbonding_merkle_leaf).collect();
+        merkle::MerkleTree::from_leaf_hashes(leaves).root()
+    }
+
+    /// SEC-05: inclusion proof for the unbonding-queue entry at `index` against
+    /// [`Self::unbonding_merkle_root`]. `None` if the index is out of range.
+    pub fn unbonding_proof(&self, index: usize) -> Option<merkle::Proof> {
+        if index >= self.unbonding.len() {
+            return None;
+        }
+        let leaves: Vec<Hash> = self.unbonding.iter().map(unbonding_merkle_leaf).collect();
+        merkle::MerkleTree::from_leaf_hashes(leaves).proof(index)
+    }
+
+    /// SEC-05: the genesis `unbonding_root` (empty queue → empty-tree root), mirroring
+    /// `bridge_merkle_root_for_genesis`.
+    pub fn unbonding_merkle_root_for_genesis(g: &Genesis) -> Hash {
+        Self::genesis_split(g.clone()).0.unbonding_merkle_root()
+    }
+
     /// M30: inclusion proof for the lock with the given `lock_id` against
     /// [`Self::bridge_merkle_root`]. Returns `None` if the id is unknown.
     /// Mirrors `account_proof` / `graph_node_proof`.
@@ -3417,6 +3466,8 @@ impl Chain {
         block.bridge_root = trial.bridge_merkle_root();
         // M185: stamp the cert-signed cNFT directory root alongside the others.
         block.contributions_root = trial.contributions_merkle_root();
+        // SEC-05: stamp the cert-signed unbonding-queue root alongside the others.
+        block.unbonding_root = trial.unbonding_merkle_root();
         Ok(())
     }
 
@@ -3469,6 +3520,10 @@ impl Chain {
         // commitment.
         if block.contributions_root == [0u8; 32] {
             block.contributions_root = trial.contributions_merkle_root();
+        }
+        // SEC-05: same auto-stamp fallback for the unbonding-queue root.
+        if block.unbonding_root == [0u8; 32] {
+            block.unbonding_root = trial.unbonding_merkle_root();
         }
         self.state = trial;
         self.head = receipt.hash;
@@ -3652,6 +3707,7 @@ mod tests {
             graph_root: [0u8; 32],
             bridge_root: [0u8; 32],
             contributions_root: [0u8; 32],
+            unbonding_root: [0u8; 32],
             txs,
             validator_updates: Vec::new(),
             stake_ops: Vec::new(),
@@ -4977,6 +5033,7 @@ mod tests {
             graph_root: [0u8; 32],
             bridge_root: [0u8; 32],
             contributions_root: [0u8; 32],
+            unbonding_root: [0u8; 32],
             txs: vec![novel_tx(2, 2, 2, 2.0)],
             validator_updates: Vec::new(),
             stake_ops: Vec::new(),
@@ -5568,6 +5625,42 @@ mod tests {
         b.bridge_root = [0xFFu8; 32];
         let err = chain.commit(&mut b).unwrap_err();
         assert!(matches!(err, ChainError::BridgeRootMismatch { height: 1 }));
+    }
+
+    #[test]
+    fn unbonding_root_mismatch_is_rejected_on_apply() {
+        // SEC-05: a normal block that populates the unbonding queue commits a real
+        // unbonding_root; tampering it is rejected on apply (the commitment honest
+        // source chains now produce, so dest-side unbond proofs are verifiable).
+        let mut chain = Chain::new(base_genesis());
+        let mut b = block(&chain, 1, Vec::new());
+        b.stake_ops = vec![
+            StakeOp {
+                account: 1,
+                kind: BondKind::Bond,
+                amount: MICRO,
+                signature: [0u8; 64],
+            }
+            .signed(&kp(1)),
+            StakeOp {
+                account: 1,
+                kind: BondKind::Unbond,
+                amount: MICRO,
+                signature: [0u8; 64],
+            }
+            .signed(&kp(1)),
+        ];
+        chain.seal(&mut b).unwrap();
+        assert_ne!(
+            b.unbonding_root, [0u8; 32],
+            "a populated queue has a non-trivial root"
+        );
+        b.unbonding_root = [0xFFu8; 32];
+        let err = chain.commit(&mut b).unwrap_err();
+        assert!(matches!(
+            err,
+            ChainError::UnbondingRootMismatch { height: 1 }
+        ));
     }
 
     /// M185: an accepted submission mints a cNFT whose inclusion proof verifies
@@ -6174,6 +6267,7 @@ mod tests {
             graph_root: [0u8; 32],
             bridge_root: [0u8; 32],
             contributions_root: [0u8; 32],
+            unbonding_root: [0u8; 32],
             txs: vec![tx2],
             validator_updates: Vec::new(),
             stake_ops: Vec::new(),
@@ -6365,7 +6459,6 @@ mod tests {
         amount: u64,
     ) -> (codec::BlockHeader, Commit, merkle::Proof, UnbondingEntry) {
         let mut chain_a = Chain::new(base_genesis());
-        let a_genesis_set = chain_a.state.validators.clone();
         let mut ab1 = block(&chain_a, 1, Vec::new());
         ab1.stake_ops = vec![
             StakeOp {
@@ -6385,33 +6478,16 @@ mod tests {
         ];
         // Seal + certify + commit the honest block first (this applies the
         // stake ops into `chain_a.state.unbonding`).
-        let _cert0 = seal_certify_commit(&mut chain_a, &mut ab1);
-        // Compute the unbonding sub-tree root from the now-populated queue.
-        let leaves: Vec<_> = chain_a
+        let cert0 = seal_certify_commit(&mut chain_a, &mut ab1);
+        // SEC-05: the committed block's header ALREADY commits the unbonding-queue root
+        // (no more patching `bridge_root`). Generate the inclusion proof from the real
+        // post-apply queue and use the real sealed header + its cert verbatim.
+        let proof = chain_a
             .state
-            .unbonding
-            .iter()
-            .map(unbonding_merkle_leaf)
-            .collect();
-        let tree = merkle::MerkleTree::from_leaf_hashes(leaves);
-        let unbonding_root = tree.root();
-        // M173: real proof from the tree (exercises the authenticated `key`/
-        // `leaf_count` path end to end, rather than a hand-built literal).
-        let proof = tree.proof(0).expect("entry 0 exists");
-        // Patch the block's `bridge_root` slot to the unbonding sub-tree
-        // root and re-certify over the patched header (the genesis set is
-        // unchanged — bond+full-unbond nets to zero bonded power).
-        ab1.bridge_root = unbonding_root;
-        let kps: BTreeMap<u64, Keypair> = a_genesis_set
-            .validators()
-            .iter()
-            .map(|v| (v.id, kp(v.id)))
-            .collect();
-        let voters: Vec<u64> = a_genesis_set.validators().iter().map(|v| v.id).collect();
-        let cert =
-            consensus::commit_block(&a_genesis_set, &kps, &ab1, 0, &voters).expect("re-certify");
+            .unbonding_proof(0)
+            .expect("entry 0 exists in the unbonding queue");
         let entry = chain_a.state.unbonding[0].clone();
-        (ab1.header(), cert, proof, entry)
+        (ab1.header(), cert0, proof, entry)
     }
 
     /// End-to-end: chain A produces a real `Unbond` → chain B follows A's

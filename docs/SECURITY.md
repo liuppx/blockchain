@@ -6,6 +6,16 @@
 > 状态:**审计前(pre-audit)**。代码本身自标 whitepaper draft v0.10 —— 参数未经经济校准
 > (见 [§10 已知边界](#10-已知边界--非目标out-of-scope))。本仓库尚未经过任何第三方审计。
 
+## 审计状态
+
+- **2026-11 P0 代码审查**([`docs/audits/P0-SECURITY-REVIEW-2026-11.md`](audits/P0-SECURITY-REVIEW-2026-11.md)):
+  1 严重 + 3 高 + 3 中,**全部已修复**(M202–M204):SEC-03 quorum u128 溢出修复、
+  SEC-02 执行参数折入 state_root、SEC-04 治理参数范围校验、SEC-01 治理 gossip 入池校验 +
+  候选过滤 + 提交清理、SEC-05 独立 `unbonding_root` 承诺(wire B7)、SEC-06 解码预分配封顶、
+  SEC-07 TLS 依赖升级 + `cargo-audit` 升为 CI 门禁。每项附回归测试。
+- 这是一轮**代码审查**,非第三方审计机构的签章报告 / 形式化证明 / 生产安全认证。修复后仍
+  建议安排独立复验,尤其对新增的 B7 wire 与治理路径。
+
 ---
 
 ## 1. 如何使用本文档(审计方)
@@ -170,9 +180,9 @@ RUSTFLAGS="-D warnings" cargo test --release --no-run     # 零编译告警
 ## 9. wire 代际 & 快照版本
 
 - **区块/头 wire**:B2 → B3(M171 桥 unbond)→ B4(M179 密钥轮换)→ B5(M185 `contributions_root`
-  前缀根)→ **B6(M194 治理 op 尾承诺)**。per-body 承诺尾追加(前缀稳定);B5 加了前缀根
-  (硬断)。`decode_certified_header` 固定前缀 252B + 10×32B 承诺尾。M192 起握手协商
-  `PROTOCOL_VERSION`,不匹配**显式拒连**(不再静默 mis-parse)。
+  前缀根)→ B6(M194 治理 op 尾承诺)→ **B7(SEC-05 `unbonding_root` 前缀根)**。per-body 承诺尾
+  追加(前缀稳定);B5/B7 加前缀根(硬断)。`decode_certified_header` 固定前缀 **284B** + 10×32B
+  承诺尾。M192 起握手协商 `PROTOCOL_VERSION`,不匹配**显式拒连**(不再静默 mis-parse)。
 - **快照版本**:`SNAPSHOT_VERSION` 当前 **5**(v3 加 cNFT、v4 加 time_decay、v5 加治理提案)。
   旧版严格拒绝。
 - **升级**:当前只支持"同版本运行 / 异版本干净拒连",**不支持多版本并存滚动升级**(需多 wire

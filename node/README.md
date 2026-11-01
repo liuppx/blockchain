@@ -1579,6 +1579,19 @@ M193–M195 把治理做到 3 个标量旋钮（`base_emission_micro` / `slash_b
 - **测试（+2 → 723）**：`route_get_parses_proposals`（`/proposals` ⇒ `Proposals`、`/proposals/` ⇒ `Health`）+ `proposal_listing_renders`（空目录 ⇒ `""`/`[]`；一个标量提案 + 一个 DeltaK 提案的 text `key=value` 行与 JSON 逐字节，含 `votes=3 yes=2` 票数）；`/routes` 漂移守卫自动覆盖。
 - **已知边界 / 非目标**：HTTP `POST` **发起** gov op（写面，需 tx-submission 式 POST 处理器 + daemon 发起 Cmd + flood，另行）；`/proposal/{id}` 单读（`/proposals` 已是明文视图）。
 
+## P0 安全审计修复 SEC-01..07（Milestone 202–204）
+
+依据 [`docs/audits/P0-SECURITY-REVIEW-2026-11.md`](../docs/audits/P0-SECURITY-REVIEW-2026-11.md)（1 严重 + 3 高 + 3 中），全部修复,每项附回归测试。
+
+- **SEC-03（严重·BFT quorum 溢出）** `validator.rs`：`quorum()` 改在 `u128` 算 `floor(2T/3)+1`，`total_power()` 改 `saturating_add`。total=2^63 时旧 `u64` 的 `2*total` 回绕为 0 → quorum 塌成 1 → <1/3 权重可认证冲突区块、破坏最终性。测试 `quorum_does_not_overflow_at_large_power`。
+- **SEC-02（高·state_root 未承诺执行参数）** `lib.rs state_root()`：折入 `base_emission_micro`/`decay_half_life_blocks`/`slash_bps` + 9 个 ΔK 字段。否则被篡改参数的快照/创世仍匹配 cert 签名根 → 节点同块异参执行而分叉。测试 `state_root_covers_execution_params`；demo state_root re-baseline `fc053560…`→`01c163ce…`（merkle_root 不变）。
+- **SEC-04（高·治理参数无范围校验）** `lib.rs`：新 `validate_gov_param`/`validate_consensus_params`（`slash_bps≤10000`、`base_emission` 上限、ΔK 浮点 `is_finite`+域、计数 `≤10000`），在 `apply_gov_proposal`（注册）+ 创世（`config` `BadGenesis`）强制。否则 `slash_bps=20000` 令拒绝交易 `slash>stake` 回绕、破坏供应守恒。测试 `gov_param_validation_rejects_unsafe_values` + `..._rejected_at_registration`。
+- **SEC-06（中·预分配过大）** `codec.rs`：新 `prealloc`/`prealloc_usize` 把解码列表的 `with_capacity` 封顶 `PREALLOC_CAP=1024`（计数仍受 `MAX_ITEMS` 限）。否则短帧声明百万项可预留 ~176MB。codec 19 处 + net 14 处改走 prealloc。测试 `prealloc_caps_reservation`。
+- **SEC-07（中·TLS 依赖公告）**：`rustls 0.23.46`/`rustls-webpki 0.103.16`/`tokio 1.54.1`（审计建议修复版）；CI `cargo-audit` 去 `continue-on-error` 升为**门禁**。
+- **SEC-01（高·无效治理 gossip 污染候选池、持续阻断出块）** `lib.rs`+`net.rs`：三处防线——(A) gossip 入池校验 `on_gov_proposal`/`on_gov_vote` 调 `gov_proposal_admissible`/`gov_vote_admissible`（账户/签名/参数域；投票还查提案存在且在窗口），不合格既不暂存也不 flood;(B) `build_candidate` 用 `filter_applicable_gov` 在 trial clone 上按区块序试应用、只纳入干净 op——stale/invalid op 被丢出本候选而非让整块 seal 失败,中毒池再不能停摆出块;(C) `apply_certified` 提交后清理已提交 gov op（避免重提已消费 nonce）。测试 `gov_gossip_rejects_inadmissible_ops`、`poisoned_gov_pool_does_not_stall_candidate_production`。
+- **SEC-05（中·BridgeUnbond 用错承诺树,wire B6→B7）** `lib.rs`+`codec.rs`：此前 unbond 证明对 `bridge_root`（锁树）验证,正常源链无法生成可验证证明（测试靠伪造头 patch `bridge_root`+re-cert）。新增独立 cert 签名的 **`unbonding_root`**（源链 unbonding 队列 Merkle 根）：`ChainState::unbonding_merkle_root`/`unbonding_proof`/`..._for_genesis`，`Block`/`BlockHeader` 加字段（前缀根 → B7 硬断,`decode_certified_header` 前缀 252→284、n_updates 偏移 244→276），seal/commit 盖根 + apply `UnbondingRootMismatch`；`apply_bridge_unbond` 改对 `source_header.unbonding_root` 验证。demo/测试与 `mirror-unbond` CLI 改用**正常 seal 的真实头**（删去死代码 `rebuild_cert_after_bridge_root_patch`）。`unbonding_root` 是头承诺非 state_root 字段 → demo state_root 不变,仅 head re-baseline。测试 `unbonding_root_mismatch_is_rejected_on_apply`，`bridge_unbond_mirrors_to_dest_and_matures` 现为真实端到端（无伪造）。
+- **结果**：node **732**（675 lib + 57 bin）全套绿、clippy `-D warnings` 干净、`cargo-audit` 已为门禁。SECURITY.md §审计状态 记录本轮。
+
 ## 治理写面：HTTP 发起 gov op（Milestone 198 · 生产就绪评估 #6 收尾·写面）
 
 M197 让钱包能**查**提案（`GET /proposals`）；M198 让钱包能**发起**——治理对 HTTP 钱包彻底打通。新增 `POST /gov/proposal` / `POST /gov/vote`：body 为 raw codec 编码的 op，节点验签后暂存 + flood，回 `{"hash":…}`。照抄 tx-submission 路径。

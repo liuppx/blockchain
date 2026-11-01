@@ -582,6 +582,7 @@ impl ValidatorTracker {
             graph_root: crate::ChainState::graph_merkle_root_for_genesis(g),
             bridge_root: crate::ChainState::bridge_merkle_root_for_genesis(g),
             contributions_root: crate::ChainState::contributions_merkle_root_for_genesis(g),
+            unbonding_root: crate::ChainState::unbonding_merkle_root_for_genesis(g),
             txs: Vec::new(),
             validator_updates: Vec::new(),
             stake_ops: Vec::new(),
