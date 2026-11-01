@@ -1,0 +1,200 @@
+# 安全审计准备 / Security & Audit Readiness
+
+> 本文件面向**外部安全审计方**,是审计的入口文档(scope、信任模型、攻击面、不变量、
+> 优先复查地图、已知边界)。目标是让审计可以**立即开工、聚焦高危面、复现每一条声明**。
+>
+> 状态:**审计前(pre-audit)**。代码本身自标 whitepaper draft v0.10 —— 参数未经经济校准
+> (见 [§10 已知边界](#10-已知边界--非目标out-of-scope))。本仓库尚未经过任何第三方审计。
+
+---
+
+## 1. 如何使用本文档(审计方)
+
+1. 读 [§2 构建与复现](#2-构建与复现) 跑通 `cargo test` + `cargo clippy`。
+2. 读 [§4 信任模型](#4-信任模型与假设) 与 [§5 攻击面](#5-攻击面) 建立心智模型。
+3. 按 [§8 优先复查地图](#8-优先复查地图-p0p1p2) 从 P0 开始。
+4. [§6 安全不变量](#6-安全不变量含编码它们的测试) 每条都附了**编码该不变量的测试名**——
+   既是规格,也是回归守卫;请把"能否绕过该不变量"作为复查问题。
+5. [§10 已知边界](#10-已知边界--非目标out-of-scope) 是我们**自认的缺口**,不必重复报告,
+   但欢迎就其**严重性/利用性**给出意见。
+
+## 2. 构建与复现
+
+```sh
+# 两个独立 crate(无 workspace),各自构建/测试:
+(cd engine && cargo test --release)              # ΔK 引擎 11 测
+(cd node   && cargo test --release -- --test-threads=1)  # 单线程避 RPC 端口冲突
+
+# 门禁(CI 同款,见 .github/workflows/ci.yml):
+cargo fmt --check
+cargo clippy --release --all-targets -- -D warnings      # 零 lint
+RUSTFLAGS="-D warnings" cargo test --release --no-run     # 零编译告警
+
+# 跨架构确定性:CI 在 ubuntu(x86_64)+ macos(arm64) 两架构跑全套,
+# 其中位锚点测(见 §6)验证共识浮点逐位一致。
+```
+
+- 测试总数:**node 724(667 lib + 57 bin)+ engine 11**,全绿。1 个 `#[ignore]`(config 的
+  环境依赖测,非安全相关)。
+- `unsafe`:**全仓非测试代码 0 处**(`grep -rn unsafe engine/src node/src`)。
+- 无 `cargo-audit` 门禁(当前 advisory,依赖树未确认无 RUSTSEC —— 见 §10)。
+
+## 3. 代码地图(scope)
+
+两个 crate,共 ~56k 行。按**风险分层**(复查优先级见 §8):
+
+### `engine/`(784 行)—— ΔK 认知增量引擎
+| 文件 | 行 | 角色 | 层 |
+|---|---|---|---|
+| `lib.rs` | 692 | `compute_delta_k`:novelty/correctness/replication/freshness → ΔK;cosine 相似度、认知图谱 | **P1**(喂增发;浮点确定性关键) |
+
+### `node/`(~55k 行)
+| 文件 | 行 | 角色 | 层 |
+|---|---|---|---|
+| `lib.rs` | 6221 | 状态机核心:`Block`/`ChainState`/`apply_block`/`state_root`/增发·罚没/治理 tally·执行/桥 apply | **P0** |
+| `codec.rs` | 4347 | 全部 wire/快照编解码(手写,解析攻击者可控字节) | **P0** |
+| `net.rs` | 5725 | gossip 协议、消息分发、flood/dedup、SPV 服务 | **P0** |
+| `bridge.rs` | 596 | 跨链 lock/redeem/unbond 端点 | **P0** |
+| `consensus.rs` | 413 | `Commit` 证书、投票、等价双签检测 | **P0** |
+| `crypto.rs` | 676 | ed25519 封装、签名/验签、BIP-39 助记词 | **P0** |
+| `keystore.rs` | 645 | Web3 Secret Storage v3 加密 keystore(scrypt+AES-CTR+Keccak MAC) | **P0** |
+| `daemon.rs` | 19148 | tokio 守护进程:actor、握手(TLS/认证/版本协商)、RPC ingress、mempool→共识→commit | **P0**(握手/认证/RPC)/ P1(其余) |
+| `round.rs` | 1035 | BFT 轮次状态机(propose/prevote/precommit、超时、锁定、换轮) | **P0** |
+| `mempool.rs` | 1108 | tx 准入、排序、配额背压 | **P1** |
+| `merkle.rs` | 378 | 二叉 Merkle 树 + 包含证明(SPV 基元) | **P0** |
+| `validator.rs` | 356 | 验证人集、权重、集合迁移、Merkle 根 | **P0** |
+| `light.rs` | 3664 | 轻客户端 / SPV 验证 / 快照验证 / `ProofEntry` | **P1** |
+| `driver.rs` | 902 | demo/离线出块器(非生产共识路径) | P2 |
+| `config.rs` | 2901 | TOML 配置 + 校验 | P1 |
+| `store.rs` | 381 | `blocks.log`/`certs.log` 追加式持久化 | P1 |
+| `main.rs` | 6812 | CLI 子命令(demo/keygen/encrypt-key/run/...) | P2 |
+
+`sim/`(Python 经济仿真)与 `tools/` 不在链上共识路径;`sim/` 对 **#7 经济参数校准**相关。
+
+## 4. 信任模型与假设
+
+- **共识安全**:Tendermint 式 BFT,`n` 个验证人、quorum **> 2/3 投票权**。安全性(不分叉)
+  在 **< 1/3 投票权拜占庭**下成立;活性在 **> 2/3 诚实且在线**下成立。投票权 == 绑定质押
+  (`bonds`)。
+- **签名**:所有共识投票、交易、质押 op、密钥轮换、桥 op、治理 op 均 **ed25519 签名**;
+  传输层身份**不**被信任(安全不依赖 TLS/握手,只依赖签名)。
+- **信任根**:创世(`Genesis`)—— 创世验证人集 + 账户 + 参数。轻客户端从创世哈希起,逐高度
+  对**当前集合**复验证书(弱主观性:长期离线的新节点需带外获得近期可信检查点)。
+- **跨链桥**:destination 链在创世声明所信任的 source 链(`bridge_sources`:genesis_hash +
+  验证人集)。redeem/unbond 的授权 = source 链 cert 签名的 `bridge_root` 包含证明。relayer
+  **信任无关**(只搬运,无授权)。
+- **传输**:默认 TLS 加密(ephemeral 自签,仅机密性,**无 MITM 抗性**);可选
+  `require_peer_auth`(签名握手,绑定到创世密钥)+ `require_peer_certs`(genesis-pinned mTLS)
+  + `bind_channel`(RFC5705 通道绑定防中继)。
+- **RPC ingress**:默认关闭;开启后写面(tx/治理提交)可配 bearer token;读面公开。
+- **密钥**:验证人签名密钥在磁盘(明文种子或 Web3 v3 加密 keystore)。无 HSM/远程签名器。
+
+## 5. 攻击面
+
+1. **wire/快照 codec**(`codec.rs`)—— **最高危**。手写解析器直面网络/磁盘的攻击者字节。
+   复查:越界、整数溢出、**伪造 length-prefix 的无界分配**(由 `Dec::count()` 的
+   `MAX_ITEMS=1_000_000` 上限 + `MAX_FRAME` 守护)、代际混淆(B2–B6,见 §9)。
+2. **gossip**(`net.rs`)—— flood/dedup、消息分发。复查:放大攻击、dedup 绕过、
+   轻客户端忽略规则、`MAX_PEERS`/`MAX_PROOF_BATCH` 等上限。
+3. **共识/轮次**(`round.rs`/`consensus.rs`)—— 复查:双签检测可靠性、锁定/换轮安全、
+   证书伪造、验证人集迁移的跨高度规则(新验证人不投自己的到场块)。
+4. **跨链桥**(`bridge.rs` + `lib.rs` 的 apply)—— 复查:mint/redeem 的**供应守恒**、
+   重放(`consumed`/`consumed_unbonds` 去重)、错误目标、未跟随 source、`bridge_root`
+   cert 绑定。历史上此处出过多个 bug(见 git log M172)。
+5. **治理**(`lib.rs` tally/执行 + `net.rs` gossip + `daemon.rs` 提交)—— **最新、未审计**。
+   复查:双门槛(质押 >2/3 **且** 声誉 >1/2)不可绕过、投票权重取值时点、提案过期/执行的
+   确定性、nonce 反重放、恶意提案洪流。
+6. **RPC ingress**(`daemon.rs`)—— 复查:bearer 认证的 timing(已做 `ct_str_eq` + jitter)、
+   body 大小上限(`MAX_RPC_BODY`)、解析健壮、写面鉴权覆盖(tx + `/gov/*`)。
+7. **密钥 & keystore**(`crypto.rs`/`keystore.rs`)—— 复查:scrypt 代价参数校验、AES-CTR
+   nonce、Keccak MAC、无回显密码输入、密钥轮换交接。
+8. **浮点确定性**(`engine` + `lib.rs` time_decay)—— 复查:共识路径是否还有 std 超越函数
+   (应全走 `libm`,见 §6);任何 `mul_add`/重结合。
+
+## 6. 安全不变量(含编码它们的测试)
+
+每条不变量都有对应测试;"能否构造反例"是核心复查问题。
+
+- **供应守恒**:`supply == Σbalances + treasury + bonded + unbonding + bridge_locked`,
+  在增发/罚没/桥/费用后恒成立。测试:`supply_conserved`、`novel_submission_mints_and_conserves_supply`、
+  `fee_credited_to_proposer_conserves_supply`、`a_full_bond_unbond_cycle_conserves_supply`、
+  `bridge_lock_drains_balance_into_bridge_locked_and_conserves_supply`、`bridge_redeem_mints_to_dest_and_conserves_supply`。
+- **确定性**(分叉安全):相同创世 + 区块序列 → 逐位相同 `state_root`。共识路径的超越函数走
+  纯 Rust `libm`(跨平台位级一致)。测试:`deterministic_replay_same_state_root`、
+  `freshness_exp_is_bit_deterministic`、`time_decay_factor_is_bit_deterministic`、
+  `run_is_deterministic`、`gossip_is_deterministic`、`proposer_is_deterministic`、
+  `genesis_hash_is_deterministic_and_matches_chainstate`(+ CI 跨架构矩阵)。
+- **state_root 完整性 & 覆盖**:每个共识状态分量都折入 `state_root`;头承诺它,cert 签名头;
+  apply 对不上即 `StateRootMismatch` 拒块。测试:`state_root_mismatch_is_rejected`、
+  `state_root_covers_{the_validator_set,bonded_stake,consumed_unbonds,contributions,proposals}`。
+- **解码器永不 panic / 永不无界分配**:14 个公开 `decode_*` 入口对空/截断/随机/伪造超长
+  length-prefix 只返回 `Ok`/`Err`。测试:`decoders_reject_adversarial_bytes_without_panicking`。
+- **反重放**:tx/质押/密钥轮换/治理 op 严格 nonce(== 账户当前 nonce);桥重放由 `consumed*`
+  去重。内容哈希 gossip dedup。
+- **SPV 可靠性**:prover 提供的 leaf **不被信任**,验证方本地重算 leaf 并对 cert 签名头的根
+  验证。测试:`verify_proof_against_header_*`(账户/评议人/验证人/图/cNFT 的接受 + 篡改拒绝)。
+- **治理双门槛**:提案过关需质押加权 >2/3 **且** 声誉加权 >1/2;空选区永不过门。测试:
+  `gov_tally_*`、`governance_*`。
+
+## 7. 密码学清单
+
+| 用途 | 原语 | crate |
+|---|---|---|
+| 签名(共识/tx/op/桥/治理) | Ed25519 | `ed25519-dalek` v2 |
+| 哈希(区块/状态/Merkle/内容寻址) | SHA-256 | `sha2` 0.10 |
+| keystore KDF | scrypt(代价参数经 `validate_scrypt_cost` 上限校验) | `scrypt` |
+| keystore 加密 / MAC | AES-128-CTR / Keccak-256 | `aes`+`ctr` / `sha3` |
+| 助记词 | BIP-39 PBKDF2-HMAC-SHA512 | `pbkdf2`+`hmac` |
+| 随机 | OS RNG | `getrandom` |
+| TLS | TLS 1.3 / RFC7250 raw-pubkey、ring 后端 | `tokio-rustls`+`rcgen` |
+| 确定性超越函数 | pure-Rust libm(exp/pow) | `libm` |
+
+依赖面小且主流(RustCrypto / dalek / rustls-ring / tokio)。`cargo-audit` 建议在审计期**升为门禁**。
+
+## 8. 优先复查地图 (P0/P1/P2)
+
+**P0(先看,价值承载/分叉/资金)**
+1. `codec.rs` 全部 `decode_*` —— 内存安全、无界分配、代际混淆。
+2. `bridge.rs` + `lib.rs` 桥 apply —— 供应守恒、重放、cert 绑定、错误目标(历史 bug 高发区)。
+3. `lib.rs` `apply_block_inner` / `state_root` / 增发·罚没 —— 守恒、确定性、根强制。
+4. `consensus.rs` + `round.rs` —— 双签检测、证书、BFT 安全/活性、验证人集迁移。
+5. `crypto.rs` + `keystore.rs` —— 签名封装、keystore 参数/MAC。
+6. 治理(`lib.rs` tally/执行)—— 双门槛不可绕过、确定性、反重放(**全新、零审计**)。
+7. `daemon.rs` 握手 + RPC 鉴权 —— 认证、timing、body 上限、版本协商。
+
+**P1**:`engine`(浮点确定性)、`net.rs`(gossip 放大/dedup)、`light.rs`(SPV)、
+`merkle.rs`、`validator.rs`、`mempool.rs`、`config.rs` 校验、`store.rs`。
+
+**P2**:`driver.rs`(非生产)、`main.rs`(CLI)。
+
+## 9. wire 代际 & 快照版本
+
+- **区块/头 wire**:B2 → B3(M171 桥 unbond)→ B4(M179 密钥轮换)→ B5(M185 `contributions_root`
+  前缀根)→ **B6(M194 治理 op 尾承诺)**。per-body 承诺尾追加(前缀稳定);B5 加了前缀根
+  (硬断)。`decode_certified_header` 固定前缀 252B + 10×32B 承诺尾。M192 起握手协商
+  `PROTOCOL_VERSION`,不匹配**显式拒连**(不再静默 mis-parse)。
+- **快照版本**:`SNAPSHOT_VERSION` 当前 **5**(v3 加 cNFT、v4 加 time_decay、v5 加治理提案)。
+  旧版严格拒绝。
+- **升级**:当前只支持"同版本运行 / 异版本干净拒连",**不支持多版本并存滚动升级**(需多 wire
+  解码器)。wire 破坏需协调停机 + 重新 snap。
+
+## 10. 已知边界 / 非目标(out-of-scope)
+
+我们**自认**的缺口 —— 不必重复报告,欢迎就严重性评估:
+
+1. **经济参数未校准**(#7):`base_emission`/`slash_bps`/`decay_half_life`/ΔK 阈值均为 draft
+   初值,需 `sim/` 经济建模 + 评审再定主网 genesis。
+2. **只罚等价双签**,不罚宕机/审查(无 liveness slashing)。
+3. **密钥在磁盘**(加密 keystore),无 HSM/远程签名器。
+4. **治理刚上线**(M193–198),未经对抗/洪流/临界票数压测。
+5. **无长跑/网络分区/混沌测**;fuzz 为 "fuzz-lite"(确定性 PRNG 轰解码器,无 cargo-fuzz 持久
+   语料)。
+6. **`cargo-audit` 当前 advisory**(依赖树未确认无 RUSTSEC)。
+7. **滚动升级未支持**(只能干净拒连不兼容 peer)。
+8. **弱主观性检查点分发**是运维事项(协议只提供验证基元)。
+9. TLS 版本协商在 `require_peer_auth` 下先于认证,MITM 篡改版本只致**拒连**(非降级),属 DoS。
+
+## 11. 负责任披露
+
+> **占位 —— 由运营方填写**:安全联系邮箱 / PGP 公钥 / 披露政策 / 赏金范围。
+> 在正式部署前,请替换为真实联系方式。
