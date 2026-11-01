@@ -22,6 +22,9 @@ python3 sim/run.py --compare # baseline 场景 Python vs Rust 后端对比
 | `model.py` | ABM 主体：智能体、图谱演化、PoK 轮次（提交→评议→复现→定稿→铸造/罚没）、指标 |
 | `run.py` | 场景矩阵（B.3.5）运行器 + Markdown 结果表 |
 | `RESULTS.md` | 最近一次运行的结果（由 `run.py --md` 自动生成）|
+| `sweep.py` | **参数敏感性扫描**（生产就绪 #7 经济校准）：逐旋钮扫 `base_emission`/`slash_ratio`/`delta_k_min`/`tau_dup`，诚实 vs 对抗场景、多种子取均值。`python3 sim/sweep.py --md` 写 `SWEEP.md` |
+| `SWEEP.md` | 扫描结果（由 `sweep.py --md` 自动生成）|
+| `CALIBRATION.md` | **主网 genesis 参数建议**（基于 `SWEEP.md` 的取值理由 + 诚实边界）|
 
 ## 设计要点
 

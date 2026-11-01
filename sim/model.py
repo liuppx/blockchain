@@ -60,6 +60,7 @@ class SimConfig:
     demand_rate: float = 0.9         # share of minted $COG burned as service demand
     seed: int = 42
     backend: str = "auto"            # "python" | "rust" | "auto" (rust if built)
+    deltak: DeltaKParams | None = None  # M200: optional ΔK-param override (sweep hook)
 
 
 # --- Agents -------------------------------------------------------------------
@@ -113,7 +114,7 @@ class Simulation:
     def __init__(self, cfg: SimConfig) -> None:
         self.cfg = cfg
         self.rng = random.Random(cfg.seed)
-        self.p = DeltaKParams()
+        self.p = cfg.deltak or DeltaKParams()
         self.graph = CognitiveGraph()
         self.domains = list(range(cfg.n_domains))   # int ids (Rust engine uses u32)
         self.day = 0.0
