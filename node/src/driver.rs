@@ -270,6 +270,7 @@ impl ChainDriver {
                     accounts_root: [0u8; 32],
                     graph_root: [0u8; 32],
                     bridge_root: [0u8; 32],
+                    contributions_root: [0u8; 32],
                     txs: Vec::new(),
                     validator_updates: Vec::new(),
                     stake_ops: Vec::new(),

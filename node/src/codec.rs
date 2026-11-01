@@ -64,6 +64,11 @@ pub fn encode_block(b: &Block) -> Vec<u8> {
     // other cert-signed commitments so `encode_header` and `encode_block`
     // agree on prefix bytes for the same block.
     e.raw(&b.bridge_root);
+    // M185 (B5 wire): cNFT directory root, in the prefix region alongside the
+    // other cert-signed commitments so `encode_header` and `encode_block` agree
+    // on prefix bytes for the same block. Adding a root here (rather than a tail
+    // per-body commitment) shifts everything after it — a hard wire break vs B4.
+    e.raw(&b.contributions_root);
     e.u64(b.validator_updates.len() as u64);
     for u in &b.validator_updates {
         e.u64(u.id);
@@ -158,6 +163,10 @@ pub fn encode_header(h: &BlockHeader) -> Vec<u8> {
     // other cert-signed state commitments so `encode_header` and
     // `encode_block` agree on prefix bytes for the same block.
     e.raw(&h.bridge_root);
+    // M185 (B5 wire): cNFT directory root, kept in the prefix alongside the
+    // other cert-signed state commitments so `encode_header` and `encode_block`
+    // agree on prefix bytes for the same block.
+    e.raw(&h.contributions_root);
     e.u64(h.validator_updates.len() as u64);
     for u in &h.validator_updates {
         e.u64(u.id);
@@ -216,6 +225,10 @@ pub fn decode_header(buf: &[u8]) -> Result<BlockHeader, CodecError> {
     // so it shares the same prefix-stability contract.
     let mut bridge_root = [0u8; 32];
     bridge_root.copy_from_slice(d.take(32)?);
+    // M185 (B5 wire): cNFT directory root, placed right after `bridge_root`
+    // in the prefix region — read at the same offset as `decode_block`.
+    let mut contributions_root = [0u8; 32];
+    contributions_root.copy_from_slice(d.take(32)?);
     let n_upd = d.count()?;
     let mut validator_updates = Vec::with_capacity(n_upd as usize);
     for _ in 0..n_upd {
@@ -258,6 +271,7 @@ pub fn decode_header(buf: &[u8]) -> Result<BlockHeader, CodecError> {
         accounts_root,
         graph_root,
         bridge_root,
+        contributions_root,
         validator_updates,
         txs_commitment,
         stake_ops_commitment,
@@ -288,17 +302,19 @@ pub fn encode_certified_header(ch: &CertifiedHeader) -> Vec<u8> {
 pub fn decode_certified_header(buf: &[u8]) -> Result<CertifiedHeader, CodecError> {
     // Header layout: 8 (height) + 32 (prev) + 4 (timestamp) + 8 (proposer, M122)
     //   + 32 (next_validators_root) + 32 (state_root) + 32 (accounts_root)
-    //   + 32 (graph_root, M27) + 32 (bridge_root, M30) + 8 (n_updates u64) =
-    //   220-byte fixed prefix ‖ n_updates * 48 bytes (u64 id ‖ 32-byte pubkey ‖
-    //   u64 power) ‖ 8 * 32-byte commitments = 256 bytes tail (M30 adds
-    //   bridge_locks_commitment; M31 adds bridge_headers_commitment +
-    //   bridge_redeems_commitment; M171 B3 adds bridge_unbondings_commitment;
-    //   M179 B4 adds key_rotations_commitment).
-    if buf.len() < 220 {
+    //   + 32 (graph_root, M27) + 32 (bridge_root, M30) + 32 (contributions_root,
+    //   M185 B5) + 8 (n_updates u64) = 252-byte fixed prefix ‖ n_updates * 48
+    //   bytes (u64 id ‖ 32-byte pubkey ‖ u64 power) ‖ 8 * 32-byte commitments =
+    //   256 bytes tail (M30 adds bridge_locks_commitment; M31 adds
+    //   bridge_headers_commitment + bridge_redeems_commitment; M171 B3 adds
+    //   bridge_unbondings_commitment; M179 B4 adds key_rotations_commitment).
+    //   M185 B5 adds contributions_root as a *prefix* root (not a tail
+    //   commitment), so the fixed prefix grows 220 → 252 and n_updates shifts.
+    if buf.len() < 252 {
         return Err(CodecError::UnexpectedEof);
     }
-    let n_updates = u64::from_be_bytes(buf[212..220].try_into().unwrap());
-    let header_len = 220 + (n_updates as usize) * 48 + 256; // 476 base + 48 per update
+    let n_updates = u64::from_be_bytes(buf[244..252].try_into().unwrap());
+    let header_len = 252 + (n_updates as usize) * 48 + 256; // 508 base + 48 per update
     if buf.len() < header_len {
         return Err(CodecError::UnexpectedEof);
     }
@@ -394,6 +410,13 @@ pub struct BlockHeader {
     /// cross-chain lock without replaying the source chain — the same SPV
     /// shape as `accounts_root` / `graph_root`, on a different commitment.
     pub bridge_root: crate::Hash,
+    /// M185 (B5 wire): Merkle root over the cNFT directory (`contributions`)
+    /// sorted by `node_id`. Cert-signed. A wallet opens a single cNFT-inclusion
+    /// proof against this root to verify "this contribution certificate is
+    /// on-chain" — a distinct commitment from `accounts_root` (cNFTs are
+    /// soulbound, not accounts-tree members). Placed in the prefix region (a new
+    /// state root, not a tail per-body commitment), so B5 is a hard break vs B4.
+    pub contributions_root: crate::Hash,
     pub validator_updates: Vec<ValidatorUpdate>,
     /// SHA-256 over the canonical encoding of the tx list (or zero for empty).
     pub txs_commitment: crate::Hash,
@@ -437,6 +460,7 @@ impl BlockHeader {
             accounts_root: b.accounts_root,
             graph_root: b.graph_root,
             bridge_root: b.bridge_root,
+            contributions_root: b.contributions_root,
             validator_updates: b.validator_updates.clone(),
             txs_commitment: list_commitment(&b.txs.iter().map(encode_tx).collect::<Vec<_>>()),
             stake_ops_commitment: list_commitment(
@@ -530,6 +554,7 @@ impl BlockHeader {
             accounts_root: self.accounts_root,
             graph_root: self.graph_root,
             bridge_root: self.bridge_root,
+            contributions_root: self.contributions_root,
             txs,
             validator_updates: self.validator_updates.clone(),
             stake_ops,
@@ -1689,6 +1714,7 @@ pub fn encode_proof_kind(k: ProofKind) -> u8 {
         ProofKind::Reviewer => 1,
         ProofKind::Validator => 2,
         ProofKind::GraphNode => 3,
+        ProofKind::Cnft => 4,
     }
 }
 
@@ -1699,6 +1725,7 @@ pub fn decode_proof_kind(b: u8) -> Result<ProofKind, CodecError> {
         1 => Ok(ProofKind::Reviewer),
         2 => Ok(ProofKind::Validator),
         3 => Ok(ProofKind::GraphNode),
+        4 => Ok(ProofKind::Cnft),
         other => Err(CodecError::BadEnum(other as u32)),
     }
 }
@@ -1865,6 +1892,9 @@ pub fn decode_proof_entry(buf: &[u8]) -> Result<ProofEntry, CodecError> {
         // M25: GraphNode: u64 node_id ‖ 8×f32 embedding ‖ u32 domain
         // = 8 + 32 + 4 = 44.
         ProofKind::GraphNode => 44,
+        // M185: Cnft: u64 node_id ‖ u64 contributor ‖ u32 domain ‖ u64
+        // reward_micro ‖ u64 height = 8 + 8 + 4 + 8 + 8 = 36.
+        ProofKind::Cnft => 36,
     };
     if buf.len() < 1 + leaf_byte_len {
         return Err(CodecError::UnexpectedEof);
@@ -1938,6 +1968,27 @@ pub fn decode_proof_entry(buf: &[u8]) -> Result<ProofEntry, CodecError> {
                 proof,
             }
         }
+        ProofKind::Cnft => {
+            let mut d2 = Dec {
+                buf: leaf_buf,
+                pos: 0,
+            };
+            let node_id = d2.u64()?;
+            let contributor = d2.u64()?;
+            let domain = d2.u32()?;
+            let reward_micro = d2.u64()?;
+            let height = d2.u64()?;
+            ProofEntry::Cnft {
+                node_id,
+                cnft: crate::Cnft {
+                    contributor,
+                    domain,
+                    reward_micro,
+                    height,
+                },
+                proof,
+            }
+        }
     };
     Ok(entry)
 }
@@ -1992,6 +2043,9 @@ pub fn decode_block(buf: &[u8]) -> Result<Block, CodecError> {
     // M30: cumulative bridge-locks root, right after `graph_root`.
     let mut bridge_root = [0u8; 32];
     bridge_root.copy_from_slice(d.take(32)?);
+    // M185 (B5 wire): cNFT directory root, right after `bridge_root`.
+    let mut contributions_root = [0u8; 32];
+    contributions_root.copy_from_slice(d.take(32)?);
     let n_upd = d.count()?;
     let mut validator_updates = Vec::with_capacity(n_upd as usize);
     for _ in 0..n_upd {
@@ -2068,6 +2122,7 @@ pub fn decode_block(buf: &[u8]) -> Result<Block, CodecError> {
         accounts_root,
         graph_root,
         bridge_root,
+        contributions_root,
         txs,
         validator_updates,
         stake_ops,
@@ -2224,6 +2279,7 @@ mod tests {
             accounts_root: [12u8; 32],
             graph_root: [13u8; 32],
             bridge_root: [14u8; 32],
+            contributions_root: [0u8; 32],
             txs: vec![SubmissionTx {
                 author: 1,
                 embedding: emb,
@@ -2991,7 +3047,33 @@ mod tests {
         assert_eq!(back, entry);
     }
 
-    // ----- M29 codec round-trips -----
+    #[test]
+    fn cnft_proof_entry_round_trip() {
+        // M185: a `ProofEntry::Cnft` survives encode→decode byte-for-byte —
+        // kind tag = 4, then a 36-byte cNFT leaf, then the proof bytes.
+        use crate::light::ProofEntry;
+        let cnft = crate::Cnft {
+            contributor: 7,
+            domain: 9,
+            reward_micro: 500,
+            height: 3,
+        };
+        let proof = Proof {
+            key: 2,
+            leaf_count: 4,
+            steps: vec![Step::Left([0x33; 32]), Step::Right([0x44; 32])],
+        };
+        let entry = ProofEntry::Cnft {
+            node_id: 5,
+            cnft: cnft.clone(),
+            proof: proof.clone(),
+        };
+        let bytes = encode_proof_entry(&entry);
+        assert_eq!(bytes[0], 4);
+        assert_eq!(&bytes[1..37], cnft.merkle_leaf(5).as_slice());
+        let back = decode_proof_entry(&bytes).expect("decode must succeed");
+        assert_eq!(back, entry);
+    }
 
     #[test]
     fn encode_knn_request_round_trips() {
@@ -3123,6 +3205,7 @@ mod tests {
                 accounts_root: [0u8; 32],
                 graph_root: [0u8; 32],
                 bridge_root: [0u8; 32],
+                contributions_root: [0u8; 32],
                 validator_updates: vec![],
                 txs_commitment: [0u8; 32],
                 stake_ops_commitment: [0u8; 32],
@@ -3149,6 +3232,7 @@ mod tests {
                 accounts_root: [0u8; 32],
                 graph_root: [0u8; 32],
                 bridge_root: [0u8; 32],
+                contributions_root: [0u8; 32],
                 validator_updates: vec![],
                 txs_commitment: [0u8; 32],
                 stake_ops_commitment: [0u8; 32],
@@ -3275,6 +3359,7 @@ mod tests {
                         accounts_root: [0u8; 32],
                         graph_root: [0u8; 32],
                         bridge_root: [0u8; 32],
+                        contributions_root: [0u8; 32],
                         validator_updates: vec![],
                         txs_commitment: [0u8; 32],
                         stake_ops_commitment: [0u8; 32],
@@ -3301,6 +3386,7 @@ mod tests {
                         accounts_root: [0u8; 32],
                         graph_root: [0u8; 32],
                         bridge_root: [0u8; 32],
+                        contributions_root: [0u8; 32],
                         validator_updates: vec![],
                         txs_commitment: [0u8; 32],
                         stake_ops_commitment: [0u8; 32],

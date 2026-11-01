@@ -64,6 +64,11 @@ pub enum ProofKind {
     Reviewer = 1,
     Validator = 2,
     GraphNode = 3,
+    /// M185: a soulbound cNFT (cognitive-contribution certificate), addressed by
+    /// its cognitive-graph `node_id`. Unlike the first three, it verifies against
+    /// `header.contributions_root` — its own cert-signed commitment, distinct
+    /// from `accounts_root` (cNFTs are not accounts-tree members).
+    Cnft = 4,
 }
 
 /// M24: typed leaf + proof for a single [`ProofKind`]. The wallet
@@ -97,6 +102,15 @@ pub enum ProofEntry {
         graph_node: crate::engine::GraphNode,
         proof: merkle::Proof,
     },
+    /// M185: a single soulbound cNFT plus its `contributions_root` Merkle proof.
+    /// `node_id` is the cognitive-graph node the accept produced (1 accept = 1
+    /// graph node = 1 cNFT). Verifies against `header.contributions_root`, a
+    /// distinct root from the account/reviewer/graph tree.
+    Cnft {
+        node_id: u64,
+        cnft: crate::Cnft,
+        proof: merkle::Proof,
+    },
 }
 
 impl ProofEntry {
@@ -106,6 +120,7 @@ impl ProofEntry {
             ProofEntry::Reviewer { .. } => ProofKind::Reviewer,
             ProofEntry::Validator { .. } => ProofKind::Validator,
             ProofEntry::GraphNode { .. } => ProofKind::GraphNode,
+            ProofEntry::Cnft { .. } => ProofKind::Cnft,
         }
     }
 
@@ -115,6 +130,7 @@ impl ProofEntry {
             | ProofEntry::Reviewer { id, .. }
             | ProofEntry::Validator { id, .. } => *id,
             ProofEntry::GraphNode { node_id, .. } => *node_id,
+            ProofEntry::Cnft { node_id, .. } => *node_id,
         }
     }
 
@@ -124,6 +140,7 @@ impl ProofEntry {
             | ProofEntry::Reviewer { proof, .. }
             | ProofEntry::Validator { proof, .. } => proof,
             ProofEntry::GraphNode { proof, .. } => proof,
+            ProofEntry::Cnft { proof, .. } => proof,
         }
     }
 
@@ -139,6 +156,7 @@ impl ProofEntry {
             .merkle_leaf(),
             ProofEntry::Validator { validator, .. } => validator.merkle_leaf(),
             ProofEntry::GraphNode { graph_node, .. } => graph_node.merkle_leaf(),
+            ProofEntry::Cnft { node_id, cnft, .. } => cnft.merkle_leaf(*node_id),
         }
     }
 }
@@ -563,6 +581,7 @@ impl ValidatorTracker {
             accounts_root: crate::ChainState::merkle_root_for_genesis(g),
             graph_root: crate::ChainState::graph_merkle_root_for_genesis(g),
             bridge_root: crate::ChainState::bridge_merkle_root_for_genesis(g),
+            contributions_root: crate::ChainState::contributions_merkle_root_for_genesis(g),
             txs: Vec::new(),
             validator_updates: Vec::new(),
             stake_ops: Vec::new(),
@@ -843,6 +862,8 @@ impl ValidatorTracker {
     ///   * [`ProofKind::GraphNode`] → `header.accounts_root` (M25 — graph
     ///     leaves share the accounts_root tree)
     ///   * [`ProofKind::Validator`] → `header.next_validators_root`
+    ///   * [`ProofKind::Cnft`]      → `header.contributions_root` (M185 — its
+    ///     own cert-signed root, distinct from the accounts tree)
     ///
     /// The prover does **not** get to claim a different leaf than it shipped
     /// — the verifier recomputes `merkle::leaf_hash(&entry.leaf())` and
@@ -867,6 +888,7 @@ impl ValidatorTracker {
             | ProofEntry::Reviewer { .. }
             | ProofEntry::GraphNode { .. } => &header.accounts_root,
             ProofEntry::Validator { .. } => &header.next_validators_root,
+            ProofEntry::Cnft { .. } => &header.contributions_root,
         };
         if !merkle::verify(root, &leaf, entry.proof()) {
             return Err(LightError::MembershipProofInvalid {
@@ -2222,6 +2244,74 @@ mod tests {
             .clone();
         ValidatorTracker::verify_proof_against_header(&header, &cert, &tracked, &entry)
             .expect("graph-node proof must verify");
+    }
+
+    /// M185: produce a 1-block certified chain with an accepted submission (which
+    /// mints a cNFT), build a `ProofEntry::Cnft`, and confirm
+    /// `verify_proof_against_header` accepts it against the cert-signed header's
+    /// `contributions_root` — cNFT's own root, not `accounts_root`.
+    #[test]
+    fn verify_proof_against_header_accepts_a_cnft_proof() {
+        let mut d = driver(base_genesis());
+        d.submit(novel_tx(1, 1, 1, 1.0)).unwrap();
+        d.produce(1.0, &no_silence()).unwrap().expect("block");
+        let block = d.blocks()[0].clone();
+        let cert = d.certificates()[0].clone();
+        let (node_id, cnft) = {
+            let (id, c) = d
+                .chain
+                .state
+                .contributions
+                .iter()
+                .next()
+                .expect("one cNFT minted");
+            (*id, c.clone())
+        };
+        let proof = d.chain.state.cnft_proof(node_id).expect("cnft proof");
+        let header = crate::codec::BlockHeader::from_block(&block);
+        let entry = ProofEntry::Cnft {
+            node_id,
+            cnft,
+            proof,
+        };
+        let tracked = ValidatorTracker::from_genesis(&base_genesis())
+            .validators()
+            .clone();
+        ValidatorTracker::verify_proof_against_header(&header, &cert, &tracked, &entry)
+            .expect("cNFT proof must verify against contributions_root");
+    }
+
+    /// M185: tamper the `reward_micro` field in a `ProofEntry::Cnft` — the
+    /// verifier recomputes the leaf locally and rejects the proof with
+    /// `MembershipProofInvalid` (prover-supplied leaf is not trusted).
+    #[test]
+    fn verify_proof_against_header_rejects_a_tampered_cnft() {
+        let mut d = driver(base_genesis());
+        d.submit(novel_tx(1, 1, 1, 1.0)).unwrap();
+        d.produce(1.0, &no_silence()).unwrap().expect("block");
+        let block = d.blocks()[0].clone();
+        let cert = d.certificates()[0].clone();
+        let (node_id, mut cnft) = {
+            let (id, c) = d.chain.state.contributions.iter().next().expect("one cNFT");
+            (*id, c.clone())
+        };
+        let proof = d.chain.state.cnft_proof(node_id).expect("cnft proof");
+        cnft.reward_micro = cnft.reward_micro.wrapping_add(1); // tamper
+        let header = crate::codec::BlockHeader::from_block(&block);
+        let entry = ProofEntry::Cnft {
+            node_id,
+            cnft,
+            proof,
+        };
+        let tracked = ValidatorTracker::from_genesis(&base_genesis())
+            .validators()
+            .clone();
+        let err = ValidatorTracker::verify_proof_against_header(&header, &cert, &tracked, &entry)
+            .unwrap_err();
+        assert!(
+            matches!(err, LightError::MembershipProofInvalid { .. }),
+            "got {err}"
+        );
     }
 
     /// M25: tamper the embedding field in a `ProofEntry::GraphNode` — the

@@ -1423,6 +1423,18 @@ M183 把 cNFT 落为认证共识状态 + 库内按 id 的 `cnft(id)` 查询，�
 - **测试（+2 → 691）**：新纯 `route_get_parses_cnfts`（`/cnfts` ⇒ `Cnfts`、`/cnfts/` ⇒ `Health`）+ 新纯 `cnft_listing_renders`（空集 ⇒ `""`/`[]`；两条 cNFT 断言精确文本 `key=value` 行与 JSON 数组逐字节）；`/routes` 漂移守卫自动覆盖新路由。
 - **已知边界 / 非目标**：不做 typed SPV 证明（`ProofEntry::Cnft` 的设计分叉——折 cNFT 入 accounts_root 重基线 vs 新 `contributions_root` 头承诺=wire bump——留待用户定向）；不做 `/cnft/{id}` 单读（本轮只做目录发现）。
 
+## cNFT typed SPV 证明（Milestone 185 · wire B4→B5 · 白皮书路线图 Phase 2）
+
+M183 把 cNFT 落为认证共识状态（折入 `state_root`），M184 加明文目录 `GET /cnfts`——但客户端还不能**零信任验证**「某张 cNFT 确在链上」：`state_root` 只是整块状态的 flat digest（证的是"链是否诚实"），要开**单条 cNFT 的包含证明**得有一棵 cNFT 专属 Merkle 树 + 一条 cert 签名的承诺根。**用户在分叉上选定**「新 `contributions_root`（wire bump B5）」而非「折入 accounts_root」——cNFT 自成证明域，与账户树解耦，代价是一次全头 re-baseline。
+
+- **leaf + 根 + 证明**（`lib.rs`，照抄 `bridge_*` 模式，同为 append-only `BTreeMap<u64,_>` keyed-by-id）：`Cnft::merkle_leaf(node_id)`（`node_id ‖ contributor ‖ domain ‖ reward_micro ‖ height`，36 字节，与 `state_root` fold 同字节序）+ `ChainState::contributions_merkle_root()`（按 node_id 排序的 Merkle 根）+ `cnft_proof(node_id) -> Option<merkle::Proof>` + `contributions_merkle_root_for_genesis(g)`（空集空树根）。
+- **第六条状态根**（`Block` / `codec::BlockHeader` 加 `contributions_root: Hash`）：置于 `bridge_root` 之后的**前缀根区**（与 `state_root`/`accounts_root`/`graph_root`/`bridge_root` 并列），**不是**尾部 per-body 承诺——所以这是 B5 **硬 wire 破**（前缀布局变，同 M179 B4 全头 re-baseline 性质，非 M171/M179 的前缀稳定尾追加）。`Chain::seal`/`commit` 走 trial 盖根 + `== [0;32]` 自动兜底，`apply_block_inner` 多一条 `ContributionsRootMismatch` 强制度（seal-then-enforce，同 `bridge_root`）。
+- **codec**：`encode_block`/`encode_header` 在 `bridge_root` 后 `e.raw(&contributions_root)`；`decode_block`/`decode_header` 对称读；`from_block`/`to_block` 搬运；`decode_certified_header` 固定前缀 **220→252 字节**、n_updates u64 偏移 **212→244**、`header_len = 252 + n_updates*48 + 256`（8 条 per-body 尾承诺不变）。
+- **SPV**（`light.rs` / `net.rs`）：`ProofKind::Cnft = 4`（wire tag 4，`decode_proof_entry` leaf 长 36）+ `ProofEntry::Cnft { node_id, cnft, proof }`（`kind()`/`id()`/`proof()`/`leaf()` 各补一臂）；`ValidatorTracker::verify_proof_against_header` 把 cNFT 路由到 `header.contributions_root`——**第三类根目标**（前两类：Account/Reviewer/GraphNode→accounts_root、Validator→next_validators_root）；gossip `GetProof` 经 `GossipNode::serve_inclusion` 的 `ProofKind::Cnft` 臂已能服务 cNFT 证明（`cnft_proof` + `contributions.get(&id)`）。
+- **re-baseline**：每块头 +32 字节 ⇒ **所有 head 移位**（demo head `db176f2d…`→`1766b97e…76e56a`、genesis head `c4903e7a…dd6c2d`；localnet 跨节点动态一致测仍绿）。**`state_root 1db88ef6…` 与 `merkle_root 5312ecf6…` 不变**（M185 不新增 state 摘要，只加头承诺；contributions 自 M183 已折入 state_root）——demo 守卫测 `demo_chain_state_roots_match_the_documented_canon` 只断言这两根，故**无需改**。
+- **测试（+5 → 696）**：`lib` `cnft_proof_verifies_against_header_contributions_root`（接受提交铸 cNFT → 包含证明对 `b.contributions_root` 验证通过；未知 id → `None`）+ `contributions_root_mismatch_is_rejected_on_apply`（seal 后只篡 `contributions_root` → `ContributionsRootMismatch`）；`codec` `cnft_proof_entry_round_trip`（tag=4 + 36 字节 leaf + 证明，encode→decode 逐字节）；`light` `verify_proof_against_header_accepts_a_cnft_proof`（端到端 driver + cert 签名头）+ `..._rejects_a_tampered_cnft`（改 `reward_micro` → 验证器本地重算 leaf 拒之 `MembershipProofInvalid`，prover 的 leaf 不被信任）。
+- **已知边界 / 非目标**：HTTP `/cnft/{id}/proof` 便捷端点**不在本轮**——gossip `GetProof` 已覆盖轻客户端（SPV 的权威传输），HTTP 便捷读留作后续（像 M184 之于 M183 的读面补齐）；不做 time_decay / $WATT / $FLOP；旧 B4 快照/区块与 B5 不兼容（pre-production，协调升级 + 重新 snap）。
+
 ## pending keystore 交互式密码提示（Milestone 181）
 
 收尾 M180 留的小口：M180 的 pending 加密 keystore 只从 `ZHIXING_PENDING_KEYSTORE_PASSWORD` 读密码，缺失即硬失败——与活跃 keystore（M175 `read_keystore_password`：env 优先、否则交互 no-echo 提示）不一致。

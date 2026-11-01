@@ -640,6 +640,19 @@ impl GossipNode {
                     })
                 })
             }
+            crate::light::ProofKind::Cnft => {
+                // M185: cNFTs are addressed by their cognitive-graph node_id and
+                // proven against the dedicated `contributions_root`.
+                self.chain.state.cnft_proof(id).and_then(|p| {
+                    self.chain.state.contributions.get(&id).cloned().map(|c| {
+                        crate::light::ProofEntry::Cnft {
+                            node_id: id,
+                            cnft: c,
+                            proof: p,
+                        }
+                    })
+                })
+            }
         }
     }
 
@@ -1251,6 +1264,7 @@ impl GossipNode {
                 accounts_root: [0u8; 32],
                 graph_root: [0u8; 32],
                 bridge_root: [0u8; 32],
+                contributions_root: [0u8; 32],
                 txs: Vec::new(),
                 validator_updates: Vec::new(),
                 stake_ops: Vec::new(),
@@ -4682,6 +4696,7 @@ mod tests {
         let header = crate::codec::BlockHeader::from_block(last_block);
         let account_root = &full.chain.state.merkle_root();
         let validator_root = &full.chain.state.validators.merkle_root();
+        let contributions_root = &full.chain.state.contributions_merkle_root();
 
         for (i, e) in entries.iter().enumerate() {
             let entry = e
@@ -4693,6 +4708,7 @@ mod tests {
                 | crate::light::ProofEntry::Reviewer { .. }
                 | crate::light::ProofEntry::GraphNode { .. } => account_root,
                 crate::light::ProofEntry::Validator { .. } => validator_root,
+                crate::light::ProofEntry::Cnft { .. } => contributions_root,
             };
             assert!(
                 crate::merkle::verify(root, &leaf, entry.proof()),
@@ -4705,6 +4721,7 @@ mod tests {
                 | crate::light::ProofEntry::Reviewer { .. }
                 | crate::light::ProofEntry::GraphNode { .. } => &header.accounts_root,
                 crate::light::ProofEntry::Validator { .. } => &header.next_validators_root,
+                crate::light::ProofEntry::Cnft { .. } => &header.contributions_root,
             };
             assert_eq!(root, header_root, "entry {i}: local root vs header root");
         }
@@ -5058,6 +5075,7 @@ mod tests {
         let header = crate::codec::BlockHeader::from_block(last_block);
         let account_root = &full.chain.state.merkle_root();
         let validator_root = &full.chain.state.validators.merkle_root();
+        let contributions_root = &full.chain.state.contributions_merkle_root();
         for (i, e) in entries.iter().enumerate() {
             let entry = e.as_ref().unwrap();
             let leaf = crate::merkle::leaf_hash(&entry.leaf());
@@ -5066,6 +5084,7 @@ mod tests {
                 | crate::light::ProofEntry::Reviewer { .. }
                 | crate::light::ProofEntry::GraphNode { .. } => account_root,
                 crate::light::ProofEntry::Validator { .. } => validator_root,
+                crate::light::ProofEntry::Cnft { .. } => contributions_root,
             };
             assert!(
                 crate::merkle::verify(root, &leaf, entry.proof()),
@@ -5077,6 +5096,7 @@ mod tests {
                 | crate::light::ProofEntry::Reviewer { .. }
                 | crate::light::ProofEntry::GraphNode { .. } => &header.accounts_root,
                 crate::light::ProofEntry::Validator { .. } => &header.next_validators_root,
+                crate::light::ProofEntry::Cnft { .. } => &header.contributions_root,
             };
             assert_eq!(
                 root.as_slice(),

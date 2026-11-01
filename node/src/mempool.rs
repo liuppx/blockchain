@@ -404,6 +404,7 @@ impl Mempool {
             // and `Chain::seal` (or `Chain::commit`'s fallback) fills it in.
             graph_root: [0u8; 32],
             bridge_root: [0u8; 32],
+            contributions_root: [0u8; 32],
             txs: included,
             validator_updates: Vec::new(),
             stake_ops: Vec::new(),

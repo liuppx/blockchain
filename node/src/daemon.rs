@@ -1674,6 +1674,9 @@ async fn run_actor(mut actor: Actor, mut rx: mpsc::UnboundedReceiver<Cmd>) {
                     }
                     // Account has its own plain read (QueryAccount); never routed here.
                     ProofKind::Account => None,
+                    // M185: cNFTs use the `/cnfts` directory (M184) and the typed SPV
+                    // proof (M185); no single-entity plain read is routed here.
+                    ProofKind::Cnft => None,
                 };
                 let _ = reply.send(view);
             }
@@ -3863,6 +3866,7 @@ fn proof_kind_label(k: ProofKind) -> &'static str {
         ProofKind::Reviewer => "reviewer",
         ProofKind::Validator => "validator",
         ProofKind::GraphNode => "graph node",
+        ProofKind::Cnft => "cnft",
     }
 }
 
@@ -5370,6 +5374,20 @@ fn json_proof_entry(e: &ProofEntry) -> String {
                 json_merkle_proof(proof),
             )
         }
+        ProofEntry::Cnft {
+            node_id,
+            cnft,
+            proof,
+        } => format!(
+            "{{\"kind\":\"cnft\",\"node_id\":{},\"contributor\":{},\"domain\":{},\
+             \"reward_micro\":{},\"height\":{},\"proof\":{}}}",
+            json_u64(*node_id),
+            json_u64(cnft.contributor),
+            json_u64(cnft.domain as u64),
+            json_u64(cnft.reward_micro),
+            json_u64(cnft.height),
+            json_merkle_proof(proof),
+        ),
     }
 }
 
@@ -17074,6 +17092,7 @@ vote_b.validator=5 vote_b.height=9 vote_b.round=2 vote_b.block_hash={b_h} vote_b
             accounts_root: [0x03; 32],
             graph_root: [0x04; 32],
             bridge_root: [0x05; 32],
+            contributions_root: [0u8; 32],
             validator_updates: vec![crate::validator::ValidatorUpdate {
                 id: 3,
                 pubkey: [0x11; 32],
@@ -17304,6 +17323,7 @@ vote_b.validator=5 vote_b.height=9 vote_b.round=2 vote_b.block_hash={b_h} vote_b
             accounts_root: [0u8; 32],
             graph_root: [0u8; 32],
             bridge_root: [0u8; 32],
+            contributions_root: [0u8; 32],
             validator_updates: vec![],
             txs_commitment: [0u8; 32],
             stake_ops_commitment: [0u8; 32],
@@ -17440,6 +17460,7 @@ vote_b.validator=5 vote_b.height=9 vote_b.round=2 vote_b.block_hash={b_h} vote_b
             accounts_root: [0u8; 32],
             graph_root: [0u8; 32],
             bridge_root: [0u8; 32],
+            contributions_root: [0u8; 32],
             validator_updates: vec![],
             txs_commitment: [0u8; 32],
             stake_ops_commitment: [0u8; 32],
@@ -17539,6 +17560,7 @@ vote_b.validator=5 vote_b.height=9 vote_b.round=2 vote_b.block_hash={b_h} vote_b
             accounts_root: [0u8; 32],
             graph_root: [0u8; 32],
             bridge_root: [0u8; 32],
+            contributions_root: [0u8; 32],
             validator_updates: vec![],
             txs_commitment: [0u8; 32],
             stake_ops_commitment: [0u8; 32],
@@ -17583,6 +17605,7 @@ vote_b.validator=5 vote_b.height=9 vote_b.round=2 vote_b.block_hash={b_h} vote_b
             accounts_root: [12u8; 32],
             graph_root: [13u8; 32],
             bridge_root: [14u8; 32],
+            contributions_root: [0u8; 32],
             txs: vec![crate::SubmissionTx {
                 author: 1,
                 embedding: emb,

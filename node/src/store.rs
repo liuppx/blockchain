@@ -227,6 +227,7 @@ mod tests {
             accounts_root: [0u8; 32],
             graph_root: [0u8; 32],
             bridge_root: [0u8; 32],
+            contributions_root: [0u8; 32],
             txs: vec![SubmissionTx {
                 author: 1,
                 embedding: emb,

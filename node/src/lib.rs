@@ -557,6 +557,17 @@ pub struct Block {
     /// cert-signed header. Stamped by [`Chain::commit`]; mismatches on
     /// apply return [`ChainError::BridgeRootMismatch`].
     pub bridge_root: Hash,
+    /// M185: Merkle root of the post-apply cNFT directory (`contributions`),
+    /// sorted by `node_id` (see [`ChainState::contributions_merkle_root`]).
+    /// Cert-signed alongside `accounts_root` / `graph_root` / `bridge_root` —
+    /// a light client opens single-cNFT inclusion proofs against this root to
+    /// verify "this contribution certificate is on-chain" against a cert-signed
+    /// header, no replay, no bodies. A **distinct** commitment from
+    /// `accounts_root` (cNFTs are soulbound, not accounts-tree members).
+    /// Stamped by [`Chain::commit`]; mismatches on apply return
+    /// [`ChainError::ContributionsRootMismatch`]. (Wire B5: a new state root in
+    /// the header prefix, so all block hashes re-baseline from this height.)
+    pub contributions_root: Hash,
     pub txs: Vec<SubmissionTx>,
     /// On-chain validator-set changes carried by this block. Applied after the
     /// transactions and taking effect from the *next* height (this block is
@@ -670,6 +681,24 @@ pub struct Cnft {
     pub reward_micro: u64,
     /// The height at which this contribution was committed.
     pub height: u64,
+}
+
+impl Cnft {
+    /// M185: canonical leaf bytes for this cNFT under `node_id` — the exact
+    /// preimage a light client hashes (via [`merkle::leaf_hash`]) to verify a
+    /// cNFT-inclusion proof against `ChainState::contributions_root`. Mirrors
+    /// `BridgeLock::merkle_leaf` / `Account::merkle_leaf` for the
+    /// contributions_root tree. Byte order matches the `state_root` fold
+    /// (node_id ‖ contributor ‖ domain ‖ reward_micro ‖ height).
+    pub fn merkle_leaf(&self, node_id: u64) -> Vec<u8> {
+        let mut e = codec::Enc(Vec::new());
+        e.u64(node_id);
+        e.u64(self.contributor);
+        e.u32(self.domain);
+        e.u64(self.reward_micro);
+        e.u64(self.height);
+        e.0
+    }
 }
 
 /// A withdrawal in flight: `amount` micro-$COG unbonded by `account`, returning
@@ -962,6 +991,15 @@ pub enum ChainError {
     BridgeRootMismatch {
         height: u64,
     },
+    /// M185: the block's `contributions_root` does not equal the post-apply
+    /// Merkle root of the cNFT directory (`contributions`) sorted by `node_id`.
+    /// Cert-signed via `header.contributions_root`, this is the commitment a
+    /// wallet opens a single cNFT-inclusion proof against — same root-mismatch
+    /// reasoning as `AccountsRootMismatch` / `GraphRootMismatch` /
+    /// `BridgeRootMismatch`.
+    ContributionsRootMismatch {
+        height: u64,
+    },
     /// M31: a `BridgeHeader` / `BridgeRedeem` op named a source chain
     /// (`source_chain`) that this chain did not declare in
     /// [`Genesis::bridge_sources`]. The trust root is missing — the chain
@@ -1117,6 +1155,10 @@ impl std::fmt::Display for ChainError {
             ChainError::BridgeRootMismatch { height } => write!(
                 f,
                 "block {height} bridge_root does not match the post-apply bridge_locks (sorted-by-lock_id) Merkle root"
+            ),
+            ChainError::ContributionsRootMismatch { height } => write!(
+                f,
+                "block {height} contributions_root does not match the post-apply cNFT directory (sorted-by-node_id) Merkle root"
             ),
             ChainError::UnknownBridgeSource(s) => write!(
                 f,
@@ -1405,6 +1447,10 @@ impl ChainState {
             // root) so a light client anchored on the genesis hash finds the
             // cert-signed bridge commitment already committed for height 0.
             bridge_root: state.bridge_merkle_root(),
+            // M185: stamp the genesis contributions_root (empty cNFT set →
+            // empty-tree root) so a light client anchored on the genesis hash
+            // finds the cert-signed cNFT commitment already committed at height 0.
+            contributions_root: state.contributions_merkle_root(),
             txs: Vec::new(),
             validator_updates: Vec::new(),
             stake_ops: Vec::new(),
@@ -1642,6 +1688,11 @@ impl ChainState {
         // would not verify on the dest side.
         if enforce_commitment && block.bridge_root != self.bridge_merkle_root() {
             return Err(ChainError::BridgeRootMismatch { height: new_height });
+        }
+        // M185: same seal-then-enforce discipline for the cNFT directory root —
+        // a wallet opens a single cNFT-inclusion proof against this commitment.
+        if enforce_commitment && block.contributions_root != self.contributions_merkle_root() {
+            return Err(ChainError::ContributionsRootMismatch { height: new_height });
         }
 
         Ok(BlockReceipt {
@@ -2598,6 +2649,45 @@ impl ChainState {
         Self::genesis_split(g.clone()).0.bridge_merkle_root()
     }
 
+    /// M185: Merkle root over the cNFT directory (`contributions`), sorted by
+    /// `node_id`. A cert-signed secondary index committed alongside
+    /// `accounts_root` / `graph_root` / `bridge_root`, distinct from all of them
+    /// because cNFTs are soulbound contribution certificates with their own
+    /// leaf shape and are **not** members of the accounts tree. Light clients
+    /// open single-cNFT inclusion proofs against `header.contributions_root`
+    /// without trusting the prover. Mirrors `bridge_merkle_root` (both are
+    /// append-only `BTreeMap<u64, _>` keyed by id).
+    pub fn contributions_merkle_root(&self) -> Hash {
+        let leaves: Vec<Hash> = self
+            .contributions
+            .iter()
+            .map(|(id, c)| merkle::leaf_hash(&c.merkle_leaf(*id)))
+            .collect();
+        merkle::MerkleTree::from_leaf_hashes(leaves).root()
+    }
+
+    /// M185: inclusion proof for the cNFT with the given `node_id` against
+    /// [`Self::contributions_merkle_root`]. Returns `None` if the id is unknown.
+    /// Mirrors `bridge_lock_proof`.
+    pub fn cnft_proof(&self, node_id: u64) -> Option<merkle::Proof> {
+        let ids: Vec<u64> = self.contributions.keys().copied().collect();
+        let index = ids.iter().position(|&k| k == node_id)?;
+        let leaves: Vec<Hash> = self
+            .contributions
+            .iter()
+            .map(|(id, c)| merkle::leaf_hash(&c.merkle_leaf(*id)))
+            .collect();
+        merkle::MerkleTree::from_leaf_hashes(leaves).proof(index)
+    }
+
+    /// M185: the genesis `contributions_root` (empty cNFT set → empty-tree
+    /// root), mirroring `bridge_merkle_root_for_genesis`. A light client
+    /// anchored on the genesis hash computes this without materialising a full
+    /// `ChainState`.
+    pub fn contributions_merkle_root_for_genesis(g: &Genesis) -> Hash {
+        Self::genesis_split(g.clone()).0.contributions_merkle_root()
+    }
+
     /// M28: produce the producer-side graph diff between this state (the
     /// "h₂" side) and `prev_state` (the "h₁" side). Caller must guarantee
     /// `prev_state.height < self.height` and both states share the same
@@ -2771,6 +2861,8 @@ impl Chain {
         // `graph_root` / `accounts_root`. Same trial, same idempotence
         // contract.
         block.bridge_root = trial.bridge_merkle_root();
+        // M185: stamp the cert-signed cNFT directory root alongside the others.
+        block.contributions_root = trial.contributions_merkle_root();
         Ok(())
     }
 
@@ -2818,6 +2910,11 @@ impl Chain {
         // commitment.
         if block.bridge_root == [0u8; 32] {
             block.bridge_root = trial.bridge_merkle_root();
+        }
+        // M185: same auto-stamp fallback for the cert-signed cNFT directory
+        // commitment.
+        if block.contributions_root == [0u8; 32] {
+            block.contributions_root = trial.contributions_merkle_root();
         }
         self.state = trial;
         self.head = receipt.hash;
@@ -2999,6 +3096,7 @@ mod tests {
             accounts_root: [0u8; 32],
             graph_root: [0u8; 32],
             bridge_root: [0u8; 32],
+            contributions_root: [0u8; 32],
             txs,
             validator_updates: Vec::new(),
             stake_ops: Vec::new(),
@@ -3821,6 +3919,7 @@ mod tests {
             accounts_root: [0u8; 32],
             graph_root: [0u8; 32],
             bridge_root: [0u8; 32],
+            contributions_root: [0u8; 32],
             txs: vec![novel_tx(2, 2, 2, 2.0)],
             validator_updates: Vec::new(),
             stake_ops: Vec::new(),
@@ -4412,6 +4511,45 @@ mod tests {
         assert!(matches!(err, ChainError::BridgeRootMismatch { height: 1 }));
     }
 
+    /// M185: an accepted submission mints a cNFT whose inclusion proof verifies
+    /// against the cert-signed `contributions_root` — same SPV shape as
+    /// `bridge_lock_proof`, on cNFT's own dedicated commitment.
+    #[test]
+    fn cnft_proof_verifies_against_header_contributions_root() {
+        let mut chain = Chain::new(base_genesis());
+        let mut b = block(&chain, 1, vec![novel_tx(1, 1, 1, 1.0)]);
+        let r = chain.commit(&mut b).unwrap();
+        assert_eq!(r.accepted, 1);
+        let (node_id, c) = {
+            let (id, cnft) = chain.state.contributions.iter().next().unwrap();
+            (*id, cnft.clone())
+        };
+
+        // Producer side: pull the inclusion proof and verify against the
+        // cert-signed `contributions_root`.
+        let proof = chain.state.cnft_proof(node_id).expect("cNFT exists");
+        let leaf = merkle::leaf_hash(&c.merkle_leaf(node_id));
+        assert!(merkle::verify(&b.contributions_root, &leaf, &proof));
+        // A proof for an unknown node_id is None.
+        assert!(chain.state.cnft_proof(node_id + 999).is_none());
+    }
+
+    /// M185: tampered `contributions_root` on apply → ContributionsRootMismatch.
+    #[test]
+    fn contributions_root_mismatch_is_rejected_on_apply() {
+        let mut chain = Chain::new(base_genesis());
+        let mut b = block(&chain, 1, vec![novel_tx(1, 1, 1, 1.0)]);
+        // Seal so every other root reflects the post-apply shape; THEN tamper
+        // only `contributions_root` to exercise its mismatch path specifically.
+        chain.seal(&mut b).unwrap();
+        b.contributions_root = [0xFFu8; 32];
+        let err = chain.commit(&mut b).unwrap_err();
+        assert!(matches!(
+            err,
+            ChainError::ContributionsRootMismatch { height: 1 }
+        ));
+    }
+
     // ---- M31: on-chain follow + redeem ----
 
     /// M31 helper: the source-chain identity a destination chain's genesis
@@ -4976,6 +5114,7 @@ mod tests {
             accounts_root: [0u8; 32],
             graph_root: [0u8; 32],
             bridge_root: [0u8; 32],
+            contributions_root: [0u8; 32],
             txs: vec![tx2],
             validator_updates: Vec::new(),
             stake_ops: Vec::new(),

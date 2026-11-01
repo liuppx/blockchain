@@ -207,6 +207,7 @@ fn demo_blocks(chain: &Chain) -> Vec<Block> {
         // M27: stamped by `Chain::commit` (or `Chain::seal`) — builder leaves zero.
         graph_root: [0u8; 32],
         bridge_root: [0u8; 32],
+        contributions_root: [0u8; 32],
         txs: vec![
             tx(
                 1,
@@ -248,6 +249,7 @@ fn demo_blocks(chain: &Chain) -> Vec<Block> {
         accounts_root: [0u8; 32],
         graph_root: [0u8; 32],
         bridge_root: [0u8; 32],
+        contributions_root: [0u8; 32],
         txs: vec![
             tx(
                 3,
@@ -3613,6 +3615,7 @@ fn empty_next_block(chain: &Chain, timestamp_days: f32) -> Block {
         accounts_root: [0u8; 32],
         graph_root: [0u8; 32],
         bridge_root: [0u8; 32],
+        contributions_root: [0u8; 32],
         txs: Vec::new(),
         validator_updates: Vec::new(),
         stake_ops: Vec::new(),
@@ -6664,6 +6667,7 @@ mod tests {
             accounts_root: [0u8; 32],
             graph_root: [0u8; 32],
             bridge_root: [0u8; 32],
+            contributions_root: [0u8; 32],
             txs,
             validator_updates: vec![],
             stake_ops: vec![],
