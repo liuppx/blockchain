@@ -360,7 +360,13 @@ pub fn compute_delta_k(
 
     // 5. freshness
     let age = (now_days - sub.timestamp_days).max(0.0);
-    let fresh = clamp((-p.decay * age).exp(), p.fresh_min, 1.0);
+    // M188: `libm::expf` (pure-Rust MUSL port), not `f32::exp` — std's exp may call
+    // the platform libm and differ by ULPs across targets. This factor flows into
+    // `dk` → `reward` → `round()` → `state_root`, so a sub-ULP divergence between
+    // heterogeneous validators could fork the chain. `+,-,*,/` and `sqrt` elsewhere
+    // are IEEE-754 correctly-rounded (deterministic), so only the transcendental
+    // needs routing through libm.
+    let fresh = clamp(libm::expf(-p.decay * age), p.fresh_min, 1.0);
 
     let dk = novelty * correctness * reproducibility * bonus * fresh;
     if dk >= p.delta_k_min {
@@ -373,6 +379,18 @@ pub fn compute_delta_k(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn freshness_exp_is_bit_deterministic() {
+        // M188: the ΔK freshness factor uses `libm::expf` (pure-Rust MUSL port) so
+        // its bits are identical on every target — it folds (via `dk`→`reward`→
+        // `round`) into the consensus `state_root`, so a ULP difference between
+        // heterogeneous validators could fork the chain. This pinned bit pattern
+        // fails loudly if someone reverts to `f32::exp` (which may delegate to a
+        // platform libm that differs). Keep in lockstep with the call in
+        // `compute_delta_k`.
+        assert_eq!(libm::expf(-0.01_f32 * 30.0_f32).to_bits(), 0x3f3da644);
+    }
 
     fn unit(x: f32) -> Embedding {
         let mut e = [0.0f32; DIM];

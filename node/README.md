@@ -1457,6 +1457,16 @@ M185 把 cNFT SPV 的 wire 根（`contributions_root`）+ 证明类型（`ProofE
 - **测试（+2 → 700）**：`time_decay_factor_halves_each_half_life`（0 禁用；height 0→1.0；一/两个半衰期→0.5/0.25；半期内单调递减）+ `emission_time_decay_reduces_mint_with_chain_age`（禁用链 mint == `base × ΔK`；`half_life=4` 的链对同一提交 ΔK 相同但 mint **严格更小** = `round(base × ΔK × 0.5^(1/4))`；供应仍守恒）。
 - **已知边界 / 非目标**：$WATT / $FLOP（需预言机/oracle）；评议人治理 DAO；主网 genesis 是否启用衰减及半衰期取值是**政策决定**（留给上线前），本轮只落机制 + 默认关。
 
+## 共识路径浮点确定性 · libm（Milestone 188 · 生产就绪评估 #1）
+
+生产就绪评估把**浮点非确定性**列为唯一能让诚实节点自发分叉的隐患：共识路径 `compute_delta_k → dk → reward → round() → state_root`，两个跑不同 CPU/libm 的验证人若某个超越函数差一个 ULP，`reward` 可能差 1 → state_root 分叉 → 链停摆。M188 把它钉死。
+
+- **先实查缩小面**：共识路径里**只有两个**非确定性超越调用——`engine/src/lib.rs` 的 ΔK freshness `(-p.decay*age).exp()` 与 M187 `node/src/lib.rs` 的 `0.5_f64.powf(height/half_life)`。其余 `.sqrt()`（cosine 相似度、复制方差、agreement）是 **IEEE-754 正确舍入**（所有合规平台位级一致）→ 本就确定；Rust 默认不做 FMA 收缩且无 `mul_add` → 无 `a*b+c` 收缩歧义；`.cos()`/`.ln()` 仅在 `bench.rs`（非共识）。所以无需重写引擎，只改这两处。
+- **方案（用户选定）**：纯 Rust `libm` crate（MUSL libm 移植）。同一份 Rust 代码编到任何目标都走相同运算 → **位级可复现**；而 std 的 `f32::exp`/`f64::powf` 可能委托平台 libm，跨目标差 ULP。`engine`：`(-p.decay*age).exp()` → `libm::expf(...)`；`node`：`0.5_f64.powf(x)` → `libm::pow(0.5, x)`。两 crate 各加 `libm = { version = "0.2", default-features = false }`（no_std、零传递依赖）。**代价**：engine 不再"零依赖"——用户已接受（libm 极小、无传递依赖、业界标配）。
+- **canon 不变（无 re-baseline）**：demo 有接受提交→走 freshness `exp`，但 `reward` 的 `round()` 吸收了 std↔libm 在 demo 输入上的亚-ULP 差异——实测 `demo_chain_state_roots_match_the_documented_canon`（state_root `1db88ef6…`、merkle_root `5312ecf6…`）**仍绿**，localnet 头不变。time_decay 的 `pow` 在 demo 默认关（half_life 0）故不触发。
+- **测试（+1 → 701 node / +1 → 11 engine）**：`node` `time_decay_factor_is_bit_deterministic`（钉死 `pow(0.5,1/4)` = `0x3feae89f995ad3ae`、`pow(0.5,3/7)` = `0x3fe7c6a1f29e2ce6` 的 `.to_bits()`；整数指幂 `0.5^(10/10)`=0.5、`0.5^(20/10)`=0.25 仍精确）+ `engine` `freshness_exp_is_bit_deterministic`（钉死 `libm::expf(-0.3)` = `0x3f3da644`）。这两个**确定性锚点**：任何回退到 std `exp`/`powf`、或 libm 大版本改了结果，都会立刻失败并提示。
+- **已知边界 / 非目标**：std 基础算术 + `.sqrt()` 本就 IEEE 确定性，不动；**多架构交叉验证 CI**（在 aarch64/x86_64 上跑同一向量断言位级一致）是生产评估 **#3** 的一部分，另行；外部审计是 **#2**。本轮只消除共识数学的平台依赖。
+
 ## pending keystore 交互式密码提示（Milestone 181）
 
 收尾 M180 留的小口：M180 的 pending 加密 keystore 只从 `ZHIXING_PENDING_KEYSTORE_PASSWORD` 读密码，缺失即硬失败——与活跃 keystore（M175 `read_keystore_password`：env 优先、否则交互 no-echo 提示）不一致。

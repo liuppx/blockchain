@@ -706,14 +706,16 @@ impl Cnft {
 /// contribution at height `half_life` earns half the base reward, at `2·half_life`
 /// a quarter, and so on, biasing emission toward early (bootstrap-era)
 /// contributions. `half_life == 0` disables decay and returns exactly `1.0`, so a
-/// chain that doesn't opt in mints unchanged. Pure `f64` of two integers →
-/// deterministic across nodes (same reproducibility class as the existing
-/// `base_emission × ΔK` rounding).
+/// chain that doesn't opt in mints unchanged. M188: uses `libm::pow` (pure-Rust
+/// MUSL port), not `f64::powf` — std's `powf` can delegate to the platform libm and
+/// differ by ULPs across targets, and this factor folds into `reward` →
+/// `state_root`, so a sub-ULP divergence between heterogeneous validators could
+/// fork the chain. Deterministic across nodes by construction.
 pub fn time_decay_factor(height: u64, half_life: u64) -> f64 {
     if half_life == 0 {
         return 1.0;
     }
-    0.5_f64.powf(height as f64 / half_life as f64)
+    libm::pow(0.5, height as f64 / half_life as f64)
 }
 
 /// A withdrawal in flight: `amount` micro-$COG unbonded by `account`, returning
@@ -3237,6 +3239,19 @@ mod tests {
             mid < 1.0 && mid > 0.5,
             "monotone decreasing within a half-life"
         );
+    }
+
+    #[test]
+    fn time_decay_factor_is_bit_deterministic() {
+        // M188: a determinism anchor. The factor folds into `reward` → `state_root`,
+        // so its float bits must be identical on every target. `libm::pow` (pure
+        // Rust) guarantees that; these pinned bit patterns fail loudly if someone
+        // reverts to `f64::powf` (which may delegate to a platform libm that differs
+        // by ULPs). Integer-exponent cases stay exact; the risk is fractional ones.
+        assert_eq!(time_decay_factor(1, 4).to_bits(), 0x3feae89f995ad3ae);
+        assert_eq!(time_decay_factor(3, 7).to_bits(), 0x3fe7c6a1f29e2ce6);
+        assert_eq!(time_decay_factor(10, 10), 0.5);
+        assert_eq!(time_decay_factor(20, 10), 0.25);
     }
 
     #[test]
