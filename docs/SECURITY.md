@@ -9,10 +9,11 @@
 ## 审计状态
 
 - **2026-11 P0 代码审查**([`docs/audits/P0-SECURITY-REVIEW-2026-11.md`](audits/P0-SECURITY-REVIEW-2026-11.md)):
-  1 严重 + 3 高 + 3 中,**全部已修复**(M202–M204):SEC-03 quorum u128 溢出修复、
-  SEC-02 执行参数折入 state_root、SEC-04 治理参数范围校验、SEC-01 治理 gossip 入池校验 +
-  候选过滤 + 提交清理、SEC-05 独立 `unbonding_root` 承诺(wire B7)、SEC-06 解码预分配封顶、
-  SEC-07 TLS 依赖升级 + `cargo-audit` 升为 CI 门禁。每项附回归测试。
+  1 严重 + 3 高 + 3 中,**全部已修复**(M202–M204);审计方**复验**后指出其中 5 项修复不彻底,
+  已**二次修复到根**(M206,见 [`P0-REMEDIATION-2026-11.md`](audits/P0-REMEDIATION-2026-11.md)
+  「第二轮」):SEC-03 `Commit::verify` 全程 u128 + `MAX_TOTAL_POWER` 三路拒绝超额集、SEC-04
+  ΔK 旋钮上限 + `checked_add`、SEC-01 先验证后缓存 + 治理去重/pending 上限、SEC-06 内联验证人集
+  decoder 封顶预分配、SEC-05 `PROTOCOL_VERSION` 1→3。每项附回归测试。
 - 这是一轮**代码审查**,非第三方审计机构的签章报告 / 形式化证明 / 生产安全认证。修复后仍
   建议安排独立复验,尤其对新增的 B7 wire 与治理路径。
 
