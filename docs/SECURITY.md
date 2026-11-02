@@ -13,7 +13,10 @@
   已**二次修复到根**(M206,见 [`P0-REMEDIATION-2026-11.md`](audits/P0-REMEDIATION-2026-11.md)
   「第二轮」):SEC-03 `Commit::verify` 全程 u128 + `MAX_TOTAL_POWER` 三路拒绝超额集、SEC-04
   ΔK 旋钮上限 + `checked_add`、SEC-01 先验证后缓存 + 治理去重/pending 上限、SEC-06 内联验证人集
-  decoder 封顶预分配、SEC-05 `PROTOCOL_VERSION` 1→3。每项附回归测试。
+  decoder 封顶预分配、SEC-05 `PROTOCOL_VERSION` 1→3。第二轮复核进一步发现 SEC-01 三处容量边界
+  (默认 `seen_cache=0` 无界、池满仍先插 seen、本地提交绕过 pending 上限),已**三次修复闭环**
+  (M207):`SeenSet::bounded(1<<16)` 默认硬上限 + 入站/本地提交均先验 `MAX_PENDING_GOV` 再写 seen。
+  每项附回归测试。
 - 这是一轮**代码审查**,非第三方审计机构的签章报告 / 形式化证明 / 生产安全认证。修复后仍
   建议安排独立复验,尤其对新增的 B7 wire 与治理路径。
 
@@ -45,7 +48,7 @@ RUSTFLAGS="-D warnings" cargo test --release --no-run     # 零编译告警
 # 其中位锚点测(见 §6)验证共识浮点逐位一致。
 ```
 
-- 测试总数:**node 724(667 lib + 57 bin)+ engine 11**,全绿。1 个 `#[ignore]`(config 的
+- 测试总数:**node 737(680 lib + 57 bin)+ engine 11**,全绿。1 个 `#[ignore]`(config 的
   环境依赖测,非安全相关)。
 - `unsafe`:**全仓非测试代码 0 处**(`grep -rn unsafe engine/src node/src`)。
 - 无 `cargo-audit` 门禁(当前 advisory,依赖树未确认无 RUSTSEC —— 见 §10)。

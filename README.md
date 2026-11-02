@@ -422,7 +422,7 @@ cargo test --release                                 # 647 项单元测试（见
 
 ## 里程碑变更日志（M6–M171）
 
-截至 M206，node 有 **736** 项单元测试（679 lib + 57 bin），engine 另有 **11** 项。早期里程碑（M6–M23）主题：确定性/守恒/回滚/持久化/Merkle/BFT/认证链/最终性复验/动态验证人集/P2P gossip/质押绑定/等价双签罚没/块级 ops 走 gossip/轻客户端跟随验证人集/验证人集 Merkle 承诺入头/头部轻同步传输/钱包 SPV 账户证明。此后逐里程碑：
+截至 M207，node 有 **737** 项单元测试（680 lib + 57 bin），engine 另有 **11** 项。早期里程碑（M6–M23）主题：确定性/守恒/回滚/持久化/Merkle/BFT/认证链/最终性复验/动态验证人集/P2P gossip/质押绑定/等价双签罚没/块级 ops 走 gossip/轻客户端跟随验证人集/验证人集 Merkle 承诺入头/头部轻同步传输/钱包 SPV 账户证明。此后逐里程碑：
 
 - **M24** 泛化批量化证明请求总线：Account/Reviewer/Validator 同一 GetProof 对、单一 verify_proof_against_header 验证器、reviewer_proof 闭合审阅人路径、MAX_PROOF_BATCH=32 上限
 - **M25** 图节点 cert-signed 包含证明
