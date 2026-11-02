@@ -224,6 +224,11 @@ pub const MAX_PEERS: usize = 1024;
 /// full pool stops staging + re-flooding further gov ops — governance is low-volume, so
 /// this bounds memory/CPU under a gossip flood without affecting honest operation.
 pub const MAX_PENDING_GOV: usize = 4096;
+/// SEC-01 (re-verify): hard default bound (FIFO) for the governance / key-rotation dedup
+/// caches, applied at construction so they are never unbounded even when `[mempool]
+/// seen_cache` is left at its `0` (unbounded) default. Governance is low-volume, so a
+/// 64Ki-entry window is ample; the operator can still raise it via `seen_cache`.
+pub const DEFAULT_OP_SEEN_CAP: usize = 1 << 16;
 
 /// M24: maximum items in a single [`GossipMsg::GetProof`] / [`GossipMsg::Proof`]
 /// — over the cap is a codec error (`TooManyItems`). Keeps a single request
@@ -304,6 +309,18 @@ impl SeenSet {
             set: BTreeSet::new(),
             order: VecDeque::new(),
             capacity: usize::MAX,
+        }
+    }
+
+    /// SEC-01 (re-verify): a dedup set with a hard default bound, used for the governance
+    /// and key-rotation op caches. Unlike `new()` (unbounded unless the operator sets
+    /// `[mempool] seen_cache`), these are ALWAYS bounded so a signed-op flood can't grow
+    /// the cache without limit even on a default config. `set_capacity` can still raise it.
+    fn bounded(capacity: usize) -> Self {
+        SeenSet {
+            set: BTreeSet::new(),
+            order: VecDeque::new(),
+            capacity,
         }
     }
 
@@ -425,9 +442,9 @@ impl GossipNode {
             seen_tx: SeenSet::new(),
             seen_evidence: SeenSet::new(),
             seen_stake_op: SeenSet::new(),
-            seen_key_rotation: SeenSet::new(),
-            seen_gov_proposal: SeenSet::new(),
-            seen_gov_vote: SeenSet::new(),
+            seen_key_rotation: SeenSet::bounded(DEFAULT_OP_SEEN_CAP),
+            seen_gov_proposal: SeenSet::bounded(DEFAULT_OP_SEEN_CAP),
+            seen_gov_vote: SeenSet::bounded(DEFAULT_OP_SEEN_CAP),
             pending_evidence: Vec::new(),
             pending_stake_ops: Vec::new(),
             pending_key_rotations: Vec::new(),
@@ -469,9 +486,9 @@ impl GossipNode {
             seen_tx: SeenSet::new(),
             seen_evidence: SeenSet::new(),
             seen_stake_op: SeenSet::new(),
-            seen_key_rotation: SeenSet::new(),
-            seen_gov_proposal: SeenSet::new(),
-            seen_gov_vote: SeenSet::new(),
+            seen_key_rotation: SeenSet::bounded(DEFAULT_OP_SEEN_CAP),
+            seen_gov_proposal: SeenSet::bounded(DEFAULT_OP_SEEN_CAP),
+            seen_gov_vote: SeenSet::bounded(DEFAULT_OP_SEEN_CAP),
             pending_evidence: Vec::new(),
             pending_stake_ops: Vec::new(),
             pending_key_rotations: Vec::new(),
@@ -1498,6 +1515,11 @@ impl GossipNode {
     /// M195: stage a locally-created governance proposal and flood it. Validation
     /// (sig / nonce) happens at apply time in `apply_gov_proposal`.
     pub fn submit_local_gov_proposal(&mut self, op: GovProposal) -> Vec<(u64, GossipMsg)> {
+        // SEC-01 (re-verify): the local-submit path honors the same pending-pool cap as
+        // gossip ingress, so an operator/RPC flood can't grow the pool without bound.
+        if self.pending_gov_proposals.len() >= MAX_PENDING_GOV {
+            return Vec::new();
+        }
         self.seen_gov_proposal.insert(op.hash());
         self.pending_gov_proposals.push(op.clone());
         self.broadcast(GossipMsg::GovProposal(Box::new(op)), None)
@@ -1505,6 +1527,9 @@ impl GossipNode {
 
     /// M195: stage a locally-created governance vote and flood it.
     pub fn submit_local_gov_vote(&mut self, op: GovVote) -> Vec<(u64, GossipMsg)> {
+        if self.pending_gov_votes.len() >= MAX_PENDING_GOV {
+            return Vec::new();
+        }
         self.seen_gov_vote.insert(op.hash());
         self.pending_gov_votes.push(op.clone());
         self.broadcast(GossipMsg::GovVote(Box::new(op)), None)
@@ -1744,13 +1769,13 @@ impl GossipNode {
         if !self.chain.state.gov_proposal_admissible(&op) {
             return Vec::new();
         }
-        if !self.seen_gov_proposal.insert(op.hash()) {
-            return Vec::new(); // already flooded through us
-        }
-        // SEC-01: bound the pending pool. A full pool stops staging + re-flood (governance
-        // is low-volume; a full gov pool is already abnormal).
+        // SEC-01 (re-verify): check pool capacity BEFORE consuming a dedup-cache slot, so
+        // a full pool doesn't let an op grow the seen set without ever being staged.
         if self.pending_gov_proposals.len() >= MAX_PENDING_GOV {
             return Vec::new();
+        }
+        if !self.seen_gov_proposal.insert(op.hash()) {
+            return Vec::new(); // already flooded through us
         }
         self.pending_gov_proposals.push(op.clone());
         self.broadcast(GossipMsg::GovProposal(Box::new(op)), Some(from))
@@ -1761,10 +1786,10 @@ impl GossipNode {
         if !self.chain.state.gov_vote_admissible(&op) {
             return Vec::new();
         }
-        if !self.seen_gov_vote.insert(op.hash()) {
+        if self.pending_gov_votes.len() >= MAX_PENDING_GOV {
             return Vec::new();
         }
-        if self.pending_gov_votes.len() >= MAX_PENDING_GOV {
+        if !self.seen_gov_vote.insert(op.hash()) {
             return Vec::new();
         }
         self.pending_gov_votes.push(op.clone());
@@ -4268,6 +4293,65 @@ mod tests {
             cand.unwrap().gov_votes.is_empty(),
             "the stale vote is filtered out of the candidate"
         );
+    }
+
+    #[test]
+    fn bounded_seen_set_evicts_oldest() {
+        // SEC-01 (re-verify): the governance dedup caches use `SeenSet::bounded` so they
+        // are capped by default (not `usize::MAX`), independent of `[mempool] seen_cache`.
+        let mut s = SeenSet::bounded(2);
+        assert!(s.insert([1u8; 32]));
+        assert!(s.insert([2u8; 32]));
+        assert!(s.insert([3u8; 32])); // evicts [1]
+        assert_eq!(s.len(), 2);
+        assert!(s.insert([1u8; 32]), "[1] was evicted, so it is new again");
+    }
+
+    #[test]
+    fn gov_pending_pool_cap_holds_on_local_and_full_pool_does_not_grow_dedup() {
+        // SEC-01 (re-verify): the pending pool is hard-capped on BOTH the local-submit and
+        // gossip paths, and a full pool returns before consuming a dedup slot.
+        let mut node = GossipNode::new(1, genesis(), 16, [1]);
+        for n in 0..(MAX_PENDING_GOV as u64) {
+            let op = crate::GovProposal {
+                proposer: 1,
+                param: crate::GovParam::BaseEmission(1),
+                voting_period: 100,
+                nonce: n,
+                signature: [0u8; 64],
+            }
+            .signed(&kp(1));
+            node.submit_local_gov_proposal(op);
+        }
+        assert_eq!(node.pending_gov_proposals().len(), MAX_PENDING_GOV);
+        // Local submit beyond the cap is dropped.
+        let extra = crate::GovProposal {
+            proposer: 1,
+            param: crate::GovParam::BaseEmission(1),
+            voting_period: 100,
+            nonce: 999_999,
+            signature: [0u8; 64],
+        }
+        .signed(&kp(1));
+        node.submit_local_gov_proposal(extra);
+        assert_eq!(
+            node.pending_gov_proposals().len(),
+            MAX_PENDING_GOV,
+            "local submit respects the pending cap"
+        );
+        // Gossip ingress of a NEW valid op when the pool is full: dropped, and (because the
+        // capacity check precedes the dedup insert) the seen cache does not grow for it.
+        let gossiped = crate::GovProposal {
+            proposer: 2,
+            param: crate::GovParam::BaseEmission(1),
+            voting_period: 100,
+            nonce: 0,
+            signature: [0u8; 64],
+        }
+        .signed(&kp(2));
+        let out = node.on_message(1, GossipMsg::GovProposal(Box::new(gossiped)));
+        assert!(out.is_empty(), "full pool drops gossiped op");
+        assert_eq!(node.pending_gov_proposals().len(), MAX_PENDING_GOV);
     }
 
     /// End-to-end: gossip an evidence through the network to a node, drain
