@@ -1,17 +1,19 @@
 # P0 审计修复对照表 / Remediation Matrix
 
 **对应审计:** [`P0-SECURITY-REVIEW-2026-11.md`](P0-SECURITY-REVIEW-2026-11.md)(1 严重 + 3 高 + 3 中)
-**修复提交:** `f85c6f2`(M202)、`1056ad0`(M203)、`3489a35`(M204),基线 `8117910`(审计对象)
-**交付目的:** 供审计方**回归复验** —— 确认每项修复到位、无引入新缺陷。重点复查新增代码:
-SEC-05 的 **B7 wire** 与 SEC-01 的治理 gossip 入口。
+**审计基线:** `8117910`(M200)。第一轮修复为 M202–M204；第二轮修复为 M206(`d94af66`)，本表更新至当前待复验状态。
+**当前状态:** 第二轮代码通过本地测试、clippy、fmt 与依赖审计；SEC-01 仍有治理缓存容量边界未闭环。**等待审计方最终复验，不代表 P0 审计通过或可生产部署。**
+**交付目的:** 请审计方对照下表复验两轮修复，重点检查 SEC-01 治理 gossip 默认容量与本地提交路径、SEC-03 权重上限、SEC-04 奖励溢出防护、SEC-05 B7 wire 版本协商和 SEC-06 短帧预分配。
 
 ## 如何复验
 
 ```sh
-git log --oneline 8117910..3489a35          # 审计基线 → 修复后的三个提交
-(cd node && cargo test --release -- --test-threads=1)   # 675 lib + 57 bin，全绿
+git log --oneline 8117910..HEAD             # 审计基线 → 当前待复验提交
+(cd node && cargo test --release -- --test-threads=1)   # 679 lib + 57 bin，全绿
 (cd engine && cargo test --release)                     # 11，全绿
 (cd node && cargo clippy --release --all-targets -- -D warnings)  # 零 lint
+(cd node && cargo fmt --all -- --check)
+(cd engine && cargo fmt --all -- --check)
 (cd node && cargo audit) && (cd engine && cargo audit)  # 现为 CI 门禁
 ```
 每项修复都附**命名回归测试**;下表的"回归测试"列可 `cargo test -- <name>` 单独跑。
@@ -20,13 +22,13 @@ git log --oneline 8117910..3489a35          # 审计基线 → 修复后的三�
 
 | 编号 | 等级 | 状态 | 根因 | 修复(文件·符号) | 回归测试 | 提交 |
 |---|---|---|---|---|---|---|
-| SEC-03 | 严重 | ✅ 已修 | `quorum()` 的 `2*total` 在 `u64` 回绕(total=2^63→quorum=1),<1/3 权重可认证冲突块、破坏最终性 | `validator.rs`:`quorum()` 改 `u128` 算 `floor(2T/3)+1`;`total_power()` 改 `saturating_add` | `quorum_does_not_overflow_at_large_power` | `f85c6f2` |
+| SEC-03 | 严重 | ⚠️ 第一轮不完整；见第二轮 | `quorum()` 的 `2*total` 在 `u64` 回绕(total=2^63→quorum=1),<1/3 权重可认证冲突块、破坏最终性 | 第一轮仅改 quorum 乘法为 `u128`、总权重改饱和加法；二轮增加总权重硬上限并覆盖证书/创世/更新入口 | `quorum_does_not_overflow_at_large_power`；二轮 `verify_rejects_overflowing_validator_set` | M202、M206 |
 | SEC-02 | 高 | ✅ 已修 | `state_root` 未承诺 `base_emission_micro`/`decay_half_life_blocks`/`slash_bps`/ΔK,篡改参数的快照/创世仍匹配 cert 根→同块异参分叉 | `lib.rs`:`ChainState::state_root()` 折入全部执行参数 | `state_root_covers_execution_params`(+ demo 守卫 re-baseline `01c163ce…`) | `f85c6f2` |
-| SEC-04 | 高 | ✅ 已修 | 治理执行不校验参数值,`slash_bps=20000` 令拒绝交易 `slash>stake` 回绕、破坏供应守恒;`usize` 转换平台相关 | `lib.rs`:`validate_gov_param`/`validate_consensus_params`(slash≤10000、emission 上限、ΔK finite+域、计数≤10000),在 `apply_gov_proposal` 注册 + `config.rs` 创世(`BadGenesis`)强制 | `gov_param_validation_rejects_unsafe_values`、`gov_proposal_with_unsafe_param_is_rejected_at_registration` | `f85c6f2` |
-| SEC-06 | 中 | ✅ 已修 | 计数虽受 `MAX_ITEMS` 限,但 `Vec::with_capacity(n)` 在读元素前即预留,短帧声明百万项→~176MB | `codec.rs`:`prealloc`/`prealloc_usize` 封顶预留 `PREALLOC_CAP=1024`;codec 19 + net 14 处改用 | `prealloc_caps_reservation`(+ 既有 `decoders_reject_adversarial_bytes_without_panicking`) | `f85c6f2` |
+| SEC-04 | 高 | ⚠️ 第一轮不完整；见第二轮 | 治理执行不校验参数值,`slash_bps=20000` 令拒绝交易 `slash>stake` 回绕、破坏供应守恒;`usize` 转换平台相关 | 第一轮为 `validate_gov_param`/`validate_consensus_params` 增加 slash、发行、计数及部分浮点域检查；二轮为 ΔK 非负参数增加上限并对奖励、余额、供应增发做 checked arithmetic | `gov_param_validation_rejects_unsafe_values`、`gov_proposal_with_unsafe_param_is_rejected_at_registration` | M202、M206 |
+| SEC-06 | 中 | ⚠️ 第一轮不完整；见第二轮 | 计数虽受 `MAX_ITEMS` 限,但某解码路径仍按攻击者声明数量预分配,短帧可触发大额申请 | 第一轮为 codec/net 多数列表增加 `PREALLOC_CAP=1024`;二轮修复 `dec_validator_set_inline` 并封顶预留 | `prealloc_caps_reservation`、`inline_validator_set_short_frame_rejects_without_large_alloc` | M202、M206 |
 | SEC-07 | 中 | ✅ 已修 | `rustls 0.23.45`/`rustls-webpki 0.103.15`/`tokio 1.53.1` 命中 RUSTSEC 公告;CI audit 为 advisory | `Cargo.lock`→`rustls 0.23.46`/`rustls-webpki 0.103.16`/`tokio 1.54.1`(审计建议修复版);`ci.yml` audit 步去 `continue-on-error`→**门禁** | `cargo audit`(CI 门禁) | `f85c6f2` |
-| SEC-01 | 高 | ✅ 已修 | 治理 gossip 只按哈希去重即入池 + flood;`build_candidate` 全量克隆 pending 池并 `seal`,任一无效/过期 op 致 `None`→持续阻断出块;提交后未清理 gov op | `net.rs`+`lib.rs` 三防线:(A) `on_gov_proposal`/`on_gov_vote` 调 `gov_proposal_admissible`/`gov_vote_admissible`(账户/签名/参数域;投票查提案存在且在窗口)不合格不暂存不 flood;(B) `build_candidate` 用 `filter_applicable_gov` 在 trial 上按序试应用、只纳入干净 op;(C) `apply_certified` 清理已提交 gov op | `gov_gossip_rejects_inadmissible_ops`、`poisoned_gov_pool_does_not_stall_candidate_production` | `1056ad0` |
-| SEC-05 | 中 | ✅ 已修 | unbond 证明对 `source_header.bridge_root`(提交 locks 树)验证,正常源链无法生成可验证证明(旧测试靠伪造头 patch `bridge_root`+re-cert) | `lib.rs`+`codec.rs`:新增独立 cert 签名 `unbonding_root`(源链 unbonding 队列 Merkle 根)——`unbonding_merkle_root`/`unbonding_proof`/`..._for_genesis` + `Block`/`BlockHeader` 字段(**wire B7**,前缀 252→284、n_updates 偏移 244→276)+ seal/commit 盖根 + apply `UnbondingRootMismatch`;`apply_bridge_unbond` 改对 `source_header.unbonding_root` 验证;demo/测试/`mirror-unbond` CLI 改用正常 seal 的真实头,删死代码 `rebuild_cert_after_bridge_root_patch` | `unbonding_root_mismatch_is_rejected_on_apply`;`bridge_unbond_mirrors_to_dest_and_matures`(现为**真实端到端**:源链正常 seal→出证明→目的链镜像,无伪造) | `3489a35` |
+| SEC-01 | 高 | ⚠️ 第一轮不完整；第二轮仍有容量边界待修 | 治理 gossip 可污染候选池并持续占用缓存/待处理池 | 第一轮加入 admissibility、候选过滤和提交清理；二轮改为先验签、增加 4096 pending 上限并让可配置去重缓存覆盖治理集合。**本轮仍发现：默认 `seen_cache=0` 表示无上限；pending 满后仍先插入 seen 哈希；本地治理提交方法也未检查 pending 上限。** 详见下方审计复核状态 | 第一轮 `gov_gossip_rejects_inadmissible_ops`、`poisoned_gov_pool_does_not_stall_candidate_production`；二轮复验仍需覆盖默认配置、池满及本地提交 | M203、M206 |
+| SEC-05 | 中 | ⚠️ 第一轮不完整；见第二轮 | unbond 证明对 `source_header.bridge_root`(提交 locks 树)验证,正常源链无法生成可验证证明(旧测试靠伪造头 patch `bridge_root`+re-cert) | `lib.rs`+`codec.rs`:新增独立 cert 签名 `unbonding_root`(源链 unbonding 队列 Merkle 根)并改用其验证；B7 wire 改动升级 `PROTOCOL_VERSION` 并拒绝旧版本 | `unbonding_root_mismatch_is_rejected_on_apply`、`bridge_unbond_mirrors_to_dest_and_matures`、`version_negotiation_rejects_older_wire_gen` | M204、M206 |
 
 ## 需审计方重点回归的新增面
 
@@ -34,22 +36,21 @@ git log --oneline 8117910..3489a35          # 审计基线 → 修复后的三�
 2. **治理 gossip 入口(SEC-01)**:`gov_proposal_admissible`/`gov_vote_admissible` **不**校验 nonce(容许流水线超前),nonce/顺序交由 apply + `filter_applicable_gov` 把关。请复查:投票要求提案**已提交**(id 仅在 apply 时分配,故这是正确约束)、`filter_applicable_gov` 的 trial 顺序(提案先于投票)与真实 `apply_block_inner` 一致、以及"中毒池不致停摆"在多提议人下成立。
 3. **state_root 变更(SEC-02)**:确认**所有**影响状态转换的参数均已折入,且创世身份与快照校验绑定同一承诺(快照已序列化这些参数,交叉校验现覆盖它们)。
 
-## 第二轮(审计复验的后续修复)
+## 第二轮(追加修复与复核状态)
 
-审计方复验第一轮后指出 5 项修复**不彻底**(正确命中)。已二次修复(M206):
+第一轮代码复核发现 5 项修复不彻底；M206 对其中问题追加修复。下表记录二轮代码及本轮独立复核结果，最终关闭状态由审计方确认。
 
-| 编号 | 第一轮遗漏 | 二次修复 | 新回归测试 |
+| 编号 | 第一轮遗漏 | M206 二次修复 | 本轮代码复核 |
 |---|---|---|---|
-| SEC-03 | `Commit::verify`(`consensus.rs`)仍用 `u64` 累加签名者权重;`total_power` **饱和**→quorum 基于偏低总量,少数可过。缺总权重上限 | `verify` 改 `u128` 累加;新增 `MAX_TOTAL_POWER=2^60` + `power_within_cap()`,在**创世(config `BadGenesis`)、验证人更新(`ValidatorPowerOverflow`)、`verify`(`PowerOverflow`)**三处拒绝超额集合→`total_power` 永不饱和、quorum 反映真实总量 | `verify_rejects_overflowing_validator_set`(7×u64::MAX、2 签名者→拒) |
-| SEC-04 | `Lam`/`BonusMax` 只要求有限非负(无上限),可把 ΔK→奖励推到 `u64` 饱和再回绕;奖励/余额/供应用普通加法 | ΔK 浮点旋钮加上限 `MAX_DELTAK_PARAM=1000`;`apply_tx` 奖励转换前检有限+非负、余额/earned/供应改 `checked_add`→溢出即 `RewardOverflow` 拒块 | `gov_param_validation_rejects_unsafe_values`(Lam/BonusMax 超上限→拒) |
-| SEC-01 | 入口**先插去重集再验签**(无效 op 仍撑大缓存);`SeenSet` 默认无上限且未覆盖治理集;pending 队列无上限 | `on_gov_*` 改**先验证后缓存**;`set_seen_capacity` 覆盖 `seen_gov_proposal`/`seen_gov_vote`(+key_rotation);pending 池加硬上限 `MAX_PENDING_GOV=4096`(满则不暂存不再 flood) | `gov_gossip_rejects_inadmissible_ops`(无效 op 不入池)、`poisoned_gov_pool_does_not_stall_candidate_production` |
-| SEC-06 | 内联验证人集 decoder(`dec_validator_set_inline`)查了 `MAX_ITEMS` 但 `with_capacity(n)` 未用封顶 | 改用 `prealloc(n)` | `inline_validator_set_short_frame_rejects_without_large_alloc`(声明 1M 后截断→拒,不大额预留) |
-| SEC-05 | B7 加了 `unbonding_root` 但 `PROTOCOL_VERSION` 仍为 1→B6/B7 节点握手通过后才遇不兼容编码 | `PROTOCOL_VERSION` 1→**3**(B6 应为 2、B7 为 3,此前漏增);补旧版拒连测 | `version_negotiation_rejects_older_wire_gen`(peer 报 `VERSION-1`→`InvalidData` 拒) |
+| SEC-03 | `Commit::verify` 仍以 `u64` 累加签名权重；饱和总权重会低估 quorum | 改用 `u128` 累加；以 `MAX_TOTAL_POWER=2^60` 在创世配置、验证人更新和证书验证处拒绝超额集合 | 实现与定向测试通过；请审计方复核上限覆盖所有构造和迁移路径 |
+| SEC-04 | `Lam`/`BonusMax` 无上限；奖励转 `u64` 后普通加法可能溢出 | ΔK 旋钮设 `MAX_DELTAK_PARAM=1000`；奖励、余额、earned 和 supply 使用 checked arithmetic，溢出返回 `RewardOverflow` | 参数边界测试和全量测试通过；请审计方复核参数边界与治理执行序列 |
+| SEC-01 | 无效操作先进入 seen；治理 seen 默认无界；pending 无界 | 先验签；缓存容量设置覆盖治理集合；远端 pending 加 4096 上限 | **未闭环**：默认 `seen_cache=0` 时无界；入站池满后仍先插 seen；`submit_local_gov_proposal/vote` 可绕过 pending 上限。建议采用默认硬上限，检查容量后再写 seen，并让本地/远端入口共用有界 admission helper |
+| SEC-06 | `dec_validator_set_inline` 有百万项计数上限但仍按 `n` 预分配 | 改用 `prealloc(n)` 封顶预留 | 短帧回归测试与全量测试通过；请审计方复核所有不可信计数解码路径 |
+| SEC-05 | B7 增加 `unbonding_root` 后仍沿用协议版本 1 | 协议版本提升为 3，并增加旧版本拒连测试 | 实现与定向测试通过；请审计方确认代际编号和升级说明一致 |
 
-**复验要点(二次)**:(1) `MAX_TOTAL_POWER` 在创世/更新/cert 三路都拒绝;`verify` 全程 u128,
-无 u64 中间量。(2) ΔK 旋钮上限 + `checked_add` 双保险,`supply_conserved` 在极端治理值下仍成立。
-(3) 治理去重集有上限且先验证后缓存;pending 池有硬顶。(4) 每次 wire 破坏必增 `PROTOCOL_VERSION`
-(本轮补齐到 3)。
+**复验要点(二次)**:(1) `MAX_TOTAL_POWER` 在创世/更新/cert 三路都拒绝；`verify` 使用 u128。(2) ΔK 旋钮上限与 checked arithmetic 共同限制单次奖励。(3) SEC-01 需补齐默认缓存、池满顺序和本地提交路径后再关闭。(4) 每次 wire 破坏必增 `PROTOCOL_VERSION`(B7 当前为 3)。
+
+**部署结论:** SEC-01 仍未闭环，本轮不能给出 P0 全项通过或生产可部署结论。其余二轮修复的最终关闭状态等待审计方基于代码和回归测试确认；外部审计及测试网经济参数反校等部署前置也须单独完成。
 
 ## 本轮未覆盖(与审计一致,non-goals)
 
