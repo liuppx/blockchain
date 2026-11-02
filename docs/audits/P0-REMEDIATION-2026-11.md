@@ -34,6 +34,23 @@ git log --oneline 8117910..3489a35          # 审计基线 → 修复后的三�
 2. **治理 gossip 入口(SEC-01)**:`gov_proposal_admissible`/`gov_vote_admissible` **不**校验 nonce(容许流水线超前),nonce/顺序交由 apply + `filter_applicable_gov` 把关。请复查:投票要求提案**已提交**(id 仅在 apply 时分配,故这是正确约束)、`filter_applicable_gov` 的 trial 顺序(提案先于投票)与真实 `apply_block_inner` 一致、以及"中毒池不致停摆"在多提议人下成立。
 3. **state_root 变更(SEC-02)**:确认**所有**影响状态转换的参数均已折入,且创世身份与快照校验绑定同一承诺(快照已序列化这些参数,交叉校验现覆盖它们)。
 
+## 第二轮(审计复验的后续修复)
+
+审计方复验第一轮后指出 5 项修复**不彻底**(正确命中)。已二次修复,提交 `238fb4f`:
+
+| 编号 | 第一轮遗漏 | 二次修复 | 新回归测试 |
+|---|---|---|---|
+| SEC-03 | `Commit::verify`(`consensus.rs`)仍用 `u64` 累加签名者权重;`total_power` **饱和**→quorum 基于偏低总量,少数可过。缺总权重上限 | `verify` 改 `u128` 累加;新增 `MAX_TOTAL_POWER=2^60` + `power_within_cap()`,在**创世(config `BadGenesis`)、验证人更新(`ValidatorPowerOverflow`)、`verify`(`PowerOverflow`)**三处拒绝超额集合→`total_power` 永不饱和、quorum 反映真实总量 | `verify_rejects_overflowing_validator_set`(7×u64::MAX、2 签名者→拒) |
+| SEC-04 | `Lam`/`BonusMax` 只要求有限非负(无上限),可把 ΔK→奖励推到 `u64` 饱和再回绕;奖励/余额/供应用普通加法 | ΔK 浮点旋钮加上限 `MAX_DELTAK_PARAM=1000`;`apply_tx` 奖励转换前检有限+非负、余额/earned/供应改 `checked_add`→溢出即 `RewardOverflow` 拒块 | `gov_param_validation_rejects_unsafe_values`(Lam/BonusMax 超上限→拒) |
+| SEC-01 | 入口**先插去重集再验签**(无效 op 仍撑大缓存);`SeenSet` 默认无上限且未覆盖治理集;pending 队列无上限 | `on_gov_*` 改**先验证后缓存**;`set_seen_capacity` 覆盖 `seen_gov_proposal`/`seen_gov_vote`(+key_rotation);pending 池加硬上限 `MAX_PENDING_GOV=4096`(满则不暂存不再 flood) | `gov_gossip_rejects_inadmissible_ops`(无效 op 不入池)、`poisoned_gov_pool_does_not_stall_candidate_production` |
+| SEC-06 | 内联验证人集 decoder(`dec_validator_set_inline`)查了 `MAX_ITEMS` 但 `with_capacity(n)` 未用封顶 | 改用 `prealloc(n)` | `inline_validator_set_short_frame_rejects_without_large_alloc`(声明 1M 后截断→拒,不大额预留) |
+| SEC-05 | B7 加了 `unbonding_root` 但 `PROTOCOL_VERSION` 仍为 1→B6/B7 节点握手通过后才遇不兼容编码 | `PROTOCOL_VERSION` 1→**3**(B6 应为 2、B7 为 3,此前漏增);补旧版拒连测 | `version_negotiation_rejects_older_wire_gen`(peer 报 `VERSION-1`→`InvalidData` 拒) |
+
+**复验要点(二次)**:(1) `MAX_TOTAL_POWER` 在创世/更新/cert 三路都拒绝;`verify` 全程 u128,
+无 u64 中间量。(2) ΔK 旋钮上限 + `checked_add` 双保险,`supply_conserved` 在极端治理值下仍成立。
+(3) 治理去重集有上限且先验证后缓存;pending 池有硬顶。(4) 每次 wire 破坏必增 `PROTOCOL_VERSION`
+(本轮补齐到 3)。
+
 ## 本轮未覆盖(与审计一致,non-goals)
 
 持久化 cargo-fuzz、形式化验证、跨实现互操作、生产渗透测试;以及 SECURITY.md §10 的已知边界

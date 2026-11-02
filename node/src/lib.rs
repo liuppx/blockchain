@@ -309,6 +309,11 @@ pub enum DeltaKParam {
 pub const MAX_SLASH_BPS: u32 = 10_000; // 100%; `stake - stake*bps/10000` must not underflow
 pub const MAX_BASE_EMISSION_MICRO: u64 = 1_000 * MICRO; // ample vs the ~8*MICRO default
 pub const MAX_GOV_COUNT: u64 = 10_000; // bound for usize-typed ΔK counts (fits usize on 32/64-bit)
+/// SEC-04 (re-verify): upper bound for the unbounded ΔK float knobs (lam/bonus_max/
+/// decay/delta_k_min). Caps ΔK so one reward `≈ base_emission × ΔK` stays far below
+/// `u64::MAX` (≤ 1000*MICRO × ~1e3 ≈ 1e12 « 1.8e19). The unit knobs (tau_dup/c_cap/
+/// fresh_min) keep their own `[0,1]` bound.
+pub const MAX_DELTAK_PARAM: f32 = 1_000.0;
 
 /// SEC-04: validate a single governable parameter value against its safe domain.
 /// Called at proposal **registration** (so only valid values ever enter the proposal
@@ -322,7 +327,11 @@ pub fn validate_gov_param(param: &GovParam) -> Result<(), ChainError> {
         }
     };
     let nonneg = |v: f32, name: &'static str| {
-        if v.is_finite() && v >= 0.0 {
+        // SEC-04 (re-verify): a finite lower AND upper bound. An unbounded `lam`/`bonus_max`
+        // let governance drive ΔK (hence the mint) arbitrarily high → reward conversion
+        // saturates `u64` and supply/balance overflow. `MAX_DELTAK_PARAM` keeps ΔK (and
+        // thus any single reward) far below `u64::MAX` even at the max base emission.
+        if v.is_finite() && (0.0..=MAX_DELTAK_PARAM).contains(&v) {
             Ok(())
         } else {
             Err(ChainError::GovParamOutOfRange(name))
@@ -1168,6 +1177,10 @@ pub enum ChainError {
     /// genesis so an unsafe value can never reach execution (where it would break
     /// supply conservation / overflow).
     GovParamOutOfRange(&'static str),
+    /// SEC-04: minting this block's reward would overflow a u64 balance/supply. Defense
+    /// in depth behind the governance param bounds — a block that cannot be applied
+    /// without breaking supply conservation is rejected rather than wrapping.
+    RewardOverflow,
     /// M143: the tx's `nonce` is further ahead than the mempool's pipelining window
     /// allows (`got > acct.nonce + nonce_lookahead`). A mempool-admission bound, not
     /// a consensus rule — it keeps per-account buffering finite.
@@ -1201,6 +1214,9 @@ pub enum ChainError {
     /// A block's validator updates would leave the set empty — consensus would
     /// become impossible, so the block is rejected.
     EmptyValidatorSet,
+    /// SEC-03: a block's validator updates would push total power past the protocol cap
+    /// (`validator::MAX_TOTAL_POWER`), making the set unsafely representable — rejected.
+    ValidatorPowerOverflow,
     /// A bond/unbond op with a zero amount (never meaningful).
     ZeroStake(u64),
     /// An unbond of more than the account currently has bonded.
@@ -1382,6 +1398,9 @@ impl std::fmt::Display for ChainError {
             ChainError::GovParamOutOfRange(field) => {
                 write!(f, "governance parameter out of safe range: {field}")
             }
+            ChainError::RewardOverflow => {
+                write!(f, "minting this block's reward would overflow balance/supply")
+            }
             ChainError::NonceTooFarAhead { account, got, limit } => write!(
                 f,
                 "account {account} nonce {got} exceeds the mempool pipelining window (max {limit})"
@@ -1400,6 +1419,9 @@ impl std::fmt::Display for ChainError {
             ChainError::BadSignature(a) => write!(f, "invalid signature for account {a}"),
             ChainError::EmptyValidatorSet => {
                 write!(f, "validator updates would empty the validator set")
+            }
+            ChainError::ValidatorPowerOverflow => {
+                write!(f, "validator updates would exceed the total-power cap")
             }
             ChainError::ZeroStake(a) => write!(f, "account {a} bond/unbond amount is zero"),
             ChainError::InsufficientBond { account, need, have } => write!(
@@ -1940,6 +1962,12 @@ impl ChainState {
             let next = self.validators.apply_updates(&updates);
             if next.is_empty() {
                 return Err(ChainError::EmptyValidatorSet);
+            }
+            // SEC-03: reject an update that pushes total power past the protocol cap,
+            // so `total_power()`/`quorum()` never saturate (which would let a minority
+            // certify). Applied on the trial clone → rolls the whole block back.
+            if !next.power_within_cap() {
+                return Err(ChainError::ValidatorPowerOverflow);
             }
             self.validators = next;
         }
@@ -2804,14 +2832,36 @@ impl ChainState {
             // makes the factor exactly `1.0`, so a chain that doesn't opt in mints
             // precisely as before (no re-baseline).
             let decay = time_decay_factor(self.height + 1, self.decay_half_life_blocks);
-            let reward = ((self.base_emission_micro as f64) * (dk as f64) * decay).round() as u64;
+            // SEC-04: clamp the f64 product into u64 range before converting (an `as u64`
+            // cast saturates, but we then reject any addition that would overflow so
+            // balance/supply never wrap). Params are bounded (MAX_DELTAK_PARAM /
+            // MAX_BASE_EMISSION_MICRO), so an honest reward is tiny; this is defense in depth.
+            let reward_f = (self.base_emission_micro as f64) * (dk as f64) * decay;
+            let reward = if reward_f.is_finite() && reward_f >= 0.0 {
+                reward_f.round() as u64
+            } else {
+                return Err(ChainError::RewardOverflow);
+            };
             {
                 let acct = self.accounts.get_mut(&tx.author).unwrap();
-                acct.balance += tx.stake + reward; // escrow returned + reward
-                acct.earned_total += reward;
+                let returned = tx
+                    .stake
+                    .checked_add(reward)
+                    .ok_or(ChainError::RewardOverflow)?;
+                acct.balance = acct
+                    .balance
+                    .checked_add(returned)
+                    .ok_or(ChainError::RewardOverflow)?;
+                acct.earned_total = acct
+                    .earned_total
+                    .checked_add(reward)
+                    .ok_or(ChainError::RewardOverflow)?;
                 acct.accepted += 1;
             }
-            self.supply += reward;
+            self.supply = self
+                .supply
+                .checked_add(reward)
+                .ok_or(ChainError::RewardOverflow)?;
             // M183: minting the cognitive-graph node also mints a cNFT bound to
             // the contributor. `graph.add` returns the new node_id (1 accept =
             // 1 node = 1 cNFT). `self.height` is the pre-block height here (it is
@@ -4209,7 +4259,15 @@ mod tests {
         assert!(validate_gov_param(&GovParam::DeltaK(DeltaKParam::TauDup(0.9))).is_ok());
         assert!(validate_gov_param(&GovParam::DeltaK(DeltaKParam::TauDup(1.5))).is_err());
         assert!(validate_gov_param(&GovParam::DeltaK(DeltaKParam::TauDup(f32::NAN))).is_err());
-        assert!(validate_gov_param(&GovParam::DeltaK(DeltaKParam::Lam(2.0))).is_ok()); // nonneg, no upper
+        assert!(validate_gov_param(&GovParam::DeltaK(DeltaKParam::Lam(2.0))).is_ok()); // within bound
+        assert!(validate_gov_param(&GovParam::DeltaK(DeltaKParam::Lam(MAX_DELTAK_PARAM))).is_ok());
+        // SEC-04 re-verify: lam/bonus_max now have an UPPER bound (unbounded before →
+        // governance could drive ΔK, hence the mint, to overflow).
+        assert!(
+            validate_gov_param(&GovParam::DeltaK(DeltaKParam::Lam(MAX_DELTAK_PARAM + 1.0)))
+                .is_err()
+        );
+        assert!(validate_gov_param(&GovParam::DeltaK(DeltaKParam::BonusMax(1e30))).is_err());
         assert!(validate_gov_param(&GovParam::DeltaK(DeltaKParam::Lam(-1.0))).is_err());
         assert!(validate_gov_param(&GovParam::DeltaK(DeltaKParam::Decay(f32::INFINITY))).is_err());
         assert!(validate_gov_param(&GovParam::DeltaK(DeltaKParam::NMin(MAX_GOV_COUNT))).is_ok());

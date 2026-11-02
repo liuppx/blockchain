@@ -1096,7 +1096,10 @@ fn dec_validator_set_inline(d: &mut Dec) -> Result<crate::validator::ValidatorSe
         return Err(CodecError::TooManyItems(n_raw as u64));
     }
     let n = n_raw as usize;
-    let mut vs = Vec::with_capacity(n);
+    // SEC-06 (re-verify): cap the up-front reservation (a short frame could claim 1M
+    // validators via this bridge-header path and force a large alloc before any element
+    // is read). The `Vec` grows as elements are actually decoded + bounds-checked.
+    let mut vs = Vec::with_capacity(prealloc(n_raw as u64));
     for _ in 0..n {
         let len = d.u32()? as usize;
         let buf = d.take(len)?;
@@ -4299,6 +4302,20 @@ mod tests {
         assert_eq!(prealloc(MAX_ITEMS), PREALLOC_CAP);
         assert_eq!(prealloc(u64::MAX), PREALLOC_CAP);
         assert_eq!(prealloc_usize(usize::MAX), PREALLOC_CAP);
+    }
+
+    #[test]
+    fn inline_validator_set_short_frame_rejects_without_large_alloc() {
+        // SEC-06 (re-verify): the inline validator-set decoder (bridge-header path) must
+        // reject a frame that claims ~1M validators but then truncates, WITHOUT reserving
+        // for the full claimed count first. It returns Err before reading the first entry.
+        let buf = 1_000_000u32.to_be_bytes().to_vec(); // claims 1M, no element bytes
+        let mut d = Dec { buf: &buf, pos: 0 };
+        assert!(dec_validator_set_inline(&mut d).is_err());
+        // Exactly at the MAX_ITEMS ceiling with no following bytes is also rejected.
+        let buf2 = (MAX_ITEMS as u32).to_be_bytes().to_vec();
+        let mut d2 = Dec { buf: &buf2, pos: 0 };
+        assert!(dec_validator_set_inline(&mut d2).is_err());
     }
 
     #[test]

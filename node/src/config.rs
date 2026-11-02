@@ -1088,6 +1088,17 @@ impl GenesisConfig {
         .map_err(|e| ConfigError::BadGenesis {
             detail: e.to_string(),
         })?;
+        // SEC-03: reject a genesis validator set whose total power exceeds the protocol
+        // cap (so `total_power()`/`quorum()` never saturate at runtime).
+        let total_power: u128 = validators.iter().map(|&(_, _, p)| p as u128).sum();
+        if total_power > crate::validator::MAX_TOTAL_POWER as u128 {
+            return Err(ConfigError::BadGenesis {
+                detail: format!(
+                    "total validator power {total_power} exceeds cap {}",
+                    crate::validator::MAX_TOTAL_POWER
+                ),
+            });
+        }
 
         Ok(Genesis {
             accounts,

@@ -166,7 +166,12 @@ async fn read_hello<R: AsyncReadExt + Unpin>(r: &mut R) -> io::Result<u64> {
 /// "negotiating" a common version would be theater. The honest contract is: same
 /// version ⇒ proceed, different ⇒ reject cleanly. Range negotiation becomes meaningful
 /// only once the node maintains multiple simultaneous wire decoders (not today).
-pub const PROTOCOL_VERSION: u32 = 1;
+///
+/// SEC-05 (re-verify): bumped to **3** — the B6 (M194 governance ops) and B7 (SEC-05
+/// `unbonding_root`) wire breaks landed while this constant was still `1`, so a B5/B6
+/// node and a B7 node would have passed the handshake and only failed later on
+/// incompatible frames. Every future wire break MUST bump this (CI/review gate).
+pub const PROTOCOL_VERSION: u32 = 3;
 
 /// M192: exchange and check [`PROTOCOL_VERSION`] at connection open. Writes ours,
 /// reads the peer's, and errors on mismatch. The 4-byte write fits the socket/TLS
@@ -9254,6 +9259,29 @@ mod tests {
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
         // And our node did announce its real version to the peer.
         assert_eq!(impostor.await.unwrap(), PROTOCOL_VERSION);
+    }
+
+    #[tokio::test]
+    async fn version_negotiation_rejects_older_wire_gen() {
+        // SEC-05 (re-verify): a peer on an OLDER wire generation (e.g. B6 = v2 vs our
+        // B7 = v3) announces `PROTOCOL_VERSION - 1` and is rejected at the handshake,
+        // not after mis-parsing frames. Guards the "bump version on every wire break"
+        // invariant that B6/B7 previously violated (both shipped as v1).
+        let (a, b) = tokio::io::duplex(64);
+        let (mut ar, mut aw) = tokio::io::split(a);
+        let (mut br, mut bw) = tokio::io::split(b);
+        let older = tokio::spawn(async move {
+            bw.write_all(&(PROTOCOL_VERSION - 1).to_be_bytes())
+                .await
+                .unwrap();
+            bw.flush().await.unwrap();
+            let mut got = [0u8; 4];
+            br.read_exact(&mut got).await.unwrap();
+            u32::from_be_bytes(got)
+        });
+        let err = negotiate_version(&mut ar, &mut aw).await.unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(older.await.unwrap(), PROTOCOL_VERSION);
     }
 
     // --- M40: authenticated handshake (pure core) -------------------------------

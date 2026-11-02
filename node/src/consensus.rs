@@ -126,7 +126,13 @@ pub enum ConsensusError {
     UnknownValidator(u64),
     BadSignature(u64),
     DuplicateValidator(u64),
-    NotEnoughPower { got: u64, need: u64 },
+    NotEnoughPower {
+        got: u64,
+        need: u64,
+    },
+    /// SEC-03: the validator set's total power exceeds the protocol cap, so it is not
+    /// safely representable and its quorum cannot be trusted.
+    PowerOverflow,
 }
 
 impl std::fmt::Display for ConsensusError {
@@ -143,6 +149,9 @@ impl std::fmt::Display for ConsensusError {
             ConsensusError::NotEnoughPower { got, need } => {
                 write!(f, "insufficient voting power: {got} < quorum {need}")
             }
+            ConsensusError::PowerOverflow => {
+                write!(f, "validator set total power exceeds the protocol cap")
+            }
         }
     }
 }
@@ -158,8 +167,18 @@ impl Commit {
         if self.precommits.is_empty() {
             return Err(ConsensusError::NoVotes);
         }
+        // SEC-03: reject a set whose total power exceeds the cap — otherwise the
+        // saturated `total_power()`/`quorum()` would understate the real total and a
+        // minority could clear it.
+        if !vset.power_within_cap() {
+            return Err(ConsensusError::PowerOverflow);
+        }
         let mut seen = BTreeSet::new();
-        let mut power = 0u64;
+        // SEC-03: accumulate signer power in u128. With u64 accumulation a set of
+        // huge-power validators could wrap the running total back above a quorum that
+        // was computed from a *saturated* total — letting a <1/3 minority certify a
+        // block. u128 can hold the sum of any number of u64 powers exactly.
+        let mut power: u128 = 0;
         for v in &self.precommits {
             if v.vote_type != VoteType::Precommit {
                 return Err(ConsensusError::WrongVoteType(v.validator));
@@ -176,13 +195,16 @@ impl Commit {
             if !crypto::verify(&val.pubkey, &v.signing_bytes(), &v.signature) {
                 return Err(ConsensusError::BadSignature(v.validator));
             }
-            power += val.power;
+            power += val.power as u128;
         }
-        let need = vset.quorum();
+        let need = vset.quorum() as u128;
         if power < need {
-            return Err(ConsensusError::NotEnoughPower { got: power, need });
+            return Err(ConsensusError::NotEnoughPower {
+                got: power.min(u64::MAX as u128) as u64,
+                need: need as u64,
+            });
         }
-        Ok(power)
+        Ok(power.min(u64::MAX as u128) as u64)
     }
 }
 
@@ -321,6 +343,42 @@ mod tests {
         let b = block(1, 1);
         // only 2 of 4 -> below quorum (need 3)
         assert!(commit_block(&vs, &ks, &b, 0, &[1, 2]).is_none());
+    }
+
+    #[test]
+    fn verify_rejects_overflowing_validator_set() {
+        // SEC-03 (re-verify): a set whose TRUE total power exceeds the cap is rejected
+        // by `verify` up front. Previously `verify` summed signer power in u64, so for
+        // 7 validators each `u64::MAX`, two signers (2/7 of real power) wrapped the
+        // running total back above the saturated-total quorum and the cert "verified".
+        let ids = [1u64, 2, 3, 4, 5, 6, 7];
+        let vs = ValidatorSet::new(
+            ids.iter()
+                .map(|&id| Validator {
+                    id,
+                    pubkey: kp(id).public(),
+                    power: u64::MAX,
+                })
+                .collect(),
+        );
+        assert!(!vs.power_within_cap(), "set is over the protocol cap");
+        let b = block(1, 1);
+        let bh = b.hash();
+        // Build a 2-signer commit directly (commit_block would reject it via verify).
+        let precommits = [1u64, 2]
+            .iter()
+            .map(|&id| Vote::signed(id, b.height, 0, bh, VoteType::Precommit, &kp(id)))
+            .collect();
+        let commit = Commit {
+            height: b.height,
+            round: 0,
+            block_hash: bh,
+            precommits,
+        };
+        assert!(matches!(
+            commit.verify(&vs),
+            Err(ConsensusError::PowerOverflow)
+        ));
     }
 
     #[test]

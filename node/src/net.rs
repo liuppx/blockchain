@@ -220,6 +220,10 @@ pub enum GossipMsg {
 /// cap is a codec error ([`CodecError::TooManyItems`]). Bounds a hostile peer's
 /// book so decoding can't fan out unboundedly.
 pub const MAX_PEERS: usize = 1024;
+/// SEC-01 (re-verify): hard cap on each staged governance pool (proposals / votes). A
+/// full pool stops staging + re-flooding further gov ops — governance is low-volume, so
+/// this bounds memory/CPU under a gossip flood without affecting honest operation.
+pub const MAX_PENDING_GOV: usize = 4096;
 
 /// M24: maximum items in a single [`GossipMsg::GetProof`] / [`GossipMsg::Proof`]
 /// — over the cap is a codec error (`TooManyItems`). Keeps a single request
@@ -1418,6 +1422,11 @@ impl GossipNode {
         self.seen_tx.set_capacity(capacity);
         self.seen_evidence.set_capacity(capacity);
         self.seen_stake_op.set_capacity(capacity);
+        // SEC-01 (re-verify): the governance dedup sets were previously unbounded, so a
+        // peer could grow them without limit. Bound them with the same policy.
+        self.seen_key_rotation.set_capacity(capacity);
+        self.seen_gov_proposal.set_capacity(capacity);
+        self.seen_gov_vote.set_capacity(capacity);
     }
 
     /// M55: current number of entries in the tx dedup set (the one under flood
@@ -1729,13 +1738,18 @@ impl GossipNode {
 
     /// M195: dedup + stage + re-flood a gossiped governance proposal.
     fn on_gov_proposal(&mut self, from: u64, op: GovProposal) -> Vec<(u64, GossipMsg)> {
-        if !self.seen_gov_proposal.insert(op.hash()) {
+        // SEC-01 (re-verify): validate BEFORE touching the dedup cache, so an invalid op
+        // never grows `seen_gov_proposal`. Cheap recompute on re-delivery is bounded by
+        // the connection cap (M177).
+        if !self.chain.state.gov_proposal_admissible(&op) {
             return Vec::new();
         }
-        // SEC-01: reject invalid ops at ingress (bad sig / unknown account / out-of-range
-        // param) — never stage or re-flood garbage. Full nonce/ordering is enforced at
-        // apply + candidate-build filtering.
-        if !self.chain.state.gov_proposal_admissible(&op) {
+        if !self.seen_gov_proposal.insert(op.hash()) {
+            return Vec::new(); // already flooded through us
+        }
+        // SEC-01: bound the pending pool. A full pool stops staging + re-flood (governance
+        // is low-volume; a full gov pool is already abnormal).
+        if self.pending_gov_proposals.len() >= MAX_PENDING_GOV {
             return Vec::new();
         }
         self.pending_gov_proposals.push(op.clone());
@@ -1744,12 +1758,13 @@ impl GossipNode {
 
     /// M195: dedup + stage + re-flood a gossiped governance vote.
     fn on_gov_vote(&mut self, from: u64, op: GovVote) -> Vec<(u64, GossipMsg)> {
+        if !self.chain.state.gov_vote_admissible(&op) {
+            return Vec::new();
+        }
         if !self.seen_gov_vote.insert(op.hash()) {
             return Vec::new();
         }
-        // SEC-01: reject invalid ops at ingress (bad sig / unknown account / unknown or
-        // closed proposal) — never stage or re-flood garbage.
-        if !self.chain.state.gov_vote_admissible(&op) {
+        if self.pending_gov_votes.len() >= MAX_PENDING_GOV {
             return Vec::new();
         }
         self.pending_gov_votes.push(op.clone());

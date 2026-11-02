@@ -17,6 +17,13 @@ use std::collections::BTreeMap;
 
 use crate::PubKey;
 
+/// SEC-03: protocol cap on total validator voting power. A set whose true total exceeds
+/// this is rejected at genesis / updates / cert verification, guaranteeing `total_power()`
+/// never saturates and the quorum reflects the real total. `2^60` micro-$COG
+/// (~1.15e12 $COG) is far above any realistic bonded total yet leaves huge headroom
+/// below `u64::MAX` for the `2*total` quorum math.
+pub const MAX_TOTAL_POWER: u64 = 1 << 60;
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct Validator {
     pub id: u64,
@@ -119,6 +126,20 @@ impl ValidatorSet {
         self.validators
             .iter()
             .fold(0u64, |acc, v| acc.saturating_add(v.power))
+    }
+
+    /// SEC-03: the exact total power in `u128` (never saturates). Used to enforce the
+    /// protocol power cap so `total_power()` above never actually saturates in practice.
+    pub fn total_power_u128(&self) -> u128 {
+        self.validators.iter().map(|v| v.power as u128).sum()
+    }
+
+    /// SEC-03: a set is representable iff its *true* total power fits the protocol cap.
+    /// If it does, `total_power()` never saturates, so the `quorum()` the certificate is
+    /// checked against reflects the real total — a <1/3-power minority can never certify.
+    /// Enforced at genesis load, validator-set updates, and certificate verification.
+    pub fn power_within_cap(&self) -> bool {
+        self.total_power_u128() <= MAX_TOTAL_POWER as u128
     }
 
     /// Apply on-chain [`ValidatorUpdate`]s in order, returning the evolved set.
