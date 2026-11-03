@@ -36,6 +36,8 @@ pub mod light;
 pub mod mempool;
 pub mod merkle;
 pub mod net;
+#[cfg(unix)]
+pub mod remote_signer;
 pub mod round;
 pub mod signer;
 pub mod store;

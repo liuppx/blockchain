@@ -328,6 +328,7 @@ fn main() {
         "encode-tx" => cmd_encode_tx(&args),
         "keygen" => cmd_keygen(&args),
         "encrypt-key" => cmd_encrypt_key(&args),
+        "signer" => cmd_signer(&args),
         "mirror-unbond" => cmd_mirror_unbond(),
         "localnet" => cmd_localnet(),
         "status" => cmd_status(&args),
@@ -433,6 +434,7 @@ fn usage() {
     eprintln!("  node keygen ... --genesis-id N [--balance MICRO] [--power P]  also print a ready-to-paste genesis [[accounts]] (and, with --power, [[validators]]) entry");
     eprintln!("  node encrypt-key --out F [--passphrase S] [--force]  M175: encrypt an existing seed (64-hex) or BIP-39 mnemonic (read no-echo from the terminal) into a Web3 Secret Storage v3 keystore (scrypt + AES-128-CTR); prompts for an encryption password; the plaintext never touches disk; refuses to overwrite --out unless --force");
     eprintln!("  node pubkey (--key-file F | --seed HEX) [--genesis-id N ...]  derive + print the pubkey for an existing seed WITHOUT writing a file (read-only; pairs with inspect-tx --pubkey)");
+    eprintln!("  node signer --keystore F --socket PATH --hwm FILE  M217: run the out-of-process remote signer — decrypt the keystore (ZHIXING_KEYSTORE_PASSWORD or no-echo prompt), serve consensus/handshake signatures over the Unix socket with a persisted anti-double-sign high-water-mark; the key never leaves this process (Unix only; see docs/design/remote-signer.md)");
     eprintln!("  node localnet           spin up an in-process tokio testnet (4 validators, no sequencer) and show all nodes converge via distributed BFT voting over real sockets");
     eprintln!("  node status --dir DIR [--config F | --genesis F]   replay the block log and print state (genesis: --config/--genesis, else demo)");
     eprintln!("  node verify --dir DIR [--config F | --genesis F]   replay blocks+certs logs through finality verification; non-zero exit on any integrity error (missing log, length mismatch, cert mismatch, < 2/3 quorum). --config/--genesis select the chain's genesis (default demo) — REQUIRED to audit a production chain");
@@ -4818,6 +4820,44 @@ fn cmd_encrypt_key(args: &[String]) {
     println!("pubkey {pub_hex}");
     println!("keystore {out_path}");
     println!("Store the password securely; it is NOT in the keystore file.");
+}
+
+/// M217 (remote-signer S2): `node signer --keystore F --socket PATH --hwm FILE` — run the
+/// out-of-process reference signer. Decrypts the keystore (password via no-echo prompt or
+/// `ZHIXING_KEYSTORE_PASSWORD`), binds the Unix socket (perms 600), and serves consensus /
+/// handshake signatures for the node, enforcing a persisted anti-double-sign high-water-mark.
+/// Blocks until killed; the key never leaves this process. Unix only.
+#[cfg(unix)]
+fn cmd_signer(args: &[String]) {
+    let ks_path = req_arg(args, "--keystore");
+    let socket = req_arg(args, "--socket");
+    let hwm = req_arg(args, "--hwm");
+
+    let json = std::fs::read_to_string(ks_path)
+        .unwrap_or_else(|e| fail_msg("read keystore", &format!("`{ks_path}`: {e}")));
+    let password = read_keystore_password(ks_path);
+    let seed = zhixing_node::keystore::decrypt_seed(&json, &password)
+        .unwrap_or_else(|e| fail_msg("decrypt keystore", &e.to_string()));
+    let kp = zhixing_node::Keypair::from_seed(seed);
+    println!(
+        "signer: pubkey {} listening on {socket} (hwm {hwm})",
+        zhixing_node::hash::hex(&kp.public())
+    );
+    if let Err(e) = zhixing_node::remote_signer::serve(
+        std::path::Path::new(socket),
+        kp,
+        std::path::Path::new(hwm),
+    ) {
+        fail_msg("signer", &e.to_string());
+    }
+}
+
+#[cfg(not(unix))]
+fn cmd_signer(_args: &[String]) {
+    fail_msg(
+        "signer",
+        "the remote signer requires a Unix domain socket (Unix only)",
+    );
 }
 
 /// M175: refuse to clobber an existing output file unless `--force` is given.
