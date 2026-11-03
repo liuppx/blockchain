@@ -821,7 +821,7 @@ fn load_snapshot_boot(
             "snapshot header_hex is not valid hex",
         )
     })?;
-    let header = crate::codec::decode_header(&header_bytes).map_err(|e| {
+    let header = crate::codec::decode_header_any(&header_bytes).map_err(|e| {
         io::Error::new(
             io::ErrorKind::InvalidData,
             format!("decode snapshot header: {e:?}"),
@@ -8219,7 +8219,7 @@ fn load_light_snapshot_seed(
         )
     })?;
     let header =
-        crate::codec::decode_header(&hex_to_bytes(&s.header_hex).ok_or_else(|| {
+        crate::codec::decode_header_any(&hex_to_bytes(&s.header_hex).ok_or_else(|| {
             io::Error::new(io::ErrorKind::InvalidData, "header_hex not valid hex")
         })?)
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("decode header: {e:?}")))?;

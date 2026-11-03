@@ -330,9 +330,9 @@ fn main() {
         "encrypt-key" => cmd_encrypt_key(&args),
         "mirror-unbond" => cmd_mirror_unbond(),
         "localnet" => cmd_localnet(),
-        "status" => cmd_status(dir_arg(&args)),
-        "verify" => cmd_verify(dir_arg(&args)),
-        "snapshot" => cmd_snapshot(dir_arg(&args), req_arg(&args, "--out").to_string()),
+        "status" => cmd_status(&args),
+        "verify" => cmd_verify(&args),
+        "snapshot" => cmd_snapshot(&args),
         "inspect-snapshot" => cmd_inspect_snapshot(req_arg(&args, "--snapshot").to_string()),
         "check-snapshot" => cmd_check_snapshot(
             req_arg(&args, "--snapshot").to_string(),
@@ -434,9 +434,9 @@ fn usage() {
     eprintln!("  node encrypt-key --out F [--passphrase S] [--force]  M175: encrypt an existing seed (64-hex) or BIP-39 mnemonic (read no-echo from the terminal) into a Web3 Secret Storage v3 keystore (scrypt + AES-128-CTR); prompts for an encryption password; the plaintext never touches disk; refuses to overwrite --out unless --force");
     eprintln!("  node pubkey (--key-file F | --seed HEX) [--genesis-id N ...]  derive + print the pubkey for an existing seed WITHOUT writing a file (read-only; pairs with inspect-tx --pubkey)");
     eprintln!("  node localnet           spin up an in-process tokio testnet (4 validators, no sequencer) and show all nodes converge via distributed BFT voting over real sockets");
-    eprintln!("  node status --dir DIR   replay the block log and print state");
-    eprintln!("  node verify --dir DIR   replay blocks+certs logs through finality verification; non-zero exit on any integrity error (missing log, length mismatch, cert mismatch, < 2/3 quorum)");
-    eprintln!("  node snapshot --dir DIR --out FILE  export the chain (replay-verified) as a M131 snapshot blob; --out - writes to stdout");
+    eprintln!("  node status --dir DIR [--config F | --genesis F]   replay the block log and print state (genesis: --config/--genesis, else demo)");
+    eprintln!("  node verify --dir DIR [--config F | --genesis F]   replay blocks+certs logs through finality verification; non-zero exit on any integrity error (missing log, length mismatch, cert mismatch, < 2/3 quorum). --config/--genesis select the chain's genesis (default demo) — REQUIRED to audit a production chain");
+    eprintln!("  node snapshot --dir DIR --out FILE [--config F | --genesis F]  export the chain (replay-verified) as a M131 snapshot blob; --out - writes to stdout; --config/--genesis select genesis (default demo)");
     eprintln!("  node inspect-snapshot --snapshot FILE  decode a M131 snapshot blob and print height/roots/supply_conserved; --snapshot - reads stdin");
     eprintln!("  node check-snapshot --snapshot FILE --header HEX  cross-check a snapshot against a cert-signed BlockHeader hex (GET /header/{{h}}): height + 3 roots must match; non-zero exit on mismatch");
     eprintln!("  node inspect-block --dir DIR [--height N]  read the persisted block log and print a per-block summary, or (with --height) one block's header + contents + tx hashes");
@@ -4983,12 +4983,13 @@ fn cmd_localnet() {
     let _ = std::fs::remove_dir_all(root);
 }
 
-fn cmd_status(dir: String) {
+fn cmd_status(args: &[String]) {
+    let dir = dir_arg(args);
+    let genesis = genesis_for_args(args);
     let path = format!("{dir}/blocks.log");
     let log = BlockLog::open(&path).unwrap_or_else(|e| fail("open log", e));
     let blocks = log.read_all().unwrap_or_else(|e| fail("read log", e));
-    let chain =
-        Chain::replay(demo_genesis(), &blocks).unwrap_or_else(|e| fail_chain("replay log", e));
+    let chain = Chain::replay(genesis, &blocks).unwrap_or_else(|e| fail_chain("replay log", e));
     println!("replayed {} block(s) from {path}", chain.state.height);
     print_summary(&chain);
 }
@@ -5015,7 +5016,16 @@ enum VerifyOutcome {
 /// every committed block is checked against its finality certificate (height + block hash
 /// bind + a real > 2/3 quorum under the height's active validator set). Pure helper (no I/O
 /// coupling to process exit) so it can be unit-tested.
+#[cfg(test)]
 fn verify_logs(dir: &str) -> VerifyOutcome {
+    verify_logs_with(dir, &demo_genesis())
+}
+
+/// M211: as [`verify_logs`], but against a caller-supplied genesis — so `node verify`
+/// can audit a *production* chain (whose validator keys/genesis differ from the demo),
+/// not only the built-in demo chain. Resolved from `--config`/`--genesis` by
+/// [`genesis_for_args`]; the demo wrapper above keeps the in-crate test callers simple.
+fn verify_logs_with(dir: &str, genesis: &Genesis) -> VerifyOutcome {
     let bpath = format!("{dir}/blocks.log");
     let cpath = format!("{dir}/certs.log");
     let blocks = match BlockLog::open(&bpath).and_then(|l| l.read_all()) {
@@ -5040,7 +5050,7 @@ fn verify_logs(dir: &str) -> VerifyOutcome {
     };
     let n = blocks.len();
     let m = certs.len();
-    match Chain::replay_verified(demo_genesis(), &blocks, &certs) {
+    match Chain::replay_verified(genesis.clone(), &blocks, &certs) {
         Ok(chain) => VerifyOutcome::Ok {
             blocks: n,
             certs: m,
@@ -5078,7 +5088,14 @@ impl std::fmt::Debug for SnapshotReplayError {
     }
 }
 
+#[cfg(test)]
 fn replay_for_snapshot(dir: &str) -> Result<Chain, SnapshotReplayError> {
+    replay_for_snapshot_with(dir, &demo_genesis())
+}
+
+/// M211: as [`replay_for_snapshot`], but against a caller-supplied genesis, so
+/// `node snapshot` can export a production chain's state (see [`verify_logs_with`]).
+fn replay_for_snapshot_with(dir: &str, genesis: &Genesis) -> Result<Chain, SnapshotReplayError> {
     let bpath = format!("{dir}/blocks.log");
     let cpath = format!("{dir}/certs.log");
     let blocks = BlockLog::open(&bpath)
@@ -5095,15 +5112,44 @@ fn replay_for_snapshot(dir: &str) -> Result<Chain, SnapshotReplayError> {
             path: cpath,
             err: e,
         })?;
-    Chain::replay_verified(demo_genesis(), &blocks, &certs).map_err(SnapshotReplayError::Replay)
+    Chain::replay_verified(genesis.clone(), &blocks, &certs).map_err(SnapshotReplayError::Replay)
+}
+
+/// M211: resolve the genesis an on-disk-chain command (`verify`/`snapshot`/`status`)
+/// should replay against. `--config FILE` (a node config, whose `genesis =` is loaded)
+/// is the production path; `--genesis FILE` points straight at a genesis TOML; with
+/// neither, falls back to the built-in **demo** genesis so the demo subcommands and
+/// their doctests keep working. A malformed config/genesis is a hard, explained exit —
+/// an operator pointing `verify` at the wrong genesis should hear about it, not get a
+/// confusing "invalid signature" from replay.
+fn genesis_for_args(args: &[String]) -> Genesis {
+    if let Some(cfg_path) = opt_arg(args, "--config") {
+        let cfg =
+            config::load_node_config(cfg_path).unwrap_or_else(|e| fail_msg("load node config", &e));
+        let gcfg =
+            config::load_genesis(&cfg.genesis).unwrap_or_else(|e| fail_msg("load genesis", &e));
+        return gcfg
+            .to_genesis()
+            .unwrap_or_else(|e| fail_msg("build genesis", &e));
+    }
+    if let Some(gpath) = opt_arg(args, "--genesis") {
+        let gcfg = config::load_genesis(gpath).unwrap_or_else(|e| fail_msg("load genesis", &e));
+        return gcfg
+            .to_genesis()
+            .unwrap_or_else(|e| fail_msg("build genesis", &e));
+    }
+    demo_genesis()
 }
 
 /// M128: `node verify --dir DIR` — the operator's finality audit. Replays `blocks.log` against
 /// `certs.log` and prints a one-line verdict. Exits **non-zero** on any integrity error
 /// (missing log, length mismatch, cert doesn't bind its block, < 2/3 quorum, …) so a
-/// monitor / CI hook can use the exit code.
-fn cmd_verify(dir: String) {
-    match verify_logs(&dir) {
+/// monitor / CI hook can use the exit code. M211: `--config`/`--genesis` select the chain's
+/// genesis (default: demo).
+fn cmd_verify(args: &[String]) {
+    let dir = dir_arg(args);
+    let genesis = genesis_for_args(args);
+    match verify_logs_with(&dir, &genesis) {
         VerifyOutcome::Ok {
             blocks,
             certs,
@@ -5129,8 +5175,11 @@ fn cmd_verify(dir: String) {
 /// replay) as a M131 snapshot blob. `--out -` writes to stdout for piping (e.g. to
 /// `gzip` or a network); otherwise the snapshot is written to `FILE`. Errors map to
 /// non-zero exit + stderr.
-fn cmd_snapshot(dir: String, out: String) {
-    let chain = match replay_for_snapshot(&dir) {
+fn cmd_snapshot(args: &[String]) {
+    let dir = dir_arg(args);
+    let out = req_arg(args, "--out").to_string();
+    let genesis = genesis_for_args(args);
+    let chain = match replay_for_snapshot_with(&dir, &genesis) {
         Ok(c) => c,
         Err(SnapshotReplayError::Io { what, path, err }) => {
             eprintln!("error: {what} ({path}): {err}");
@@ -5245,7 +5294,7 @@ fn check_snapshot_against_header(snapshot_bytes: &[u8], header_hex: &str) -> Che
             std::process::exit(1);
         }
     };
-    let header = match zhixing_node::codec::decode_header(&header_bytes) {
+    let header = match zhixing_node::codec::decode_header_any(&header_bytes) {
         Ok(h) => h,
         Err(e) => {
             eprintln!("error: decode header: {e:?}");

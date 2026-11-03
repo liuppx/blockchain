@@ -371,6 +371,21 @@ pub fn decode_certified_header(buf: &[u8]) -> Result<CertifiedHeader, CodecError
     Ok(CertifiedHeader { header, cert })
 }
 
+/// M211: decode a header hex that may be **either** a bare `BlockHeader`
+/// (`encode_header`) or a full `CertifiedHeader` (`encode_certified_header` — the
+/// on-wire form `GET /header/{h}` actually returns). Tries the certified form first
+/// (a certified header is header bytes + a cert tail, so a bare header fails its cert
+/// decode and a certified blob fails `decode_header` with `TrailingBytes` — the two are
+/// unambiguous), falling back to the bare header. Returns the `BlockHeader` either way.
+/// This lets `node check-snapshot`/`run --snapshot-header` accept exactly what operators
+/// copy from the RPC, not only an undocumented bare-header hex.
+pub fn decode_header_any(buf: &[u8]) -> Result<BlockHeader, CodecError> {
+    match decode_certified_header(buf) {
+        Ok(ch) => Ok(ch.header),
+        Err(_) => decode_header(buf),
+    }
+}
+
 /// M147: wire encoding of a full [`ValidatorSet`] — a length-prefixed list of
 /// `(u64 id, 32-byte pubkey, u64 power)`, mirroring the validator-update layout the
 /// block header already uses. Deterministic: `ValidatorSet::new` sorts by id, so the
@@ -3208,6 +3223,33 @@ mod tests {
             decode_certified_header(&extra),
             Err(CodecError::TrailingBytes)
         ));
+    }
+
+    #[test]
+    fn decode_header_any_accepts_both_bare_and_certified() {
+        // M211: `decode_header_any` must accept EITHER a bare BlockHeader hex
+        // (`encode_header`) or the certified form `GET /header/{h}` returns
+        // (`encode_certified_header`) — the latter is what `check-snapshot` /
+        // `run --snapshot-header` receive in practice, and `decode_header` alone
+        // rejected it with `TrailingBytes` (the bug the testnet drill surfaced).
+        let b = sample_block();
+        let hdr = BlockHeader::from_block(&b);
+        let cert = crate::consensus::Commit {
+            height: b.height,
+            round: 0,
+            block_hash: hdr.hash(),
+            precommits: Vec::new(),
+        };
+        let ch = CertifiedHeader::from_certified(&b, &cert);
+
+        let from_bare = decode_header_any(&encode_header(&hdr)).unwrap();
+        let from_cert = decode_header_any(&encode_certified_header(&ch)).unwrap();
+        assert_eq!(from_bare.hash(), hdr.hash());
+        assert_eq!(from_cert.hash(), hdr.hash());
+        assert_eq!(from_bare.hash(), from_cert.hash());
+
+        // garbage is still an error (not a panic, not a silent zero header)
+        assert!(decode_header_any(&[0u8; 8]).is_err());
     }
 
     // --- M27: graph_root slot round-trip ----------------------------------
