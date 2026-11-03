@@ -350,6 +350,29 @@ pub struct ValidatorKeyConfig {
     /// Unset (default) ⇒ no pending key (M179 behavior).
     #[serde(default)]
     pub pending: Option<Box<ValidatorKeyConfig>>,
+    /// M218 (remote-signer S3): optional `[validator.signer]` sub-table. When present,
+    /// this node holds **no** key on disk — it signs consensus votes/proposals and the
+    /// peer-auth handshake by asking an out-of-process `node signer` over the Unix socket
+    /// (see `docs/design/remote-signer.md`). `seed_hex`/`mnemonic`/`encrypted_keystore_path`
+    /// are then unused. Mutually exclusive with `pending` (key rotation of a remote signer
+    /// is handled out-of-band at the signer process).
+    #[serde(default)]
+    pub signer: Option<SignerConfig>,
+}
+
+/// M218: `[validator.signer]` — how to reach the out-of-process remote signer.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct SignerConfig {
+    /// Path to the signer's Unix domain socket (the `node signer --socket` path).
+    pub socket: String,
+    /// Per-request timeout; a slower response fails closed (the node does not vote that
+    /// step). Defaults to 500ms — ample for a local socket, well under the block interval.
+    #[serde(default = "default_signer_timeout_ms")]
+    pub timeout_ms: u64,
+}
+
+fn default_signer_timeout_ms() -> u64 {
+    500
 }
 
 impl ValidatorKeyConfig {
@@ -2307,6 +2330,44 @@ mod tests {
     }
 
     #[test]
+    fn validator_signer_subtable_parses() {
+        // M218: `[validator.signer]` configures the out-of-process remote signer; the
+        // node then holds no key on disk. `timeout_ms` defaults to 500.
+        let s = r#"
+            genesis = "genesis.toml"
+            [node]
+            id = 21
+            listen = "0.0.0.0:9021"
+            data_dir = "./data/n21"
+            [validator]
+            enabled = true
+            [validator.signer]
+            socket = "/run/zhixing/signer.sock"
+        "#;
+        let cfg: NodeConfig = toml::from_str(s).unwrap();
+        let vc = cfg.validator.as_ref().unwrap();
+        assert!(vc.enabled);
+        let sc = vc.signer.as_ref().expect("signer sub-table present");
+        assert_eq!(sc.socket, "/run/zhixing/signer.sock");
+        assert_eq!(sc.timeout_ms, 500, "timeout_ms defaults to 500");
+        // explicit timeout_ms overrides the default
+        let s2 = r#"
+            genesis = "g.toml"
+            [node]
+            id = 21
+            listen = "0.0.0.0:9021"
+            data_dir = "./d"
+            [validator]
+            enabled = true
+            [validator.signer]
+            socket = "/s.sock"
+            timeout_ms = 250
+        "#;
+        let cfg2: NodeConfig = toml::from_str(s2).unwrap();
+        assert_eq!(cfg2.validator.unwrap().signer.unwrap().timeout_ms, 250);
+    }
+
+    #[test]
     fn genesis_config_converts_to_demo_genesis() {
         // Mirror main.rs demo_genesis: accounts 1..=3 @ 30 COG, reviewers 10..=12,
         // validators 21..=24 equal power. Verify to_genesis() reproduces the fields.
@@ -2481,6 +2542,7 @@ mod tests {
             passphrase: None,
             encrypted_keystore_path: None,
             pending: None,
+            signer: None,
         }
         .keypair()
         .unwrap();
@@ -2491,6 +2553,7 @@ mod tests {
             passphrase: None,
             encrypted_keystore_path: None,
             pending: None,
+            signer: None,
         }
         .keypair()
         .unwrap();
@@ -2514,6 +2577,7 @@ mod tests {
             passphrase: None,
             encrypted_keystore_path: None,
             pending: None,
+            signer: None,
         };
         match bad.keypair() {
             Err(ConfigError::BadMnemonic { detail }) => {
@@ -2549,6 +2613,7 @@ mod tests {
             passphrase: None,
             encrypted_keystore_path: Some("/nonexistent/keystore.json".to_string()),
             pending: None,
+            signer: None,
         };
         match vc.keypair() {
             Err(ConfigError::KeystoreDecrypt { detail }) => {
@@ -2579,6 +2644,7 @@ mod tests {
             passphrase: None,
             encrypted_keystore_path: Some(path.to_string_lossy().to_string()),
             pending: None,
+            signer: None,
         };
         let from_keystore = vc.keypair_with_password("s3cret-pass").unwrap();
         let direct = crate::Keypair::from_seed(seed);
@@ -2615,6 +2681,7 @@ mod tests {
             passphrase: None,
             encrypted_keystore_path: Some(path.to_string_lossy().to_string()),
             pending: None,
+            signer: None,
         };
         let resolved = vc.keypair_with_password("pw").unwrap();
         assert_eq!(
@@ -2639,6 +2706,7 @@ mod tests {
             passphrase: None,
             encrypted_keystore_path: None,
             pending: None,
+            signer: None,
         };
         let a = vc.keypair().unwrap();
         let b = vc.keypair_with_password("ignored").unwrap();

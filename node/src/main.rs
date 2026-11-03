@@ -4152,6 +4152,9 @@ fn cmd_run(config_path: String, args: &[String]) {
     // (no-echo prompt, or `ZHIXING_KEYSTORE_PASSWORD` for unattended boot) and
     // decrypt; otherwise the seed_hex/mnemonic path needs no password.
     let validator_key = match cfg.validator.as_ref() {
+        // M218: a remote signer holds the key out of process — the node decrypts nothing
+        // and passes no key; `Node::start` builds the `RemoteSigner` from `[validator.signer]`.
+        Some(vc) if vc.enabled && vc.signer.is_some() => None,
         Some(vc) if vc.enabled => {
             let kp = if let Some(path) = vc.encrypted_keystore_path.as_deref() {
                 let password = read_keystore_password(path);

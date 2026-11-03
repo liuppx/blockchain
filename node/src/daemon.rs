@@ -69,6 +69,7 @@ use crate::crypto::verify;
 use crate::light::{BatchItem, BatchResponseEnvelope, ProofEntry, ProofKind};
 use crate::net::{decode_gossip, encode_gossip, GossipMsg, GossipNode};
 use crate::round::{Action, Msg, RoundState, Step};
+use crate::signer::{SignDomain, Signer};
 use crate::store::{BlockLog, CertLog};
 use crate::{
     Account, Block, Cnft, Genesis, GovParam, Hash, Keypair, Proposal, PubKey, SlashEvidence,
@@ -283,7 +284,7 @@ fn auth_transcript(
 /// daemon fails fast at boot otherwise.
 struct AuthContext {
     my_id: u64,
-    kp: Option<Keypair>,
+    signer: Option<Arc<dyn Signer>>,
     validators: HashMap<u64, PubKey>,
     require: bool,
     tls: Option<TlsSetup>,
@@ -341,7 +342,7 @@ where
     R: AsyncReadExt + Unpin,
     W: AsyncWriteExt + Unpin,
 {
-    let kp = ctx.kp.as_ref().ok_or_else(|| {
+    let signer = ctx.signer.as_ref().ok_or_else(|| {
         io::Error::new(
             io::ErrorKind::InvalidInput,
             "peer auth required but this node has no signing key",
@@ -355,7 +356,7 @@ where
     }
     // Only fold the binding in when the policy is on (byte-identical to M40 otherwise).
     let cb = if ctx.bind_channel { binding } else { None };
-    let my_pk = kp.public();
+    let my_pk = signer.public();
     let mut my_nonce = [0u8; 32];
     getrandom::getrandom(&mut my_nonce)
         .map_err(|e| io::Error::other(format!("handshake nonce rng failed: {e}")))?;
@@ -378,13 +379,12 @@ where
     peer_nonce.copy_from_slice(&pi[40..72]);
 
     // sign our transcript and send the signature
-    let sig = kp.sign(&auth_transcript(
-        ctx.my_id,
-        &my_nonce,
-        peer_id,
-        &peer_nonce,
-        cb,
-    ));
+    let sig = signer
+        .sign(
+            SignDomain::Handshake,
+            &auth_transcript(ctx.my_id, &my_nonce, peer_id, &peer_nonce, cb),
+        )
+        .map_err(|e| io::Error::other(format!("handshake signer unavailable: {e}")))?;
     wr.write_all(&sig).await?;
     wr.flush().await?;
 
@@ -1147,7 +1147,7 @@ struct Actor {
     /// One outbound queue per connected peer id.
     outbound: HashMap<u64, mpsc::UnboundedSender<GossipMsg>>,
     /// This process's signing key, or `None` for a pure follower (never votes).
-    kp: Option<Keypair>,
+    signer: Option<Arc<dyn Signer>>,
     /// M180: a staged **pending** signing key for an in-flight key rotation. When
     /// this validator's own `KeyRotation` takes effect (the active set's pubkey
     /// for our id changes to this key), `reconcile_signing_key` swaps it into
@@ -1417,7 +1417,7 @@ impl Actor {
     fn on_start_tick(&mut self, height: u64) {
         if self.timing.create_empty_blocks || self.node.has_pending_work() {
             self.start_height(height);
-        } else if self.kp.is_some() && self.node.height() + 1 == height {
+        } else if self.signer.is_some() && self.node.height() + 1 == height {
             // Nothing to propose yet: hold the height and check again later.
             self.schedule_start(height, self.timing.block_interval_ms);
         }
@@ -1430,7 +1430,7 @@ impl Actor {
     /// gate before calling here, while `on_consensus` calls here directly (a peer's
     /// proposal already implies work).
     fn start_height(&mut self, height: u64) {
-        if self.kp.is_none() {
+        if self.signer.is_none() {
             return; // pure follower
         }
         if self.node.height() + 1 != height {
@@ -1453,7 +1453,7 @@ impl Actor {
             }
         };
         let mut round = RoundState::new(active, val_id, height, candidate);
-        let actions = match self.kp.as_ref() {
+        let actions = match self.signer.as_deref() {
             Some(kp) => round.start(kp),
             None => return,
         };
@@ -1473,7 +1473,7 @@ impl Actor {
             Msg::Proposal(p) => p.height,
             Msg::Vote(v) => v.height,
         };
-        if self.kp.is_some()
+        if self.signer.is_some()
             && mh == self.node.height() + 1
             && self.cons.as_ref().is_none_or(|c| c.height != mh)
         {
@@ -1487,7 +1487,7 @@ impl Actor {
                 return;
             }
         }
-        let (height, actions) = match (self.kp.as_ref(), self.cons.as_mut()) {
+        let (height, actions) = match (self.signer.as_deref(), self.cons.as_mut()) {
             (Some(kp), Some(cons)) => (cons.height, cons.round.on_message(kp, m)),
             _ => return,
         };
@@ -1496,7 +1496,7 @@ impl Actor {
 
     /// M33: a consensus timeout fired — advance the round if it is still current.
     fn on_timeout(&mut self, height: u64, step: Step, round: u32) {
-        let (h, actions) = match (self.kp.as_ref(), self.cons.as_mut()) {
+        let (h, actions) = match (self.signer.as_deref(), self.cons.as_mut()) {
             (Some(kp), Some(cons)) if cons.height == height => {
                 (cons.height, cons.round.on_timeout(kp, step, round))
             }
@@ -1571,7 +1571,7 @@ impl Actor {
     /// round we were running for a now-committed height is obsolete, so drop it
     /// and (re)arm consensus for the new next height.
     fn reconcile_after_sync(&mut self) {
-        if self.kp.is_none() {
+        if self.signer.is_none() {
             return; // pure follower never runs consensus
         }
         let stale = self
@@ -1594,7 +1594,7 @@ impl Actor {
     /// A stateless invariant ("signing key == set pubkey for our id") rather than
     /// height tracking, so it covers both commit paths uniformly.
     fn reconcile_signing_key(&mut self) {
-        let Some(kp) = self.kp.as_ref() else {
+        let Some(kp) = self.signer.as_deref() else {
             return; // pure follower
         };
         let expected = self
@@ -1612,7 +1612,10 @@ impl Actor {
         match decision {
             SigningKeyDecision::Keep => {}
             SigningKeyDecision::Adopt => {
-                self.kp = self.pending_kp.take();
+                self.signer = self
+                    .pending_kp
+                    .take()
+                    .map(|k| Arc::new(k) as Arc<dyn Signer>);
                 info!(
                     node = self.node.id,
                     "adopted rotated signing key (own KeyRotation took effect)"
@@ -2014,7 +2017,7 @@ async fn run_actor(mut actor: Actor, mut rx: mpsc::UnboundedReceiver<Cmd>) {
             Cmd::QueryConfig { reply } => {
                 // M119: operational config from the actor's resolved timing + mempool bounds.
                 let _ = reply.send(ConfigView {
-                    role: if actor.kp.is_some() {
+                    role: if actor.signer.is_some() {
                         "validator"
                     } else {
                         "follower"
@@ -2035,7 +2038,7 @@ async fn run_actor(mut actor: Actor, mut rx: mpsc::UnboundedReceiver<Cmd>) {
             }
             Cmd::QueryNode { reply } => {
                 // M120: this node's own id + whether it holds a voting key.
-                let _ = reply.send((actor.node.id, actor.kp.is_some()));
+                let _ = reply.send((actor.node.id, actor.signer.is_some()));
             }
             Cmd::QueryGenesisHash { reply } => {
                 // M106: this node's chain identity, stamped into state at genesis_split.
@@ -2062,7 +2065,7 @@ async fn run_actor(mut actor: Actor, mut rx: mpsc::UnboundedReceiver<Cmd>) {
                     height: actor.node.height(),
                     head: actor.node.head(),
                     peers: actor.outbound.len(),
-                    is_validator: actor.kp.is_some(),
+                    is_validator: actor.signer.is_some(),
                     consensus_active: actor.cons.is_some(),
                     mempool: actor.node.mempool.len(),
                     mempool_capacity: actor.node.mempool.capacity(),
@@ -7598,11 +7601,59 @@ impl Node {
             }
         }
 
+        // M218 (remote-signer S3): resolve the active signer. A `[validator.signer]`
+        // sub-table means the key lives in an out-of-process `node signer`; the node holds
+        // no key and signs over the socket. Otherwise the in-process key (if any) signs —
+        // cloned via its seed into the trait object so `validator_key` stays owned for the
+        // genesis-pinned mTLS path below (which needs the raw seed). Startup fails fast if a
+        // remote signer's pubkey is not this node's genesis validator key.
+        let signer: Option<Arc<dyn Signer>> = match cfg.validator.as_ref() {
+            Some(v) if v.enabled && v.signer.is_some() => {
+                #[cfg(unix)]
+                {
+                    let sc = v.signer.as_ref().expect("guarded by is_some");
+                    let rs = crate::remote_signer::RemoteSigner::connect(
+                        sc.socket.as_str(),
+                        std::time::Duration::from_millis(sc.timeout_ms),
+                    )
+                    .map_err(|e| {
+                        io::Error::other(format!("connect remote signer at {}: {e}", sc.socket))
+                    })?;
+                    match genesis.validators.iter().find(|(id, _, _)| *id == my_id) {
+                        Some((_, pk, _)) if *pk == rs.public() => {}
+                        Some(_) => {
+                            return Err(io::Error::new(
+                                io::ErrorKind::InvalidInput,
+                                format!("remote signer pubkey for node {my_id} does not match its genesis pubkey"),
+                            ));
+                        }
+                        None => {
+                            return Err(io::Error::new(
+                                io::ErrorKind::InvalidInput,
+                                format!("node {my_id} configures a signer but is not in genesis.validators"),
+                            ));
+                        }
+                    }
+                    Some(Arc::new(rs) as Arc<dyn Signer>)
+                }
+                #[cfg(not(unix))]
+                {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "a remote signer requires a Unix domain socket (Unix only)",
+                    ));
+                }
+            }
+            _ => validator_key
+                .as_ref()
+                .map(|kp| Arc::new(Keypair::from_seed(kp.secret_seed())) as Arc<dyn Signer>),
+        };
+
         // M40: strict peer auth requires this node to prove its own identity in the
-        // handshake, which it can only do with a signing key. A keyless follower
-        // could never complete an authenticated handshake, so refuse to start
-        // rather than silently fail every dial (fail-fast, mirrors the check above).
-        if cfg.network.require_peer_auth && validator_key.is_none() {
+        // handshake, which it can only do with a signing key (in-process or remote). A
+        // keyless follower could never complete an authenticated handshake, so refuse to
+        // start rather than silently fail every dial (fail-fast, mirrors the check above).
+        if cfg.network.require_peer_auth && signer.is_none() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 format!("node {my_id} sets require_peer_auth but has no validator signing key"),
@@ -7744,7 +7795,7 @@ impl Node {
         // follow + serve but never propose (its `start_height` membership guard never
         // opens). Surface that loudly rather than letting the node idle silently.
         if snapshot_boot.is_some()
-            && validator_key.is_some()
+            && signer.is_some()
             && node.chain.state.validators.get(my_id).is_none()
         {
             eprintln!(
@@ -7770,7 +7821,7 @@ impl Node {
 
         let (cmd_tx, cmd_rx) = mpsc::unbounded_channel::<Cmd>();
 
-        let is_validator = validator_key.is_some();
+        let is_validator = signer.is_some();
         let timing = Timing {
             propose_ms: cfg.consensus.propose_timeout_ms,
             prevote_ms: cfg.consensus.prevote_timeout_ms,
@@ -7856,7 +7907,7 @@ impl Node {
         };
         let auth = Arc::new(AuthContext {
             my_id,
-            kp: validator_key.clone(),
+            signer: signer.clone(),
             validators,
             require: cfg.network.require_peer_auth,
             tls,
@@ -7878,7 +7929,7 @@ impl Node {
         let actor = Actor {
             node,
             outbound: HashMap::new(),
-            kp: validator_key,
+            signer,
             pending_kp: pending_key,
             self_tx: cmd_tx.clone(),
             cons: None,
@@ -8385,7 +8436,7 @@ impl LightNode {
         };
         let auth = Arc::new(AuthContext {
             my_id,
-            kp: None,
+            signer: None,
             validators,
             require: cfg.network.require_peer_auth, // false (guarded above)
             tls,
@@ -10632,6 +10683,75 @@ mod tests {
             "got {rej:?}"
         );
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn remote_signer_backed_validator_produces_blocks() {
+        // M218 (remote-signer S3): a validator whose key lives in an out-of-process
+        // `node signer` drives real consensus — proves the config → RemoteSigner →
+        // RoundState wiring end to end (the node holds NO key; every vote/proposal is
+        // signed over the Unix socket).
+        let dir = tmp_dir("remote-signer-run");
+        let _ = std::fs::create_dir_all(&dir);
+        let signing_kp = kp(21);
+        // Short /tmp socket (sun_path length limit).
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let socket = format!("/tmp/zxrs{}{}.sock", std::process::id(), nanos % 1_000_000);
+        let hwm = format!("{dir}/hwm");
+        {
+            let (s, h) = (socket.clone(), hwm.clone());
+            std::thread::spawn(move || {
+                let _ = crate::remote_signer::serve(
+                    std::path::Path::new(&s),
+                    signing_kp,
+                    std::path::Path::new(&h),
+                );
+            });
+        }
+        for _ in 0..200 {
+            if std::path::Path::new(&socket).exists() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+
+        let mut cfg = node_config(21, 21441, &[21], dir.clone());
+        cfg.consensus.create_empty_blocks = true; // heartbeat so height advances with no load
+        cfg.validator = Some(crate::config::ValidatorKeyConfig {
+            enabled: true,
+            signer: Some(crate::config::SignerConfig {
+                socket: socket.clone(),
+                timeout_ms: 1000,
+            }),
+            ..Default::default()
+        });
+        let mut genesis = test_genesis();
+        genesis.validators = vec![(21, kp(21).public(), 1)];
+
+        // No in-process key: Node::start builds the RemoteSigner from the config and
+        // verifies its pubkey == genesis.
+        let node = Node::start(cfg, genesis, None, None)
+            .await
+            .expect("start validator backed by the remote signer");
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+        loop {
+            let h = node.metrics().await.expect("metrics").height;
+            if h >= 2 {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "remote-signer-backed validator did not produce blocks (height {h})"
+            );
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+
+        let _ = std::fs::remove_file(&socket);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -19259,7 +19379,7 @@ vote_b.validator=5 vote_b.height=9 vote_b.round=2 vote_b.block_hash={b_h} vote_b
         // end-to-end discovery is covered by the full node's M39 tests + M148's sync.)
         let auth = Arc::new(AuthContext {
             my_id: 5,
-            kp: None,
+            signer: None,
             validators: HashMap::new(),
             require: false,
             tls: None,
