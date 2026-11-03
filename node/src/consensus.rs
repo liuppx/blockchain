@@ -77,16 +77,16 @@ pub fn vote_signing_bytes(
 }
 
 impl Vote {
-    /// Construct and sign a vote with `signer` (must hold `validator`'s key). M215: signs
-    /// through the [`Signer`] seam; the in-process [`Keypair`] impl is byte-identical to
-    /// the former direct `kp.sign`.
+    /// Construct and sign a vote with `kp` (must be `validator`'s key). Infallible
+    /// in-process path, used by tests and the offline driver. Production consensus uses
+    /// [`Vote::signed_with`] so an external/fallible signer can fail closed.
     pub fn signed(
         validator: u64,
         height: u64,
         round: u32,
         block_hash: Hash,
         vote_type: VoteType,
-        signer: &dyn Signer,
+        kp: &Keypair,
     ) -> Self {
         let msg = vote_signing_bytes(validator, height, round, &block_hash, vote_type);
         Vote {
@@ -95,8 +95,41 @@ impl Vote {
             round,
             block_hash,
             vote_type,
-            signature: signer.sign(&msg),
+            signature: kp.sign(&msg),
         }
+    }
+
+    /// M216: construct and sign a vote through a [`Signer`] (the production consensus path).
+    /// Builds the [`SignDomain::Consensus`] context (so an external signer can apply its
+    /// anti-double-sign high-water-mark) and returns `Err` if the signer refuses or is
+    /// unavailable — the caller then fails closed (does not vote this step).
+    pub fn signed_with(
+        validator: u64,
+        height: u64,
+        round: u32,
+        block_hash: Hash,
+        vote_type: VoteType,
+        signer: &dyn Signer,
+    ) -> Result<Self, crate::signer::SignerError> {
+        let step = match vote_type {
+            VoteType::Prevote => crate::signer::ConsensusStep::Prevote,
+            VoteType::Precommit => crate::signer::ConsensusStep::Precommit,
+        };
+        let domain = crate::signer::SignDomain::Consensus {
+            height,
+            round,
+            step,
+        };
+        let msg = vote_signing_bytes(validator, height, round, &block_hash, vote_type);
+        let signature = signer.sign(domain, &msg)?;
+        Ok(Vote {
+            validator,
+            height,
+            round,
+            block_hash,
+            vote_type,
+            signature,
+        })
     }
 
     fn signing_bytes(&self) -> Vec<u8> {

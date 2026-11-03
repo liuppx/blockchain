@@ -87,13 +87,15 @@ pub fn proposal_signing_bytes(
 }
 
 impl Proposal {
+    /// Infallible in-process signing (tests / offline driver). Production consensus uses
+    /// [`Proposal::signed_with`] so an external/fallible signer can fail closed.
     pub fn signed(
         height: u64,
         round: u32,
         block: Block,
         valid_round: i64,
         proposer: u64,
-        kp: &dyn Signer,
+        kp: &Keypair,
     ) -> Self {
         let msg = proposal_signing_bytes(height, round, &block.hash(), valid_round, proposer);
         let signature = kp.sign(&msg);
@@ -105,6 +107,34 @@ impl Proposal {
             proposer,
             signature,
         }
+    }
+
+    /// M216: sign a proposal through a [`Signer`] (the production path). Tags the signature
+    /// with [`ConsensusStep::Propose`] for the signer's high-water-mark; `Err` ⇒ the
+    /// proposer fails closed (proposes nothing; the round times out to the next proposer).
+    pub fn signed_with(
+        height: u64,
+        round: u32,
+        block: Block,
+        valid_round: i64,
+        proposer: u64,
+        signer: &dyn Signer,
+    ) -> Result<Self, crate::signer::SignerError> {
+        let domain = crate::signer::SignDomain::Consensus {
+            height,
+            round,
+            step: crate::signer::ConsensusStep::Propose,
+        };
+        let msg = proposal_signing_bytes(height, round, &block.hash(), valid_round, proposer);
+        let signature = signer.sign(domain, &msg)?;
+        Ok(Proposal {
+            height,
+            round,
+            block,
+            valid_round,
+            proposer,
+            signature,
+        })
     }
 
     fn verify_sig(&self, pk: &PubKey) -> bool {
@@ -388,15 +418,21 @@ impl RoundState {
     }
 
     fn cast_prevote(&mut self, round: u32, hash: Hash, kp: &dyn Signer, out: &mut Vec<Action>) {
-        let v = Vote::signed(self.id, self.height, round, hash, VoteType::Prevote, kp);
-        self.ingest(Msg::Vote(v.clone()));
-        out.push(Action::Broadcast(Msg::Vote(v)));
+        // M216: fail closed — if the signer refuses (anti-double-sign) or is unavailable,
+        // cast no prevote this step. A liveness cost (the round may time out), never a
+        // safety one. The in-process `Keypair` signer never errors.
+        if let Ok(v) = Vote::signed_with(self.id, self.height, round, hash, VoteType::Prevote, kp) {
+            self.ingest(Msg::Vote(v.clone()));
+            out.push(Action::Broadcast(Msg::Vote(v)));
+        }
     }
 
     fn cast_precommit(&mut self, round: u32, hash: Hash, kp: &dyn Signer, out: &mut Vec<Action>) {
-        let v = Vote::signed(self.id, self.height, round, hash, VoteType::Precommit, kp);
-        self.ingest(Msg::Vote(v.clone()));
-        out.push(Action::Broadcast(Msg::Vote(v)));
+        if let Ok(v) = Vote::signed_with(self.id, self.height, round, hash, VoteType::Precommit, kp)
+        {
+            self.ingest(Msg::Vote(v.clone()));
+            out.push(Action::Broadcast(Msg::Vote(v)));
+        }
     }
 
     fn start_round(&mut self, round: u32, kp: &dyn Signer, out: &mut Vec<Action>) {
@@ -409,9 +445,16 @@ impl RoundState {
                 Some((b, r)) => (b.clone(), *r as i64),
                 None => (self.candidate.clone(), -1),
             };
-            let prop = Proposal::signed(self.height, round, block, vr, self.id, kp);
-            self.ingest(Msg::Proposal(prop.clone()));
-            out.push(Action::Broadcast(Msg::Proposal(prop)));
+            // M216: fail closed — a proposer that cannot sign proposes nothing and instead
+            // schedules the propose timeout (as a non-proposer would), so the round cleanly
+            // advances to the next proposer rather than stalling.
+            match Proposal::signed_with(self.height, round, block, vr, self.id, kp) {
+                Ok(prop) => {
+                    self.ingest(Msg::Proposal(prop.clone()));
+                    out.push(Action::Broadcast(Msg::Proposal(prop)));
+                }
+                Err(_) => out.push(Action::Schedule(Step::Propose, round)),
+            }
         } else {
             out.push(Action::Schedule(Step::Propose, round));
         }
@@ -877,6 +920,52 @@ mod tests {
         let decided = node.decided_block().expect("decided block available");
         assert_eq!(decided.hash(), b.hash());
         assert_eq!(commit.block_hash, decided.hash());
+    }
+
+    #[test]
+    fn signer_failure_casts_no_vote_or_proposal_fail_closed() {
+        // M216: if the signer refuses / is unavailable, the round casts NOTHING (no
+        // proposal, no self-prevote) — fail-closed. It still schedules the propose timeout,
+        // so the round cleanly advances to the next proposer (a liveness cost, not a fork).
+        use crate::signer::{SignDomain, Signer, SignerError};
+        struct DeadSigner(crate::PubKey);
+        impl Signer for DeadSigner {
+            fn public(&self) -> crate::PubKey {
+                self.0
+            }
+            fn sign(&self, _d: SignDomain, _m: &[u8]) -> Result<crate::Sig, SignerError> {
+                Err(SignerError::Unavailable("test: signer down".into()))
+            }
+        }
+
+        let ids = [1u64, 2, 3, 4];
+        let vs = vset(&ids);
+        let b = block(1);
+        let proposer = vs.proposer_for_round(1, 0).unwrap();
+
+        // Healthy in-process signer: the proposer broadcasts a proposal.
+        let mut healthy = RoundState::new(vs.clone(), proposer, 1, b.clone());
+        let out_ok = healthy.start(&kp(proposer));
+        assert!(
+            out_ok
+                .iter()
+                .any(|a| matches!(a, Action::Broadcast(Msg::Proposal(_)))),
+            "healthy proposer broadcasts a proposal"
+        );
+
+        // Dead signer: the same proposer broadcasts nothing, only schedules the timeout.
+        let mut dead = RoundState::new(vs, proposer, 1, b);
+        let out = dead.start(&DeadSigner(kp(proposer).public()));
+        assert!(
+            !out.iter().any(|a| matches!(a, Action::Broadcast(_))),
+            "no broadcast (proposal or vote) when the signer fails"
+        );
+        assert!(
+            out.iter()
+                .any(|a| matches!(a, Action::Schedule(Step::Propose, 0))),
+            "the round still schedules its propose timeout"
+        );
+        assert!(dead.decided().is_none());
     }
 
     #[test]
