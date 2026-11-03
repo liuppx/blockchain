@@ -7,7 +7,10 @@
 > 投票/提案/`RoundState` 全程改走 `&dyn Signer`。**S2 Step A 已落地(M216)**——`sign` 扩为
 > `sign(domain, msg) -> Result<Sig, SignerError>`(带 `SignDomain`/`ConsensusStep`),共识对
 > `Err` **fail-closed**(不投票/不提案,仅排超时);进程内 `Keypair` 永不出错,故仍零行为变更。
-> **剩余 S2 Step B**:`RemoteSigner`(Unix socket)+ `node signer` 参考进程 + 反双签高水位持久化。
+> **S2 Step B 已落地(M217)**——`RemoteSigner`(Unix socket 客户端)+ `node signer` 参考签名
+> 进程 + 反双签高水位持久化(`src/remote_signer.rs`)。**剩余 S3**:config 接线
+> (`[validator] signer = { socket, timeout_ms }`)+ 启动校验 signer pubkey == genesis +
+> DEPLOYMENT 部署小节;远程签名器尚未接入 `node run`(S3 做)。
 
 ## 1. 动机与威胁模型
 
@@ -126,9 +129,17 @@ step)`。对 `Consensus` 请求,仅当 `(height,round,step) > last`(字典序)�
   超时推进到下任提议人)。`Vote::signed`/`Proposal::signed`(`&Keypair`,infallible)保留给
   测试/driver。**已验证**:`signer_failure_casts_no_vote_or_proposal_fail_closed`(失败签名器
   → 零广播 + 排超时)+ 全套共识/确定性/localnet 测试逐位不变。
-- **S2 Step B(本地外部签名器)**:`RemoteSigner`(Unix socket 客户端,带超时 + fail-closed)+
-  `node signer` 参考进程 + 反双签高水位持久化。集成测试:进程内起 socket 签名器,驱动一轮共识,
-  断言签名有效 + 对回退的 (h,r,step) 请求返回 `refused_hwm`。
+- **S2 Step B(本地外部签名器)✅ M217**:`src/remote_signer.rs`——`RemoteSigner`(Unix socket
+  客户端,per-request 连接 + 读写超时,I/O/超时→`Unavailable`、高水位拒绝→`DoubleSignRefused`,
+  并对返回签名二次 `crypto::verify` 防恶意签名器)+ `serve`/`node signer` 参考进程(顺序处理、
+  socket 权限 600)+ 反双签高水位持久化(tmp 写→fsync→rename,签名前先落盘)。回归:
+  `remote_signer_signs_and_enforces_high_water_mark`(正常签名验签 + 同/回退 (h,r,step) 拒绝 +
+  更高步/高度放行 + 握手无高水位)、`high_water_mark_survives_reload`、
+  `unavailable_signer_is_fail_closed_error`;`node signer` CLI 本机 smoke 通过(keystore 解密、
+  socket 0600 绑定)。
+- **S3(接线 + 文档)**:`[validator] signer = "inproc"` 或 `{ socket = "…", timeout_ms = … }`
+  config;启动校验签名器 pubkey == genesis;DEPLOYMENT.md 增"远程签名器部署"小节
+  (socket 权限、签名器主机加固、高水位备份);README/SECURITY §10 #3 更新。
 - **S3(接线 + 文档)**:`[validator] signer = "inproc"` 或 `{ socket = "…", timeout_ms = … }`
   config;启动校验签名器 pubkey == genesis;DEPLOYMENT.md 增"远程签名器部署"小节
   (socket 权限、签名器主机加固、高水位备份);README/SECURITY §10 #3 更新。
