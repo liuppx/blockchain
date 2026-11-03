@@ -55,7 +55,7 @@ RUSTFLAGS="-D warnings" cargo test --release --no-run     # 零编译告警
 # 其中位锚点测(见 §6)验证共识浮点逐位一致。
 ```
 
-- 测试总数:**node 743(686 lib + 57 bin)+ engine 11**,全绿。1 个 `#[ignore]`(config 的
+- 测试总数:**node 745(688 lib + 57 bin)+ engine 11**,全绿。1 个 `#[ignore]`(config 的
   环境依赖测,非安全相关)。
 - `unsafe`:**全仓非测试代码 0 处**(`grep -rn unsafe engine/src node/src`)。
 - 无 `cargo-audit` 门禁(当前 advisory,依赖树未确认无 RUSTSEC —— 见 §10)。
@@ -205,7 +205,10 @@ RUSTFLAGS="-D warnings" cargo test --release --no-run     # 零编译告警
 
 1. **经济参数未校准**(#7):`base_emission`/`slash_bps`/`decay_half_life`/ΔK 阈值均为 draft
    初值,需 `sim/` 经济建模 + 评审再定主网 genesis。
-2. **只罚等价双签**,不罚宕机/审查(无 liveness slashing)。
+2. **只罚等价双签**,不罚宕机/审查(无自动 liveness slashing/jailing)。M212 起提供**本地可观测**:
+   每节点经 `/metrics` 暴露 `zhixing_validator_missed_commits{validator=…}`(本节点 cert 视角的
+   滑窗缺席计数),运营方据此**手动**经验证人集变更移除长期缺席者。自动 jailing 需确定性的
+   per-height 参与记录(区块内嵌 canonical `last_commit`),属 wire 破坏的后续项。
 3. **密钥在磁盘**(加密 keystore),无 HSM/远程签名器。
 4. **治理刚上线**(M193–198),未经对抗/洪流/临界票数压测。
 5. **无长跑/网络分区/混沌测**;fuzz 为 "fuzz-lite"(确定性 PRNG 轰解码器,无 cargo-fuzz 持久

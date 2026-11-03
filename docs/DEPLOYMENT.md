@@ -148,8 +148,13 @@ ZHIXING_KEYSTORE_PASSWORD=… node run --config node21.toml     # 验证人/foll
 
 - **metrics**:`GET http://<metrics.listen>/metrics`(Prometheus 文本)——高度、peer 数、
   mempool、tx 提交→落块延迟直方图、auth 失败计数等。配 token 时带 `Authorization: Bearer`。
+- **验证人在线度(M212)**:`zhixing_validator_missed_commits{validator="<id>"}` = 本节点近
+  `zhixing_liveness_window_samples` 个已落定高度中该验证人**缺席**的次数(本节点 cert 视角)。
+  缺席数随窗口样本数增长 ≈ 该验证人已离线。**无自动 jailing**:据此**手动**经验证人集变更
+  (治理 / `validator_updates`)移除长期缺席者;移除后其质押可正常 unbond。注:该指标非共识状态,
+  不同诚实节点可因 cert 子集不同而略有差异,用于观测而非裁决。
 - **health**:`GET /`(metrics 或 rpc)→ `200 ok`。
-- **status**:`node status --dir <data_dir>`(本地读 head/高度/state_root)。
+- **status**:`node status --dir <data_dir> --config <node.toml>`(本地读 head/高度/state_root)。
 - **日志**:结构化 tracing(`RUST_LOG` 控级别,`info` 缺省),支持 JSON + 文件 appender。
 
 ## 8. 持久化 / 备份 / 恢复
