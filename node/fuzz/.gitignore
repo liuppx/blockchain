@@ -1,0 +1,5 @@
+# cargo-fuzz build artifacts (keep the committed seed corpus/ under version control)
+target/
+corpus/*/.state
+artifacts/
+coverage/

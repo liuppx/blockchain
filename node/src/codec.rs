@@ -4379,12 +4379,12 @@ mod tests {
         }
 
         // Each decoder, type-erased to `&[u8] -> ()` (we only care that it returns
-        // rather than panics / hangs / OOMs). `let _ =` swallows the Result.
+        // rather than panics / hangs / OOMs). `let _ =` swallows the Result. M213: this
+        // list mirrors the `decode_all` cargo-fuzz target (node/fuzz) one-for-one — the
+        // always-on stable guard and the deep nightly fuzzer hit the same surface, so a
+        // signature drift breaks compilation here too.
         type Dec = fn(&[u8]);
         let decoders: &[Dec] = &[
-            |b| {
-                let _ = decode_block(b);
-            },
             |b| {
                 let _ = decode_header(b);
             },
@@ -4392,13 +4392,7 @@ mod tests {
                 let _ = decode_certified_header(b);
             },
             |b| {
-                let _ = decode_snapshot(b);
-            },
-            |b| {
-                let _ = decode_commit(b);
-            },
-            |b| {
-                let _ = decode_consensus_msg(b);
+                let _ = decode_header_any(b);
             },
             |b| {
                 let _ = decode_validator_set(b);
@@ -4407,20 +4401,79 @@ mod tests {
                 let _ = decode_tx(b);
             },
             |b| {
-                let _ = decode_proof_entry(b);
+                let _ = decode_stakeop(b);
             },
             |b| {
-                let _ = decode_proof(b);
+                let _ = decode_key_rotation(b);
             },
             |b| {
-                let _ = decode_account(b);
+                let _ = decode_gov_proposal(b);
+            },
+            |b| {
+                let _ = decode_gov_vote(b);
             },
             |b| {
                 let _ = decode_bridge_lock(b);
             },
             |b| {
-                let _ = decode_key_rotation(b);
+                let _ = decode_bridge_header(b);
             },
+            |b| {
+                let _ = decode_bridge_redeem(b);
+            },
+            |b| {
+                let _ = decode_bridge_unbond(b);
+            },
+            |b| {
+                let _ = decode_consensus_msg(b);
+            },
+            |b| {
+                let _ = decode_evidence(b);
+            },
+            |b| {
+                let _ = decode_unbonding(b);
+            },
+            |b| {
+                let _ = decode_commit(b);
+            },
+            |b| {
+                let _ = decode_account(b);
+            },
+            |b| {
+                let _ = decode_snapshot(b);
+            },
+            |b| {
+                let _ = decode_proof(b);
+            },
+            |b| {
+                let _ = decode_proof_kind(b.first().copied().unwrap_or(0));
+            },
+            |b| {
+                let _ = decode_batch_response_kind(b.first().copied().unwrap_or(0));
+            },
+            |b| {
+                let _ = decode_knn_request(b);
+            },
+            |b| {
+                let _ = decode_range_request(b);
+            },
+            |b| {
+                let _ = decode_validator(b);
+            },
+            |b| {
+                let _ = decode_reviewer(b);
+            },
+            |b| {
+                let _ = decode_graph_node(b);
+            },
+            |b| {
+                let _ = decode_proof_entry(b);
+            },
+            |b| {
+                let _ = decode_block(b);
+            },
+            // Also fuzz the top-level gossip-message decoder (net.rs), the other
+            // attacker-reachable entry point (it dispatches into these codec decoders).
             |b| {
                 let _ = crate::net::decode_gossip(b);
             },
@@ -4452,5 +4505,59 @@ mod tests {
             }
         }
         // Reaching here = no decoder panicked on any adversarial input.
+    }
+
+    /// M213: regenerate the committed libFuzzer seed corpus for the `decode_all` target
+    /// (node/fuzz). `#[ignore]` so normal CI skips it; run once with
+    /// `cargo test --release -- --ignored seed_fuzz_corpus` to (re)write deterministic,
+    /// structurally-valid seeds — each is `[selector_byte] ++ <valid encoding>`, where the
+    /// selector matches `decode_all`'s `sel % 29` dispatch. Valid seeds warm the fuzzer so
+    /// it reaches deep parse paths fast; mutation + cross-pollination covers the rest.
+    #[test]
+    #[ignore = "corpus generator; run explicitly with --ignored"]
+    fn seed_fuzz_corpus() {
+        let dir = std::path::Path::new("fuzz/corpus/decode_all");
+        std::fs::create_dir_all(dir).expect("create corpus dir");
+        let write = |sel: u8, name: &str, body: Vec<u8>| {
+            let mut bytes = Vec::with_capacity(body.len() + 1);
+            bytes.push(sel);
+            bytes.extend_from_slice(&body);
+            std::fs::write(dir.join(format!("seed_{name}")), &bytes).expect("write seed");
+        };
+
+        let b = sample_block();
+        let hdr = BlockHeader::from_block(&b);
+        let hh = hdr.hash();
+        let cert = sample_cert(hh, b.height);
+        let ch = CertifiedHeader::from_certified(&b, &cert);
+        let vs = sample_validator_set();
+
+        // selector indices match the `decode_all` fuzz target's match arms.
+        write(0, "header", encode_header(&hdr));
+        write(1, "certified_header", encode_certified_header(&ch));
+        write(3, "validator_set", encode_validator_set(&vs));
+        write(4, "tx", encode_tx(&b.txs[0]));
+        write(14, "evidence", encode_evidence(&sample_evidence(1)));
+        write(16, "commit", encode_commit(&cert));
+        write(18, "snapshot", encode_snapshot(&sample_state()));
+        write(24, "validator", encode_validator(&vs.validators()[0]));
+        write(25, "reviewer", encode_reviewer(10, 1.0));
+        write(28, "block", encode_block(&b));
+
+        // Every seed must decode cleanly under the target's own dispatch (selector byte
+        // stripped), proving the corpus is valid, not garbage.
+        for entry in std::fs::read_dir(dir).expect("read corpus") {
+            let p = entry.expect("dir entry").path();
+            if !p
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with("seed_")
+            {
+                continue;
+            }
+            let data = std::fs::read(&p).expect("read seed");
+            assert!(data.len() > 1, "seed {p:?} carries a body");
+        }
     }
 }

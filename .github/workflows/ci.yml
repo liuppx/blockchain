@@ -87,3 +87,36 @@ jobs:
         run: |
           (cd engine && cargo audit)
           (cd node && cargo audit)
+
+  fuzz:
+    name: cargo-fuzz smoke (codec decoders)
+    runs-on: ubuntu-latest
+    # M213: a short, time-boxed libFuzzer run over the committed seed corpus — catches a
+    # decoder that panics/OOMs on adversarial bytes before it reaches `main`. Advisory
+    # (nightly + fuzzing are both less stable than the gates above); promote to a hard
+    # gate once the corpus + target have proven steady. A found crash still surfaces here.
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust (nightly — libFuzzer needs it)
+        run: |
+          rustup toolchain install nightly --profile minimal
+      - name: Install cargo-fuzz
+        run: cargo install cargo-fuzz --locked
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            node/fuzz/target
+          key: ${{ runner.os }}-fuzz-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-fuzz-
+      - name: fuzz decode_all (120s over the committed corpus)
+        # RUSTUP_TOOLCHAIN=nightly so cargo-fuzz's inner `cargo build` also uses nightly
+        # (the sanitizer `-Z` flags require it). `-max_total_time` time-boxes the run;
+        # the committed corpus (node/fuzz/corpus/decode_all) seeds it warm.
+        run: |
+          cd node
+          RUSTUP_TOOLCHAIN=nightly cargo fuzz run decode_all -- -max_total_time=120
+

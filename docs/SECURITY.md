@@ -55,8 +55,8 @@ RUSTFLAGS="-D warnings" cargo test --release --no-run     # 零编译告警
 # 其中位锚点测(见 §6)验证共识浮点逐位一致。
 ```
 
-- 测试总数:**node 745(688 lib + 57 bin)+ engine 11**,全绿。1 个 `#[ignore]`(config 的
-  环境依赖测,非安全相关)。
+- 测试总数:**node 745(688 lib + 57 bin)+ engine 11**,全绿。2 个 `#[ignore]`(config 的
+  环境依赖测;M213 的 `seed_fuzz_corpus` 语料生成器,均非安全相关)。
 - `unsafe`:**全仓非测试代码 0 处**(`grep -rn unsafe engine/src node/src`)。
 - 无 `cargo-audit` 门禁(当前 advisory,依赖树未确认无 RUSTSEC —— 见 §10)。
 
@@ -211,8 +211,9 @@ RUSTFLAGS="-D warnings" cargo test --release --no-run     # 零编译告警
    per-height 参与记录(区块内嵌 canonical `last_commit`),属 wire 破坏的后续项。
 3. **密钥在磁盘**(加密 keystore),无 HSM/远程签名器。
 4. **治理刚上线**(M193–198),未经对抗/洪流/临界票数压测。
-5. **无长跑/网络分区/混沌测**;fuzz 为 "fuzz-lite"(确定性 PRNG 轰解码器,无 cargo-fuzz 持久
-   语料)。
+5. **无长跑/网络分区/混沌测**;fuzz 有两层:always-on 的 "fuzz-lite"(确定性 PRNG 轰全部 29 个
+   `decode_*` 入口,stable CI 门禁)+ **M213 cargo-fuzz**(`node/fuzz/` libFuzzer `decode_all`
+   多路目标 + 提交的种子语料,nightly CI advisory 跑;见 `node/fuzz/README.md`)。仍无混沌/分区测。
 6. **`cargo-audit` 当前 advisory**(依赖树未确认无 RUSTSEC)。
 7. **滚动升级未支持**(只能干净拒连不兼容 peer)。
 8. **弱主观性检查点分发**是运维事项(协议只提供验证基元)。

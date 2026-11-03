@@ -1,0 +1,29 @@
+[package]
+name = "zhixing-node-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+# Own workspace root so the parent `zhixing-node` crate never tries to build the fuzz
+# crate as part of its normal `cargo build`/`cargo test` (which run on stable).
+[workspace]
+
+[dependencies]
+libfuzzer-sys = "0.4"
+
+[dependencies.zhixing-node]
+path = ".."
+
+# cargo-fuzz builds with instrumentation; keep some debug info for useful crash traces.
+[profile.release]
+debug = 1
+
+[[bin]]
+name = "decode_all"
+path = "fuzz_targets/decode_all.rs"
+test = false
+doc = false
+bench = false
