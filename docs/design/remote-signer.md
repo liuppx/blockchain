@@ -1,7 +1,12 @@
 # 设计:远程签名器 / Remote signer (production-readiness §10 #3)
 
 > 状态:**设计稿**,供评审后分片实现。对应 [`docs/SECURITY.md` §10 第 3 项](../SECURITY.md)
-> 「密钥在磁盘(加密 keystore),无 HSM/远程签名器」。本文不改代码。
+> 「密钥在磁盘(加密 keystore),无 HSM/远程签名器」。
+>
+> **实现进度**:**S1 已落地(M215)**——最小 `Signer` seam(`public()` + `sign(&[u8]) -> Sig`,
+> `impl Signer for Keypair` 为进程内默认,逐位等价);共识投票/提案/`RoundState` 全程改走
+> `&dyn Signer`。§3 的 `SignDomain`/`(height,round,step)` 反双签高水位与 `Result`/fail-closed
+> 语义**随 S2 `RemoteSigner` 落地**(S1 保持同步状态机不变、零行为变更,故暂不引入这些)。
 
 ## 1. 动机与威胁模型
 
@@ -108,12 +113,17 @@ step)`。对 `Consensus` 请求,仅当 `(height,round,step) > last`(字典序)�
 
 ## 7. 分片实现计划
 
-- **S1(基础,零行为变更)**:`Signer` trait + `LocalSigner`;把 `round.rs`/`consensus.rs`/
-  `daemon.rs` 的 `&Keypair` 签名入口全部改走 `&dyn Signer`(或泛型)。守护进程默认 `LocalSigner`。
-  **验证**:全测试套件 + localnet 收敛 + `testnet/` smoke/recover 逐位不变(signer 默认即今日行为)。
-- **S2(本地外部签名器)**:`RemoteSigner`(Unix socket 客户端,带超时 + fail-closed)+
-  `node signer` 参考进程 + 反双签高水位持久化。集成测试:进程内起 socket 签名器,驱动一轮共识,
-  断言签名有效 + 对回退的 (h,r,step) 请求返回 `refused_hwm`。
+- **S1(基础,零行为变更)✅ M215**:`Signer` trait(`public()` + `sign(&[u8]) -> Sig`)+
+  `impl Signer for Keypair`(进程内默认);`round.rs`/`consensus.rs` 的 `Vote::signed`/
+  `Proposal::signed`/`RoundState` 方法签名入口由 `&Keypair` 改走 `&dyn Signer`(`&Keypair`
+  经非定长强制自动适配,59+3 处调用点无需改动)。守护进程仍持 `Keypair`(即一个 `Signer`)。
+  **已验证**:全测试套件 + localnet 收敛(含确定性锚点测)逐位不变。
+  *注*:本片保持同步状态机不变,故**未**引入 `SignDomain`/高水位/`Result`;它们随 S2 落地。
+- **S2(本地外部签名器)**:**先扩 trait**(`sign(domain, msg) -> Result<Sig, SignerError>`,
+  共识调用点填 `SignDomain::Consensus{height,round,step}`,`cast_*`/`start_round` 对 `Err`
+  fail-closed 不产出投票动作)——这步改动由全套共识测试守卫;再加 `RemoteSigner`(Unix socket
+  客户端,带超时 + fail-closed)+ `node signer` 参考进程 + 反双签高水位持久化。集成测试:进程内
+  起 socket 签名器,驱动一轮共识,断言签名有效 + 对回退的 (h,r,step) 请求返回 `refused_hwm`。
 - **S3(接线 + 文档)**:`[validator] signer = "inproc"` 或 `{ socket = "…", timeout_ms = … }`
   config;启动校验签名器 pubkey == genesis;DEPLOYMENT.md 增"远程签名器部署"小节
   (socket 权限、签名器主机加固、高水位备份);README/SECURITY §10 #3 更新。
