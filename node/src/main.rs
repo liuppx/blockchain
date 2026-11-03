@@ -4832,9 +4832,20 @@ fn refuse_overwrite(path: &str, args: &[String]) {
     }
 }
 
-/// M175: prompt for a new password twice (no-echo) and require the two entries
-/// to match. Used by `encrypt-key` and `keygen --encrypt`. Exits on mismatch.
+/// M175: prompt (no-echo, with confirmation) for a NEW keystore encryption
+/// password; used by `encrypt-key` and `keygen --encrypt`, exits on mismatch.
+/// M210: falls back to `ZHIXING_KEYSTORE_PASSWORD` when set and
+/// non-empty — the same unattended path `node run` uses to *read* a keystore —
+/// so a testnet / CI script can mint encrypted keystores without a TTY. The
+/// env-var path skips the confirmation (there is no typo to catch) and trades
+/// `/proc/<pid>/environ` exposure for automation; interactive operators should
+/// prefer the prompt.
 fn prompt_new_password() -> String {
+    if let Ok(pw) = std::env::var("ZHIXING_KEYSTORE_PASSWORD") {
+        if !pw.is_empty() {
+            return pw;
+        }
+    }
     let pw = rpassword::prompt_password("Enter encryption password: ")
         .unwrap_or_else(|e| fail("read password", e));
     if pw.is_empty() {

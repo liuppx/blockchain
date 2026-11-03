@@ -25,6 +25,9 @@ __pycache__/
 # Rust (node)
 /node/target/
 
+# Testnet kit: generated keystores / configs / data dirs / logs (never commit)
+/testnet/out/
+
 # YeYing Project local task state
 /.project/
 .playwright-cli

@@ -175,7 +175,8 @@ ZHIXING_KEYSTORE_PASSWORD=… node run --config node21.toml     # 验证人/foll
 ## 11. 上线前检查清单
 
 - [ ] 外部审计完成,finding 已修复(SECURITY.md)。
-- [ ] genesis 参数经测试网实测反校(CALIBRATION.md 诚实边界)。
+- [ ] genesis 参数经测试网实测反校(CALIBRATION.md 诚实边界;本地多验证人测试网一键起网见
+      [`testnet/README.md`](../testnet/README.md):`gen.sh` → `up.sh` → `smoke.sh`)。
 - [ ] 所有运营方比对**同一 genesis 哈希**(`genesis-hash` 带外核对)。
 - [ ] 验证人用**加密 keystore**,密码经 env/secret 注入,文件 600 + 分离备份。
 - [ ] `[network]` 开 `enable_tls` + `require_peer_auth`(许可制再加 `require_peer_certs`+`bind_channel`)。
