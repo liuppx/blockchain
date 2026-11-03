@@ -8,9 +8,10 @@
 > `sign(domain, msg) -> Result<Sig, SignerError>`(带 `SignDomain`/`ConsensusStep`),共识对
 > `Err` **fail-closed**(不投票/不提案,仅排超时);进程内 `Keypair` 永不出错,故仍零行为变更。
 > **S2 Step B 已落地(M217)**——`RemoteSigner`(Unix socket 客户端)+ `node signer` 参考签名
-> 进程 + 反双签高水位持久化(`src/remote_signer.rs`)。**剩余 S3**:config 接线
-> (`[validator] signer = { socket, timeout_ms }`)+ 启动校验 signer pubkey == genesis +
-> DEPLOYMENT 部署小节;远程签名器尚未接入 `node run`(S3 做)。
+>> 进程 + 反双签高水位持久化(`src/remote_signer.rs`)。**S3 已落地(M218)**——`[validator.signer]`
+> config、`node run` 据此构造 `RemoteSigner`(默认仍进程内 `Keypair`)、启动校验 signer pubkey ==
+> genesis、auth 握手亦走签名器、DEPLOYMENT §2b 部署小节。远程签名器端到端可用;§10 #3 由「无」变
+> 「可选启用」。**本地 socket 参考实现;HSM/云 KMS 后端仍为后续**。
 
 ## 1. 动机与威胁模型
 
@@ -137,12 +138,13 @@ step)`。对 `Consensus` 请求,仅当 `(height,round,step) > last`(字典序)�
   更高步/高度放行 + 握手无高水位)、`high_water_mark_survives_reload`、
   `unavailable_signer_is_fail_closed_error`;`node signer` CLI 本机 smoke 通过(keystore 解密、
   socket 0600 绑定)。
-- **S3(接线 + 文档)**:`[validator] signer = "inproc"` 或 `{ socket = "…", timeout_ms = … }`
-  config;启动校验签名器 pubkey == genesis;DEPLOYMENT.md 增"远程签名器部署"小节
-  (socket 权限、签名器主机加固、高水位备份);README/SECURITY §10 #3 更新。
-- **S3(接线 + 文档)**:`[validator] signer = "inproc"` 或 `{ socket = "…", timeout_ms = … }`
-  config;启动校验签名器 pubkey == genesis;DEPLOYMENT.md 增"远程签名器部署"小节
-  (socket 权限、签名器主机加固、高水位备份);README/SECURITY §10 #3 更新。
+- **S3(接线 + 文档)✅ M218**:`[validator.signer] { socket, timeout_ms }` config
+  (`config::SignerConfig`);`node run` 在 `[validator.signer]` 存在时构造 `RemoteSigner`、否则进程内
+  `Keypair`(两者经 `Arc<dyn Signer>` 统一喂给 actor + auth 握手);`Node::start` 启动校验 signer
+  pubkey == genesis 本节点 pubkey,`require_peer_auth` 据 signer 判定;DEPLOYMENT §2b「远程签名器」
+  部署小节。约束:远程签名器不支持 `require_peer_certs`(需节点原始 seed),轮换在签名器侧完成。
+  回归:`validator_signer_subtable_parses`、`remote_signer_backed_validator_produces_blocks`
+  (无在盘密钥的验证人经签名器驱动共识出块)。
 
 ## 8. 非目标 / 已知边界
 

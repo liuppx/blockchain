@@ -37,9 +37,41 @@ node pubkey --seed <64hex>            # 或 --key-file <path>
 ```
 - 运行时密码来自环境变量 `ZHIXING_KEYSTORE_PASSWORD`(无人值守)或交互 no-echo 提示
   (M181);密钥轮换的 pending key 用 `ZHIXING_PENDING_KEYSTORE_PASSWORD`。
-- keystore 文件权限设 `600`,与节点数据分离备份。**高价值验证人**:目前密钥在盘,无
-  HSM/远程签名器(SECURITY.md 已知边界 #3)——高价值场景请隔离主机 + 磁盘加密。远程签名器
-  (密钥移出节点进程 + 反双签高水位)设计见 [`docs/design/remote-signer.md`](design/remote-signer.md)。
+- keystore 文件权限设 `600`,与节点数据分离备份。**高价值验证人**:密钥在盘(加密 keystore)时
+  请隔离主机 + 磁盘加密;或改用**远程签名器**(下)把密钥移出节点进程。
+
+### 2b. 远程签名器(可选,M218;密钥不落节点进程)
+
+把验证人密钥放进一个独立的签名进程,节点只持公钥、每次签名经本地 Unix socket 请求。核心
+收益是**反双签高水位**:即便节点被完全攻破,签名器也物理上拒绝对同一 `(height,round,step)`
+签两个不同区块(设计见 [`docs/design/remote-signer.md`](design/remote-signer.md))。
+
+```sh
+# 在签名器主机(可与节点同机但建议隔离账户/命名空间)运行长驻签名进程:
+ZHIXING_KEYSTORE_PASSWORD=… \
+  node signer --keystore keystore/val21.json \
+              --socket /run/zhixing/signer21.sock \
+              --hwm   /var/lib/zhixing/signer21.hwm   # 反双签高水位,务必与密钥一同备份/持久化
+```
+
+节点侧在 `[validator]` 下加 `[validator.signer]`(此时**不要**再配 `seed_hex`/`mnemonic`/
+`encrypted_keystore_path`):
+
+```toml
+[validator]
+enabled = true
+[validator.signer]
+socket     = "/run/zhixing/signer21.sock"
+timeout_ms = 500   # 签名超时;超时即该步不投票(fail-closed),默认 500
+```
+
+- 启动时节点经 socket 取签名器公钥并**校验 == genesis 中本节点的 pubkey**,不符即 fail-fast。
+- **fail-closed**:签名器宕机/超时/拒签 → 节点该步不投票/不提案(活性降级,非安全/分叉)。
+- socket 文件权限 `600`;签名器主机按密钥主机等级加固。
+- **高水位文件**(`--hwm`)是安全关键:崩溃重启不得丢失,否则可能重签。与密钥一同保护/备份。
+- 约束:远程签名器**不支持** `require_peer_certs`(genesis-pinned mTLS 需节点持原始 seed);
+  密钥轮换在签名器侧换 keystore 重启完成(节点侧 `[validator.pending]` 的在进程轮换仅适用于
+  进程内密钥)。Unix 专有。
 
 ## 3. 构造 genesis(所有节点共享、逐字节一致)
 

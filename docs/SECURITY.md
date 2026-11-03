@@ -55,7 +55,7 @@ RUSTFLAGS="-D warnings" cargo test --release --no-run     # 零编译告警
 # 其中位锚点测(见 §6)验证共识浮点逐位一致。
 ```
 
-- 测试总数:**node 751(694 lib + 57 bin)+ engine 11**,全绿。2 个 `#[ignore]`(config 的
+- 测试总数:**node 753(696 lib + 57 bin)+ engine 11**,全绿。2 个 `#[ignore]`(config 的
   环境依赖测;M213 的 `seed_fuzz_corpus` 语料生成器,均非安全相关)。
 - `unsafe`:**全仓非测试代码 0 处**(`grep -rn unsafe engine/src node/src`)。
 - 无 `cargo-audit` 门禁(当前 advisory,依赖树未确认无 RUSTSEC —— 见 §10)。
@@ -108,7 +108,8 @@ RUSTFLAGS="-D warnings" cargo test --release --no-run     # 零编译告警
   `require_peer_auth`(签名握手,绑定到创世密钥)+ `require_peer_certs`(genesis-pinned mTLS)
   + `bind_channel`(RFC5705 通道绑定防中继)。
 - **RPC ingress**:默认关闭;开启后写面(tx/治理提交)可配 bearer token;读面公开。
-- **密钥**:验证人签名密钥在磁盘(明文种子或 Web3 v3 加密 keystore)。无 HSM/远程签名器。
+- **密钥**:验证人签名密钥默认在磁盘(明文种子或 Web3 v3 加密 keystore)。M218 起可选**远程签名器**
+  (`[validator.signer]`:密钥在独立进程,节点经本地 Unix socket 请签 + 反双签高水位)。无 HSM/云 KMS。
 
 ## 5. 攻击面
 
@@ -209,8 +210,10 @@ RUSTFLAGS="-D warnings" cargo test --release --no-run     # 零编译告警
    每节点经 `/metrics` 暴露 `zhixing_validator_missed_commits{validator=…}`(本节点 cert 视角的
    滑窗缺席计数),运营方据此**手动**经验证人集变更移除长期缺席者。自动 jailing 需确定性的
    per-height 参与记录(区块内嵌 canonical `last_commit`),属 wire 破坏的后续项。
-3. **密钥在磁盘**(加密 keystore),无 HSM/远程签名器。远程签名器(密钥隔离 + 反双签高水位)
-   的设计见 [`docs/design/remote-signer.md`](design/remote-signer.md)(设计稿,待分片实现)。
+3. **密钥默认在磁盘**(加密 keystore)。**M218 起可选远程签名器**:`[validator.signer]` 让密钥
+   移出节点进程(独立 `node signer` 进程 + 本地 Unix socket + 持久化反双签高水位),节点只持公钥、
+   fail-closed;见 [`docs/design/remote-signer.md`](design/remote-signer.md) 与 DEPLOYMENT §2b。
+   仍无 HSM/云 KMS 后端(远程签名器为本地 socket 参考实现)。
 4. **治理刚上线**(M193–198),未经对抗/洪流/临界票数压测。
 5. **无长跑/网络分区/混沌测**;fuzz 有两层:always-on 的 "fuzz-lite"(确定性 PRNG 轰全部 29 个
    `decode_*` 入口,stable CI 门禁)+ **M213 cargo-fuzz**(`node/fuzz/` libFuzzer `decode_all`
