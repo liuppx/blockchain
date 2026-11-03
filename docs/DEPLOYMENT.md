@@ -38,7 +38,8 @@ node pubkey --seed <64hex>            # 或 --key-file <path>
 - 运行时密码来自环境变量 `ZHIXING_KEYSTORE_PASSWORD`(无人值守)或交互 no-echo 提示
   (M181);密钥轮换的 pending key 用 `ZHIXING_PENDING_KEYSTORE_PASSWORD`。
 - keystore 文件权限设 `600`,与节点数据分离备份。**高价值验证人**:目前密钥在盘,无
-  HSM/远程签名器(SECURITY.md 已知边界 #3)——高价值场景请隔离主机 + 磁盘加密。
+  HSM/远程签名器(SECURITY.md 已知边界 #3)——高价值场景请隔离主机 + 磁盘加密。远程签名器
+  (密钥移出节点进程 + 反双签高水位)设计见 [`docs/design/remote-signer.md`](design/remote-signer.md)。
 
 ## 3. 构造 genesis(所有节点共享、逐字节一致)
 

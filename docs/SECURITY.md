@@ -209,7 +209,8 @@ RUSTFLAGS="-D warnings" cargo test --release --no-run     # 零编译告警
    每节点经 `/metrics` 暴露 `zhixing_validator_missed_commits{validator=…}`(本节点 cert 视角的
    滑窗缺席计数),运营方据此**手动**经验证人集变更移除长期缺席者。自动 jailing 需确定性的
    per-height 参与记录(区块内嵌 canonical `last_commit`),属 wire 破坏的后续项。
-3. **密钥在磁盘**(加密 keystore),无 HSM/远程签名器。
+3. **密钥在磁盘**(加密 keystore),无 HSM/远程签名器。远程签名器(密钥隔离 + 反双签高水位)
+   的设计见 [`docs/design/remote-signer.md`](design/remote-signer.md)(设计稿,待分片实现)。
 4. **治理刚上线**(M193–198),未经对抗/洪流/临界票数压测。
 5. **无长跑/网络分区/混沌测**;fuzz 有两层:always-on 的 "fuzz-lite"(确定性 PRNG 轰全部 29 个
    `decode_*` 入口,stable CI 门禁)+ **M213 cargo-fuzz**(`node/fuzz/` libFuzzer `decode_all`
