@@ -3,10 +3,11 @@
 > 状态:**设计稿**,供评审后分片实现。对应 [`docs/SECURITY.md` §10 第 3 项](../SECURITY.md)
 > 「密钥在磁盘(加密 keystore),无 HSM/远程签名器」。
 >
-> **实现进度**:**S1 已落地(M215)**——最小 `Signer` seam(`public()` + `sign(&[u8]) -> Sig`,
-> `impl Signer for Keypair` 为进程内默认,逐位等价);共识投票/提案/`RoundState` 全程改走
-> `&dyn Signer`。§3 的 `SignDomain`/`(height,round,step)` 反双签高水位与 `Result`/fail-closed
-> 语义**随 S2 `RemoteSigner` 落地**(S1 保持同步状态机不变、零行为变更,故暂不引入这些)。
+> **实现进度**:**S1 已落地(M215)**——最小 `Signer` seam(`public()` + `sign`),共识
+> 投票/提案/`RoundState` 全程改走 `&dyn Signer`。**S2 Step A 已落地(M216)**——`sign` 扩为
+> `sign(domain, msg) -> Result<Sig, SignerError>`(带 `SignDomain`/`ConsensusStep`),共识对
+> `Err` **fail-closed**(不投票/不提案,仅排超时);进程内 `Keypair` 永不出错,故仍零行为变更。
+> **剩余 S2 Step B**:`RemoteSigner`(Unix socket)+ `node signer` 参考进程 + 反双签高水位持久化。
 
 ## 1. 动机与威胁模型
 
@@ -119,11 +120,15 @@ step)`。对 `Consensus` 请求,仅当 `(height,round,step) > last`(字典序)�
   经非定长强制自动适配,59+3 处调用点无需改动)。守护进程仍持 `Keypair`(即一个 `Signer`)。
   **已验证**:全测试套件 + localnet 收敛(含确定性锚点测)逐位不变。
   *注*:本片保持同步状态机不变,故**未**引入 `SignDomain`/高水位/`Result`;它们随 S2 落地。
-- **S2(本地外部签名器)**:**先扩 trait**(`sign(domain, msg) -> Result<Sig, SignerError>`,
-  共识调用点填 `SignDomain::Consensus{height,round,step}`,`cast_*`/`start_round` 对 `Err`
-  fail-closed 不产出投票动作)——这步改动由全套共识测试守卫;再加 `RemoteSigner`(Unix socket
-  客户端,带超时 + fail-closed)+ `node signer` 参考进程 + 反双签高水位持久化。集成测试:进程内
-  起 socket 签名器,驱动一轮共识,断言签名有效 + 对回退的 (h,r,step) 请求返回 `refused_hwm`。
+- **S2 Step A(trait 扩展 + fail-closed)✅ M216**:`sign(domain, msg) -> Result<Sig,
+  SignerError>`;`Vote::signed_with`/`Proposal::signed_with` 填 `SignDomain::Consensus
+  {height,round,step}`,`cast_*`/`start_round` 对 `Err` fail-closed(不产出投票/提案,排 propose
+  超时推进到下任提议人)。`Vote::signed`/`Proposal::signed`(`&Keypair`,infallible)保留给
+  测试/driver。**已验证**:`signer_failure_casts_no_vote_or_proposal_fail_closed`(失败签名器
+  → 零广播 + 排超时)+ 全套共识/确定性/localnet 测试逐位不变。
+- **S2 Step B(本地外部签名器)**:`RemoteSigner`(Unix socket 客户端,带超时 + fail-closed)+
+  `node signer` 参考进程 + 反双签高水位持久化。集成测试:进程内起 socket 签名器,驱动一轮共识,
+  断言签名有效 + 对回退的 (h,r,step) 请求返回 `refused_hwm`。
 - **S3(接线 + 文档)**:`[validator] signer = "inproc"` 或 `{ socket = "…", timeout_ms = … }`
   config;启动校验签名器 pubkey == genesis;DEPLOYMENT.md 增"远程签名器部署"小节
   (socket 权限、签名器主机加固、高水位备份);README/SECURITY §10 #3 更新。
