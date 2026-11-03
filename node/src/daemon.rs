@@ -782,6 +782,14 @@ pub struct Metrics {
     pub tx_submit_buckets: [u64; N_TX_BUCKETS],
     pub tx_submit_sum_micros: u64,
     pub tx_submit_count: u64,
+    /// M212: committed heights in this node's local liveness-observability window (the
+    /// miss-rate denominator). Observability only — see `net::LivenessTracker`.
+    pub liveness_samples: u64,
+    /// M212: `(validator_id, missed_commits)` for every current validator within the
+    /// liveness window, from THIS node's cert view (non-consensus observability, sorted
+    /// by id). An operator watches this to spot a persistently-absent validator and
+    /// remove it via a normal validator-set change (there is no automatic jailing).
+    pub validator_missed: Vec<(u64, u64)>,
 }
 
 /// A handle to a running node (for the in-process `localnet` demo and tests).
@@ -2049,6 +2057,7 @@ async fn run_actor(mut actor: Actor, mut rx: mpsc::UnboundedReceiver<Cmd>) {
                 let _ = reply.send(actor.node.base_height());
             }
             Cmd::Metrics(reply) => {
+                let (liveness_samples, validator_missed) = actor.node.liveness_report();
                 let _ = reply.send(Metrics {
                     height: actor.node.height(),
                     head: actor.node.head(),
@@ -2081,6 +2090,11 @@ async fn run_actor(mut actor: Actor, mut rx: mpsc::UnboundedReceiver<Cmd>) {
                     tx_submit_buckets: actor.tx_submit_buckets,
                     tx_submit_sum_micros: actor.tx_submit_sum_micros,
                     tx_submit_count: actor.tx_submit_count,
+                    liveness_samples: liveness_samples as u64,
+                    validator_missed: validator_missed
+                        .into_iter()
+                        .map(|(id, m)| (id, m as u64))
+                        .collect(),
                 });
             }
         }
@@ -2919,6 +2933,24 @@ fn render_prometheus(m: &Metrics) -> String {
         "zhixing_tx_submit_to_commit_seconds_count {}\n",
         m.tx_submit_count,
     ));
+    // M212: local liveness observability. `zhixing_liveness_window_samples` is how many
+    // recently-committed heights this node remembers; `zhixing_validator_missed_commits`
+    // is, per current validator, how many of those it did NOT see sign (this node's cert
+    // view — non-consensus). A validator whose missed count tracks the window size has
+    // likely gone offline; remove it via a validator-set change (no automatic jailing).
+    gauge(
+        &mut s,
+        "zhixing_liveness_window_samples",
+        "Committed heights in this node's local liveness window (miss-rate denominator).",
+        m.liveness_samples,
+    );
+    s.push_str("# HELP zhixing_validator_missed_commits Missed commits per current validator within the local liveness window (this node's cert view).\n");
+    s.push_str("# TYPE zhixing_validator_missed_commits gauge\n");
+    for (id, missed) in &m.validator_missed {
+        s.push_str(&format!(
+            "zhixing_validator_missed_commits{{validator=\"{id}\"}} {missed}\n"
+        ));
+    }
     s
 }
 
@@ -9981,6 +10013,8 @@ mod tests {
             tx_submit_buckets: [0, 1, 2, 1, 0, 0, 0, 0, 0, 0, 0],
             tx_submit_sum_micros: 7_500_000,
             tx_submit_count: 5,
+            liveness_samples: 6,
+            validator_missed: vec![(21, 0), (22, 2)],
         }
     }
 
@@ -10000,6 +10034,7 @@ mod tests {
             ("zhixing_seen_tx_capacity", 1024),
             ("zhixing_pending_stake_ops", 2),
             ("zhixing_pending_evidence", 1),
+            ("zhixing_liveness_window_samples", 6),
         ] {
             assert!(
                 out.contains(&format!("# TYPE {name} gauge")),
@@ -10010,6 +10045,10 @@ mod tests {
                 "missing `{name} {value}`"
             );
         }
+        // M212: the per-validator liveness gauge is labeled, so assert its lines directly.
+        assert!(out.contains("# TYPE zhixing_validator_missed_commits gauge"));
+        assert!(out.contains("zhixing_validator_missed_commits{validator=\"21\"} 0\n"));
+        assert!(out.contains("zhixing_validator_missed_commits{validator=\"22\"} 2\n"));
     }
 
     #[test]

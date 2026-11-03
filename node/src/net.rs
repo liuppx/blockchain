@@ -291,6 +291,49 @@ pub const TAG_GOVVOTE: u8 = 22;
 /// `serve_*` helper as today.
 pub const MAX_BATCH_ITEMS: usize = 32;
 
+/// M212: how many recently-committed heights the per-node liveness tracker remembers.
+/// 1024 heights ≈ a generous observation window for an operator to spot a validator
+/// that has stopped signing. Bounded memory (a sliding window of id-sets).
+pub const LIVENESS_WINDOW: usize = 1024;
+
+/// M212: **local, observability-only** record of which validators have been signing
+/// recent commits, from THIS node's cert view. Each committed cert names its signer
+/// subset (`Commit::precommits`); we remember the last [`LIVENESS_WINDOW`] such sets so
+/// an operator can scrape, per current validator, how many of those heights it missed —
+/// the signal to remove a persistently-absent validator via a normal validator-set
+/// change (there is no automatic jailing/slashing).
+///
+/// Deliberately **not** consensus state: cert signer subsets are non-canonical (each
+/// node assembles any >2/3 subset), so this is never folded into `state_root` and never
+/// affects determinism, block validity, or the wire. Two honest nodes may report
+/// slightly different missed counts; that is expected and fine for observability.
+#[derive(Clone, Default)]
+struct LivenessTracker {
+    /// Signer id-set of each remembered height (most recent at the back), capped at
+    /// [`LIVENESS_WINDOW`].
+    recent: VecDeque<BTreeSet<u64>>,
+}
+
+impl LivenessTracker {
+    /// Remember one committed height's signer set, evicting the oldest past the window.
+    fn record(&mut self, signers: BTreeSet<u64>) {
+        self.recent.push_back(signers);
+        while self.recent.len() > LIVENESS_WINDOW {
+            self.recent.pop_front();
+        }
+    }
+
+    /// Committed heights currently remembered (the denominator for a miss rate).
+    fn samples(&self) -> usize {
+        self.recent.len()
+    }
+
+    /// How many remembered heights `id` did NOT sign.
+    fn missed(&self, id: u64) -> usize {
+        self.recent.iter().filter(|s| !s.contains(&id)).count()
+    }
+}
+
 /// M55: a flood-dedup hash set bounded to its `capacity` most-recent entries.
 /// Unlike the mempool's *reject-at-bound* policy (M54), a dedup set must keep
 /// accepting new hashes to suppress floods, so it evicts the **oldest** entry
@@ -431,6 +474,9 @@ pub struct GossipNode {
     pending_gov_votes: Vec<GovVote>,
     /// Known peer ids (iterated in sorted order for deterministic output).
     peers: BTreeSet<u64>,
+    /// M212: local liveness-observability window (NOT consensus state; see
+    /// [`LivenessTracker`]).
+    liveness: LivenessTracker,
 }
 
 impl GossipNode {
@@ -463,6 +509,7 @@ impl GossipNode {
             pending_gov_proposals: Vec::new(),
             pending_gov_votes: Vec::new(),
             peers: peers.into_iter().filter(|&p| p != id).collect(),
+            liveness: LivenessTracker::default(),
         }
     }
 
@@ -507,6 +554,7 @@ impl GossipNode {
             pending_gov_proposals: Vec::new(),
             pending_gov_votes: Vec::new(),
             peers: peers.into_iter().filter(|&p| p != id).collect(),
+            liveness: LivenessTracker::default(),
         }
     }
 
@@ -599,6 +647,25 @@ impl GossipNode {
     }
     pub fn pending_gov_votes(&self) -> &[GovVote] {
         &self.pending_gov_votes
+    }
+
+    /// M212: local liveness-observability snapshot — `(window_samples, [(validator_id,
+    /// missed_commits)])` for every **current** validator, sorted by id. `window_samples`
+    /// is the number of recently-committed heights remembered (the miss-rate denominator);
+    /// `missed_commits` is how many of those this node did not see the validator sign.
+    /// Observability only (this node's cert view) — never consensus state. See
+    /// [`LivenessTracker`].
+    pub fn liveness_report(&self) -> (usize, Vec<(u64, usize)>) {
+        let mut per_val: Vec<(u64, usize)> = self
+            .chain
+            .state
+            .validators
+            .validators()
+            .iter()
+            .map(|v| (v.id, self.liveness.missed(v.id)))
+            .collect();
+        per_val.sort_by_key(|&(id, _)| id);
+        (self.liveness.samples(), per_val)
     }
 
     /// M35: is there any block-worthy pending work — mempool txs or staged
@@ -1354,6 +1421,12 @@ impl GossipNode {
                 });
             }
         }
+        // M212: record which validators signed this height's commit, from THIS node's
+        // cert view, for local liveness observability (see `LivenessTracker`). Pure
+        // local metric — NOT folded into state_root (cert signer subsets are
+        // non-canonical), so it never affects determinism or the chain.
+        let signers: BTreeSet<u64> = cert.precommits.iter().map(|v| v.validator).collect();
+        self.liveness.record(signers);
         self.blocks.push(block);
         self.certs.push(cert);
         true
@@ -3979,6 +4052,69 @@ mod tests {
         let out = fresh.on_message(1, GossipMsg::Blocks(batch));
         assert!(out.is_empty());
         assert_eq!(fresh.height(), 1);
+    }
+
+    #[test]
+    fn liveness_tracker_counts_missed_and_evicts() {
+        // M212: the per-node liveness window counts, per validator, how many remembered
+        // heights it did NOT sign, and evicts past LIVENESS_WINDOW.
+        let mut lt = LivenessTracker::default();
+        assert_eq!(lt.samples(), 0);
+        lt.record(BTreeSet::from([21, 22, 23])); // 24 absent
+        lt.record(BTreeSet::from([21, 22, 23, 24])); // all present
+        lt.record(BTreeSet::from([21, 22])); // 23, 24 absent
+        assert_eq!(lt.samples(), 3);
+        assert_eq!(lt.missed(21), 0);
+        assert_eq!(lt.missed(23), 1);
+        assert_eq!(lt.missed(24), 2);
+        // a validator never seen misses every remembered height
+        assert_eq!(lt.missed(99), 3);
+        // the window evicts oldest past the cap
+        for _ in 0..LIVENESS_WINDOW {
+            lt.record(BTreeSet::from([21]));
+        }
+        assert_eq!(lt.samples(), LIVENESS_WINDOW);
+    }
+
+    #[test]
+    fn liveness_report_tracks_an_absent_validator_from_cert_view() {
+        // M212: end-to-end — applying certified blocks feeds the liveness window, and
+        // `liveness_report` reflects exactly who signed each height's cert (this node's
+        // view). With a 4-validator set every cert carries quorum (3), so one validator
+        // is absent each height; the report must count those absences. Pure local
+        // observability — not consensus state.
+        let (blocks, certs) = certified_chain(2);
+        assert!(certs.len() >= 2);
+        let signers: Vec<BTreeSet<u64>> = certs[..2]
+            .iter()
+            .map(|c| c.precommits.iter().map(|v| v.validator).collect())
+            .collect();
+        assert!(
+            signers.iter().all(|s| s.len() >= 3),
+            "each cert clears quorum"
+        );
+
+        let mut node = GossipNode::new(2, genesis(), 8, [1]);
+        assert!(node.apply_certified(blocks[0].clone(), certs[0].clone()));
+        assert!(node.apply_certified(blocks[1].clone(), certs[1].clone()));
+
+        let (samples, missed) = node.liveness_report();
+        assert_eq!(samples, 2, "two committed heights remembered");
+        // report covers exactly the current validator set, sorted by id
+        assert_eq!(
+            missed.iter().map(|&(id, _)| id).collect::<Vec<_>>(),
+            vec![21, 22, 23, 24]
+        );
+        // each validator's missed count == the heights whose cert it was absent from
+        for &(id, m) in &missed {
+            let expected = signers.iter().filter(|s| !s.contains(&id)).count();
+            assert_eq!(m, expected, "validator {id} missed count");
+        }
+        // quorum < full set, so at least one validator shows an observed miss
+        assert!(
+            missed.iter().any(|&(_, m)| m > 0),
+            "an absent validator is visible"
+        );
     }
 
     #[test]
