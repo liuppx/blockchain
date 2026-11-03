@@ -21,6 +21,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use crate::signer::Signer;
 use crate::validator::ValidatorSet;
 use crate::{codec, crypto, Block, Hash, Keypair, Sig};
 
@@ -76,14 +77,16 @@ pub fn vote_signing_bytes(
 }
 
 impl Vote {
-    /// Construct and sign a vote with `kp` (must be `validator`'s key).
+    /// Construct and sign a vote with `signer` (must hold `validator`'s key). M215: signs
+    /// through the [`Signer`] seam; the in-process [`Keypair`] impl is byte-identical to
+    /// the former direct `kp.sign`.
     pub fn signed(
         validator: u64,
         height: u64,
         round: u32,
         block_hash: Hash,
         vote_type: VoteType,
-        kp: &Keypair,
+        signer: &dyn Signer,
     ) -> Self {
         let msg = vote_signing_bytes(validator, height, round, &block_hash, vote_type);
         Vote {
@@ -92,7 +95,7 @@ impl Vote {
             round,
             block_hash,
             vote_type,
-            signature: kp.sign(&msg),
+            signature: signer.sign(&msg),
         }
     }
 

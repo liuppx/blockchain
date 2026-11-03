@@ -22,6 +22,7 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use crate::consensus::{vote_signing_bytes, Commit, Vote, VoteType};
+use crate::signer::Signer;
 use crate::validator::ValidatorSet;
 use crate::{codec, crypto, Block, Hash, Keypair, PubKey, Sig, SlashEvidence};
 
@@ -92,7 +93,7 @@ impl Proposal {
         block: Block,
         valid_round: i64,
         proposer: u64,
-        kp: &Keypair,
+        kp: &dyn Signer,
     ) -> Self {
         let msg = proposal_signing_bytes(height, round, &block.hash(), valid_round, proposer);
         let signature = kp.sign(&msg);
@@ -205,7 +206,7 @@ impl RoundState {
     }
 
     /// Enter the machine at round 0.
-    pub fn start(&mut self, kp: &Keypair) -> Vec<Action> {
+    pub fn start(&mut self, kp: &dyn Signer) -> Vec<Action> {
         let mut out = Vec::new();
         self.start_round(0, kp, &mut out);
         self.evaluate(kp, &mut out);
@@ -213,7 +214,7 @@ impl RoundState {
     }
 
     /// Feed one received message, then re-evaluate.
-    pub fn on_message(&mut self, kp: &Keypair, msg: Msg) -> Vec<Action> {
+    pub fn on_message(&mut self, kp: &dyn Signer, msg: Msg) -> Vec<Action> {
         let mut out = Vec::new();
         if let Some(ev) = self.ingest(msg) {
             out.push(Action::Equivocation(ev));
@@ -223,7 +224,7 @@ impl RoundState {
     }
 
     /// A previously-scheduled timeout for (step, round) elapsed.
-    pub fn on_timeout(&mut self, kp: &Keypair, step: Step, round: u32) -> Vec<Action> {
+    pub fn on_timeout(&mut self, kp: &dyn Signer, step: Step, round: u32) -> Vec<Action> {
         let mut out = Vec::new();
         if round == self.round {
             match step {
@@ -386,19 +387,19 @@ impl RoundState {
         }
     }
 
-    fn cast_prevote(&mut self, round: u32, hash: Hash, kp: &Keypair, out: &mut Vec<Action>) {
+    fn cast_prevote(&mut self, round: u32, hash: Hash, kp: &dyn Signer, out: &mut Vec<Action>) {
         let v = Vote::signed(self.id, self.height, round, hash, VoteType::Prevote, kp);
         self.ingest(Msg::Vote(v.clone()));
         out.push(Action::Broadcast(Msg::Vote(v)));
     }
 
-    fn cast_precommit(&mut self, round: u32, hash: Hash, kp: &Keypair, out: &mut Vec<Action>) {
+    fn cast_precommit(&mut self, round: u32, hash: Hash, kp: &dyn Signer, out: &mut Vec<Action>) {
         let v = Vote::signed(self.id, self.height, round, hash, VoteType::Precommit, kp);
         self.ingest(Msg::Vote(v.clone()));
         out.push(Action::Broadcast(Msg::Vote(v)));
     }
 
-    fn start_round(&mut self, round: u32, kp: &Keypair, out: &mut Vec<Action>) {
+    fn start_round(&mut self, round: u32, kp: &dyn Signer, out: &mut Vec<Action>) {
         self.round = round;
         self.step = Step::Propose;
         if self.proposer(round) == self.id {
@@ -416,7 +417,7 @@ impl RoundState {
         }
     }
 
-    fn evaluate(&mut self, kp: &Keypair, out: &mut Vec<Action>) {
+    fn evaluate(&mut self, kp: &dyn Signer, out: &mut Vec<Action>) {
         let mut guard = 0;
         while self.eval_once(kp, out) {
             guard += 1;
@@ -427,7 +428,7 @@ impl RoundState {
     }
 
     /// Apply the first applicable `upon` rule; return whether one fired.
-    fn eval_once(&mut self, kp: &Keypair, out: &mut Vec<Action>) -> bool {
+    fn eval_once(&mut self, kp: &dyn Signer, out: &mut Vec<Action>) -> bool {
         let q = self.quorum();
         let r = self.round;
 

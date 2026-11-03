@@ -37,6 +37,7 @@ pub mod mempool;
 pub mod merkle;
 pub mod net;
 pub mod round;
+pub mod signer;
 pub mod store;
 pub mod validator;
 
@@ -48,6 +49,7 @@ pub use consensus::{Vote, VoteType};
 pub use crypto::{Keypair, PubKey, Sig};
 pub use hash::{hex, sha256};
 pub use light::{LightError, ValidatorTracker};
+pub use signer::Signer;
 // M25: re-export the engine module so `crate::engine::GraphNode` works from
 // codec.rs / light.rs without a direct engine dependency in those modules.
 pub mod engine {
