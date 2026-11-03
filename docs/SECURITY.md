@@ -55,7 +55,7 @@ RUSTFLAGS="-D warnings" cargo test --release --no-run     # 零编译告警
 # 其中位锚点测(见 §6)验证共识浮点逐位一致。
 ```
 
-- 测试总数:**node 742(685 lib + 57 bin)+ engine 11**,全绿。1 个 `#[ignore]`(config 的
+- 测试总数:**node 743(686 lib + 57 bin)+ engine 11**,全绿。1 个 `#[ignore]`(config 的
   环境依赖测,非安全相关)。
 - `unsafe`:**全仓非测试代码 0 处**(`grep -rn unsafe engine/src node/src`)。
 - 无 `cargo-audit` 门禁(当前 advisory,依赖树未确认无 RUSTSEC —— 见 §10)。

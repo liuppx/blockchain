@@ -13,11 +13,20 @@ OUT="$HERE/out"
 export ZHIXING_KEYSTORE_PASSWORD="$(cat "$OUT/password")"
 export RUST_LOG="${RUST_LOG:-info}"
 
+# Best-effort guard: refuse to spawn a node whose p2p port is already held (e.g. an
+# orphan from an aborted run) — otherwise the new process dies on bind and a stale one
+# keeps serving stale state. Needs lsof; skipped silently if unavailable.
+port_busy() { command -v lsof >/dev/null 2>&1 && lsof -nP -iTCP:"$1" -sTCP:LISTEN >/dev/null 2>&1; }
+
 for d in "$OUT"/n*/; do
   d="${d%/}"
   id="$(basename "$d" | sed 's/^n//')"
   if [ -f "$d/pid" ] && kill -0 "$(cat "$d/pid")" 2>/dev/null; then
     echo "  n$id already running (pid $(cat "$d/pid"))"; continue
+  fi
+  if port_busy "90$id"; then
+    echo "  n$id: port 90$id already in use (stale daemon?) — run testnet/down.sh or kill it" >&2
+    exit 1
   fi
   nohup "$BIN" run --config "$d/node.toml" >> "$d/node.log" 2>&1 &
   echo $! > "$d/pid"

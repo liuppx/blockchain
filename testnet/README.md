@@ -8,8 +8,9 @@ bearer token),只是全部跑在本机 loopback。
 ```sh
 testnet/gen.sh            # 1) 密钥 → genesis → 每节点配置 → check-config + genesis-hash 一致性
 testnet/up.sh             # 2) 后台启动全部验证人(SIGTERM 优雅关闭)
-testnet/smoke.sh 3        # 3) 所有节点到达高度 3 且同一 cert 签名头(一条链)
-testnet/down.sh           # 4) 优雅停止
+testnet/smoke.sh 3        # 3) 所有节点到达高度 3 且同一区块哈希(一条链)
+testnet/recover.sh 5      # 4) 备份/恢复 + 快照 fast-sync 演练(§11「备份/恢复演练」)
+testnet/down.sh           # 5) 优雅停止
 ```
 
 默认 **4 验证人**(id 21–24,容 1 拜占庭)+ **3 个有余额账户**(id 1–3,tx 作者)+

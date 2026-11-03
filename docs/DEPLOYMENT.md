@@ -128,6 +128,11 @@ enable_tls = true
 - **RPC/metrics**:`auth_token` 对写面(tx/治理提交)与 metrics 抓取做 bearer 鉴权;
   非 loopback 暴露**必须**设 token + `enable_tls`。读面(GET)公开。
 - 共识安全**不依赖**传输层(投票 ed25519 签名);TLS/握手是额外的接入控制与机密性。
+- **`require_peer_auth` 只认创世验证人身份**:签名握手用的是节点的创世验证人密钥,校验方按
+  `genesis.validators` 的 id→pubkey 注册表核对。因此**无密钥的纯 follower / 轻客户端无法加入
+  开启 `require_peer_auth` 的网络**(与 light node 的约束相同)。两种做法:① 需要只读副本时,该
+  网段用 `enable_tls` 单独加密、不开 `require_peer_auth`(共识仍由签名保证);② 要从快照重建一个
+  节点,就以**验证人身份**重建(配置带其验证人 keystore)——见 §8 的快照恢复演练。
 
 ## 6. 启动 / 关闭
 
@@ -151,10 +156,19 @@ ZHIXING_KEYSTORE_PASSWORD=… node run --config node21.toml     # 验证人/foll
 
 - 状态在 `data_dir/`:`blocks.log` + `certs.log`(追加式,逐条 fsync)。重启即**重放复验最终性**
   (逐高度复验 >2/3 证书),恢复的是*最终性*而非仅状态。
-- **完整性校验**:`node verify --dir <data_dir>`(对持久链逐块复验证书)。
-- **快照**(fast-sync 大件 / 备份):`node snapshot --dir <data_dir> --out snap.bin` →
-  `node inspect-snapshot --snapshot snap.bin`。快照版本当前 **v5**;跨 wire 代际需重新 snap。
+- **完整性校验**:`node verify --dir <data_dir> --config <node.toml>`(对持久链逐块复验证书)。
+  **生产链必须带 `--config`(或 `--genesis`)**——否则 `verify`/`snapshot`/`status` 回落内置
+  **demo** 创世,用错创世集会报"invalid signature"等误导性错误(M211 修复:三命令接受
+  `--config`/`--genesis`)。
+- **快照**(fast-sync 大件 / 备份):`node snapshot --dir <data_dir> --out snap.bin --config <node.toml>` →
+  `node inspect-snapshot --snapshot snap.bin` →(可选)`node check-snapshot --snapshot snap.bin
+  --header <GET /header/{h} 的 hex>` 交叉校验高度与三根。快照版本当前 **v5**;跨 wire 代际需重新 snap。
 - 备份:定期归档 `blocks.log`/`certs.log`(或快照)+ keystore(分离保管)。
+- **恢复 / fast-sync 新节点**:新 follower 以 `node run --config F --snapshot snap.bin
+  --snapshot-header <hex>` 从快照起步(免全量重放),随后经 gossip 同步尾部;带
+  `--snapshot-cert`+`--snapshot-validators` 可额外要求证书达钉死集 >2/3(弱主观性检查点)。
+- **演练**:[`testnet/recover.sh`](../testnet/README.md) 一键跑完整流程(verify → snapshot →
+  备份/恢复字节一致 → 新节点 fast-sync 收敛),即本节的可重复验证。
 
 ## 9. 升级(wire 代际)
 
