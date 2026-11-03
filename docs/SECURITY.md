@@ -20,7 +20,10 @@
   仍回报 `Ok(hash)`),已**四次修复**(M208):gossip 与本地/RPC 共用唯一 `admit_gov_*` 入口、
   `GOV_NONCE_LOOKAHEAD=8` nonce 窗口、`MAX_PENDING_GOV_PER_ACCOUNT=16` 按账户配额、结构化
   `GovPoolFull/GovAccountQuotaExceeded/GovAlreadySeen`、RPC 未入池即 429/409/422、提交后清理滞留项。
-  每项附回归测试。
+  审计方第四轮复验再指出两项条件剩余(≥256 账户各停放未来 nonce 可占满全局池;密钥轮换后旧公钥
+  签名项仍占账户配额),已**五次修复**(M209):当前 nonce(立即可应用)操作在池满/配额满时优先淘汰
+  停放最远的未来项(不依赖创世账户数,淘汰项哈希从 seen 移除可重提,全池皆当前 nonce 时硬上限仍生效);
+  含 key rotation 的区块提交后对被轮换账户重跑完整 admissibility 清除旧签名项。每项附回归测试。
 - 这是一轮**代码审查**,非第三方审计机构的签章报告 / 形式化证明 / 生产安全认证。修复后仍
   建议安排独立复验,尤其对新增的 B7 wire 与治理路径。
 
@@ -52,7 +55,7 @@ RUSTFLAGS="-D warnings" cargo test --release --no-run     # 零编译告警
 # 其中位锚点测(见 §6)验证共识浮点逐位一致。
 ```
 
-- 测试总数:**node 740(683 lib + 57 bin)+ engine 11**,全绿。1 个 `#[ignore]`(config 的
+- 测试总数:**node 742(685 lib + 57 bin)+ engine 11**,全绿。1 个 `#[ignore]`(config 的
   环境依赖测,非安全相关)。
 - `unsafe`:**全仓非测试代码 0 处**(`grep -rn unsafe engine/src node/src`)。
 - 无 `cargo-audit` 门禁(当前 advisory,依赖树未确认无 RUSTSEC —— 见 §10)。
