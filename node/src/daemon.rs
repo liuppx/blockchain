@@ -1009,8 +1009,10 @@ impl Node {
     }
 
     /// M198: submit a governance proposal / vote through the external-ingress path.
-    /// `Ok(hash)` once staged + flooded (sig verified); `Err` on bad sig / unknown
-    /// account. `None` if the actor has stopped.
+    /// `Ok(hash)` once staged + flooded; `Err` with the structured admission reason
+    /// when the op was NOT staged (bad sig / unknown account / param out of range /
+    /// nonce outside the window / pool full / account quota / already seen — see
+    /// `GossipNode::submit_local_gov_proposal`). `None` if the actor has stopped.
     pub async fn submit_gov_proposal(
         &self,
         op: crate::GovProposal,
@@ -1733,42 +1735,28 @@ async fn run_actor(mut actor: Actor, mut rx: mpsc::UnboundedReceiver<Cmd>) {
                 }
             }
             Cmd::SubmitGovProposal { op, reply } => {
-                // M198: verify sig against the proposer's account key, then stage + flood.
-                let res = match actor.node.chain.state.accounts.get(&op.proposer) {
-                    Some(acct)
-                        if verify(
-                            &acct.pubkey,
-                            &crate::codec::govproposal_signing_bytes(&op),
-                            &op.signature,
-                        ) =>
-                    {
-                        let h = op.hash();
-                        let out = actor.node.submit_local_gov_proposal(*op);
+                // M198 / SEC-01 (round 3): admission (sig / param / nonce window / pool
+                // caps / dedup) is the GossipNode's shared helper — the same path gossip
+                // ingress uses — so the RPC caller gets the structured reason when the
+                // op was NOT staged instead of a misleading `Ok(hash)`.
+                let h = op.hash();
+                let res = match actor.node.submit_local_gov_proposal(*op) {
+                    Ok(out) => {
                         actor.route(out);
                         Ok(h)
                     }
-                    Some(_) => Err(crate::ChainError::BadSignature(op.proposer)),
-                    None => Err(crate::ChainError::UnknownAccount(op.proposer)),
+                    Err(e) => Err(e),
                 };
                 let _ = reply.send(res);
             }
             Cmd::SubmitGovVote { op, reply } => {
-                // M198: verify sig against the voter's account key, then stage + flood.
-                let res = match actor.node.chain.state.accounts.get(&op.voter) {
-                    Some(acct)
-                        if verify(
-                            &acct.pubkey,
-                            &crate::codec::govvote_signing_bytes(&op),
-                            &op.signature,
-                        ) =>
-                    {
-                        let h = op.hash();
-                        let out = actor.node.submit_local_gov_vote(*op);
+                let h = op.hash();
+                let res = match actor.node.submit_local_gov_vote(*op) {
+                    Ok(out) => {
                         actor.route(out);
                         Ok(h)
                     }
-                    Some(_) => Err(crate::ChainError::BadSignature(op.voter)),
-                    None => Err(crate::ChainError::UnknownAccount(op.voter)),
+                    Err(e) => Err(e),
                 };
                 let _ = reply.send(res);
             }
@@ -3175,6 +3163,21 @@ fn unauthorized_bearer_response() -> String {
 
 /// Build a fixed-shape `HTTP/1.1` response with a plain-text body. `status_line`
 /// is e.g. `"200 OK"`; the connection is closed after the response.
+/// SEC-01 (round 3): HTTP status for a governance op the actor did NOT stage. Every
+/// case is a client-visible 4xx (never a 200 with a hash): load-shedding bounds
+/// (pool full / per-account quota) → 429 so the client backs off and retries; a
+/// content-hash the node already has → 409; everything else (bad sig, unknown
+/// account, param out of range, nonce stale / too far ahead, closed proposal) → 422.
+fn gov_reject_status(e: &crate::ChainError) -> &'static str {
+    match e {
+        crate::ChainError::GovPoolFull | crate::ChainError::GovAccountQuotaExceeded { .. } => {
+            "429 Too Many Requests"
+        }
+        crate::ChainError::GovAlreadySeen => "409 Conflict",
+        _ => "422 Unprocessable Entity",
+    }
+}
+
 fn http_response(status_line: &str, body: &str) -> String {
     // M66: delegate to the Content-Type-aware builder with the historic plaintext type,
     // so every pre-M66 caller's output stays byte-identical.
@@ -7422,7 +7425,7 @@ async fn serve_rpc_conn(
                 let hex = crate::hash::hex(&h);
                 ok_body(fmt, &hex, &format!("{{\"hash\":{}}}", json_str(&hex)))
             }
-            Ok(Err(e)) => error_body(fmt, "422 Unprocessable Entity", &e.to_string()),
+            Ok(Err(e)) => error_body(fmt, gov_reject_status(&e), &e.to_string()),
             Err(_) => http_response("503 Service Unavailable", "node stopped"),
         };
         let _ = stream.write_all(resp.as_bytes()).await;
@@ -7458,7 +7461,7 @@ async fn serve_rpc_conn(
                 let hex = crate::hash::hex(&h);
                 ok_body(fmt, &hex, &format!("{{\"hash\":{}}}", json_str(&hex)))
             }
-            Ok(Err(e)) => error_body(fmt, "422 Unprocessable Entity", &e.to_string()),
+            Ok(Err(e)) => error_body(fmt, gov_reject_status(&e), &e.to_string()),
             Err(_) => http_response("503 Service Unavailable", "node stopped"),
         };
         let _ = stream.write_all(resp.as_bytes()).await;
@@ -10589,6 +10592,83 @@ mod tests {
             matches!(rej, Err(crate::ChainError::BadSignature(1))),
             "got {rej:?}"
         );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn rpc_gov_submit_returns_4xx_when_not_staged() {
+        // SEC-01 (round 3): `POST /gov/proposal` answers 200 + hash ONLY when the op was
+        // actually staged; every admission rejection is a 4xx carrying the reason —
+        // 422 (nonce outside the window), 409 (already seen), 429 (per-account quota).
+        // A pure follower (no signing key) so no block production races the pool.
+        let dir = tmp_dir("rpc-gov-4xx");
+        let mut cfg = node_config(21, 21401, &[21], dir.clone());
+        let rpc_addr = "127.0.0.1:19899";
+        cfg.rpc = Some(crate::config::RpcConfig {
+            enabled: true,
+            listen: rpc_addr.into(),
+            auth_token: String::new(),
+            enable_tls: false,
+        });
+        let mut genesis = test_genesis();
+        genesis.validators = vec![(21, kp(21).public(), 1)];
+        let _node = Node::start(cfg, genesis, None, None)
+            .await
+            .expect("start node");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        async fn post(addr: &str, body: &[u8]) -> String {
+            let mut req = format!(
+                "POST /gov/proposal HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            )
+            .into_bytes();
+            req.extend_from_slice(body);
+            let mut stream = TcpStream::connect(addr).await.expect("connect rpc");
+            stream.write_all(&req).await.expect("send request");
+            let mut resp = Vec::new();
+            stream.read_to_end(&mut resp).await.expect("read response");
+            String::from_utf8_lossy(&resp).into_owned()
+        }
+        let prop = |nonce: u64, period: u64| {
+            crate::GovProposal {
+                proposer: 1,
+                param: crate::GovParam::BaseEmission(1),
+                voting_period: period,
+                nonce,
+                signature: [0u8; 64],
+            }
+            .signed(&kp(1))
+        };
+        let enc = |p: &crate::GovProposal| crate::codec::encode_gov_proposal(p);
+
+        // Nonce past the pipelining window → 422, not staged.
+        let t = post(rpc_addr, &enc(&prop(crate::GOV_NONCE_LOOKAHEAD + 1, 100))).await;
+        assert!(t.starts_with("HTTP/1.1 422"), "expected 422, got: {t}");
+
+        // A valid op → 200 + its hash; the same op again → 409.
+        let first = prop(0, 100);
+        let t = post(rpc_addr, &enc(&first)).await;
+        assert!(t.starts_with("HTTP/1.1 200 OK"), "expected 200, got: {t}");
+        assert!(
+            t.contains(&crate::hash::hex(&first.hash())),
+            "hash in body: {t}"
+        );
+        let t = post(rpc_addr, &enc(&first)).await;
+        assert!(t.starts_with("HTTP/1.1 409"), "expected 409, got: {t}");
+
+        // Fill the rest of account 1's quota (distinct hashes) → 200 each; one more → 429.
+        let quota = crate::net::MAX_PENDING_GOV_PER_ACCOUNT as u64;
+        for i in 1..quota {
+            let t = post(rpc_addr, &enc(&prop(0, 100 + i))).await;
+            assert!(
+                t.starts_with("HTTP/1.1 200 OK"),
+                "op {i}: expected 200, got: {t}"
+            );
+        }
+        let t = post(rpc_addr, &enc(&prop(1, 999))).await;
+        assert!(t.starts_with("HTTP/1.1 429"), "expected 429, got: {t}");
 
         let _ = std::fs::remove_dir_all(&dir);
     }

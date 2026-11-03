@@ -315,6 +315,13 @@ pub const MAX_GOV_COUNT: u64 = 10_000; // bound for usize-typed ΔK counts (fits
 /// fresh_min) keep their own `[0,1]` bound.
 pub const MAX_DELTAK_PARAM: f32 = 1_000.0;
 
+/// SEC-01 (round 3): how far ahead of an account's current nonce a staged governance
+/// op may be. A pipelined submitter may legitimately be a few nonces ahead, but an
+/// op further ahead than this can never apply before the pool turns over, so it is
+/// refused at admission (`NonceTooFarAhead`) instead of occupying a pending slot.
+/// Mirrors the mempool's tx `nonce_lookahead` (M143) for the governance pools.
+pub const GOV_NONCE_LOOKAHEAD: u64 = 8;
+
 /// SEC-04: validate a single governable parameter value against its safe domain.
 /// Called at proposal **registration** (so only valid values ever enter the proposal
 /// set → only valid values ever execute) and at genesis load.
@@ -1181,6 +1188,18 @@ pub enum ChainError {
     /// in depth behind the governance param bounds — a block that cannot be applied
     /// without breaking supply conservation is rejected rather than wrapping.
     RewardOverflow,
+    /// SEC-01 (round 3): the governance pending pool is at `net::MAX_PENDING_GOV`; the
+    /// op was not staged. A pool-admission bound, not a consensus rule.
+    GovPoolFull,
+    /// SEC-01 (round 3): this account already has `net::MAX_PENDING_GOV_PER_ACCOUNT`
+    /// governance ops staged, so one account cannot monopolize the pool.
+    GovAccountQuotaExceeded {
+        account: u64,
+        limit: usize,
+    },
+    /// SEC-01 (round 3): the op's content hash is already in the dedup cache (it was
+    /// previously staged and flooded); it was not staged again.
+    GovAlreadySeen,
     /// M143: the tx's `nonce` is further ahead than the mempool's pipelining window
     /// allows (`got > acct.nonce + nonce_lookahead`). A mempool-admission bound, not
     /// a consensus rule — it keeps per-account buffering finite.
@@ -1400,6 +1419,14 @@ impl std::fmt::Display for ChainError {
             }
             ChainError::RewardOverflow => {
                 write!(f, "minting this block's reward would overflow balance/supply")
+            }
+            ChainError::GovPoolFull => write!(f, "governance pending pool is full"),
+            ChainError::GovAccountQuotaExceeded { account, limit } => write!(
+                f,
+                "account {account} already has {limit} governance ops pending"
+            ),
+            ChainError::GovAlreadySeen => {
+                write!(f, "governance op already seen (staged or flooded before)")
             }
             ChainError::NonceTooFarAhead { account, got, limit } => write!(
                 f,
@@ -2208,42 +2235,102 @@ impl ChainState {
         }
     }
 
-    /// SEC-01: cheap admissibility check for a gossiped `GovProposal` — account exists,
-    /// signature valid, param in safe range. Deliberately does NOT check nonce (a
-    /// pipelined submitter may legitimately be ahead); nonce/ordering are enforced at
-    /// block apply and at candidate-build filtering. Used at gossip ingress so invalid
-    /// ops are neither staged nor re-flooded (no pool pollution, no amplification).
-    pub(crate) fn gov_proposal_admissible(&self, op: &GovProposal) -> bool {
-        match self.accounts.get(&op.proposer) {
-            Some(acct) => {
-                crypto::verify(
-                    &acct.pubkey,
-                    &codec::govproposal_signing_bytes(op),
-                    &op.signature,
-                ) && validate_gov_param(&op.param).is_ok()
-            }
-            None => false,
+    /// SEC-01 (round 3): shared nonce-window check for governance admission. A stale
+    /// op (`nonce < acct.nonce`) can never apply → `BadNonce`; one further ahead than
+    /// [`GOV_NONCE_LOOKAHEAD`] can't apply before the pool turns over → `NonceTooFarAhead`.
+    /// Anything inside the window is accepted as legitimate pipelining; strict
+    /// `nonce == acct.nonce` ordering is still enforced at block apply.
+    fn gov_nonce_window(&self, account: u64, nonce: u64) -> Result<(), ChainError> {
+        let acct = self
+            .accounts
+            .get(&account)
+            .ok_or(ChainError::UnknownAccount(account))?;
+        if nonce < acct.nonce {
+            return Err(ChainError::BadNonce {
+                account,
+                expected: acct.nonce,
+                got: nonce,
+            });
         }
+        let limit = acct.nonce.saturating_add(GOV_NONCE_LOOKAHEAD);
+        if nonce > limit {
+            return Err(ChainError::NonceTooFarAhead {
+                account,
+                got: nonce,
+                limit,
+            });
+        }
+        Ok(())
     }
 
-    /// SEC-01: cheap admissibility check for a gossiped `GovVote` — account exists,
-    /// signature valid, and the referenced proposal exists and is still open. No nonce
-    /// check (see [`Self::gov_proposal_admissible`]).
-    pub(crate) fn gov_vote_admissible(&self, op: &GovVote) -> bool {
-        let sig_ok = match self.accounts.get(&op.voter) {
-            Some(acct) => crypto::verify(
-                &acct.pubkey,
-                &codec::govvote_signing_bytes(op),
-                &op.signature,
-            ),
-            None => false,
-        };
-        // Proposal must exist and not yet be closed at the next commit height.
-        let open = self
+    /// SEC-01: admissibility check for a `GovProposal` shared by gossip ingress and
+    /// local/RPC submission — account exists, signature valid, param in safe range,
+    /// nonce inside the pipelining window ([`Self::gov_nonce_window`]). Strict nonce
+    /// ordering is enforced at block apply and at candidate-build filtering. Used at
+    /// every pool entrance so an invalid op is neither staged nor re-flooded (no pool
+    /// pollution, no amplification), and the caller gets a structured reason.
+    pub(crate) fn gov_proposal_admissible(&self, op: &GovProposal) -> Result<(), ChainError> {
+        let acct = self
+            .accounts
+            .get(&op.proposer)
+            .ok_or(ChainError::UnknownAccount(op.proposer))?;
+        if !crypto::verify(
+            &acct.pubkey,
+            &codec::govproposal_signing_bytes(op),
+            &op.signature,
+        ) {
+            return Err(ChainError::BadSignature(op.proposer));
+        }
+        validate_gov_param(&op.param)?;
+        self.gov_nonce_window(op.proposer, op.nonce)
+    }
+
+    /// SEC-01: admissibility check for a `GovVote` — account exists, signature valid,
+    /// the referenced proposal exists and is still open at the next commit height,
+    /// nonce inside the pipelining window (see [`Self::gov_proposal_admissible`]).
+    pub(crate) fn gov_vote_admissible(&self, op: &GovVote) -> Result<(), ChainError> {
+        let acct = self
+            .accounts
+            .get(&op.voter)
+            .ok_or(ChainError::UnknownAccount(op.voter))?;
+        if !crypto::verify(
+            &acct.pubkey,
+            &codec::govvote_signing_bytes(op),
+            &op.signature,
+        ) {
+            return Err(ChainError::BadSignature(op.voter));
+        }
+        self.gov_vote_proposal_open(op)?;
+        self.gov_nonce_window(op.voter, op.nonce)
+    }
+
+    /// The vote's proposal must exist and not yet be closed at the next commit height.
+    fn gov_vote_proposal_open(&self, op: &GovVote) -> Result<(), ChainError> {
+        let p = self
             .proposals
             .get(&op.proposal_id)
-            .is_some_and(|p| self.height + 1 < p.created_height + p.voting_period);
-        sig_ok && open
+            .ok_or(ChainError::UnknownProposal(op.proposal_id))?;
+        let next = self.height + 1;
+        if next >= p.created_height + p.voting_period {
+            return Err(ChainError::ProposalClosed {
+                id: op.proposal_id,
+                height: next,
+            });
+        }
+        Ok(())
+    }
+
+    /// SEC-01 (round 3): cheap (no signature work) "could this staged proposal still
+    /// apply?" predicate for pruning the pending pool after each commit — the nonce
+    /// window only, since an account's nonce can only move up and make an op stale.
+    pub(crate) fn gov_proposal_not_stale(&self, op: &GovProposal) -> bool {
+        self.gov_nonce_window(op.proposer, op.nonce).is_ok()
+    }
+
+    /// SEC-01 (round 3): as [`Self::gov_proposal_not_stale`], plus the vote's proposal
+    /// must still be open (a vote on a matured/removed proposal can never apply).
+    pub(crate) fn gov_vote_not_stale(&self, op: &GovVote) -> bool {
+        self.gov_vote_proposal_open(op).is_ok() && self.gov_nonce_window(op.voter, op.nonce).is_ok()
     }
 
     /// SEC-01: from staged governance pools, return the subset that applies cleanly

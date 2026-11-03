@@ -50,8 +50,8 @@ use crate::mempool::Mempool;
 use crate::merkle;
 use crate::validator::ValidatorSet;
 use crate::{
-    Block, Chain, Genesis, GovProposal, GovVote, Hash, KeyRotation, SlashEvidence, StakeOp,
-    SubmissionTx,
+    Block, Chain, ChainError, Genesis, GovProposal, GovVote, Hash, KeyRotation, SlashEvidence,
+    StakeOp, SubmissionTx,
 };
 
 /// Maximum certified blocks returned in a single [`GossipMsg::Blocks`] batch — a
@@ -224,6 +224,11 @@ pub const MAX_PEERS: usize = 1024;
 /// full pool stops staging + re-flooding further gov ops — governance is low-volume, so
 /// this bounds memory/CPU under a gossip flood without affecting honest operation.
 pub const MAX_PENDING_GOV: usize = 4096;
+/// SEC-01 (round 3): per-account share of each governance pool. Together with the
+/// nonce window ([`crate::GOV_NONCE_LOOKAHEAD`]) this means one account can neither
+/// fill the pool with future-nonce ops nor crowd out other accounts' current-nonce
+/// ops — reaching `MAX_PENDING_GOV` takes `MAX_PENDING_GOV / 16` distinct accounts.
+pub const MAX_PENDING_GOV_PER_ACCOUNT: usize = 16;
 /// SEC-01 (re-verify): hard default bound (FIFO) for the governance / key-rotation dedup
 /// caches, applied at construction so they are never unbounded even when `[mempool]
 /// seen_cache` is left at its `0` (unbounded) default. Governance is low-volume, so a
@@ -1316,6 +1321,17 @@ impl GossipNode {
             self.pending_gov_votes
                 .retain(|op| !committed.contains(&op.hash()));
         }
+        // SEC-01 (round 3): the block just applied may have advanced account nonces
+        // (via any op type) or matured proposals, so staged gov ops that can now never
+        // apply are dropped here instead of holding pool slots until eviction. Cheap:
+        // nonce-window / proposal-open checks only, no signature work.
+        {
+            let state = &self.chain.state;
+            self.pending_gov_proposals
+                .retain(|op| state.gov_proposal_not_stale(op));
+            self.pending_gov_votes
+                .retain(|op| state.gov_vote_not_stale(op));
+        }
         self.blocks.push(block);
         self.certs.push(cert);
         true
@@ -1512,27 +1528,91 @@ impl GossipNode {
         self.broadcast(GossipMsg::KeyRotation(op), None)
     }
 
-    /// M195: stage a locally-created governance proposal and flood it. Validation
-    /// (sig / nonce) happens at apply time in `apply_gov_proposal`.
-    pub fn submit_local_gov_proposal(&mut self, op: GovProposal) -> Vec<(u64, GossipMsg)> {
-        // SEC-01 (re-verify): the local-submit path honors the same pending-pool cap as
-        // gossip ingress, so an operator/RPC flood can't grow the pool without bound.
-        if self.pending_gov_proposals.len() >= MAX_PENDING_GOV {
-            return Vec::new();
-        }
-        self.seen_gov_proposal.insert(op.hash());
-        self.pending_gov_proposals.push(op.clone());
-        self.broadcast(GossipMsg::GovProposal(Box::new(op)), None)
+    /// M195: stage a locally-created governance proposal and flood it. Goes through
+    /// the same admission as gossip ingress ([`Self::admit_gov_proposal`]): the
+    /// structured `Err` tells the caller (RPC) exactly why the op was NOT staged.
+    pub fn submit_local_gov_proposal(
+        &mut self,
+        op: GovProposal,
+    ) -> Result<Vec<(u64, GossipMsg)>, ChainError> {
+        self.admit_gov_proposal(&op)?;
+        Ok(self.broadcast(GossipMsg::GovProposal(Box::new(op)), None))
     }
 
-    /// M195: stage a locally-created governance vote and flood it.
-    pub fn submit_local_gov_vote(&mut self, op: GovVote) -> Vec<(u64, GossipMsg)> {
-        if self.pending_gov_votes.len() >= MAX_PENDING_GOV {
-            return Vec::new();
+    /// M195: stage a locally-created governance vote and flood it (see
+    /// [`Self::submit_local_gov_proposal`]).
+    pub fn submit_local_gov_vote(
+        &mut self,
+        op: GovVote,
+    ) -> Result<Vec<(u64, GossipMsg)>, ChainError> {
+        self.admit_gov_vote(&op)?;
+        Ok(self.broadcast(GossipMsg::GovVote(Box::new(op)), None))
+    }
+
+    /// SEC-01 (round 3): the single admission path into the governance proposal pool,
+    /// shared by gossip ingress and local/RPC submission so the two can't drift.
+    /// Order matters: validity (sig / param / nonce window) → global pool cap →
+    /// per-account quota → dedup → stage. Capacity is checked BEFORE the dedup insert
+    /// so a full pool never consumes a `seen` slot for an op that was not staged.
+    fn admit_gov_proposal(&mut self, op: &GovProposal) -> Result<(), ChainError> {
+        self.chain.state.gov_proposal_admissible(op)?;
+        if self.pending_gov_proposals.len() >= MAX_PENDING_GOV {
+            return Err(ChainError::GovPoolFull);
         }
-        self.seen_gov_vote.insert(op.hash());
+        let mine = self
+            .pending_gov_proposals
+            .iter()
+            .filter(|p| p.proposer == op.proposer)
+            .count();
+        if mine >= MAX_PENDING_GOV_PER_ACCOUNT {
+            return Err(ChainError::GovAccountQuotaExceeded {
+                account: op.proposer,
+                limit: MAX_PENDING_GOV_PER_ACCOUNT,
+            });
+        }
+        if !self.seen_gov_proposal.insert(op.hash()) {
+            return Err(ChainError::GovAlreadySeen);
+        }
+        self.pending_gov_proposals.push(op.clone());
+        Ok(())
+    }
+
+    /// SEC-01 (round 3): as [`Self::admit_gov_proposal`], for the vote pool.
+    fn admit_gov_vote(&mut self, op: &GovVote) -> Result<(), ChainError> {
+        self.chain.state.gov_vote_admissible(op)?;
+        if self.pending_gov_votes.len() >= MAX_PENDING_GOV {
+            return Err(ChainError::GovPoolFull);
+        }
+        let mine = self
+            .pending_gov_votes
+            .iter()
+            .filter(|v| v.voter == op.voter)
+            .count();
+        if mine >= MAX_PENDING_GOV_PER_ACCOUNT {
+            return Err(ChainError::GovAccountQuotaExceeded {
+                account: op.voter,
+                limit: MAX_PENDING_GOV_PER_ACCOUNT,
+            });
+        }
+        if !self.seen_gov_vote.insert(op.hash()) {
+            return Err(ChainError::GovAlreadySeen);
+        }
         self.pending_gov_votes.push(op.clone());
-        self.broadcast(GossipMsg::GovVote(Box::new(op)), None)
+        Ok(())
+    }
+
+    /// Test-only: push a vote straight into the pending pool, bypassing admission —
+    /// models a pool poisoned by any means (e.g. an op that was valid when staged and
+    /// went stale) for the "poisoned pool must not stall production" guard.
+    #[cfg(test)]
+    pub(crate) fn inject_pending_gov_vote(&mut self, op: GovVote) {
+        self.pending_gov_votes.push(op);
+    }
+
+    /// Test-only: size of the governance-proposal dedup cache.
+    #[cfg(test)]
+    pub(crate) fn seen_gov_proposal_len(&self) -> usize {
+        self.seen_gov_proposal.len()
     }
 
     /// The gossip a node emits to announce its current height (anti-entropy tick).
@@ -1761,38 +1841,22 @@ impl GossipNode {
         self.broadcast(GossipMsg::KeyRotation(op), Some(from))
     }
 
-    /// M195: dedup + stage + re-flood a gossiped governance proposal.
+    /// M195: dedup + stage + re-flood a gossiped governance proposal. Admission (and
+    /// its ordering — validate before touching the dedup cache, capacity before the
+    /// dedup insert) lives in [`Self::admit_gov_proposal`], shared with local submit.
+    /// A rejected or duplicate op is silently dropped: neither staged nor re-flooded.
     fn on_gov_proposal(&mut self, from: u64, op: GovProposal) -> Vec<(u64, GossipMsg)> {
-        // SEC-01 (re-verify): validate BEFORE touching the dedup cache, so an invalid op
-        // never grows `seen_gov_proposal`. Cheap recompute on re-delivery is bounded by
-        // the connection cap (M177).
-        if !self.chain.state.gov_proposal_admissible(&op) {
+        if self.admit_gov_proposal(&op).is_err() {
             return Vec::new();
         }
-        // SEC-01 (re-verify): check pool capacity BEFORE consuming a dedup-cache slot, so
-        // a full pool doesn't let an op grow the seen set without ever being staged.
-        if self.pending_gov_proposals.len() >= MAX_PENDING_GOV {
-            return Vec::new();
-        }
-        if !self.seen_gov_proposal.insert(op.hash()) {
-            return Vec::new(); // already flooded through us
-        }
-        self.pending_gov_proposals.push(op.clone());
         self.broadcast(GossipMsg::GovProposal(Box::new(op)), Some(from))
     }
 
     /// M195: dedup + stage + re-flood a gossiped governance vote.
     fn on_gov_vote(&mut self, from: u64, op: GovVote) -> Vec<(u64, GossipMsg)> {
-        if !self.chain.state.gov_vote_admissible(&op) {
+        if self.admit_gov_vote(&op).is_err() {
             return Vec::new();
         }
-        if self.pending_gov_votes.len() >= MAX_PENDING_GOV {
-            return Vec::new();
-        }
-        if !self.seen_gov_vote.insert(op.hash()) {
-            return Vec::new();
-        }
-        self.pending_gov_votes.push(op.clone());
         self.broadcast(GossipMsg::GovVote(Box::new(op)), Some(from))
     }
 
@@ -1878,17 +1942,25 @@ impl Network {
         self.enqueue(id, out);
     }
 
-    /// M195: submit a governance proposal / vote at `id` and flood it.
+    /// M195: submit a governance proposal / vote at `id` and flood it. Panics if the
+    /// op is not admitted (test-bus helper; tests that exercise rejection call
+    /// `submit_local_gov_*` on the node directly).
     pub fn submit_gov_proposal(&mut self, id: u64, op: GovProposal) {
         let out = self
             .nodes
             .get_mut(&id)
             .unwrap()
-            .submit_local_gov_proposal(op);
+            .submit_local_gov_proposal(op)
+            .expect("gov proposal admitted");
         self.enqueue(id, out);
     }
     pub fn submit_gov_vote(&mut self, id: u64, op: GovVote) {
-        let out = self.nodes.get_mut(&id).unwrap().submit_local_gov_vote(op);
+        let out = self
+            .nodes
+            .get_mut(&id)
+            .unwrap()
+            .submit_local_gov_vote(op)
+            .expect("gov vote admitted");
         self.enqueue(id, out);
     }
 
@@ -4274,8 +4346,9 @@ mod tests {
     #[test]
     fn poisoned_gov_pool_does_not_stall_candidate_production() {
         // SEC-01 core: even if a stale/invalid gov op is in the pending pool (injected
-        // here via the un-checked local-submit path), build_candidate must still produce
-        // a sealable block — the invalid op is filtered out, not allowed to stall.
+        // here via the test-only hook — modelling an op that was valid when admitted
+        // and went stale after), build_candidate must still produce a sealable block —
+        // the invalid op is filtered out, not allowed to stall.
         let mut node = GossipNode::new(1, genesis(), 16, [1]);
         let bogus = crate::GovVote {
             proposal_id: 999, // no such committed proposal
@@ -4285,7 +4358,7 @@ mod tests {
             signature: [0u8; 64],
         }
         .signed(&kp(1));
-        let _ = node.submit_local_gov_vote(bogus); // pushes straight into the pool
+        node.inject_pending_gov_vote(bogus);
         assert_eq!(node.pending_gov_votes().len(), 1, "op is in the pool");
         let cand = node.build_candidate(1.0);
         assert!(cand.is_some(), "poisoned pool must not stall production");
@@ -4307,51 +4380,189 @@ mod tests {
         assert!(s.insert([1u8; 32]), "[1] was evicted, so it is new again");
     }
 
-    #[test]
-    fn gov_pending_pool_cap_holds_on_local_and_full_pool_does_not_grow_dedup() {
-        // SEC-01 (re-verify): the pending pool is hard-capped on BOTH the local-submit and
-        // gossip paths, and a full pool returns before consuming a dedup slot.
-        let mut node = GossipNode::new(1, genesis(), 16, [1]);
-        for n in 0..(MAX_PENDING_GOV as u64) {
-            let op = crate::GovProposal {
-                proposer: 1,
-                param: crate::GovParam::BaseEmission(1),
-                voting_period: 100,
-                nonce: n,
-                signature: [0u8; 64],
-            }
-            .signed(&kp(1));
-            node.submit_local_gov_proposal(op);
-        }
-        assert_eq!(node.pending_gov_proposals().len(), MAX_PENDING_GOV);
-        // Local submit beyond the cap is dropped.
-        let extra = crate::GovProposal {
-            proposer: 1,
+    /// A proposal from `proposer` at `nonce`; `period` varies the content hash.
+    fn gov_prop(proposer: u64, nonce: u64, period: u64) -> crate::GovProposal {
+        crate::GovProposal {
+            proposer,
             param: crate::GovParam::BaseEmission(1),
-            voting_period: 100,
-            nonce: 999_999,
+            voting_period: period,
+            nonce,
             signature: [0u8; 64],
         }
-        .signed(&kp(1));
-        node.submit_local_gov_proposal(extra);
+        .signed(&kp(proposer))
+    }
+
+    /// `genesis()` with accounts `1..=n` (enough distinct accounts to fill a pool
+    /// under the per-account quota).
+    fn genesis_with_accounts(n: u64) -> Genesis {
+        let mut g = genesis();
+        g.accounts = (1..=n)
+            .map(|id| (id, 30 * MICRO, kp(id).public()))
+            .collect();
+        g
+    }
+
+    #[test]
+    fn gov_pending_pool_cap_holds_on_local_and_full_pool_does_not_grow_dedup() {
+        // SEC-01 (round 3): the pending pool is hard-capped on BOTH the local-submit and
+        // gossip paths; a full pool is a structured `GovPoolFull` (not a silent drop or a
+        // misleading success) and does not consume a dedup slot. Reaching the cap needs
+        // MAX_PENDING_GOV / MAX_PENDING_GOV_PER_ACCOUNT distinct accounts, each staging
+        // its full quota of future-nonce (within-window) ops.
+        let fillers = (MAX_PENDING_GOV / MAX_PENDING_GOV_PER_ACCOUNT) as u64;
+        let mut node = GossipNode::new(1, genesis_with_accounts(fillers + 2), 16, [1]);
+        for acct in 1..=fillers {
+            for i in 0..MAX_PENDING_GOV_PER_ACCOUNT as u64 {
+                // nonces 1..=8 (ahead of the current 0, inside the window), two periods
+                let op = gov_prop(acct, 1 + i % crate::GOV_NONCE_LOOKAHEAD, 100 + i);
+                node.submit_local_gov_proposal(op).expect("within caps");
+            }
+        }
+        assert_eq!(node.pending_gov_proposals().len(), MAX_PENDING_GOV);
+        let seen_full = node.seen_gov_proposal_len();
+
+        // Local submit of a current-nonce op from an untouched account: explicitly
+        // refused as PoolFull (never silently dropped), pool and seen unchanged.
+        let r = node.submit_local_gov_proposal(gov_prop(fillers + 1, 0, 100));
+        assert!(matches!(r, Err(ChainError::GovPoolFull)), "got {r:?}");
+        assert_eq!(node.pending_gov_proposals().len(), MAX_PENDING_GOV);
+        assert_eq!(
+            node.seen_gov_proposal_len(),
+            seen_full,
+            "no seen slot consumed"
+        );
+
+        // Gossip ingress of a NEW valid op when the pool is full: dropped, not re-flooded,
+        // and (capacity check precedes the dedup insert) the seen cache does not grow.
+        let gossiped = gov_prop(fillers + 2, 0, 100);
+        let out = node.on_message(1, GossipMsg::GovProposal(Box::new(gossiped)));
+        assert!(out.is_empty(), "full pool drops gossiped op");
+        assert_eq!(node.pending_gov_proposals().len(), MAX_PENDING_GOV);
+        assert_eq!(
+            node.seen_gov_proposal_len(),
+            seen_full,
+            "no seen slot consumed"
+        );
+    }
+
+    #[test]
+    fn gov_admission_bounds_nonce_window_and_per_account_quota() {
+        // SEC-01 (round 3): one account can neither park ops arbitrarily far ahead
+        // (nonce window) nor hold more than its quota of pool slots; both are structured
+        // rejections, and another account's current-nonce op is still admitted.
+        let mut node = GossipNode::new(1, genesis(), 16, [1]);
+        // Inside the window: nonces 0..=GOV_NONCE_LOOKAHEAD are all admitted.
+        for n in 0..=crate::GOV_NONCE_LOOKAHEAD {
+            node.submit_local_gov_proposal(gov_prop(1, n, 100))
+                .expect("inside the nonce window");
+        }
+        // One past the window → NonceTooFarAhead, not staged.
+        let r = node.submit_local_gov_proposal(gov_prop(1, crate::GOV_NONCE_LOOKAHEAD + 1, 100));
+        assert!(
+            matches!(r, Err(ChainError::NonceTooFarAhead { account: 1, .. })),
+            "got {r:?}"
+        );
+        // Re-submitting a staged op → GovAlreadySeen, not staged twice.
+        let r = node.submit_local_gov_proposal(gov_prop(1, 0, 100));
+        assert!(matches!(r, Err(ChainError::GovAlreadySeen)), "got {r:?}");
+        // Fill the rest of account 1's quota with distinct hashes at the current nonce.
+        let mut period = 101;
+        while node.pending_gov_proposals().len() < MAX_PENDING_GOV_PER_ACCOUNT {
+            node.submit_local_gov_proposal(gov_prop(1, 0, period))
+                .expect("inside the quota");
+            period += 1;
+        }
+        let r = node.submit_local_gov_proposal(gov_prop(1, 1, 999));
+        assert!(
+            matches!(
+                r,
+                Err(ChainError::GovAccountQuotaExceeded {
+                    account: 1,
+                    limit: MAX_PENDING_GOV_PER_ACCOUNT
+                })
+            ),
+            "got {r:?}"
+        );
+        let seen_before = node.seen_gov_proposal_len();
+        // Account 1 at quota does not crowd out account 2's current-nonce op.
+        node.submit_local_gov_proposal(gov_prop(2, 0, 100))
+            .expect("another account is still admitted");
+        assert_eq!(node.seen_gov_proposal_len(), seen_before + 1);
+        // Gossip ingress of an over-quota op: dropped without consuming a seen slot.
+        let out = node.on_message(1, GossipMsg::GovProposal(Box::new(gov_prop(1, 2, 5000))));
+        assert!(out.is_empty());
+        assert_eq!(node.seen_gov_proposal_len(), seen_before + 1);
         assert_eq!(
             node.pending_gov_proposals().len(),
-            MAX_PENDING_GOV,
-            "local submit respects the pending cap"
+            MAX_PENDING_GOV_PER_ACCOUNT + 1
         );
-        // Gossip ingress of a NEW valid op when the pool is full: dropped, and (because the
-        // capacity check precedes the dedup insert) the seen cache does not grow for it.
-        let gossiped = crate::GovProposal {
-            proposer: 2,
-            param: crate::GovParam::BaseEmission(1),
-            voting_period: 100,
+    }
+
+    #[test]
+    fn stale_gov_ops_are_pruned_on_commit() {
+        // SEC-01 (round 3): a staged op whose nonce was consumed by a *different* op in
+        // a committed block, or a vote whose proposal has closed, can never apply — so
+        // apply_certified prunes it instead of letting it hold a pool slot indefinitely.
+        let ids = [1u64, 2, 3, 21, 22, 23, 24];
+        let seeds: BTreeMap<u64, [u8; 32]> = ids.iter().map(|&id| (id, seed(id))).collect();
+        let mut driver = ChainDriver::new(genesis(), seeds, 4);
+        let mut node = GossipNode::new(1, genesis(), 16, [1]);
+
+        // The node stages account 1's nonce-0 proposal; the network commits a DIFFERENT
+        // nonce-0 proposal from account 1 (short voting window for the vote half below).
+        node.submit_local_gov_proposal(gov_prop(1, 0, 100))
+            .expect("admitted");
+        driver.stage_gov_proposal(gov_prop(1, 0, 2));
+        driver.produce(1.0, &BTreeSet::new()).unwrap();
+        let (b1, c1) = (driver.blocks()[0].clone(), driver.certificates()[0].clone());
+        assert!(node.apply_certified(b1, c1));
+        assert!(
+            node.pending_gov_proposals().is_empty(),
+            "nonce-0 proposal is stale once account 1's nonce advanced"
+        );
+        // ...and the same nonce is now refused at admission as stale.
+        let r = node.submit_local_gov_proposal(gov_prop(1, 0, 7));
+        assert!(
+            matches!(
+                r,
+                Err(ChainError::BadNonce {
+                    account: 1,
+                    expected: 1,
+                    got: 0
+                })
+            ),
+            "got {r:?}"
+        );
+
+        // Vote half: the committed proposal (period 2, registered at h=1) is open for
+        // h=2, so a vote is admitted now — and pruned once h=2 commits (closed at h=3).
+        let pid = *node
+            .chain
+            .state
+            .proposals
+            .keys()
+            .next()
+            .expect("proposal registered");
+        let vote = crate::GovVote {
+            proposal_id: pid,
+            voter: 2,
+            approve: true,
             nonce: 0,
             signature: [0u8; 64],
         }
         .signed(&kp(2));
-        let out = node.on_message(1, GossipMsg::GovProposal(Box::new(gossiped)));
-        assert!(out.is_empty(), "full pool drops gossiped op");
-        assert_eq!(node.pending_gov_proposals().len(), MAX_PENDING_GOV);
+        node.submit_local_gov_vote(vote)
+            .expect("proposal still open");
+        assert_eq!(node.pending_gov_votes().len(), 1);
+        // h=2 needs content for the driver to emit a block: account 1's next proposal.
+        driver.stage_gov_proposal(gov_prop(1, 1, 50));
+        driver.produce(2.0, &BTreeSet::new()).unwrap();
+        let (b2, c2) = (driver.blocks()[1].clone(), driver.certificates()[1].clone());
+        assert!(node.apply_certified(b2, c2));
+        assert!(
+            node.pending_gov_votes().is_empty(),
+            "vote on a closed proposal is pruned"
+        );
     }
 
     /// End-to-end: gossip an evidence through the network to a node, drain
