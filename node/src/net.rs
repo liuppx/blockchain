@@ -355,6 +355,13 @@ impl SeenSet {
         is_new
     }
 
+    /// SEC-01 (round 5): forget `h` so it can be re-admitted — used when a staged op
+    /// is evicted from a full pool (not consumed), so its owner can resubmit later.
+    /// The FIFO slot stays as a harmless tombstone (its eventual pop is a no-op).
+    fn remove(&mut self, h: &Hash) {
+        self.set.remove(h);
+    }
+
     fn len(&self) -> usize {
         self.set.len()
     }
@@ -1331,6 +1338,21 @@ impl GossipNode {
                 .retain(|op| state.gov_proposal_not_stale(op));
             self.pending_gov_votes
                 .retain(|op| state.gov_vote_not_stale(op));
+            // SEC-01 (round 5): a key rotation in this block replaced the account's
+            // pubkey, so its queued ops signed by the OLD key are still inside the nonce
+            // window (rotation bumps the nonce by one) yet can never verify at apply.
+            // Re-run full admissibility (signature included) for just those accounts —
+            // bounded by their quota, so the signature work is small.
+            if !block.key_rotations.is_empty() {
+                let rotated: std::collections::HashSet<u64> =
+                    block.key_rotations.iter().map(|r| r.account).collect();
+                self.pending_gov_proposals.retain(|op| {
+                    !rotated.contains(&op.proposer) || state.gov_proposal_admissible(op).is_ok()
+                });
+                self.pending_gov_votes.retain(|op| {
+                    !rotated.contains(&op.voter) || state.gov_vote_admissible(op).is_ok()
+                });
+            }
         }
         self.blocks.push(block);
         self.certs.push(cert);
@@ -1551,24 +1573,42 @@ impl GossipNode {
 
     /// SEC-01 (round 3): the single admission path into the governance proposal pool,
     /// shared by gossip ingress and local/RPC submission so the two can't drift.
-    /// Order matters: validity (sig / param / nonce window) → global pool cap →
-    /// per-account quota → dedup → stage. Capacity is checked BEFORE the dedup insert
+    /// Order matters: validity (sig / param / nonce window) → per-account quota →
+    /// global pool cap → dedup → stage. Capacity is checked BEFORE the dedup insert
     /// so a full pool never consumes a `seen` slot for an op that was not staged.
+    ///
+    /// SEC-01 (round 5): a **current-nonce** op (immediately applicable) never loses
+    /// its slot to parked future-nonce ops: at quota it evicts this account's
+    /// furthest-future op, at the global cap it evicts the pool's furthest-future op
+    /// ([`Self::evict_furthest_future_gov_proposal`]). Only when nothing is evictable
+    /// (the pool holds nothing but current-nonce ops) does the hard cap reject it —
+    /// so many accounts parking future-nonce ops can't starve governance.
     fn admit_gov_proposal(&mut self, op: &GovProposal) -> Result<(), ChainError> {
         self.chain.state.gov_proposal_admissible(op)?;
-        if self.pending_gov_proposals.len() >= MAX_PENDING_GOV {
-            return Err(ChainError::GovPoolFull);
-        }
+        // Admissibility proved the account exists and `op.nonce >= acct.nonce`.
+        let current = self
+            .chain
+            .state
+            .accounts
+            .get(&op.proposer)
+            .is_some_and(|a| a.nonce == op.nonce);
         let mine = self
             .pending_gov_proposals
             .iter()
             .filter(|p| p.proposer == op.proposer)
             .count();
-        if mine >= MAX_PENDING_GOV_PER_ACCOUNT {
+        if mine >= MAX_PENDING_GOV_PER_ACCOUNT
+            && !(current && self.evict_furthest_future_gov_proposal(Some(op.proposer)))
+        {
             return Err(ChainError::GovAccountQuotaExceeded {
                 account: op.proposer,
                 limit: MAX_PENDING_GOV_PER_ACCOUNT,
             });
+        }
+        if self.pending_gov_proposals.len() >= MAX_PENDING_GOV
+            && !(current && self.evict_furthest_future_gov_proposal(None))
+        {
+            return Err(ChainError::GovPoolFull);
         }
         if !self.seen_gov_proposal.insert(op.hash()) {
             return Err(ChainError::GovAlreadySeen);
@@ -1577,28 +1617,92 @@ impl GossipNode {
         Ok(())
     }
 
-    /// SEC-01 (round 3): as [`Self::admit_gov_proposal`], for the vote pool.
+    /// SEC-01 (round 3/5): as [`Self::admit_gov_proposal`], for the vote pool.
     fn admit_gov_vote(&mut self, op: &GovVote) -> Result<(), ChainError> {
         self.chain.state.gov_vote_admissible(op)?;
-        if self.pending_gov_votes.len() >= MAX_PENDING_GOV {
-            return Err(ChainError::GovPoolFull);
-        }
+        let current = self
+            .chain
+            .state
+            .accounts
+            .get(&op.voter)
+            .is_some_and(|a| a.nonce == op.nonce);
         let mine = self
             .pending_gov_votes
             .iter()
             .filter(|v| v.voter == op.voter)
             .count();
-        if mine >= MAX_PENDING_GOV_PER_ACCOUNT {
+        if mine >= MAX_PENDING_GOV_PER_ACCOUNT
+            && !(current && self.evict_furthest_future_gov_vote(Some(op.voter)))
+        {
             return Err(ChainError::GovAccountQuotaExceeded {
                 account: op.voter,
                 limit: MAX_PENDING_GOV_PER_ACCOUNT,
             });
+        }
+        if self.pending_gov_votes.len() >= MAX_PENDING_GOV
+            && !(current && self.evict_furthest_future_gov_vote(None))
+        {
+            return Err(ChainError::GovPoolFull);
         }
         if !self.seen_gov_vote.insert(op.hash()) {
             return Err(ChainError::GovAlreadySeen);
         }
         self.pending_gov_votes.push(op.clone());
         Ok(())
+    }
+
+    /// SEC-01 (round 5): drop the staged proposal (optionally restricted to `account`)
+    /// whose nonce is furthest ahead of its account's current nonce — the one least
+    /// likely to apply soon; ties go to the oldest. Its hash is forgotten by the dedup
+    /// cache so the owner can resubmit once there is room. `false` if every candidate
+    /// is at its current nonce (nothing is "parked", so nothing is evictable).
+    fn evict_furthest_future_gov_proposal(&mut self, account: Option<u64>) -> bool {
+        let state = &self.chain.state;
+        let victim = self
+            .pending_gov_proposals
+            .iter()
+            .enumerate()
+            .filter(|(_, p)| account.is_none_or(|a| p.proposer == a))
+            .filter_map(|(i, p)| {
+                let cur = state.accounts.get(&p.proposer)?.nonce;
+                (p.nonce > cur).then_some((p.nonce - cur, i))
+            })
+            // max distance; `max_by_key` takes the LAST max, so negate the index to
+            // prefer the oldest (lowest index) on ties.
+            .max_by_key(|&(d, i)| (d, std::cmp::Reverse(i)))
+            .map(|(_, i)| i);
+        match victim {
+            Some(i) => {
+                let gone = self.pending_gov_proposals.remove(i);
+                self.seen_gov_proposal.remove(&gone.hash());
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// SEC-01 (round 5): as [`Self::evict_furthest_future_gov_proposal`], for votes.
+    fn evict_furthest_future_gov_vote(&mut self, account: Option<u64>) -> bool {
+        let state = &self.chain.state;
+        let victim = self
+            .pending_gov_votes
+            .iter()
+            .enumerate()
+            .filter(|(_, v)| account.is_none_or(|a| v.voter == a))
+            .filter_map(|(i, v)| {
+                let cur = state.accounts.get(&v.voter)?.nonce;
+                (v.nonce > cur).then_some((v.nonce - cur, i))
+            })
+            .max_by_key(|&(d, i)| (d, std::cmp::Reverse(i)))
+            .map(|(_, i)| i);
+        match victim {
+            Some(i) => {
+                let gone = self.pending_gov_votes.remove(i);
+                self.seen_gov_vote.remove(&gone.hash());
+                true
+            }
+            None => false,
+        }
     }
 
     /// Test-only: push a vote straight into the pending pool, bypassing admission —
@@ -4421,9 +4525,11 @@ mod tests {
         assert_eq!(node.pending_gov_proposals().len(), MAX_PENDING_GOV);
         let seen_full = node.seen_gov_proposal_len();
 
-        // Local submit of a current-nonce op from an untouched account: explicitly
-        // refused as PoolFull (never silently dropped), pool and seen unchanged.
-        let r = node.submit_local_gov_proposal(gov_prop(fillers + 1, 0, 100));
+        // Local submit of a FUTURE-nonce op from an untouched account: explicitly
+        // refused as PoolFull (never silently dropped), pool and seen unchanged. (A
+        // current-nonce op would instead evict a parked one — see
+        // `current_nonce_gov_op_evicts_parked_future_op_when_pool_full`.)
+        let r = node.submit_local_gov_proposal(gov_prop(fillers + 1, 1, 100));
         assert!(matches!(r, Err(ChainError::GovPoolFull)), "got {r:?}");
         assert_eq!(node.pending_gov_proposals().len(), MAX_PENDING_GOV);
         assert_eq!(
@@ -4432,9 +4538,10 @@ mod tests {
             "no seen slot consumed"
         );
 
-        // Gossip ingress of a NEW valid op when the pool is full: dropped, not re-flooded,
-        // and (capacity check precedes the dedup insert) the seen cache does not grow.
-        let gossiped = gov_prop(fillers + 2, 0, 100);
+        // Gossip ingress of a NEW valid future-nonce op when the pool is full: dropped,
+        // not re-flooded, and (capacity check precedes the dedup insert) the seen cache
+        // does not grow.
+        let gossiped = gov_prop(fillers + 2, 1, 100);
         let out = node.on_message(1, GossipMsg::GovProposal(Box::new(gossiped)));
         assert!(out.is_empty(), "full pool drops gossiped op");
         assert_eq!(node.pending_gov_proposals().len(), MAX_PENDING_GOV);
@@ -4563,6 +4670,162 @@ mod tests {
             node.pending_gov_votes().is_empty(),
             "vote on a closed proposal is pruned"
         );
+    }
+
+    #[test]
+    fn current_nonce_gov_op_evicts_parked_future_op_when_pool_full() {
+        // SEC-01 (round 5): many accounts parking within-window future-nonce ops can
+        // fill the pool, and empty blocks never advance their nonces — so a full pool
+        // must not starve immediately-applicable (current-nonce) ops. A current-nonce
+        // op evicts the furthest-future parked op (globally, or its own at quota); the
+        // evicted op's hash is forgotten so its owner can resubmit; a future-nonce op
+        // still gets the hard `GovPoolFull`.
+        let fillers = (MAX_PENDING_GOV / MAX_PENDING_GOV_PER_ACCOUNT) as u64;
+        let mut node = GossipNode::new(1, genesis_with_accounts(fillers + 1), 16, [1]);
+        for acct in 1..=fillers {
+            for i in 0..MAX_PENDING_GOV_PER_ACCOUNT as u64 {
+                let op = gov_prop(acct, 1 + i % crate::GOV_NONCE_LOOKAHEAD, 100 + i);
+                node.submit_local_gov_proposal(op).expect("within caps");
+            }
+        }
+        assert_eq!(node.pending_gov_proposals().len(), MAX_PENDING_GOV);
+        // Number of furthest-future (nonce 8) parked ops: two per filler account.
+        let far = |node: &GossipNode| {
+            node.pending_gov_proposals()
+                .iter()
+                .filter(|p| p.nonce == crate::GOV_NONCE_LOOKAHEAD)
+                .count()
+        };
+        assert_eq!(far(&node), fillers as usize * 2);
+
+        // (a) An untouched account's current-nonce op is admitted into the full pool by
+        // evicting exactly one parked op — a furthest-future one; the pool stays at cap.
+        let cur = gov_prop(fillers + 1, 0, 100);
+        node.submit_local_gov_proposal(cur.clone())
+            .expect("current nonce takes priority over parked future ops");
+        let pool = node.pending_gov_proposals();
+        assert_eq!(pool.len(), MAX_PENDING_GOV, "still at the hard cap");
+        assert!(pool.iter().any(|p| p.hash() == cur.hash()), "staged");
+        assert_eq!(
+            far(&node),
+            fillers as usize * 2 - 1,
+            "the victim was a furthest-future (nonce 8) op"
+        );
+        // Ties go to the oldest: account 1's first nonce-8 op (period 107). Resubmitting
+        // it is refused by the (still full) pool cap — NOT as `GovAlreadySeen`, proving
+        // eviction forgot its hash so the owner can resubmit once there is room.
+        let r = node.submit_local_gov_proposal(gov_prop(1, 8, 107));
+        assert!(matches!(r, Err(ChainError::GovPoolFull)), "got {r:?}");
+
+        // (b) A FUTURE-nonce op from an account with spare quota still hits the hard
+        // cap: priority is only for immediately-applicable ops.
+        let r = node.submit_local_gov_proposal(gov_prop(fillers + 1, 1, 100));
+        assert!(matches!(r, Err(ChainError::GovPoolFull)), "got {r:?}");
+
+        // (c) Per-account path, pool NOT full: account 1 parks its whole quota (two ops
+        // at nonce 8); its current-nonce op evicts its own furthest-future op, oldest on
+        // ties, and the quota count is unchanged.
+        let mut node = GossipNode::new(1, genesis(), 16, [1]);
+        for i in 0..MAX_PENDING_GOV_PER_ACCOUNT as u64 {
+            node.submit_local_gov_proposal(gov_prop(
+                1,
+                1 + i % crate::GOV_NONCE_LOOKAHEAD,
+                100 + i,
+            ))
+            .expect("within quota");
+        }
+        assert_eq!(far(&node), 2);
+        node.submit_local_gov_proposal(gov_prop(1, 0, 777))
+            .expect("current nonce evicts this account's furthest parked op");
+        let mine: Vec<_> = node
+            .pending_gov_proposals()
+            .iter()
+            .filter(|p| p.proposer == 1)
+            .collect();
+        assert_eq!(mine.len(), MAX_PENDING_GOV_PER_ACCOUNT, "quota unchanged");
+        assert!(mine.iter().any(|p| p.nonce == 0), "current-nonce op staged");
+        assert_eq!(far(&node), 1, "one nonce-8 op evicted");
+        // The victim (older nonce-8 op, period 107) is refused by quota on resubmit —
+        // not `GovAlreadySeen`.
+        let r = node.submit_local_gov_proposal(gov_prop(1, 8, 107));
+        assert!(
+            matches!(
+                r,
+                Err(ChainError::GovAccountQuotaExceeded { account: 1, .. })
+            ),
+            "got {r:?}"
+        );
+
+        // (d) With nothing parked (a pool of only current-nonce ops) the hard cap holds
+        // even for a current-nonce op — eviction never drops an applicable op.
+        let mut node = GossipNode::new(1, genesis_with_accounts(fillers + 1), 16, [1]);
+        for acct in 1..=fillers {
+            for i in 0..MAX_PENDING_GOV_PER_ACCOUNT as u64 {
+                node.submit_local_gov_proposal(gov_prop(acct, 0, 100 + i))
+                    .expect("within caps");
+            }
+        }
+        let r = node.submit_local_gov_proposal(gov_prop(fillers + 1, 0, 100));
+        assert!(matches!(r, Err(ChainError::GovPoolFull)), "got {r:?}");
+        assert_eq!(node.pending_gov_proposals().len(), MAX_PENDING_GOV);
+    }
+
+    #[test]
+    fn key_rotation_purges_pending_gov_ops_signed_by_old_key() {
+        // SEC-01 (round 5): after a committed key rotation, the account's parked ops
+        // signed by the OLD key are still inside the nonce window (rotation consumed
+        // just one nonce) but can never verify at apply — they must not keep holding
+        // the account's quota. Other accounts' ops are untouched.
+        let ids = [1u64, 2, 3, 21, 22, 23, 24];
+        let seeds: BTreeMap<u64, [u8; 32]> = ids.iter().map(|&id| (id, seed(id))).collect();
+        let mut driver = ChainDriver::new(genesis(), seeds, 4);
+        let mut node = GossipNode::new(1, genesis(), 16, [1]);
+
+        for n in 1..=3 {
+            node.submit_local_gov_proposal(gov_prop(1, n, 100))
+                .expect("inside the window");
+        }
+        node.submit_local_gov_proposal(gov_prop(2, 1, 100))
+            .expect("control op from another account");
+        assert_eq!(node.pending_gov_proposals().len(), 4);
+
+        // The network commits account 1's rotation to kp(99) at nonce 0.
+        let rot = KeyRotation {
+            account: 1,
+            new_pubkey: kp(99).public(),
+            nonce: 0,
+            signature: [0u8; 64],
+        }
+        .signed(&kp(1));
+        driver.stage_key_rotation(rot);
+        driver.produce(1.0, &BTreeSet::new()).unwrap();
+        let (b1, c1) = (driver.blocks()[0].clone(), driver.certificates()[0].clone());
+        assert!(node.apply_certified(b1, c1));
+        assert_eq!(
+            node.chain.state.accounts.get(&1).map(|a| a.nonce),
+            Some(1),
+            "rotation consumed nonce 0, so nonces 1..=3 are still inside the window"
+        );
+        let pool = node.pending_gov_proposals();
+        assert!(
+            pool.iter().all(|p| p.proposer != 1),
+            "old-key ops purged despite being inside the nonce window"
+        );
+        assert_eq!(pool.len(), 1, "account 2's op survives");
+
+        // Old key at the new current nonce → BadSignature; new key → admitted.
+        let r = node.submit_local_gov_proposal(gov_prop(1, 1, 100));
+        assert!(matches!(r, Err(ChainError::BadSignature(1))), "got {r:?}");
+        let fresh = crate::GovProposal {
+            proposer: 1,
+            param: crate::GovParam::BaseEmission(1),
+            voting_period: 100,
+            nonce: 1,
+            signature: [0u8; 64],
+        }
+        .signed(&kp(99));
+        node.submit_local_gov_proposal(fresh)
+            .expect("op signed by the rotated-in key is admitted");
     }
 
     /// End-to-end: gossip an evidence through the network to a node, drain
