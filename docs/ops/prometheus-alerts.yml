@@ -1,0 +1,97 @@
+# M220: Prometheus alerting rules for a zhixing validator / full node.
+#
+# Every expression references a metric this node actually exports (see
+# `node/src/daemon.rs::render_prometheus`; cross-checked against the exporter). Load via
+# Prometheus `rule_files:`; scrape each node's `[metrics] listen` (Bearer METRICS_TOKEN).
+# Thresholds are starting points — tune to your block interval / fleet size.
+#
+# Validate: `promtool check rules docs/ops/prometheus-alerts.yml`
+groups:
+  - name: zhixing-consensus
+    rules:
+      - alert: ZhixingChainHeightStalled
+        # No new certified block in 10m. For a chain with create_empty_blocks=false this can
+        # be benign when idle; pair with ZhixingNoPeers / validator liveness to disambiguate.
+        expr: increase(zhixing_height[10m]) == 0
+        for: 5m
+        labels: { severity: critical }
+        annotations:
+          summary: "Chain height stalled on {{ $labels.instance }}"
+          description: "zhixing_height has not advanced in 10m — consensus may be stuck (lost quorum, partition, or all proposers down)."
+
+      - alert: ZhixingValidatorMissingCommits
+        # A validator absent from >50% of the recent liveness window (this node's cert view,
+        # M212). Only fires once the window has enough samples to be meaningful.
+        expr: >
+          (zhixing_validator_missed_commits / ignoring(validator) group_left zhixing_liveness_window_samples) > 0.5
+          and ignoring(validator) zhixing_liveness_window_samples > 100
+        for: 10m
+        labels: { severity: warning }
+        annotations:
+          summary: "Validator {{ $labels.validator }} missing commits (seen by {{ $labels.instance }})"
+          description: "Validator {{ $labels.validator }} signed <50% of the last liveness window. If persistent, remove it via a validator-set change (no auto-jailing)."
+
+      - alert: ZhixingEquivocationObserved
+        # A double-sign (equivocation) was observed + submitted as slashing evidence.
+        expr: increase(zhixing_slashing_events_total[1h]) > 0
+        for: 0m
+        labels: { severity: critical }
+        annotations:
+          summary: "Equivocation observed on {{ $labels.instance }}"
+          description: "zhixing_slashing_events_total increased — an attributable double-sign was detected and flooded as evidence. Investigate the offending validator."
+
+  - name: zhixing-network
+    rules:
+      - alert: ZhixingNoPeers
+        expr: zhixing_peers_connected == 0
+        for: 2m
+        labels: { severity: critical }
+        annotations:
+          summary: "No connected peers on {{ $labels.instance }}"
+          description: "zhixing_peers_connected == 0 — this node is isolated (bad addresses, firewall, or TLS/auth handshake failures). It cannot sync or vote."
+
+      - alert: ZhixingRpcAuthFailureSpike
+        expr: rate(zhixing_rpc_auth_failures_total[5m]) > 0.2
+        for: 5m
+        labels: { severity: warning }
+        annotations:
+          summary: "RPC bearer-auth failures on {{ $labels.instance }}"
+          description: "Sustained 401s on the RPC write path — a misconfigured client or a credential-guessing attempt."
+
+      - alert: ZhixingMetricsAuthFailureSpike
+        expr: rate(zhixing_metrics_auth_failures_total[5m]) > 0.2
+        for: 5m
+        labels: { severity: warning }
+        annotations:
+          summary: "Metrics bearer-auth failures on {{ $labels.instance }}"
+          description: "Sustained 401s scraping /metrics — a misconfigured scraper or a probing attempt."
+
+  - name: zhixing-mempool
+    rules:
+      - alert: ZhixingMempoolSaturated
+        # Guard on a bounded capacity (unbounded renders as a huge sentinel).
+        expr: zhixing_mempool_capacity < 1e18 and (zhixing_mempool_txs / zhixing_mempool_capacity) > 0.9
+        for: 5m
+        labels: { severity: warning }
+        annotations:
+          summary: "Mempool >90% full on {{ $labels.instance }}"
+          description: "zhixing_mempool_txs near zhixing_mempool_capacity — tx backpressure; blocks may not be draining or load exceeds throughput."
+
+      - alert: ZhixingSeenTxCacheSaturated
+        expr: zhixing_seen_tx_capacity < 1e18 and (zhixing_seen_tx / zhixing_seen_tx_capacity) > 0.9
+        for: 10m
+        labels: { severity: info }
+        annotations:
+          summary: "Gossip dedup cache >90% full on {{ $labels.instance }}"
+          description: "zhixing_seen_tx near its bound — under flood pressure; eviction may cause bounded re-floods (never a safety issue)."
+
+  - name: zhixing-latency
+    rules:
+      - alert: ZhixingBlockApplyLatencyHigh
+        # p99 block-apply (consensus→committed) latency over 2s.
+        expr: histogram_quantile(0.99, rate(zhixing_block_apply_seconds_bucket[10m])) > 2
+        for: 10m
+        labels: { severity: warning }
+        annotations:
+          summary: "Block-apply p99 latency high on {{ $labels.instance }}"
+          description: "p99 of zhixing_block_apply_seconds > 2s — slow disk (fsync), CPU pressure, or oversized blocks."

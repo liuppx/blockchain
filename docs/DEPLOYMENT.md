@@ -189,6 +189,9 @@ ZHIXING_KEYSTORE_PASSWORD=… node run --config node21.toml     # 验证人/foll
 - **health**:`GET /`(metrics 或 rpc)→ `200 ok`。
 - **status**:`node status --dir <data_dir> --config <node.toml>`(本地读 head/高度/state_root)。
 - **日志**:结构化 tracing(`RUST_LOG` 控级别,`info` 缺省),支持 JSON + 文件 appender。
+- **告警**:Prometheus 告警规则见 [`docs/ops/prometheus-alerts.yml`](ops/prometheus-alerts.yml)
+  (高度停滞 / 验证人掉线 / 双签 / 无 peer / 认证失败突增 / mempool 饱和 / 落块延迟),
+  抓取与处置说明见 [`docs/ops/README.md`](ops/README.md)。
 
 ## 8. 持久化 / 备份 / 恢复
 
@@ -234,7 +237,7 @@ ZHIXING_KEYSTORE_PASSWORD=… node run --config node21.toml     # 验证人/foll
 - [ ] `[network]` 开 `enable_tls` + `require_peer_auth`(许可制再加 `require_peer_certs`+`bind_channel`)。
 - [ ] RPC/metrics 若非 loopback 暴露:设 `auth_token` + `enable_tls`。
 - [ ] ≥ 4 验证人(容 1 拜占庭);`check-config` 全绿;`genesis-hash` 一致。
-- [ ] 监控接入 `/metrics` + 告警;日志归集。
+- [ ] 监控接入 `/metrics` + 告警(规则见 [`docs/ops/prometheus-alerts.yml`](ops/prometheus-alerts.yml));日志归集。
 - [ ] 备份/恢复演练过一次(snapshot + verify + 重放)。
 - [ ] 升级演练:协调停机 + 换二进制 + 重启能恢复同一 head。
 - [ ] 复核 SECURITY.md §10 已知边界,确认当前部署形态可接受(如无 liveness slashing、
