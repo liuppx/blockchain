@@ -3758,6 +3758,18 @@ fn check_config(config_path: &str) -> Result<String, config::ConfigError> {
     // — the file must exist and parse as a v3 keystore — without recovering the
     // key. The seed_hex/mnemonic paths are fully derived as before.
     let role = match cfg.validator.as_ref() {
+        Some(vc) if vc.enabled && vc.signer.is_some() => {
+            // M219: a remote-signer validator holds no key on disk. Validate the signer
+            // sub-table structurally (non-empty socket); the live connect + genesis-pubkey
+            // check happens at `node run` startup (a dry-run neither binds nor dials).
+            let sc = vc.signer.as_ref().expect("guarded by is_some");
+            if sc.socket.trim().is_empty() {
+                return Err(config::ConfigError::BadGenesis {
+                    detail: "[validator.signer] socket must not be empty".into(),
+                });
+            }
+            "validator (remote signer)"
+        }
         Some(vc) if vc.enabled => {
             if let Some(path) = vc.encrypted_keystore_path.as_deref() {
                 let json = std::fs::read_to_string(path).map_err(|e| {
@@ -6349,6 +6361,30 @@ mod tests {
         let summary = check_config(&cpath).expect("valid validator config");
         assert!(summary.contains("\nrole validator\n"), "{summary}");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn check_config_ok_for_remote_signer_validator() {
+        // M219: an enabled `[validator]` with a `[validator.signer]` sub-table (no on-disk
+        // key) validates — the dry-run checks the socket structurally; the live connect +
+        // genesis-pubkey check happens at `node run`. Role names the remote signer.
+        let (_seed_hex, pub_hex) = keygen_derive(seed_for(1));
+        let vsec = "[validator]\nenabled = true\n[validator.signer]\nsocket = \"/run/zx/s.sock\"\n";
+        let (cpath, dir) =
+            write_check_config_fixture("remote-signer", &valid_genesis_body(&pub_hex), vsec);
+        let summary = check_config(&cpath).expect("valid remote-signer config");
+        assert!(
+            summary.contains("\nrole validator (remote signer)\n"),
+            "{summary}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+
+        // An empty socket is rejected by the dry-run.
+        let bad = "[validator]\nenabled = true\n[validator.signer]\nsocket = \"\"\n";
+        let (cpath2, dir2) =
+            write_check_config_fixture("remote-signer-bad", &valid_genesis_body(&pub_hex), bad);
+        assert!(check_config(&cpath2).is_err(), "empty socket must fail");
+        let _ = std::fs::remove_dir_all(&dir2);
     }
 
     #[test]
