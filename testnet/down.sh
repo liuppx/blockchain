@@ -7,15 +7,19 @@ OUT="$HERE/out"
 
 for d in "$OUT"/n*/; do
   d="${d%/}"
-  [ -f "$d/pid" ] || continue
-  id="$(basename "$d" | sed 's/^n//')"; pid="$(cat "$d/pid")"
-  if kill -0 "$pid" 2>/dev/null; then
-    kill -TERM "$pid"
-    for _ in $(seq 1 50); do kill -0 "$pid" 2>/dev/null || break; sleep 0.2; done
-    if kill -0 "$pid" 2>/dev/null; then echo "  n$id (pid $pid) did not exit in 10s" >&2
-    else echo "  n$id stopped"; fi
-  else
-    echo "  n$id not running"
-  fi
-  rm -f "$d/pid"
+  id="$(basename "$d" | sed 's/^n//')"
+  # Stop the node first, then its remote signer (M219), if any.
+  for role in pid signer.pid; do
+    [ -f "$d/$role" ] || continue
+    pid="$(cat "$d/$role")"; what="n$id"; [ "$role" = "signer.pid" ] && what="n$id signer"
+    if kill -0 "$pid" 2>/dev/null; then
+      kill -TERM "$pid"
+      for _ in $(seq 1 50); do kill -0 "$pid" 2>/dev/null || break; sleep 0.2; done
+      if kill -0 "$pid" 2>/dev/null; then echo "  $what (pid $pid) did not exit in 10s" >&2
+      else echo "  $what stopped"; fi
+    else
+      echo "  $what not running"
+    fi
+    rm -f "$d/$role"
+  done
 done

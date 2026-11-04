@@ -16,6 +16,15 @@ testnet/down.sh           # 5) 优雅停止
 默认 **4 验证人**(id 21–24,容 1 拜占庭)+ **3 个有余额账户**(id 1–3,tx 作者)+
 3 个评议人(id 10–12)。`gen.sh -n 7 -a 5` 改规模;`--force` 重新生成(**销毁**旧密钥)。
 
+### 远程签名器(M219)
+
+`gen.sh --signer 24`(可多个:`--signer 23,24`)让这些验证人经**进程外 `node signer`**
+签名——其节点配置写 `[validator.signer]`(无在盘密钥),`up.sh` 在启动该节点前先起一个
+`node signer`(持 `keys/val<id>.json`,socket + 反双签高水位),`down.sh` 一并停掉。
+`smoke.sh` 应照常收敛——证明远程签名验证人与在进程验证人在同一条链上共识(含 peer-auth
+握手亦经签名器)。见 [`docs/design/remote-signer.md`](../docs/design/remote-signer.md) 与
+DEPLOYMENT §2b。
+
 ## 生成物(`testnet/out/`,已 gitignore,**切勿提交**)
 
 | 路径 | 内容 |

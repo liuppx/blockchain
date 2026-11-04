@@ -28,6 +28,21 @@ for d in "$OUT"/n*/; do
     echo "  n$id: port 90$id already in use (stale daemon?) — run testnet/down.sh or kill it" >&2
     exit 1
   fi
+  # M219: if this node signs via a remote `node signer`, start that signer first (it holds
+  # the key; the node's config points at its socket). Idempotent per run.
+  if [ -f "$d/signer.socket" ]; then
+    sock="$(cat "$d/signer.socket")"
+    if [ -f "$d/signer.pid" ] && kill -0 "$(cat "$d/signer.pid")" 2>/dev/null; then
+      :
+    else
+      nohup "$BIN" signer --keystore "$OUT/keys/val$id.json" --socket "$sock" \
+        --hwm "$d/signer.hwm" >> "$d/signer.log" 2>&1 &
+      echo $! > "$d/signer.pid"
+      for _ in $(seq 1 100); do [ -S "$sock" ] && break; sleep 0.1; done
+      [ -S "$sock" ] || { echo "  n$id: signer did not bind $sock (see $d/signer.log)" >&2; exit 1; }
+      echo "  n$id signer started (pid $(cat "$d/signer.pid"))  socket: $sock"
+    fi
+  fi
   nohup "$BIN" run --config "$d/node.toml" >> "$d/node.log" 2>&1 &
   echo $! > "$d/pid"
   echo "  n$id started (pid $!)  log: $d/node.log"

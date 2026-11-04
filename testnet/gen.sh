@@ -18,15 +18,22 @@ OUT="$HERE/out"
 N=4          # validators (ids 21..)  — ≥4 tolerates 1 Byzantine (3f+1, f=1)
 ACCOUNTS=3   # funded accounts (ids 1..) — tx authors for load / calibration
 FORCE=0
+SIGNER_IDS=""   # M219: comma-separated validator ids to run behind a remote `node signer`
 while [ $# -gt 0 ]; do
   case "$1" in
     -n) N="$2"; shift 2 ;;
     -a) ACCOUNTS="$2"; shift 2 ;;
+    --signer) SIGNER_IDS="$2"; shift 2 ;;
     --force) FORCE=1; shift ;;
-    *) echo "usage: $0 [-n VALIDATORS] [-a ACCOUNTS] [--force]" >&2; exit 2 ;;
+    *) echo "usage: $0 [-n VALIDATORS] [-a ACCOUNTS] [--signer id1,id2,...] [--force]" >&2; exit 2 ;;
   esac
 done
 if [ "$N" -lt 4 ]; then echo "need at least 4 validators (BFT 3f+1)" >&2; exit 2; fi
+
+# M219: is validator `$1` configured to sign via a remote `node signer`?
+is_signer_id() {
+  case ",$SIGNER_IDS," in *",$1,"*) return 0 ;; *) return 1 ;; esac
+}
 
 if [ -e "$OUT" ]; then
   if [ "$FORCE" = 1 ]; then rm -rf "$OUT"; else
@@ -99,7 +106,16 @@ for ((i = 1; i <= N; i++)); do
     done
     echo
     echo "[validator]"; echo "enabled = true"
-    echo "encrypted_keystore_path = \"$OUT/keys/val$id.json\""
+    if is_signer_id "$id"; then
+      # M219: key lives in an out-of-process `node signer`; this node holds none on disk.
+      # up.sh starts the signer (keys/val<id>.json) on this socket before the node.
+      sock="/tmp/zxsig-$id-$RANDOM.sock"
+      echo "$sock" > "$d/signer.socket"
+      echo "$id" >> "$OUT/signers.txt"
+      echo "[validator.signer]"; echo "socket = \"$sock\""; echo "timeout_ms = 1000"
+    else
+      echo "encrypted_keystore_path = \"$OUT/keys/val$id.json\""
+    fi
     echo
     echo "[consensus]"; echo "block_interval_ms = 1000"
     echo "# Heartbeat blocks so convergence is observable with no load; production: false."
