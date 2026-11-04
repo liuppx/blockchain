@@ -218,6 +218,8 @@ ZHIXING_KEYSTORE_PASSWORD=… node run --config node21.toml     # 验证人/foll
   历史)需**协调停机升级 + 必要时重新 snap**。升级流程:
   1. 全网公告升级窗口;2. `SIGTERM` 停全部节点;3. 换二进制;4. (若快照版本变)重新 snap;
   5. 同步重启。
+  未来的**滚动升级**(逐个换二进制 + 按高度激活、全程不停机)设计见
+  [`docs/design/rolling-upgrade.md`](design/rolling-upgrade.md)。
 - 发布务必带 CHANGELOG 注明是否为 wire/snapshot 破坏版本(本仓 README 变更日志已逐里程碑标注)。
 
 ## 10. 治理运维(M193–198)

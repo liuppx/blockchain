@@ -219,7 +219,7 @@ RUSTFLAGS="-D warnings" cargo test --release --no-run     # 零编译告警
    `decode_*` 入口,stable CI 门禁)+ **M213 cargo-fuzz**(`node/fuzz/` libFuzzer `decode_all`
    多路目标 + 提交的种子语料,nightly CI advisory 跑;见 `node/fuzz/README.md`)。仍无混沌/分区测。
 6. **`cargo-audit` 当前 advisory**(依赖树未确认无 RUSTSEC)。
-7. **滚动升级未支持**(只能干净拒连不兼容 peer)。
+7. **滚动升级未支持**(只能干净拒连不兼容 peer)。设计见 [`docs/design/rolling-upgrade.md`](design/rolling-upgrade.md)(设计稿,待实现)。
 8. **弱主观性检查点分发**是运维事项(协议只提供验证基元)。
 9. TLS 版本协商在 `require_peer_auth` 下先于认证,MITM 篡改版本只致**拒连**(非降级),属 DoS。
 
