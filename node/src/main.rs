@@ -48,8 +48,8 @@ use zhixing_node::store::{BlockLog, CertLog};
 use zhixing_node::validator::{Validator, ValidatorSet, ValidatorUpdate};
 use zhixing_node::{
     hex, Block, BondKind, BridgeHeader, BridgeLock, BridgeRedeem, BridgeUnbond, Chain, ChainError,
-    ChainState, Genesis, KeyRotation, Keypair, Review, SlashEvidence, StakeOp, SubmissionTx, Vote,
-    VoteType, MICRO,
+    ChainState, Genesis, GovParam, GovProposal, GovVote, KeyRotation, Keypair, Review,
+    SlashEvidence, StakeOp, SubmissionTx, Vote, VoteType, MICRO,
 };
 
 type Emb = [f32; DIM];
@@ -326,6 +326,8 @@ fn main() {
         "submit-tx" => cmd_submit_tx(config_arg(&args), tx_arg(&args)),
         "rpc" => cmd_rpc(&args),
         "encode-tx" => cmd_encode_tx(&args),
+        "encode-gov-proposal" => cmd_encode_gov_proposal(&args),
+        "encode-gov-vote" => cmd_encode_gov_vote(&args),
         "keygen" => cmd_keygen(&args),
         "encrypt-key" => cmd_encrypt_key(&args),
         "signer" => cmd_signer(&args),
@@ -428,6 +430,8 @@ fn usage() {
     eprintln!("  node submit-tx --config F --tx F  submit a codec-encoded tx to a running daemon's [rpc] ingress endpoint; print accepted hash or reject reason");
     eprintln!("  node rpc --config F --path P [--post FILE]  send a request to the config's [rpc] endpoint and print the response body; GET by default, or POST FILE's raw bytes (e.g. /validate, /submit_tx, /batch)");
     eprintln!("  node encode-tx --key-file F --out F --author N --domain N --stake N --embedding f,..(DIM) --review R:S.. --repl-success N --repl-total N --timestamp-days F [--fee MICRO] [--nonce N] [--config F]  author+sign a tx offline into a submit-tx file; print its hash; M122: --fee paid to the proposer (default 0), --nonce must equal the author's account nonce (default 0)");
+    eprintln!("  node encode-gov-proposal --key-file F --out F --proposer N --param name=value --voting-period N [--nonce N]  M228: author+sign a GovProposal (param: base_emission|slash_bps|decay_half_life) into a raw op file for `node rpc --path /gov/proposal --post F`");
+    eprintln!("  node encode-gov-vote --key-file F --out F --proposal-id N --voter N --approve true|false [--nonce N]  M228: author+sign a GovVote into a raw op file for `node rpc --path /gov/vote --post F`");
     eprintln!("  node inspect-tx --tx F [--pubkey HEX]  decode a codec-encoded tx file and print its fields + content hash; with --pubkey, also verify the signature (the read-side companion to encode-tx)");
     eprintln!("  node keygen --out F [--seed HEX]  generate (or derive from a 64-hex seed) an ed25519 keypair; write the seed file (for encode-tx --key-file) and print the pubkey");
     eprintln!("  node keygen ... --new-mnemonic [--encrypt]  M169/M175: generate a fresh BIP-39 mnemonic; --encrypt (M175) writes an encrypted Web3SS keystore to --out (prompts for a password) instead of a plaintext seed file");
@@ -4573,6 +4577,90 @@ fn cmd_encode_tx(args: &[String]) {
     println!("out {out_path}");
 }
 
+/// M228: parse a `--param name=value` governance target into a [`GovParam`]. Supports the
+/// three scalar knobs (`base_emission`, `slash_bps`, `decay_half_life`); the ΔK fields
+/// (`GovParam::DeltaK`) are not expressible on the CLI yet (they need per-field addressing).
+fn parse_gov_param(s: &str) -> Result<GovParam, String> {
+    let (name, val) = s
+        .split_once('=')
+        .ok_or_else(|| format!("expected name=value, got `{s}`"))?;
+    let val = val.trim();
+    let bad = || format!("`{val}` is not a valid number for {name}");
+    match name.trim() {
+        "base_emission" => Ok(GovParam::BaseEmission(val.parse().map_err(|_| bad())?)),
+        "slash_bps" => Ok(GovParam::SlashBps(val.parse().map_err(|_| bad())?)),
+        "decay_half_life" => Ok(GovParam::DecayHalfLife(val.parse().map_err(|_| bad())?)),
+        other => Err(format!(
+            "unknown/unsupported param `{other}` (CLI supports base_emission, slash_bps, decay_half_life)"
+        )),
+    }
+}
+
+/// M228: author + ed25519-sign a `GovProposal` offline (the producer side of M198's
+/// `POST /gov/proposal`), writing the raw `codec::encode_gov_proposal` bytes to `--out` for
+/// `node rpc --path /gov/proposal --post <out>`. Mirrors `encode-tx`: `--key-file` is the
+/// proposer's 64-hex seed; `--param name=value` names the target; the id is assigned on apply.
+fn cmd_encode_gov_proposal(args: &[String]) {
+    let key_path = req_arg(args, "--key-file");
+    let out_path = req_arg(args, "--out");
+    let proposer: u64 = parse_arg(args, "--proposer");
+    let voting_period: u64 = parse_arg(args, "--voting-period");
+    let nonce: u64 = opt_arg(args, "--nonce")
+        .map(|s| s.parse().unwrap_or(0))
+        .unwrap_or(0);
+    let param = parse_gov_param(req_arg(args, "--param"))
+        .unwrap_or_else(|e| fail_msg("encode-gov-proposal param", &e));
+    let key_hex = std::fs::read_to_string(key_path).unwrap_or_else(|e| fail("read key file", e));
+    let seed = config::decode_seed(key_hex.trim(), "--key-file")
+        .unwrap_or_else(|e| fail_msg("decode key seed", &e));
+    let op = GovProposal {
+        proposer,
+        param,
+        voting_period,
+        nonce,
+        signature: [0u8; 64],
+    }
+    .signed(&Keypair::from_seed(seed));
+    let bytes = zhixing_node::codec::encode_gov_proposal(&op);
+    if let Err(e) = zhixing_node::codec::decode_gov_proposal(&bytes) {
+        fail_msg("encode-gov-proposal self-check", &e);
+    }
+    std::fs::write(out_path, &bytes).unwrap_or_else(|e| fail("write op file", e));
+    println!("encoded {}", hex(&op.hash()));
+    println!("out {out_path}");
+}
+
+/// M228: author + ed25519-sign a `GovVote` offline (producer side of `POST /gov/vote`).
+/// `--key-file` is the voter's seed; `--proposal-id` the open proposal; `--approve true|false`.
+fn cmd_encode_gov_vote(args: &[String]) {
+    let key_path = req_arg(args, "--key-file");
+    let out_path = req_arg(args, "--out");
+    let proposal_id: u64 = parse_arg(args, "--proposal-id");
+    let voter: u64 = parse_arg(args, "--voter");
+    let approve: bool = parse_arg(args, "--approve");
+    let nonce: u64 = opt_arg(args, "--nonce")
+        .map(|s| s.parse().unwrap_or(0))
+        .unwrap_or(0);
+    let key_hex = std::fs::read_to_string(key_path).unwrap_or_else(|e| fail("read key file", e));
+    let seed = config::decode_seed(key_hex.trim(), "--key-file")
+        .unwrap_or_else(|e| fail_msg("decode key seed", &e));
+    let op = GovVote {
+        proposal_id,
+        voter,
+        approve,
+        nonce,
+        signature: [0u8; 64],
+    }
+    .signed(&Keypair::from_seed(seed));
+    let bytes = zhixing_node::codec::encode_gov_vote(&op);
+    if let Err(e) = zhixing_node::codec::decode_gov_vote(&bytes) {
+        fail_msg("encode-gov-vote self-check", &e);
+    }
+    std::fs::write(out_path, &bytes).unwrap_or_else(|e| fail("write op file", e));
+    println!("encoded {}", hex(&op.hash()));
+    println!("out {out_path}");
+}
+
 /// M73: derive the hex seed + hex ed25519 public key for a 32-byte seed. Pure (no
 /// RNG, no I/O) so keygen's core is unit-tested deterministically; `cmd_keygen`
 /// handles seed sourcing (CSPRNG or `--seed`) and the `--out` file. The returned
@@ -5692,6 +5780,32 @@ fn demo_driver_seeds() -> std::collections::BTreeMap<u64, [u8; 32]> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parse_gov_param_scalars_and_errors() {
+        // M228: the three CLI-expressible governance params parse to the right variant/type.
+        assert_eq!(
+            parse_gov_param("base_emission=9000000").unwrap(),
+            GovParam::BaseEmission(9_000_000)
+        );
+        assert_eq!(
+            parse_gov_param("slash_bps=5000").unwrap(),
+            GovParam::SlashBps(5000)
+        );
+        assert_eq!(
+            parse_gov_param("decay_half_life=1000").unwrap(),
+            GovParam::DecayHalfLife(1000)
+        );
+        assert!(
+            parse_gov_param("slash_bps=notnum").is_err(),
+            "non-numeric value"
+        );
+        assert!(
+            parse_gov_param("deltak_min=0.1").is_err(),
+            "ΔK not CLI-expressible"
+        );
+        assert!(parse_gov_param("no_equals_sign").is_err(), "missing =");
+    }
 
     /// M179 (doc-integrity guard): the `demo` chain's cert-signed STATE roots are
     /// M181/M183: guard the demo chain's cert-signed STATE roots against silent
