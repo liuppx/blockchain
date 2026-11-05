@@ -220,11 +220,24 @@ RUSTFLAGS="-D warnings" cargo test --release --no-run     # 零编译告警
 4. **治理刚上线**(M193–198),未经对抗/洪流/临界票数压测。
 5. **无长跑/网络分区/混沌测**;fuzz 有两层:always-on 的 "fuzz-lite"(确定性 PRNG 轰全部 29 个
    `decode_*` 入口,stable CI 门禁)+ **M213 cargo-fuzz**(`node/fuzz/` libFuzzer `decode_all`
-   多路目标 + 提交的种子语料,nightly CI advisory 跑;见 `node/fuzz/README.md`)。仍无混沌/分区测。
+   多路目标 + 提交的种子语料,nightly CI advisory 跑;见 `node/fuzz/README.md`)。**M231 起**补
+   `testnet/chaos.sh`:对 4 验证人测试网注入**崩溃容错**(杀少数、存活 >2/3 继续出块且不分叉)、
+   **崩溃恢复**(重启节点追回同一 head)、**失去法定数的安全停摆**(在线 < 法定数时停摆而非分叉)
+   + 恢复——均为 loopback 可达场景(无需 root/iptables)。仍无**真正的网络分区注入**(iptables/
+   tc 延迟·丢包)、**活体拜占庭注入**(进程外双签 → 证据 → 罚没的端到端)、**长跑 soak**(小时/天级
+   内存·磁盘增长、状态不漂移),与**超 loopback 规模**测。见 §10.10 的活性恢复边界。
 6. **`cargo-audit` 当前 advisory**(依赖树未确认无 RUSTSEC)。
 7. **滚动升级未支持**(只能干净拒连不兼容 peer)。设计见 [`docs/design/rolling-upgrade.md`](design/rolling-upgrade.md)(设计稿,待实现)。
 8. **弱主观性检查点分发**是运维事项(协议只提供验证基元)。
 9. TLS 版本协商在 `require_peer_auth` 下先于认证,MITM 篡改版本只致**拒连**(非降级),属 DoS。
+10. **失去法定数停摆后的自动活性恢复不完整**(M231 `chaos.sh` Phase B 暴露)。失去 >2/3 在线的
+    停摆期间,**保持在线**的验证人对待定高度不断换轮(propose 超时 → round++);被杀后重启的节点
+    从 round 0 开始。法定数恢复后两侧轮次号**不经 gossip 自动对齐**(无轮次追赶 / catch-up),存活
+    节点仍卡住(`/metrics` 见 `zhixing_consensus_active=1` 但 `zhixing_height` 冻结),即便所有
+    peer 已重连。**安全性始终不破**:无 >2/3 不出块 → 不分叉、正确停摆(供应守恒、state_root 一致)。
+    **仅自动活性恢复受影响**。恢复手段明确:**全量重启验证人集**(含存活节点)即让每个节点回到待定
+    高度的干净轮次,链在同一 head 继续(实测 15→16→… 重新收敛)。属**共识线待修项**(需轮次追赶:
+    节点见到更高轮次的 >2f+1 消息时跳转),非安全缺陷;修复为协议改动,风险较高,留作后续。
 
 ## 11. 负责任披露
 
