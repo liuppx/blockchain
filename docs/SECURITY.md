@@ -55,7 +55,7 @@ RUSTFLAGS="-D warnings" cargo test --release --no-run     # 零编译告警
 # 其中位锚点测(见 §6)验证共识浮点逐位一致。
 ```
 
-- 测试总数:**node 765(704 lib + 61 bin)+ engine 11**,全绿。2 个 `#[ignore]`(config 的
+- 测试总数:**node 766(705 lib + 61 bin)+ engine 11**,全绿。2 个 `#[ignore]`(config 的
   环境依赖测;M213 的 `seed_fuzz_corpus` 语料生成器,均非安全相关)。
 - `unsafe`:**全仓非测试代码 0 处**(`grep -rn unsafe engine/src node/src`)。
 - 无 `cargo-audit` 门禁(当前 advisory,依赖树未确认无 RUSTSEC —— 见 §10)。
@@ -233,10 +233,13 @@ RUSTFLAGS="-D warnings" cargo test --release --no-run     # 零编译告警
    token,M233/M234;实测 5/5 tx 接受、供应守恒+跨节点一致)。**M236 起** `gen.sh --permissioned`
    开**完全加固许可制姿态**(genesis-pinned mTLS `require_peer_certs` + RFC5705 `bind_channel`,叠加
    既有 peer-auth + TLS);实测该姿态下 `smoke`/`chaos`/`soak load` **全过**(收敛、崩溃容错+安全停摆+
-   mTLS 重连恢复、tx 经 mTLS gossip 落块)。仍无**真正的网络分区注入**(iptables/tc 延迟·丢包,需 root)、
-   **加固姿态下的活体拜占庭注入**(等价双签 → 罚没的集成测目前走明文握手;加固姿态下仅验证了收敛/
-   混沌/负载,未注入双签)、**小时/天级或跨机规模的长跑**(当前 loopback、数百区块级)。见
-   §10.10 的活性恢复边界、§10.11 的绑定准入边界。
+   mTLS 重连恢复、tx 经 mTLS gossip 落块)。**M237 起**补 `equivocation_under_peer_auth_still_slashes`:
+   honest 节点开 `require_peer_auth`,一个持**有效创世密钥**的拜占庭验证人(21)完成认证握手后仍泛洪
+   双签——链照常检测 → 产证据 → 入块 → 罚没移除它(证明认证层拦不住"有合法密钥的内鬼",罚没仍生效;
+   mTLS/通道绑定为传输层,不触碰基于签名的罚没路径,故在 peer-auth 层注入即安全相关闭环)。仍无**真正的
+   网络分区注入**(iptables/tc 延迟·丢包,需 root,本环境不可做)、**加固姿态(mTLS)下的双签注入**
+   (已在 peer-auth 层注入;mTLS 层需 TLS 客户端注入器,属传输层、安全等价)、**小时/天级或跨机规模的
+   长跑**(当前 loopback、数百区块级)。见 §10.10 的活性恢复边界、§10.11 的绑定准入边界。
 6. **`cargo-audit` 当前 advisory**(依赖树未确认无 RUSTSEC)。
 7. **滚动升级未支持**(只能干净拒连不兼容 peer)。设计见 [`docs/design/rolling-upgrade.md`](design/rolling-upgrade.md)(设计稿,待实现)。
 8. **弱主观性检查点分发**是运维事项(协议只提供验证基元)。

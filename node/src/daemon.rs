@@ -10131,6 +10131,119 @@ mod tests {
         cleanup(&data_dirs);
     }
 
+    #[tokio::test]
+    async fn equivocation_under_peer_auth_still_slashes() {
+        // M237 (§10.5): the same active-slashing guarantee as the test above, but the honest
+        // nodes now run with `require_peer_auth = true` (the production authenticated handshake).
+        // A Byzantine validator that holds a *valid* genesis key (here 21) still passes peer-auth
+        // — authentication proves key possession, not honesty — so the chain must still detect its
+        // double-sign and slash it. (mTLS / channel-binding are transport-only and never touch the
+        // signature-based slashing path, so peer-auth is the security-relevant layer to inject
+        // under; running over plain TCP lets the injector complete the signed handshake without a
+        // TLS client, which an attacker holding 21's key could equally do inside the TLS tunnel.)
+        use crate::consensus::{Vote, VoteType};
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+        let live = [22u64, 23, 24];
+        let port_base = 19671u16;
+        let genesis = test_genesis(); // validators = 21,22,23,24
+
+        let mut nodes = Vec::new();
+        let mut data_dirs = BTreeMap::new();
+        for &id in &live {
+            let dir = tmp_dir(&format!("equiv-auth-n{id}"));
+            data_dirs.insert(id, dir.clone());
+            let mut cfg = node_config(id, port_base, &live, dir);
+            cfg.network.require_peer_auth = true; // production authenticated handshake
+            let node = Node::start(cfg, genesis.clone(), Some(kp(id)), None)
+                .await
+                .expect("start node");
+            nodes.push((id, node));
+        }
+
+        // Byzantine connection to each honest node, AUTHENTICATING as genesis validator 21.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let mut injectors = Vec::new();
+        for &id in &live {
+            let addr = format!("127.0.0.1:{}", port_base + (id - 21) as u16);
+            let stream = TcpStream::connect(&addr).await.expect("byzantine connect");
+            let _ = stream.set_nodelay(true);
+            let (mut rd, mut wr) = stream.into_split();
+            // 1) protocol version (as on every link).
+            negotiate_version(&mut rd, &mut wr)
+                .await
+                .expect("version negotiation");
+            // 2) the authenticated handshake, client side, as validator 21 (we hold kp(21)):
+            //    send HelloInit(id||pk||nonce), read the peer's, sign our transcript, exchange sigs.
+            let mut my_nonce = [0u8; 32];
+            getrandom::getrandom(&mut my_nonce).unwrap();
+            let mut init = Vec::with_capacity(72);
+            init.extend_from_slice(&21u64.to_be_bytes());
+            init.extend_from_slice(&kp(21).public());
+            init.extend_from_slice(&my_nonce);
+            wr.write_all(&init).await.expect("send HelloInit");
+            wr.flush().await.unwrap();
+            let mut pi = [0u8; 72];
+            rd.read_exact(&mut pi).await.expect("read peer HelloInit");
+            let peer_id = u64::from_be_bytes(pi[..8].try_into().unwrap());
+            let mut peer_nonce = [0u8; 32];
+            peer_nonce.copy_from_slice(&pi[40..72]);
+            // no TLS in this test ⇒ no channel binding (cb = None), exactly as the node computes it.
+            let transcript = auth_transcript(21, &my_nonce, peer_id, &peer_nonce, None);
+            let sig = kp(21).sign(&transcript);
+            wr.write_all(&sig).await.expect("send handshake signature");
+            wr.flush().await.unwrap();
+            let mut peer_sig = [0u8; 64];
+            rd.read_exact(&mut peer_sig)
+                .await
+                .expect("read peer signature");
+            // Drain (and discard) everything the honest node sends us.
+            tokio::spawn(async move { while read_frame(&mut rd).await.is_ok() {} });
+            injectors.push(wr);
+        }
+
+        // Flood two conflicting precommits until an honest node commits evidence against 21.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(50);
+        let mut ev_height: Option<u64> = None;
+        while tokio::time::Instant::now() < deadline {
+            let h = nodes[0].1.status().await.map(|(h, _)| h).unwrap_or(0);
+            let target = h + 1;
+            let va = Vote::signed(21, target, 0, [1u8; 32], VoteType::Precommit, &kp(21));
+            let vb = Vote::signed(21, target, 0, [2u8; 32], VoteType::Precommit, &kp(21));
+            let ma = GossipMsg::Consensus(Box::new(Msg::Vote(va)));
+            let mb = GossipMsg::Consensus(Box::new(Msg::Vote(vb)));
+            for wr in injectors.iter_mut() {
+                let _ = write_frame(wr, &ma).await;
+                let _ = write_frame(wr, &mb).await;
+            }
+            if let Ok(blocks) =
+                BlockLog::open(format!("{}/blocks.log", data_dirs[&22])).and_then(|l| l.read_all())
+            {
+                if let Some(b) = blocks
+                    .iter()
+                    .find(|b| b.slashing_evidence.iter().any(|e| e.vote_a.validator == 21))
+                {
+                    ev_height = Some(b.height);
+                    break;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(150)).await;
+        }
+
+        let ev_height =
+            ev_height.expect("evidence against 21 committed on-chain even under peer-auth");
+        let (blocks, certs) =
+            read_prefix(&data_dirs[&22], ev_height as usize, Duration::from_secs(5)).await;
+        let chain =
+            crate::Chain::replay_verified(genesis.clone(), &blocks, &certs).expect("finality");
+        assert!(
+            chain.state.validators.get(21).is_none(),
+            "an authenticated-but-Byzantine validator is still slashed and removed"
+        );
+
+        cleanup(&data_dirs);
+    }
+
     // --- M35: config-driven timing + create_empty_blocks ------------------------
 
     #[test]
