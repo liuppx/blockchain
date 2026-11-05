@@ -430,7 +430,7 @@ fn usage() {
     eprintln!("  node inspect-genesis --config F  dump the config's genesis contents: every account (id/balance/pubkey), reviewer, validator, plus params (the detail view to genesis-hash's identity)");
     eprintln!("  node submit-tx --config F --tx F  submit a codec-encoded tx to a running daemon's [rpc] ingress endpoint; print accepted hash or reject reason");
     eprintln!("  node rpc --config F --path P [--post FILE]  send a request to the config's [rpc] endpoint and print the response body; GET by default, or POST FILE's raw bytes (e.g. /validate, /submit_tx, /batch)");
-    eprintln!("  node encode-tx --key-file F --out F --author N --domain N --stake N --embedding f,..(DIM) --review R:S.. --repl-success N --repl-total N --timestamp-days F [--fee MICRO] [--nonce N] [--config F]  author+sign a tx offline into a submit-tx file; print its hash; M122: --fee paid to the proposer (default 0), --nonce must equal the author's account nonce (default 0)");
+    eprintln!("  node encode-tx --key-file F --out F --author N --domain N --stake N --embedding f,..(DIM) --review R:S.. --repl-success N --repl-total N --timestamp-days F [--fee MICRO] [--nonce N] [--config F]  author+sign a tx offline into a submit-tx file; print its hash; M122: --fee paid to the proposer (default 0), --nonce must equal the author's account nonce (default 0); M233: --key-file is a raw 64-hex seed OR an encrypted keystore (ZHIXING_KEYSTORE_PASSWORD) — same for encode-stakeop/encode-gov-*");
     eprintln!("  node encode-gov-proposal --key-file F --out F --proposer N --param name=value --voting-period N [--nonce N]  M228: author+sign a GovProposal (param: base_emission|slash_bps|decay_half_life) into a raw op file for `node rpc --path /gov/proposal --post F`");
     eprintln!("  node encode-gov-vote --key-file F --out F --proposal-id N --voter N --approve true|false [--nonce N]  M228: author+sign a GovVote into a raw op file for `node rpc --path /gov/vote --post F`");
     eprintln!("  node encode-stakeop --key-file F --out F --account N --kind bond|unbond --amount N  M229: author+sign a bond/unbond StakeOp into a raw op file for `node rpc --path /stake --post F`");
@@ -3941,6 +3941,26 @@ fn derive_pubkey(seed_hex: &str, field: &str) -> Result<String, config::ConfigEr
     Ok(hex(&Keypair::from_seed(seed).public()))
 }
 
+/// M233: resolve a signing seed from `--key-file`, accepting EITHER a 64-hex raw seed (what
+/// `keygen` writes) OR a Web3 Secret Storage v3 encrypted keystore (what `keygen --encrypt` /
+/// `encrypt-key` / the `testnet/` harness write). A keystore is decrypted with the password
+/// from `ZHIXING_KEYSTORE_PASSWORD` (unattended) or a no-echo prompt — the same discipline as
+/// `node run` / `node signer`. This lets the offline op-authoring commands (`encode-tx` /
+/// `encode-stakeop` / `encode-gov-*`) sign from an encrypted keystore, not just a plaintext
+/// seed — e.g. driving tx load against the production-parity testnet (`testnet/soak.sh`).
+fn read_seed_from_key_file(path: &str) -> [u8; 32] {
+    let contents = std::fs::read_to_string(path).unwrap_or_else(|e| fail("read key file", e));
+    let trimmed = contents.trim();
+    // A raw seed is exactly 64 hex chars; anything else is treated as keystore JSON.
+    if trimmed.len() == 64 && trimmed.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return config::decode_seed(trimmed, "--key-file")
+            .unwrap_or_else(|e| fail_msg("decode key seed", &e));
+    }
+    let password = read_keystore_password_from("ZHIXING_KEYSTORE_PASSWORD", path);
+    zhixing_node::keystore::decrypt_seed(&contents, &password)
+        .unwrap_or_else(|e| fail_msg("decrypt keystore", &e))
+}
+
 /// M99: `node pubkey (--key-file F | --seed HEX) [--genesis-id N ...]` — derive and print the
 /// pubkey for an existing seed **without writing any file** (unlike `keygen`, which recovers a
 /// pubkey only as a side effect of writing a seed file). Read-only; pairs with
@@ -4523,11 +4543,9 @@ fn cmd_encode_tx(args: &[String]) {
         .map(|r| parse_review(r).unwrap_or_else(|e| fail_msg("encode-tx review", &e)))
         .collect();
 
-    // --key-file holds a 64-char hex seed (a trailing newline is tolerated via
-    // `trim`); reuse config::decode_seed for identical parsing + BadHex errors.
-    let key_hex = std::fs::read_to_string(key_path).unwrap_or_else(|e| fail("read key file", e));
-    let seed = config::decode_seed(key_hex.trim(), "--key-file")
-        .unwrap_or_else(|e| fail_msg("decode key seed", &e));
+    // --key-file is a raw 64-hex seed OR an encrypted keystore (M233); see
+    // `read_seed_from_key_file`.
+    let seed = read_seed_from_key_file(key_path);
     let kp = Keypair::from_seed(seed);
 
     // Optional guardrail: the derived pubkey must match the author's genesis entry.
@@ -4612,9 +4630,7 @@ fn cmd_encode_gov_proposal(args: &[String]) {
         .unwrap_or(0);
     let param = parse_gov_param(req_arg(args, "--param"))
         .unwrap_or_else(|e| fail_msg("encode-gov-proposal param", &e));
-    let key_hex = std::fs::read_to_string(key_path).unwrap_or_else(|e| fail("read key file", e));
-    let seed = config::decode_seed(key_hex.trim(), "--key-file")
-        .unwrap_or_else(|e| fail_msg("decode key seed", &e));
+    let seed = read_seed_from_key_file(key_path);
     let op = GovProposal {
         proposer,
         param,
@@ -4643,9 +4659,7 @@ fn cmd_encode_gov_vote(args: &[String]) {
     let nonce: u64 = opt_arg(args, "--nonce")
         .map(|s| s.parse().unwrap_or(0))
         .unwrap_or(0);
-    let key_hex = std::fs::read_to_string(key_path).unwrap_or_else(|e| fail("read key file", e));
-    let seed = config::decode_seed(key_hex.trim(), "--key-file")
-        .unwrap_or_else(|e| fail_msg("decode key seed", &e));
+    let seed = read_seed_from_key_file(key_path);
     let op = GovVote {
         proposal_id,
         voter,
@@ -4680,9 +4694,7 @@ fn cmd_encode_stakeop(args: &[String]) {
             &format!("`{other}` (use bond|unbond)"),
         ),
     };
-    let key_hex = std::fs::read_to_string(key_path).unwrap_or_else(|e| fail("read key file", e));
-    let seed = config::decode_seed(key_hex.trim(), "--key-file")
-        .unwrap_or_else(|e| fail_msg("decode key seed", &e));
+    let seed = read_seed_from_key_file(key_path);
     let op = StakeOp {
         account,
         kind,
@@ -5892,6 +5904,36 @@ mod tests {
         std::env::set_var(var, "");
         assert!(std::env::var(var).unwrap().is_empty());
         std::env::remove_var(var);
+    }
+
+    #[test]
+    fn read_seed_from_key_file_accepts_raw_seed_and_keystore() {
+        // M233: `--key-file` resolves EITHER a raw 64-hex seed OR an encrypted keystore,
+        // so the offline op-authoring commands can sign from the production-parity
+        // keystores the testnet ships (not just plaintext seeds).
+        let seed = seed_for(7);
+        let dir = std::env::temp_dir();
+
+        // (1) raw 64-hex seed (trailing newline tolerated)
+        let raw = dir.join(format!("zx-m233-{}-raw", std::process::id()));
+        std::fs::write(&raw, format!("{}\n", zhixing_node::hash::hex(&seed))).unwrap();
+        assert_eq!(read_seed_from_key_file(raw.to_str().unwrap()), seed);
+        let _ = std::fs::remove_file(&raw);
+
+        // (2) Web3 Secret Storage v3 encrypted keystore, password via env (unattended)
+        let ks = zhixing_node::keystore::encrypt_seed(&seed, "pw-m233").unwrap();
+        let json = zhixing_node::keystore::to_json(&ks).unwrap();
+        let ksf = dir.join(format!("zx-m233-{}-ks.json", std::process::id()));
+        std::fs::write(&ksf, &json).unwrap();
+        let var = "ZHIXING_KEYSTORE_PASSWORD";
+        let prev = std::env::var(var).ok();
+        std::env::set_var(var, "pw-m233");
+        assert_eq!(read_seed_from_key_file(ksf.to_str().unwrap()), seed);
+        match prev {
+            Some(v) => std::env::set_var(var, v),
+            None => std::env::remove_var(var),
+        }
+        let _ = std::fs::remove_file(&ksf);
     }
 
     fn seed_for(id: u64) -> [u8; 32] {

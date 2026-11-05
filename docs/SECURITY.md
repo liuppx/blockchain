@@ -55,7 +55,7 @@ RUSTFLAGS="-D warnings" cargo test --release --no-run     # 零编译告警
 # 其中位锚点测(见 §6)验证共识浮点逐位一致。
 ```
 
-- 测试总数:**node 757(698 lib + 59 bin)+ engine 11**,全绿。2 个 `#[ignore]`(config 的
+- 测试总数:**node 758(698 lib + 60 bin)+ engine 11**,全绿。2 个 `#[ignore]`(config 的
   环境依赖测;M213 的 `seed_fuzz_corpus` 语料生成器,均非安全相关)。
 - `unsafe`:**全仓非测试代码 0 处**(`grep -rn unsafe engine/src node/src`)。
 - 无 `cargo-audit` 门禁(当前 advisory,依赖树未确认无 RUSTSEC —— 见 §10)。
@@ -225,9 +225,14 @@ RUSTFLAGS="-D warnings" cargo test --release --no-run     # 零编译告警
    **崩溃恢复**(重启节点追回同一 head)、**失去法定数的安全停摆**(在线 < 法定数时停摆而非分叉)
    + 恢复——均为 loopback 可达场景(无需 root/iptables)。**M232 起**补 `testnet/soak.sh`:
    长跑稳定性 soak,每采样点断言活性(高度严格递增)、不分叉/不漂移(跨节点区块哈希 **+ state_root**
-   一致)、供应守恒且跨节点一致、无内存泄漏(RSS 增幅有界)、干净日志。仍无**真正的网络分区注入**
-   (iptables/tc 延迟·丢包)、**活体拜占庭注入**(进程外双签 → 证据 → 罚没的端到端)、**tx 负载下的
-   长跑**(soak 目前无负载;负载需明文种子账户)、与**超 loopback 规模**测。见 §10.10 的活性恢复边界。
+   一致)、供应守恒且跨节点一致、无内存泄漏(RSS 增幅有界)、干净日志。**活体拜占庭 → 罚没已有集成测**
+   (`equivocation_over_tcp_slashes_the_offender`,daemon.rs:真实 TCP 套接字上一个冒充验证人的裸 peer
+   泛洪两张冲突 precommit,诚实节点经 wire 观测双签 → 产证据 → 入块 → 罚没并移出验证人集;另有
+   `slashes_an_equivocating_validator_through_the_certified_chain` 走认证链)。仍无**真正的网络分区注入**
+   (iptables/tc 延迟·丢包)、**生产安全姿态下的活体拜占庭**(上测用明文握手,未经 `require_peer_auth`
+   + mTLS)、**tx 负载下的长跑**(soak 目前无负载;**M233 起** `encode-*` 的 `--key-file` 可直接吃加密
+   keystore 签名,授权层已通,仍差 CLI 写面 bearer-token 支持)、与**超 loopback 规模**测。见 §10.10 的
+   活性恢复边界。
 6. **`cargo-audit` 当前 advisory**(依赖树未确认无 RUSTSEC)。
 7. **滚动升级未支持**(只能干净拒连不兼容 peer)。设计见 [`docs/design/rolling-upgrade.md`](design/rolling-upgrade.md)(设计稿,待实现)。
 8. **弱主观性检查点分发**是运维事项(协议只提供验证基元)。
