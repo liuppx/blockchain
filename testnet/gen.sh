@@ -19,13 +19,15 @@ N=4          # validators (ids 21..)  — ≥4 tolerates 1 Byzantine (3f+1, f=1)
 ACCOUNTS=3   # funded accounts (ids 1..) — tx authors for load / calibration
 FORCE=0
 SIGNER_IDS=""   # M219: comma-separated validator ids to run behind a remote `node signer`
+PERMISSIONED=0  # M236: --permissioned ⇒ genesis-pinned mTLS + RFC5705 channel binding
 while [ $# -gt 0 ]; do
   case "$1" in
     -n) N="$2"; shift 2 ;;
     -a) ACCOUNTS="$2"; shift 2 ;;
     --signer) SIGNER_IDS="$2"; shift 2 ;;
+    --permissioned) PERMISSIONED=1; shift ;;
     --force) FORCE=1; shift ;;
-    *) echo "usage: $0 [-n VALIDATORS] [-a ACCOUNTS] [--signer id1,id2,...] [--force]" >&2; exit 2 ;;
+    *) echo "usage: $0 [-n VALIDATORS] [-a ACCOUNTS] [--signer id1,id2,...] [--permissioned] [--force]" >&2; exit 2 ;;
   esac
 done
 if [ "$N" -lt 4 ]; then echo "need at least 4 validators (BFT 3f+1)" >&2; exit 2; fi
@@ -124,8 +126,15 @@ for ((i = 1; i <= N; i++)); do
     echo
     echo "[network]  # DEPLOYMENT.md §5 hardening on, as in production"
     echo "enable_tls = true"; echo "require_peer_auth = true"; echo "max_inbound_connections = 64"
-    echo "# require_peer_certs = true   # permissioned nets: genesis-pinned mTLS"
-    echo "# bind_channel = true         # RFC5705 channel binding (needs TLS + auth)"
+    if [ "$PERMISSIONED" = 1 ]; then
+      # M236: fully-hardened permissioned posture — genesis-pinned mutual TLS (RFC7250
+      # raw-pubkey, keyed by each node's genesis ed25519 seed; no cert files) + RFC5705
+      # channel binding (anti-relay; needs TLS + peer-auth).
+      echo "require_peer_certs = true"; echo "bind_channel = true"
+    else
+      echo "# require_peer_certs = true   # permissioned nets: genesis-pinned mTLS (--permissioned)"
+      echo "# bind_channel = true         # RFC5705 channel binding (needs TLS + auth)"
+    fi
     echo
     echo "[metrics]"; echo "enabled = true"; echo "listen = \"127.0.0.1:91$id\""
     echo "auth_token = \"$METRICS_TOKEN\""; echo "enable_tls = false  # loopback only"

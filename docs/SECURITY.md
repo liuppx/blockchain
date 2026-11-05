@@ -230,9 +230,12 @@ RUSTFLAGS="-D warnings" cargo test --release --no-run     # 零编译告警
    泛洪两张冲突 precommit,诚实节点经 wire 观测双签 → 产证据 → 入块 → 罚没并移出验证人集;另有
    `slashes_an_equivocating_validator_through_the_certified_chain` 走认证链)。**M234 起** `soak.sh load`
    驱动真实 **tx 负载**(从加密 keystore 授权知识 tx → `submit-tx` 投到 bearer 门控写面;CLI 现发配置
-   token,M233/M234;实测 5/5 tx 接受、供应守恒+跨节点一致)。仍无**真正的网络分区注入**
-   (iptables/tc 延迟·丢包)、**生产安全姿态下的活体拜占庭**(上测用明文握手,未经 `require_peer_auth`
-   + mTLS)、**小时/天级或跨机规模的长跑**(当前 loopback、数百区块级)、与**超 loopback 规模**测。见
+   token,M233/M234;实测 5/5 tx 接受、供应守恒+跨节点一致)。**M236 起** `gen.sh --permissioned`
+   开**完全加固许可制姿态**(genesis-pinned mTLS `require_peer_certs` + RFC5705 `bind_channel`,叠加
+   既有 peer-auth + TLS);实测该姿态下 `smoke`/`chaos`/`soak load` **全过**(收敛、崩溃容错+安全停摆+
+   mTLS 重连恢复、tx 经 mTLS gossip 落块)。仍无**真正的网络分区注入**(iptables/tc 延迟·丢包,需 root)、
+   **加固姿态下的活体拜占庭注入**(等价双签 → 罚没的集成测目前走明文握手;加固姿态下仅验证了收敛/
+   混沌/负载,未注入双签)、**小时/天级或跨机规模的长跑**(当前 loopback、数百区块级)。见
    §10.10 的活性恢复边界、§10.11 的绑定准入边界。
 6. **`cargo-audit` 当前 advisory**(依赖树未确认无 RUSTSEC)。
 7. **滚动升级未支持**(只能干净拒连不兼容 peer)。设计见 [`docs/design/rolling-upgrade.md`](design/rolling-upgrade.md)(设计稿,待实现)。

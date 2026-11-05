@@ -63,6 +63,15 @@ testnet/soak.sh [DURATION_S=180] [INTERVAL_S=10] [LAG=2] [LEAK_PCT=50] [load]
 握手亦经签名器)。见 [`docs/design/remote-signer.md`](../docs/design/remote-signer.md) 与
 DEPLOYMENT §2b。
 
+### 完全加固的许可制姿态(M236,`--permissioned`)
+
+默认测试网已开 `enable_tls + require_peer_auth`;`gen.sh --permissioned` 再开 **genesis-pinned
+mTLS**(`require_peer_certs`,RFC7250 raw-pubkey,用各节点的创世 ed25519 种子,无需证书文件)+
+**RFC5705 通道绑定**(`bind_channel`,防中继)——即 DEPLOYMENT §5 的生产许可制全套。实测该姿态下
+`smoke.sh`(收敛)、`chaos.sh`(崩溃容错 + 安全停摆 + 恢复,恢复握手经 mTLS+签名重连)、
+`soak.sh load`(知识 tx 经 mTLS gossip 落块、供应守恒+跨节点一致)**全部通过**——补上了此前"加固
+姿态仅收敛过、未经混沌/负载"的空白。
+
 ## 生成物(`testnet/out/`,已 gitignore,**切勿提交**)
 
 | 路径 | 内容 |
