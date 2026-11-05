@@ -1018,6 +1018,12 @@ pub struct GenesisConfig {
     #[serde(default)]
     pub decay_half_life_blocks: u64,
     pub slash_bps: u32,
+    /// M235 (§10.11): max share of total voting power any single non-genesis validator may
+    /// hold, in basis points (`3333` = 1/3). Optional; defaults to `0` (disabled — unchanged
+    /// behavior). Set it (e.g. `3333`) to stop a large bond from a non-running key from
+    /// acquiring ≥1/3 and wedging quorum. Must be ≤ 10000.
+    #[serde(default)]
+    pub max_validator_power_bps: u32,
     #[serde(default)]
     pub timestamp_days: f32,
     #[serde(default)]
@@ -1123,6 +1129,16 @@ impl GenesisConfig {
             });
         }
 
+        // M235 (§10.11): the validator power share cap is a basis-points fraction (≤ 10000).
+        if self.max_validator_power_bps > 10_000 {
+            return Err(ConfigError::BadGenesis {
+                detail: format!(
+                    "max_validator_power_bps {} exceeds 10000 (100%)",
+                    self.max_validator_power_bps
+                ),
+            });
+        }
+
         Ok(Genesis {
             accounts,
             reviewers,
@@ -1131,6 +1147,7 @@ impl GenesisConfig {
             base_emission_micro: self.base_emission_micro,
             decay_half_life_blocks: self.decay_half_life_blocks,
             slash_bps: self.slash_bps,
+            max_validator_power_bps: self.max_validator_power_bps,
             timestamp_days: self.timestamp_days,
             validators,
             bridge_sources: Vec::new(),
@@ -2390,6 +2407,7 @@ mod tests {
             base_emission_micro: 8 * crate::MICRO,
             decay_half_life_blocks: 0,
             slash_bps: 10_000,
+            max_validator_power_bps: 0,
             timestamp_days: 0.0,
             validators: (21..=24)
                 .map(|id| ValidatorConfig {
@@ -2439,6 +2457,7 @@ mod tests {
             base_emission_micro: 0,
             decay_half_life_blocks: 0,
             slash_bps: 0,
+            max_validator_power_bps: 0,
             timestamp_days: 0.0,
             validators: vec![],
             params: None,
@@ -2775,6 +2794,7 @@ mod tests {
             base_emission_micro: 8 * crate::MICRO,
             decay_half_life_blocks: 0,
             slash_bps: 10_000,
+            max_validator_power_bps: 0,
             timestamp_days: 0.0,
             validators: (21..=24)
                 .map(|id| ValidatorConfig {

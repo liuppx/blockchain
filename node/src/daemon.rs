@@ -9685,6 +9685,7 @@ mod tests {
             base_emission_micro: 8 * MICRO,
             decay_half_life_blocks: 0,
             slash_bps: 10_000,
+            max_validator_power_bps: 0,
             timestamp_days: 0.0,
             validators: [21u64, 22, 23, 24]
                 .iter()
@@ -11827,6 +11828,7 @@ mod tests {
             base_emission_micro: 0,
             decay_half_life_blocks: 0,
             slash_bps: 10_000,
+            max_validator_power_bps: 0,
             timestamp_days: 0.0,
             validators: vec![(21, kp(21).public(), 1)],
             bridge_sources: vec![],
@@ -15300,6 +15302,7 @@ mod tests {
             base_emission_micro: 0,
             decay_half_life_blocks: 0,
             slash_bps: 10_000,
+            max_validator_power_bps: 0,
             timestamp_days: 0.0,
             validators: vec![(21, kp(21).public(), 1)],
             bridge_sources: vec![],
@@ -16474,6 +16477,7 @@ vote_b.validator=5 vote_b.height=9 vote_b.round=2 vote_b.block_hash={b_h} vote_b
             base_emission_micro: 0,
             decay_half_life_blocks: 0,
             slash_bps: 10_000,
+            max_validator_power_bps: 0,
             timestamp_days: 0.0,
             validators: vec![(21, kp(21).public(), 1)],
             bridge_sources: vec![],

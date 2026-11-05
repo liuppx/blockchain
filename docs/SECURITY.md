@@ -55,7 +55,7 @@ RUSTFLAGS="-D warnings" cargo test --release --no-run     # 零编译告警
 # 其中位锚点测(见 §6)验证共识浮点逐位一致。
 ```
 
-- 测试总数:**node 759(698 lib + 61 bin)+ engine 11**,全绿。2 个 `#[ignore]`(config 的
+- 测试总数:**node 765(704 lib + 61 bin)+ engine 11**,全绿。2 个 `#[ignore]`(config 的
   环境依赖测;M213 的 `seed_fuzz_corpus` 语料生成器,均非安全相关)。
 - `unsafe`:**全仓非测试代码 0 处**(`grep -rn unsafe engine/src node/src`)。
 - 无 `cargo-audit` 门禁(当前 advisory,依赖树未确认无 RUSTSEC —— 见 §10)。
@@ -257,7 +257,15 @@ RUSTFLAGS="-D warnings" cargo test --release --no-run     # 零编译告警
     **无 proof-of-operation、无绑定激活延迟、无单笔权力占比上限**,故小规模链上一笔绑定即可瘫痪共识。
     运维缓解:受控/许可制网络下绑定由可信方操作、且只对**在运密钥**绑定;主网前应加准入门槛(最小/
     封顶权力、激活延迟、或绑定与在运证明挂钩)。因此 `testnet/soak.sh` 的负载用**知识 tx**(不动验证人集)
-    而非 stake-op。属**经济/共识线待设计项**,记入 §10 已知边界。
+    而非 stake-op。
+    **M235 已缓解**:新增创世参数 `max_validator_power_bps`(默认 `0`=禁用;`testnet/gen.sh` 设 `3333`=1/3)。
+    `apply_block_inner` 拒绝任何会让**新加入**验证人超过该占比的更新(`ValidatorPowerShareExceeded`,
+    整块回滚);折入 `state_root`(SEC-02 式,防篡改)。**创世/既有验证人豁免**(它们是运营方选定且已在运的
+    参与者,豁免也让单验证人链与正常再绑定可用);`mempool`/候选块经 `filter_applicable_stake_ops` 丢弃超限
+    绑定以免生产停摆(镜像 SEC-01 的 gov 过滤)。启用后单账户无法再凭一笔绑定占 ≥1/3 → 幽灵验证人不能瘫痪
+    quorum。**残余**:① 豁免的既有验证人若**后续**增绑超 1/3 再下线仍可影响活性(范围窄,与 §10.2 活性问责
+    重叠);② `0` 默认为向后兼容,运营方须**显式**在创世启用;③ 治理动态调参(`GovParam`)为后续项。属
+    **已缓解的已知边界**。
 
 ## 11. 负责任披露
 

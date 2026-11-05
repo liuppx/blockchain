@@ -311,6 +311,11 @@ pub enum DeltaKParam {
 /// decides *economics*, but these are hard *safety* bounds so a passed proposal can
 /// never drive overflow / broken supply conservation / platform-divergent state.
 pub const MAX_SLASH_BPS: u32 = 10_000; // 100%; `stake - stake*bps/10000` must not underflow
+/// M235 (§10.11): the recommended default share cap — 1/3 of total voting power. At this cap
+/// no single non-genesis validator can reach ≥1/3, so a large bond from a key that never runs
+/// a node cannot wedge quorum. `0` disables the rule (the struct default, so existing chains
+/// are unchanged until a genesis opts in). A genesis must not set it above 10000 (100%).
+pub const DEFAULT_MAX_VALIDATOR_POWER_BPS: u32 = 3_333;
 pub const MAX_BASE_EMISSION_MICRO: u64 = 1_000 * MICRO; // ample vs the ~8*MICRO default
 pub const MAX_GOV_COUNT: u64 = 10_000; // bound for usize-typed ΔK counts (fits usize on 32/64-bit)
 /// SEC-04 (re-verify): upper bound for the unbounded ΔK float knobs (lam/bonus_max/
@@ -1059,6 +1064,15 @@ pub struct ChainState {
     pub decay_half_life_blocks: u64,
     /// Fraction of stake slashed on reject, in basis points (10000 = 100%).
     pub slash_bps: u32,
+    /// M235 (§10.11): max share of total voting power a single **non-genesis** validator may
+    /// hold, in basis points (`3333` = 1/3; `0` = disabled). A bond-derived or
+    /// proposer-supplied validator update that would push a non-genesis validator past this
+    /// share is rejected by `apply_block_inner` (the whole block rolls back). Genesis
+    /// validators are exempt (the trust root the operator chose). Skipped while the set has
+    /// <2 validators (a sole validator is 100% by construction). Folded into `state_root`
+    /// (a consensus rule, like `slash_bps`), so a tampered value can't match a cert-signed
+    /// root. Governance-adjustable via `GovParam` is a future item; set at genesis for now.
+    pub max_validator_power_bps: u32,
     pub supply: u64,   // total $COG in existence (micro)
     pub treasury: u64, // slashed stake pool (redistributed, not burned)
     /// Total micro-$COG bonded as validator stake (backs voting power). Equals
@@ -1136,6 +1150,11 @@ pub struct Genesis {
     /// See [`ChainState::decay_half_life_blocks`].
     pub decay_half_life_blocks: u64,
     pub slash_bps: u32,
+    /// M235 (§10.11): max share of total voting power any single **non-genesis** validator
+    /// may hold, in basis points (`3333` = 1/3; `0` = disabled, the default). Bounds a bond
+    /// so a key that never runs a node can't acquire ≥1/3 and permanently wedge quorum.
+    /// See [`ChainState::max_validator_power_bps`].
+    pub max_validator_power_bps: u32,
     pub timestamp_days: f32,
     /// The initial validator set (id, pubkey, voting power). Consensus over
     /// height 1 uses exactly this set; later heights evolve it on-chain.
@@ -1240,6 +1259,14 @@ pub enum ChainError {
     /// SEC-03: a block's validator updates would push total power past the protocol cap
     /// (`validator::MAX_TOTAL_POWER`), making the set unsafely representable — rejected.
     ValidatorPowerOverflow,
+    /// M235 (§10.11): a validator update would admit a NEW validator holding more than
+    /// `max_validator_power_bps`/10000 of total voting power — rejected so a non-running key
+    /// can't acquire ≥1/3 and wedge quorum.
+    ValidatorPowerShareExceeded {
+        id: u64,
+        power: u64,
+        cap_bps: u32,
+    },
     /// A bond/unbond op with a zero amount (never meaningful).
     ZeroStake(u64),
     /// An unbond of more than the account currently has bonded.
@@ -1454,6 +1481,10 @@ impl std::fmt::Display for ChainError {
             ChainError::ValidatorPowerOverflow => {
                 write!(f, "validator updates would exceed the total-power cap")
             }
+            ChainError::ValidatorPowerShareExceeded { id, power, cap_bps } => write!(
+                f,
+                "new validator {id} power {power} exceeds the {cap_bps} bps share cap of total voting power"
+            ),
             ChainError::ZeroStake(a) => write!(f, "account {a} bond/unbond amount is zero"),
             ChainError::InsufficientBond { account, need, have } => write!(
                 f,
@@ -1733,6 +1764,7 @@ impl ChainState {
             base_emission_micro: g.base_emission_micro,
             decay_half_life_blocks: g.decay_half_life_blocks,
             slash_bps: g.slash_bps,
+            max_validator_power_bps: g.max_validator_power_bps,
             supply,
             treasury: 0,
             bonded: 0,
@@ -1999,6 +2031,29 @@ impl ChainState {
             // certify). Applied on the trial clone → rolls the whole block back.
             if !next.power_within_cap() {
                 return Err(ChainError::ValidatorPowerOverflow);
+            }
+            // M235 (§10.11): bound any *newly-added* validator's share of total power.
+            // A bond (or a proposer-supplied update) that would admit a NEW validator holding
+            // more than `max_validator_power_bps`/10000 of the resulting total is rejected —
+            // so a large bond from a key that never runs a node can't acquire ≥1/3 and wedge
+            // quorum. Existing validators (genesis, or previously admitted under this same
+            // rule) are exempt: they are already live participants, and exempting them keeps
+            // a sole-validator chain (100% by construction) and normal re-bonding working.
+            // `bps == 0` disables the rule (default). Checked on the trial clone ⇒ the whole
+            // block rolls back on violation.
+            if self.max_validator_power_bps > 0 {
+                let total = next.total_power_u128();
+                let bps = self.max_validator_power_bps as u128;
+                for v in next.validators() {
+                    let is_new = self.validators.get(v.id).is_none();
+                    if is_new && (v.power as u128) * 10_000 > total * bps {
+                        return Err(ChainError::ValidatorPowerShareExceeded {
+                            id: v.id,
+                            power: v.power,
+                            cap_bps: self.max_validator_power_bps,
+                        });
+                    }
+                }
             }
             self.validators = next;
         }
@@ -2364,7 +2419,47 @@ impl ChainState {
         (kept_props, kept_votes)
     }
 
-    /// Apply one bond/unbond op at `height` (the height of the block carrying it).
+    /// M235: select the pending stake-ops a proposer can include without making the candidate
+    /// block unsealable. Mirrors `filter_applicable_gov` (SEC-01): a stale op (bad sig / unknown
+    /// account / insufficient balance-or-bond) or one that would violate the §10.11 share cap
+    /// (a NEW validator over `max_validator_power_bps`) is dropped, so a single bad op can't
+    /// stall production. Ops are tried in order against a trial clone so accepted ops see each
+    /// other's effect; the share-cap check derives the validator update against the ORIGINAL
+    /// pre-block set (exactly as `apply_block_inner` does). Correctness still rests on
+    /// `apply_block_inner` rejecting a bad block; this is the liveness guard.
+    pub(crate) fn filter_applicable_stake_ops(&self, ops: &[StakeOp]) -> Vec<StakeOp> {
+        let mut trial = self.clone();
+        let mut kept = Vec::new();
+        for op in ops {
+            let mut scratch = trial.clone();
+            if scratch.apply_stake_op(op, scratch.height + 1).is_err() {
+                continue;
+            }
+            // Would this bond admit a NEW validator over the share cap? (unbond lowers power,
+            // never trips it; an existing validator is exempt — see apply_block_inner.)
+            if self.max_validator_power_bps > 0 && self.validators.get(op.account).is_none() {
+                let power = scratch.bonds.get(&op.account).copied().unwrap_or(0);
+                let pubkey = scratch
+                    .accounts
+                    .get(&op.account)
+                    .map(|a| a.pubkey)
+                    .unwrap_or_default();
+                let next = self.validators.apply_updates(&[ValidatorUpdate {
+                    id: op.account,
+                    pubkey,
+                    power,
+                }]);
+                let total = next.total_power_u128();
+                if (power as u128) * 10_000 > total * (self.max_validator_power_bps as u128) {
+                    continue;
+                }
+            }
+            trial = scratch;
+            kept.push(op.clone());
+        }
+        kept
+    }
+
     /// Bond escrows funds from the account balance into the bonded pool; unbond
     /// removes them from the pool and schedules a delayed withdrawal. Never
     /// partially mutates on error (all checks precede any mutation), so a failing
@@ -3163,6 +3258,7 @@ impl ChainState {
         e.u64(self.base_emission_micro);
         e.u64(self.decay_half_life_blocks);
         e.u32(self.slash_bps);
+        e.u32(self.max_validator_power_bps); // M235 (§10.11): consensus rule, fold like slash_bps
         let p = &self.params;
         e.f32(p.tau_dup);
         e.u64(p.n_review_min as u64);
@@ -3780,6 +3876,7 @@ mod tests {
             base_emission_micro: 8 * MICRO,
             decay_half_life_blocks: 0,
             slash_bps: 10_000,
+            max_validator_power_bps: 0,
             timestamp_days: 0.0,
             validators: vec![
                 (21, kp(21).public(), 1),
@@ -4909,6 +5006,107 @@ mod tests {
             Err(ChainError::InsufficientBond { .. })
         ));
         assert_eq!(chain.state.height, 0);
+    }
+
+    // M235 (§10.11): a genesis with the validator power share cap enabled.
+    fn capped_genesis(bps: u32) -> Genesis {
+        let mut g = base_genesis();
+        g.max_validator_power_bps = bps;
+        g
+    }
+
+    #[test]
+    fn a_new_validator_bond_over_the_share_cap_is_rejected() {
+        // §10.11: validators 21,22,23 have power 1 (total 3). Account 1 (NOT a validator) bonds
+        // 10 $COG → it would enter as a new validator with power 10_000_000 ≈ 100% ≫ 1/3, which
+        // would make quorum unreachable if its key never runs. The block is rejected and the
+        // chain rolls fully back.
+        let mut chain = Chain::new(capped_genesis(3333));
+        let mut b = stake_block(&chain, 1, 1, BondKind::Bond, 10 * MICRO);
+        assert!(matches!(
+            chain.commit(&mut b),
+            Err(ChainError::ValidatorPowerShareExceeded { id: 1, .. })
+        ));
+        assert_eq!(chain.state.height, 0, "rejected block rolls fully back");
+        assert!(chain.state.bonds.is_empty());
+        assert!(
+            chain.state.validators.get(1).is_none(),
+            "no ghost validator"
+        );
+    }
+
+    #[test]
+    fn a_genesis_validator_is_exempt_from_the_share_cap() {
+        // A validator already in the set (here account 1 is both a genesis account and a genesis
+        // validator) is exempt — it is a live participant, and exempting it keeps a sole-validator
+        // chain and normal re-bonding working.
+        let mut g = capped_genesis(3333);
+        g.validators.push((1, kp(1).public(), 1)); // account 1 is also a genesis validator
+        let mut chain = Chain::new(g);
+        let mut b = stake_block(&chain, 1, 1, BondKind::Bond, 10 * MICRO);
+        chain
+            .commit(&mut b)
+            .expect("existing validator bond is exempt");
+        assert_eq!(chain.state.validators.get(1).unwrap().power, 10 * MICRO);
+        assert!(chain.state.supply_conserved());
+    }
+
+    #[test]
+    fn a_new_validator_bond_within_the_share_cap_is_allowed() {
+        // New validator joining under the cap: validators 21,22,23 at power 1000 (total 3000),
+        // cap 1/3. Account 1 bonds 1000 → power 1000 of total 4000 = 25% ≤ 1/3 → allowed.
+        let mut g = capped_genesis(3333);
+        g.validators = vec![
+            (21, kp(21).public(), 1000),
+            (22, kp(22).public(), 1000),
+            (23, kp(23).public(), 1000),
+        ];
+        let mut chain = Chain::new(g);
+        let mut b = stake_block(&chain, 1, 1, BondKind::Bond, 1000);
+        chain.commit(&mut b).expect("within-cap bond admitted");
+        assert_eq!(chain.state.validators.get(1).unwrap().power, 1000);
+        assert!(chain.state.supply_conserved());
+    }
+
+    #[test]
+    fn filter_applicable_stake_ops_drops_an_over_cap_bond() {
+        // The mempool filter must drop an over-cap bond so a proposer never builds an unsealable
+        // candidate (no production stall) — mirroring the gov filter (SEC-01).
+        let chain = Chain::new(capped_genesis(3333));
+        let over = StakeOp {
+            account: 1,
+            kind: BondKind::Bond,
+            amount: 10 * MICRO,
+            signature: [0u8; 64],
+        }
+        .signed(&kp(1));
+        let within = StakeOp {
+            account: 2,
+            kind: BondKind::Bond,
+            amount: 1, // power 1 of total ~4 ⇒ under 1/3
+            signature: [0u8; 64],
+        }
+        .signed(&kp(2));
+        let kept = chain
+            .state
+            .filter_applicable_stake_ops(&[over.clone(), within.clone()]);
+        assert_eq!(kept.len(), 1, "over-cap bond dropped, within-cap kept");
+        assert_eq!(kept[0].account, 2);
+    }
+
+    #[test]
+    fn state_root_covers_max_validator_power_bps() {
+        // §10.11 cap is a consensus rule folded into state_root (SEC-02 style), so a tampered
+        // value can't match a cert-signed root.
+        let base = Chain::new(base_genesis());
+        let r0 = base.state.state_root();
+        let mut a = base.state.clone();
+        a.max_validator_power_bps += 1;
+        assert_ne!(
+            r0,
+            a.state_root(),
+            "max_validator_power_bps changes state_root"
+        );
     }
 
     #[test]

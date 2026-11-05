@@ -301,6 +301,7 @@ mod tests {
             base_emission_micro: 8 * MICRO,
             decay_half_life_blocks: 0,
             slash_bps: 10_000,
+            max_validator_power_bps: 0,
             timestamp_days: 0.0,
             validators: vec![
                 (21, kp(21).public(), 1),

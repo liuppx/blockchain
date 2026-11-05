@@ -82,6 +82,7 @@ timeout_ms = 500   # 签名超时;超时即该步不投票(fail-closed),默认 5
 base_emission_micro    = 8000000     # 诚实 ROI 稳健正、膨胀温和(4–8M 区间)
 decay_half_life_blocks = 0           # M187 增发衰减:0=关;生产建议设为"引导期区块数"
 slash_bps              = 10000       # 满罚:最强攻击威慑 + 最低 fake-pass(CALIBRATION)
+max_validator_power_bps = 3333       # M235 §10.11:新验证人单体权力上限 1/3,防不运行节点的大额绑定瘫痪共识(0=关)
 timestamp_days         = 0.0
 
 [[accounts]]   # 初始账户(id/balance_micro/pubkey_hex)

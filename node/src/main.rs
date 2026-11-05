@@ -144,6 +144,7 @@ fn demo_genesis() -> Genesis {
         base_emission_micro: 8 * MICRO,
         decay_half_life_blocks: 0, // M187: decay disabled in the demo (canon unchanged)
         slash_bps: 10_000,
+        max_validator_power_bps: 0,
         timestamp_days: 0.0,
         validators: vset
             .validators()
@@ -5889,7 +5890,8 @@ mod tests {
         }
         assert_eq!(
             hex(&chain.state.state_root()),
-            "01c163cec782b5022db9993b822c1d0b9a1defb5c90875306a4073b2a98d296b"
+            // M235: re-baselined — the §10.11 share cap folds into state_root (SEC-02 style).
+            "f656223f0db70b2683c3b6cac1ac017f2165d39983e211554010a99730010ddd"
         );
         assert_eq!(
             hex(&chain.state.merkle_root()),

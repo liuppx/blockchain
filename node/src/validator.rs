@@ -142,6 +142,25 @@ impl ValidatorSet {
         self.total_power_u128() <= MAX_TOTAL_POWER as u128
     }
 
+    /// M235 (§10.11): the first validator whose power exceeds `bps`/10000 of the set's
+    /// total power, or `None` if every validator is within that share. `bps == 0` disables
+    /// the check (returns `None`). A share cap bounds any single validator's fraction of
+    /// voting power, so a large bond from a key that never runs a node can't acquire ≥1/3
+    /// and permanently wedge quorum (the §10.11 liveness failure). The comparison is exact
+    /// in `u128` (`power * 10000 <= total * bps`). Only meaningful for a set of ≥2
+    /// validators — a sole validator is 100% by construction (callers skip the check then).
+    pub fn validator_exceeding_power_share(&self, bps: u32) -> Option<u64> {
+        if bps == 0 {
+            return None;
+        }
+        let total = self.total_power_u128();
+        let bps = bps as u128;
+        self.validators
+            .iter()
+            .find(|v| (v.power as u128) * 10_000 > total * bps)
+            .map(|v| v.id)
+    }
+
     /// Apply on-chain [`ValidatorUpdate`]s in order, returning the evolved set.
     /// `power == 0` removes `id` (no-op if absent); `power > 0` upserts
     /// `(id, pubkey, power)`. The result is re-sorted by id (via [`Self::new`]),
@@ -336,6 +355,25 @@ mod tests {
         let next = vs.apply_updates(&[upd(99, 0)]);
         let ids: Vec<u64> = next.validators().iter().map(|v| v.id).collect();
         assert_eq!(ids, vec![1, 2]);
+    }
+
+    #[test]
+    fn validator_exceeding_power_share_flags_a_dominant_validator() {
+        // M235 (§10.11): with a 1/3 (3333 bps) share cap, a validator holding >1/3 of total
+        // power is flagged; one at or below 1/3 is not. bps==0 disables the check.
+        // total = 4; 3333 bps ⇒ allow power ≤ floor(4*0.3333)=1 (power*10000 ≤ total*bps).
+        let balanced = vset(&[(1, 1), (2, 1), (3, 1), (4, 1)]);
+        assert_eq!(balanced.validator_exceeding_power_share(3333), None);
+
+        // one validator with power 1000 against three power-1 ⇒ total 1003, 1000 > 1/3 ⇒ flagged.
+        let dominant = vset(&[(1, 1000), (2, 1), (3, 1)]);
+        assert_eq!(dominant.validator_exceeding_power_share(3333), Some(1));
+
+        // exactly 1/3: powers 1,1,1 ⇒ total 3, each power*10000=10000 ≤ 3*3333=9999? no (10000>9999)
+        // so an exact-thirds split is just over; use 5000 bps (1/2) to show a clean pass.
+        assert_eq!(dominant.validator_exceeding_power_share(0), None); // disabled
+        let half = vset(&[(1, 1), (2, 1)]);
+        assert_eq!(half.validator_exceeding_power_share(5000), None); // each exactly 1/2
     }
 
     #[test]

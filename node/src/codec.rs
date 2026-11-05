@@ -1602,7 +1602,10 @@ pub fn decode_account(buf: &[u8]) -> Result<Account, CodecError> {
 /// v5 (M194): the snapshot now also serializes the governance `proposals` map +
 /// `next_proposal_id` (M194 folds them into `state_root`). A v4 snapshot lacks
 /// them, so v4 is now rejected — regenerate.
-pub const SNAPSHOT_VERSION: u32 = 5;
+///
+/// v6 (M235): adds `max_validator_power_bps` (§10.11 validator power share cap, folded into
+/// `state_root`). A v5 snapshot lacks it, so v5 is now rejected — regenerate.
+pub const SNAPSHOT_VERSION: u32 = 6;
 
 /// Write the account's state fields into the shared stream (same layout as
 /// [`encode_account`], inlined so the snapshot controls framing).
@@ -1674,6 +1677,7 @@ pub fn encode_snapshot(s: &ChainState) -> Vec<u8> {
     e.u64(s.base_emission_micro);
     e.u64(s.decay_half_life_blocks); // M187 (§6.2): emission time-decay half-life
     e.u32(s.slash_bps);
+    e.u32(s.max_validator_power_bps); // M235 (§10.11): validator power share cap
     e.raw(&s.genesis_hash);
     // ΔK params
     let p = &s.params;
@@ -1797,6 +1801,7 @@ pub fn decode_snapshot(buf: &[u8]) -> Result<ChainState, CodecError> {
     let base_emission_micro = d.u64()?;
     let decay_half_life_blocks = d.u64()?; // M187 (§6.2)
     let slash_bps = d.u32()?;
+    let max_validator_power_bps = d.u32()?; // M235 (§10.11)
     let mut genesis_hash = [0u8; 32];
     genesis_hash.copy_from_slice(d.take(32)?);
     let params = DeltaKParams {
@@ -1964,6 +1969,7 @@ pub fn decode_snapshot(buf: &[u8]) -> Result<ChainState, CodecError> {
         base_emission_micro,
         decay_half_life_blocks,
         slash_bps,
+        max_validator_power_bps,
         supply,
         treasury,
         bonded,
@@ -4082,6 +4088,7 @@ mod tests {
             base_emission_micro: 8 * MICRO,
             decay_half_life_blocks: 0,
             slash_bps: 10_000,
+            max_validator_power_bps: 3_333, // M235 (§10.11): snapshot round-trip covers v6 field
             timestamp_days: 1.5,
             validators: vec![(21, pk(21), 3), (22, pk(22), 1)],
             bridge_sources: vec![],

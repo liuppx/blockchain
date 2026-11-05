@@ -76,6 +76,7 @@ GEN="$OUT/genesis.toml"
   echo "base_emission_micro    = 8000000"
   echo "decay_half_life_blocks = 0"
   echo "slash_bps              = 10000"
+  echo "max_validator_power_bps = 3333   # M235 §10.11: no new validator may exceed 1/3 of power"
   echo "timestamp_days         = 0.0"
   echo
   for ((i = 1; i <= ACCOUNTS; i++)); do

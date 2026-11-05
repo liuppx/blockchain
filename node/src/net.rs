@@ -1471,7 +1471,13 @@ impl GossipNode {
                 gov_proposals: Vec::new(),
                 gov_votes: Vec::new(),
             });
-        candidate.stake_ops = self.pending_stake_ops.clone();
+        // M235: include only stake-ops that apply cleanly AND don't trip the §10.11 share cap,
+        // so a stale/over-cap bond can't make the whole candidate unsealable and stall
+        // production (mirrors the gov filter below / SEC-01).
+        candidate.stake_ops = self
+            .chain
+            .state
+            .filter_applicable_stake_ops(&self.pending_stake_ops);
         candidate.slashing_evidence = self.pending_evidence.clone();
         candidate.key_rotations = self.pending_key_rotations.clone();
         // SEC-01: include only governance ops that apply cleanly against current state
@@ -3639,6 +3645,7 @@ mod tests {
             base_emission_micro: 8 * MICRO,
             decay_half_life_blocks: 0,
             slash_bps: 10_000,
+            max_validator_power_bps: 0,
             timestamp_days: 0.0,
             validators: [21u64, 22, 23, 24]
                 .iter()
@@ -3871,6 +3878,7 @@ mod tests {
             base_emission_micro: 0,
             decay_half_life_blocks: 0,
             slash_bps: 10_000,
+            max_validator_power_bps: 0,
             timestamp_days: 0.0,
             validators: vec![(21, kp(21).public(), 1)],
             bridge_sources: vec![],
@@ -3921,6 +3929,7 @@ mod tests {
             base_emission_micro: 0,
             decay_half_life_blocks: 0,
             slash_bps: 10_000,
+            max_validator_power_bps: 0,
             timestamp_days: 0.0,
             validators: vec![(21, kp(21).public(), 1)],
             bridge_sources: vec![],
