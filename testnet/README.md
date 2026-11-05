@@ -41,12 +41,15 @@ testnet/down.sh           # 7) 优雅停止
 error/panic 行)。
 
 ```sh
-testnet/soak.sh [DURATION_S=180] [INTERVAL_S=10] [LAG=2] [LEAK_PCT=50]
+testnet/soak.sh [DURATION_S=180] [INTERVAL_S=10] [LAG=2] [LEAK_PCT=50] [load]
 ```
 
-无负载(依赖 `create_empty_blocks` 心跳,数千块无需造 tx)。**tx 负载 soak** 另需明文种子账户
-(测试网发的是加密 keystore,`encode-tx --key-file` 不吃 keystore),列为后续项。真正的上线前
-soak 应为**小时/天级**;本脚本是可重复的**分钟级门禁**。
+默认无负载(依赖 `create_empty_blocks` 心跳,数千块无需造 tx)。**第 5 参数 `load`(M234)驱动真实写
+负载**:每采样从账户 2 的加密 keystore(M233)授权一笔**知识 tx**,经 `submit-tx` 投到首节点的 bearer
+门控写面(CLI 现发配置里的 `[rpc] auth_token`,M234)。用 tx 而非 bond 是有意的——**一笔 `bond` 会立刻
+变成验证人权力**,不运行节点的账户绑定超 1/3 会**永久瘫痪共识**(见 [`docs/SECURITY.md`](../docs/SECURITY.md)
+§10.11);知识 tx 只增发/记账,**绝不动验证人集**,是安全的持续负载。实测 5/5 tx 被接受、供应随增发增长
+且全程守恒+跨节点一致。真正的上线前 soak 应为**小时/天级**;本脚本是可重复的**分钟级门禁**。
 
 默认 **4 验证人**(id 21–24,容 1 拜占庭)+ **3 个有余额账户**(id 1–3,tx 作者)+
 3 个评议人(id 10–12)。`gen.sh -n 7 -a 5` 改规模;`--force` 重新生成(**销毁**旧密钥)。

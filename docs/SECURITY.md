@@ -55,7 +55,7 @@ RUSTFLAGS="-D warnings" cargo test --release --no-run     # 零编译告警
 # 其中位锚点测(见 §6)验证共识浮点逐位一致。
 ```
 
-- 测试总数:**node 758(698 lib + 60 bin)+ engine 11**,全绿。2 个 `#[ignore]`(config 的
+- 测试总数:**node 759(698 lib + 61 bin)+ engine 11**,全绿。2 个 `#[ignore]`(config 的
   环境依赖测;M213 的 `seed_fuzz_corpus` 语料生成器,均非安全相关)。
 - `unsafe`:**全仓非测试代码 0 处**(`grep -rn unsafe engine/src node/src`)。
 - 无 `cargo-audit` 门禁(当前 advisory,依赖树未确认无 RUSTSEC —— 见 §10)。
@@ -228,11 +228,12 @@ RUSTFLAGS="-D warnings" cargo test --release --no-run     # 零编译告警
    一致)、供应守恒且跨节点一致、无内存泄漏(RSS 增幅有界)、干净日志。**活体拜占庭 → 罚没已有集成测**
    (`equivocation_over_tcp_slashes_the_offender`,daemon.rs:真实 TCP 套接字上一个冒充验证人的裸 peer
    泛洪两张冲突 precommit,诚实节点经 wire 观测双签 → 产证据 → 入块 → 罚没并移出验证人集;另有
-   `slashes_an_equivocating_validator_through_the_certified_chain` 走认证链)。仍无**真正的网络分区注入**
+   `slashes_an_equivocating_validator_through_the_certified_chain` 走认证链)。**M234 起** `soak.sh load`
+   驱动真实 **tx 负载**(从加密 keystore 授权知识 tx → `submit-tx` 投到 bearer 门控写面;CLI 现发配置
+   token,M233/M234;实测 5/5 tx 接受、供应守恒+跨节点一致)。仍无**真正的网络分区注入**
    (iptables/tc 延迟·丢包)、**生产安全姿态下的活体拜占庭**(上测用明文握手,未经 `require_peer_auth`
-   + mTLS)、**tx 负载下的长跑**(soak 目前无负载;**M233 起** `encode-*` 的 `--key-file` 可直接吃加密
-   keystore 签名,授权层已通,仍差 CLI 写面 bearer-token 支持)、与**超 loopback 规模**测。见 §10.10 的
-   活性恢复边界。
+   + mTLS)、**小时/天级或跨机规模的长跑**(当前 loopback、数百区块级)、与**超 loopback 规模**测。见
+   §10.10 的活性恢复边界、§10.11 的绑定准入边界。
 6. **`cargo-audit` 当前 advisory**(依赖树未确认无 RUSTSEC)。
 7. **滚动升级未支持**(只能干净拒连不兼容 peer)。设计见 [`docs/design/rolling-upgrade.md`](design/rolling-upgrade.md)(设计稿,待实现)。
 8. **弱主观性检查点分发**是运维事项(协议只提供验证基元)。
@@ -245,6 +246,18 @@ RUSTFLAGS="-D warnings" cargo test --release --no-run     # 零编译告警
     **仅自动活性恢复受影响**。恢复手段明确:**全量重启验证人集**(含存活节点)即让每个节点回到待定
     高度的干净轮次,链在同一 head 继续(实测 15→16→… 重新收敛)。属**共识线待修项**(需轮次追赶:
     节点见到更高轮次的 >2f+1 消息时跳转),非安全缺陷;修复为协议改动,风险较高,留作后续。
+11. **绑定即验证人权力,无在运证明 / 无激活延迟 / 无权力爬坡**(M234 tx-load soak 过程中实测暴露)。
+    `apply_block_inner` 对**任何**绑定了质押的账户直接 `ValidatorUpdate { id, power: bonds[id] }`——
+    即一笔 `bond` 会**立刻**把该账户注入活跃验证人集,权力 = 绑定额。若该账户的密钥**并未运行验证人
+    节点**,这份权力是永远不会投票的"幽灵权力";当它超过总权力的 1/3 时,法定数**永久不可达**——
+    链停摆且**重启也无法恢复**(与 §10.10 不同,这不是轮次漂移,而是集合本身已不可能达成 quorum)。
+    实测:4 个 power=1(总 4)的验证人链上,用一个**不运行节点**的创世账户绑定 1000 → 它以 power=1000
+    独占 >2/3 → 全链冻结,`gen.sh` 重来才恢复。**安全性不破**(不分叉、供应守恒),是**活性**风险。
+    这是本链经济/共识模型的**已知边界**(bond == stake == power,无许可验证人准入很常见),但锐利之处在于
+    **无 proof-of-operation、无绑定激活延迟、无单笔权力占比上限**,故小规模链上一笔绑定即可瘫痪共识。
+    运维缓解:受控/许可制网络下绑定由可信方操作、且只对**在运密钥**绑定;主网前应加准入门槛(最小/
+    封顶权力、激活延迟、或绑定与在运证明挂钩)。因此 `testnet/soak.sh` 的负载用**知识 tx**(不动验证人集)
+    而非 stake-op。属**经济/共识线待设计项**,记入 §10 已知边界。
 
 ## 11. 负责任披露
 

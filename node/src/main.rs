@@ -4285,15 +4285,12 @@ fn cmd_submit_tx(config_path: String, tx_path: String) {
     }
 
     let mut stream = std::net::TcpStream::connect(&addr).unwrap_or_else(|e| fail("connect rpc", e));
-    let header = format!(
-        "POST /submit_tx HTTP/1.1\r\nHost: {addr}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-        body.len()
-    );
+    // M234: carry the configured `[rpc] auth_token` as a bearer so a token-gated write face
+    // accepts the submission (empty token ⇒ no header, unchanged for open loopback nets).
+    let token = (!rpc.auth_token.is_empty()).then_some(rpc.auth_token.as_str());
+    let req = rpc_post_request(&addr, "/submit_tx", &body, token);
     stream
-        .write_all(header.as_bytes())
-        .unwrap_or_else(|e| fail("send request", e));
-    stream
-        .write_all(&body)
+        .write_all(&req)
         .unwrap_or_else(|e| fail("send request", e));
 
     let mut resp = Vec::new();
@@ -4323,10 +4320,17 @@ fn rpc_get_request(host: &str, path: &str) -> String {
 
 /// M117: build a full HTTP/1.1 POST request (header block + raw body) for the RPC client's
 /// `--post` mode. Returns bytes (not a `String`) so a binary codec body passes through
-/// untouched; `Content-Length` is the exact body length. Pure for unit testing.
-fn rpc_post_request(host: &str, path: &str, body: &[u8]) -> Vec<u8> {
+/// untouched; `Content-Length` is the exact body length. M234: `token` adds an
+/// `Authorization: Bearer <token>` header so the client can reach a bearer-gated write face
+/// (`[rpc] auth_token`); an empty/`None` token sends no auth header (public reads unaffected).
+/// Pure for unit testing.
+fn rpc_post_request(host: &str, path: &str, body: &[u8], token: Option<&str>) -> Vec<u8> {
+    let auth = match token {
+        Some(t) if !t.is_empty() => format!("Authorization: Bearer {t}\r\n"),
+        _ => String::new(),
+    };
     let mut req = format!(
-        "POST {path} HTTP/1.1\r\nHost: {host}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        "POST {path} HTTP/1.1\r\nHost: {host}\r\n{auth}Content-Length: {}\r\nConnection: close\r\n\r\n",
         body.len()
     )
     .into_bytes();
@@ -4364,13 +4368,16 @@ fn cmd_rpc(args: &[String]) {
         ),
     };
     let addr = rpc.listen.clone();
+    // M234: send `[rpc] auth_token` as a bearer on POST so bearer-gated writes
+    // (/submit_tx, /gov/*, /stake) are accepted; reads stay public (no header needed).
+    let token = (!rpc.auth_token.is_empty()).then_some(rpc.auth_token.as_str());
 
     let mut stream = std::net::TcpStream::connect(&addr).unwrap_or_else(|e| fail("connect rpc", e));
     match opt_arg(args, "--post") {
         Some(file) => {
             let body = std::fs::read(file).unwrap_or_else(|e| fail("read post body", e));
             stream
-                .write_all(&rpc_post_request(&addr, path, &body))
+                .write_all(&rpc_post_request(&addr, path, &body, token))
                 .unwrap_or_else(|e| fail("send request", e));
         }
         None => {
@@ -6790,11 +6797,15 @@ mod tests {
     #[test]
     fn rpc_post_request_includes_content_length_and_body() {
         // M117: a POST carries the body after a Content-Length header equal to its byte length.
-        let req = rpc_post_request("127.0.0.1:9000", "/validate", b"hello");
+        let req = rpc_post_request("127.0.0.1:9000", "/validate", b"hello", None);
         let text = String::from_utf8(req).unwrap();
         assert!(text.starts_with("POST /validate HTTP/1.1\r\n"), "{text}");
         assert!(text.contains("Host: 127.0.0.1:9000\r\n"), "{text}");
         assert!(text.contains("Content-Length: 5\r\n"), "{text}");
+        assert!(
+            !text.contains("Authorization"),
+            "no auth header without a token"
+        );
         assert!(text.ends_with("\r\n\r\nhello"), "{text}");
     }
 
@@ -6803,7 +6814,7 @@ mod tests {
         // M117: a binary (non-UTF-8) body — like a codec-encoded tx — passes through byte-for
         // byte; the request is bytes, not a String, so nothing is mangled.
         let body: Vec<u8> = vec![0x00, 0xff, 0x80, 0x01, 0xfe];
-        let req = rpc_post_request("h:1", "/submit_tx", &body);
+        let req = rpc_post_request("h:1", "/submit_tx", &body, None);
         assert!(req.ends_with(&body), "binary body preserved at the tail");
         // Content-Length reflects the raw length.
         assert!(String::from_utf8_lossy(&req).contains("Content-Length: 5\r\n"));
@@ -6812,10 +6823,27 @@ mod tests {
     #[test]
     fn rpc_post_request_empty_body() {
         // M117: an empty body ⇒ Content-Length: 0 and nothing after the header terminator.
-        let req = rpc_post_request("h:1", "/x", b"");
+        let req = rpc_post_request("h:1", "/x", b"", None);
         let text = String::from_utf8(req).unwrap();
         assert!(text.contains("Content-Length: 0\r\n"), "{text}");
         assert!(text.ends_with("\r\n\r\n"), "{text}");
+    }
+
+    #[test]
+    fn rpc_post_request_adds_bearer_when_token_present() {
+        // M234: a non-empty token adds exactly one `Authorization: Bearer <token>` header
+        // before Content-Length; an empty token adds none (public reads unaffected).
+        let req = rpc_post_request("h:1", "/stake", b"xy", Some("s3cr3t"));
+        let text = String::from_utf8(req).unwrap();
+        assert!(
+            text.contains("Authorization: Bearer s3cr3t\r\n"),
+            "bearer header present: {text}"
+        );
+        assert!(text.contains("Content-Length: 2\r\n"), "{text}");
+        assert!(text.ends_with("\r\n\r\nxy"), "{text}");
+        // an empty token behaves like None
+        let req2 = rpc_post_request("h:1", "/stake", b"xy", Some(""));
+        assert!(!String::from_utf8(req2).unwrap().contains("Authorization"));
     }
 
     // M98: build a signed tx and its canonical encoding for inspect-tx tests.

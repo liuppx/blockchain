@@ -16,15 +16,36 @@
 # (testnet ships encrypted keystores, which `encode-tx --key-file` can't consume) — tracked
 # as a follow-up. Real pre-mainnet soak = hours/days; this is a repeatable minutes-scale gate.
 #
-#   testnet/soak.sh [DURATION_S=180] [INTERVAL_S=10] [LAG=2] [LEAK_PCT=50]
+# M234: pass `load` as the 5th arg to drive REAL write load — each sample authors a knowledge
+# submission tx from a genesis account's encrypted keystore (M233) and POSTs it to the first
+# node's bearer-gated write face via `submit-tx` (the CLI now sends the configured RPC token,
+# M234). A tx is pure PoK load: it mints/credits but NEVER mutates the validator set, so the
+# chain can't be wedged by the load itself (bonding WOULD — a bond instantly becomes validator
+# power, see SECURITY.md §10.11; that is why load uses txs, not stake-ops).
+#
+#   testnet/soak.sh [DURATION_S=180] [INTERVAL_S=10] [LAG=2] [LEAK_PCT=50] [load]
 set -euo pipefail
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
+ROOT="$(cd "$HERE/.." && pwd)"
+BIN="$ROOT/node/target/release/node"
 OUT="$HERE/out"
 DURATION="${1:-180}"
 INTERVAL="${2:-10}"
 LAG="${3:-2}"          # trailing height offset for agreement checks (avoid tip races)
 LEAK_PCT="${4:-50}"    # max tolerated RSS growth over the run, percent
+LOAD="${5:-}"          # "load" ⇒ submit a knowledge tx each sample (needs keystore password)
+LOAD_ACCT=2            # genesis account (funded, non-validator) whose keystore authors the tx
+LOAD_REVIEWER=10       # a genesis reviewer id (reputation weight)
+loadok=0; loadtry=0    # loadok doubles as the next tx nonce (== account 2's accepted count)
+
+if [ "$LOAD" = load ]; then
+  if [ -z "${ZHIXING_KEYSTORE_PASSWORD:-}" ] && [ -f "$OUT/password" ]; then
+    export ZHIXING_KEYSTORE_PASSWORD="$(cat "$OUT/password")"
+  fi
+  [ -x "$BIN" ] || { echo "LOAD needs the release binary at $BIN" >&2; exit 1; }
+  [ -f "$OUT/keys/acct$LOAD_ACCT.json" ] || { echo "LOAD needs out/keys/acct$LOAD_ACCT.json" >&2; exit 1; }
+fi
 
 ids=()
 for d in "$OUT"/n*/; do ids+=("$(basename "$d" | sed 's/^n//')"); done
@@ -83,7 +104,25 @@ while [ $SECONDS -lt $deadline ]; do
       [ "$sup"  = "$rsup"  ] || { echo "FAIL: SUPPLY n$id $sup != $rsup" >&2; exit 1; }
     fi
   done
-  echo "  sample $samples: min height $minh | agree @$ch root=${rroot:0:10}… supply=$rsup conserved ✓"
+  loadnote=""
+  if [ "$LOAD" = load ]; then
+    loadtry=$((loadtry + 1))
+    nonce=$loadok                       # account 2's next nonce == its accepted-tx count
+    dim=$(( nonce % 8 ))                 # rotate a unit-vector embedding to stay novel (ΔK>0)
+    emb=""; for k in 0 1 2 3 4 5 6 7; do [ "$k" = "$dim" ] && emb="$emb${emb:+,}1" || emb="$emb${emb:+,}0"; done
+    # author from the encrypted keystore (M233); submit-tx sends the config bearer token (M234).
+    # A knowledge tx mints/credits but never touches the validator set — safe sustained load.
+    if "$BIN" encode-tx --key-file "$OUT/keys/acct$LOAD_ACCT.json" --out "$OUT/.soak-load.bin" \
+         --author "$LOAD_ACCT" --domain 1 --embedding "$emb" --review "$LOAD_REVIEWER:0.9" \
+         --repl-success 3 --repl-total 3 --timestamp-days 1.0 --stake 2000000 --fee 0 \
+         --nonce "$nonce" >/dev/null 2>&1 \
+       && "$BIN" submit-tx --config "$OUT/n${ids[0]}/node.toml" --tx "$OUT/.soak-load.bin" >/dev/null 2>&1; then
+      loadok=$((loadok + 1)); loadnote=" | load $loadok/$loadtry ok"
+    else
+      loadnote=" | load submit FAILED ($loadok/$loadtry ok)"
+    fi
+  fi
+  echo "  sample $samples: min height $minh | agree @$ch root=${rroot:0:10}… supply=$rsup conserved ✓${loadnote}"
 done
 
 # post-run: leak guard + clean-log guard
@@ -99,4 +138,10 @@ for i in "${!ids[@]}"; do
   [ "$enew" -eq 0 ] || { echo "    FAIL: n$id logged $enew new error/panic line(s)" >&2; fail=1; }
 done
 [ "$fail" = 0 ] || { echo "SOAK FAILED" >&2; exit 1; }
-echo "OK: soak passed — liveness, no fork/drift, supply conserved+identical, no leak, clean logs"
+rm -f "$OUT/.soak-load.bin"
+if [ "$LOAD" = load ]; then
+  [ "$loadok" -gt 0 ] || { echo "SOAK FAILED: load mode on but 0/$loadtry writes landed" >&2; exit 1; }
+  echo "OK: soak passed under write load ($loadok/$loadtry knowledge txs accepted) — liveness, no fork/drift, supply conserved+identical, no leak, clean logs"
+else
+  echo "OK: soak passed — liveness, no fork/drift, supply conserved+identical, no leak, clean logs"
+fi
