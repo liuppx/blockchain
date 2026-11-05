@@ -174,33 +174,57 @@ async fn read_hello<R: AsyncReadExt + Unpin>(r: &mut R) -> io::Result<u64> {
 /// incompatible frames. Every future wire break MUST bump this (CI/review gate).
 pub const PROTOCOL_VERSION: u32 = 3;
 
-/// M192: exchange and check [`PROTOCOL_VERSION`] at connection open. Writes ours,
-/// reads the peer's, and errors on mismatch. The 4-byte write fits the socket/TLS
-/// buffer so write-then-read can't deadlock (same pattern as [`write_hello`]).
-/// Runs over the already-TLS-wrapped stream when `[network] enable_tls` is on.
+/// M221 (rolling-upgrade S1): the LOWEST wire version this build still speaks. Together
+/// with [`PROTOCOL_VERSION`] (the highest) this build advertises the supported range
+/// `[MIN_WIRE_VERSION, PROTOCOL_VERSION]` at handshake; two peers agree on their highest
+/// common version. A build that wants to interop with the previous generation during a
+/// rolling upgrade keeps the old version in this range (then drops it a release later —
+/// a sliding window). Equal to `PROTOCOL_VERSION` today ⇒ single-version behavior, but
+/// now negotiated as a range so future upgrades need no coordinated full-network stop.
+pub const MIN_WIRE_VERSION: u32 = 3;
+
+/// M192 / M221: exchange supported wire-version *ranges* at connection open and agree on
+/// the highest common version (returned). Writes our `[MIN_WIRE_VERSION, PROTOCOL_VERSION]`,
+/// reads the peer's, and errors if the ranges do not overlap. The 8-byte write fits the
+/// socket/TLS buffer so write-then-read can't deadlock. Runs over the already-TLS-wrapped
+/// stream when `[network] enable_tls` is on.
+///
+/// M221 note: moving from a single-u32 exchange (M192) to an 8-byte range is itself a
+/// one-time handshake break (a pre-M221 node sends 4 bytes) — the bootstrap break that
+/// enables all *subsequent* upgrades to roll without a coordinated stop. See
+/// [`docs/design/rolling-upgrade.md`](../../docs/design/rolling-upgrade.md).
 ///
 /// Security note: when `require_peer_auth` is on this runs *before* the authenticated
 /// handshake, so a MITM could tamper the version bytes — but a tampered value only
 /// forces a *reject* (disconnect), never a downgrade to weaker crypto, so the worst
 /// case is a DoS equivalent to cutting the wire. Folding the negotiated version into
 /// the auth transcript (to detect tampering when authed) is a follow-up hardening.
-async fn negotiate_version<R, W>(rd: &mut R, wr: &mut W) -> io::Result<()>
+async fn negotiate_version<R, W>(rd: &mut R, wr: &mut W) -> io::Result<u32>
 where
     R: AsyncReadExt + Unpin,
     W: AsyncWriteExt + Unpin,
 {
-    wr.write_all(&PROTOCOL_VERSION.to_be_bytes()).await?;
+    let mut ours = [0u8; 8];
+    ours[0..4].copy_from_slice(&MIN_WIRE_VERSION.to_be_bytes());
+    ours[4..8].copy_from_slice(&PROTOCOL_VERSION.to_be_bytes());
+    wr.write_all(&ours).await?;
     wr.flush().await?;
-    let mut b = [0u8; 4];
+    let mut b = [0u8; 8];
     rd.read_exact(&mut b).await?;
-    let peer = u32::from_be_bytes(b);
-    if peer != PROTOCOL_VERSION {
+    let peer_min = u32::from_be_bytes(b[0..4].try_into().unwrap());
+    let peer_max = u32::from_be_bytes(b[4..8].try_into().unwrap());
+    // Agree on the highest version both sides speak; reject if the ranges don't overlap.
+    let common_min = MIN_WIRE_VERSION.max(peer_min);
+    let common_max = PROTOCOL_VERSION.min(peer_max);
+    if common_max < common_min {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            format!("peer protocol version {peer} != local {PROTOCOL_VERSION}"),
+            format!(
+                "no common wire version: local [{MIN_WIRE_VERSION},{PROTOCOL_VERSION}] peer [{peer_min},{peer_max}]"
+            ),
         ));
     }
-    Ok(())
+    Ok(common_max)
 }
 
 // ----------------------------------------------------------------------------
@@ -9311,63 +9335,70 @@ mod tests {
 
     #[tokio::test]
     async fn version_negotiation_accepts_matching_peers() {
-        // M192: two nodes on the same PROTOCOL_VERSION complete negotiation. Both sides
-        // write-then-read over a duplex pipe (mirrors the real `handle_conn` convergence
-        // point); each must see Ok.
+        // M192/M221: two nodes advertising overlapping wire ranges agree (here both
+        // [MIN_WIRE_VERSION, PROTOCOL_VERSION]); each sees Ok with the highest common version.
         let (a, b) = tokio::io::duplex(64);
         let (mut ar, mut aw) = tokio::io::split(a);
         let (mut br, mut bw) = tokio::io::split(b);
         let left = tokio::spawn(async move { negotiate_version(&mut ar, &mut aw).await });
         let right = tokio::spawn(async move { negotiate_version(&mut br, &mut bw).await });
-        assert!(left.await.unwrap().is_ok());
-        assert!(right.await.unwrap().is_ok());
+        assert_eq!(left.await.unwrap().unwrap(), PROTOCOL_VERSION);
+        assert_eq!(right.await.unwrap().unwrap(), PROTOCOL_VERSION);
     }
 
-    #[tokio::test]
-    async fn version_negotiation_rejects_mismatch() {
-        // M192: a peer announcing a different version is rejected with `InvalidData`
-        // rather than silently proceeding to mis-parse frames. We play the "peer" by
-        // writing a forged version and reading our side's announced version.
+    // M221: play the "peer" by writing a forged [min,max] range and reading our side's.
+    async fn negotiate_against_peer_range(peer_min: u32, peer_max: u32) -> (io::Result<u32>, [u32; 2]) {
         let (a, b) = tokio::io::duplex(64);
         let (mut ar, mut aw) = tokio::io::split(a);
         let (mut br, mut bw) = tokio::io::split(b);
-        // The impostor announces PROTOCOL_VERSION + 1.
-        let impostor = tokio::spawn(async move {
-            bw.write_all(&(PROTOCOL_VERSION + 1).to_be_bytes())
-                .await
-                .unwrap();
+        let peer = tokio::spawn(async move {
+            let mut buf = [0u8; 8];
+            buf[0..4].copy_from_slice(&peer_min.to_be_bytes());
+            buf[4..8].copy_from_slice(&peer_max.to_be_bytes());
+            bw.write_all(&buf).await.unwrap();
             bw.flush().await.unwrap();
-            let mut got = [0u8; 4];
+            let mut got = [0u8; 8];
             br.read_exact(&mut got).await.unwrap();
-            u32::from_be_bytes(got)
+            [
+                u32::from_be_bytes(got[0..4].try_into().unwrap()),
+                u32::from_be_bytes(got[4..8].try_into().unwrap()),
+            ]
         });
-        let err = negotiate_version(&mut ar, &mut aw).await.unwrap_err();
-        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
-        // And our node did announce its real version to the peer.
-        assert_eq!(impostor.await.unwrap(), PROTOCOL_VERSION);
+        let res = negotiate_version(&mut ar, &mut aw).await;
+        (res, peer.await.unwrap())
+    }
+
+    #[tokio::test]
+    async fn version_negotiation_rejects_disjoint_ranges() {
+        // M192/M221: a peer whose range is entirely above ours (e.g. [v+1, v+1]) shares no
+        // common version ⇒ rejected with InvalidData, not a silent mis-parse. We still
+        // announced our real range to the peer.
+        let (res, peer_saw) =
+            negotiate_against_peer_range(PROTOCOL_VERSION + 1, PROTOCOL_VERSION + 1).await;
+        assert_eq!(res.unwrap_err().kind(), io::ErrorKind::InvalidData);
+        assert_eq!(peer_saw, [MIN_WIRE_VERSION, PROTOCOL_VERSION]);
     }
 
     #[tokio::test]
     async fn version_negotiation_rejects_older_wire_gen() {
-        // SEC-05 (re-verify): a peer on an OLDER wire generation (e.g. B6 = v2 vs our
-        // B7 = v3) announces `PROTOCOL_VERSION - 1` and is rejected at the handshake,
-        // not after mis-parsing frames. Guards the "bump version on every wire break"
-        // invariant that B6/B7 previously violated (both shipped as v1).
-        let (a, b) = tokio::io::duplex(64);
-        let (mut ar, mut aw) = tokio::io::split(a);
-        let (mut br, mut bw) = tokio::io::split(b);
-        let older = tokio::spawn(async move {
-            bw.write_all(&(PROTOCOL_VERSION - 1).to_be_bytes())
-                .await
-                .unwrap();
-            bw.flush().await.unwrap();
-            let mut got = [0u8; 4];
-            br.read_exact(&mut got).await.unwrap();
-            u32::from_be_bytes(got)
-        });
-        let err = negotiate_version(&mut ar, &mut aw).await.unwrap_err();
-        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
-        assert_eq!(older.await.unwrap(), PROTOCOL_VERSION);
+        // SEC-05/M221: a peer entirely on an OLDER generation ([v-1, v-1], outside our
+        // supported range) is rejected at the handshake rather than after mis-parsing frames.
+        let (res, _) = negotiate_against_peer_range(PROTOCOL_VERSION - 1, PROTOCOL_VERSION - 1).await;
+        assert_eq!(res.unwrap_err().kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[tokio::test]
+    async fn version_negotiation_agrees_on_highest_common() {
+        // M221: overlapping ranges agree on the highest common version. A peer that also
+        // speaks one generation above us ([MIN, PROTOCOL+1]) still agrees on PROTOCOL_VERSION
+        // (our max) — the core of rolling upgrade: a newer peer talks down to our generation.
+        let (res, _) = negotiate_against_peer_range(MIN_WIRE_VERSION, PROTOCOL_VERSION + 1).await;
+        assert_eq!(res.unwrap(), PROTOCOL_VERSION);
+        // A peer that also speaks one generation below us ([MIN-… , PROTOCOL]) likewise agrees
+        // on PROTOCOL_VERSION.
+        let lo = MIN_WIRE_VERSION.saturating_sub(1);
+        let (res2, _) = negotiate_against_peer_range(lo, PROTOCOL_VERSION).await;
+        assert_eq!(res2.unwrap(), PROTOCOL_VERSION);
     }
 
     // --- M40: authenticated handshake (pure core) -------------------------------
