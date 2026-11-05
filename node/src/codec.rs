@@ -362,10 +362,17 @@ pub fn decode_certified_header(buf: &[u8]) -> Result<CertifiedHeader, CodecError
         return Err(CodecError::UnexpectedEof);
     }
     let n_updates = u64::from_be_bytes(buf[276..284].try_into().unwrap());
-    let header_len = 284 + (n_updates as usize) * 48 + 320; // 604 base + 48 per update
-    if buf.len() < header_len {
-        return Err(CodecError::UnexpectedEof);
-    }
+    // SEC/fuzz: `n_updates` is attacker-controlled — compute the length in checked arithmetic so
+    // a huge value can't overflow `usize` (a debug/overflow-checked panic, caught by cargo-fuzz).
+    // Any overflow, or a length past the buffer, is a truncated/malformed header ⇒ `UnexpectedEof`
+    // (no allocation: `header_len` is bounded by `buf.len()`).
+    let header_len = match (n_updates as usize)
+        .checked_mul(48)
+        .and_then(|u| u.checked_add(284 + 320))
+    {
+        Some(len) if len <= buf.len() => len, // 604 base + 48 per update
+        _ => return Err(CodecError::UnexpectedEof),
+    };
     let header = decode_header(&buf[..header_len])?;
     let cert = decode_commit(&buf[header_len..])?;
     Ok(CertifiedHeader { header, cert })
@@ -3229,6 +3236,22 @@ mod tests {
             decode_certified_header(&extra),
             Err(CodecError::TrailingBytes)
         ));
+    }
+
+    #[test]
+    fn decode_certified_header_rejects_overflowing_n_updates_without_panicking() {
+        // Regression (cargo-fuzz `decode_all`): `n_updates` (buf[276..284]) is attacker-
+        // controlled; `284 + n_updates*48 + 320` overflowed `usize` and panicked before the
+        // length check. A huge count must now return `UnexpectedEof`, never panic.
+        let mut buf = vec![0u8; 284]; // the minimum fixed-prefix length
+        buf[276..284].copy_from_slice(&u64::MAX.to_be_bytes()); // n_updates = 2^64-1
+        assert!(matches!(
+            decode_certified_header(&buf),
+            Err(CodecError::UnexpectedEof)
+        ));
+        // A merely-large count that still overflows when ×48 is likewise rejected, not panicked.
+        buf[276..284].copy_from_slice(&(usize::MAX as u64 / 8).to_be_bytes());
+        assert!(decode_certified_header(&buf).is_err());
     }
 
     #[test]
