@@ -124,12 +124,50 @@ submit() {
   fi
 }
 
+# M228: governance demo. propose/vote author+sign a gov op (encode-gov-*) and POST it to the
+# node's /gov/* endpoint; gov shows the live proposal list. NOTE: a proposal *passing* needs
+# voters carrying stake (bonds) AND reputation (reviewer) weight — the default demo accounts
+# have neither, so a proposal will REGISTER and record votes but not pass (correct, safe
+# governance behavior). It still demonstrates the full authoring → submit → read path.
+gov_submit() {  # $1=endpoint-path  $2=opfile  $3=nonce-file
+  local out; out="$("$BIN" rpc --config "$D/node.toml" --path "$1" --post "$2" 2>&1)"; echo "$out"
+  # success returns the op hash (bare 64-hex in text, or {"hash":…} in json); bump nonce then.
+  if echo "$out" | grep -qiE '[0-9a-f]{64}|"hash"'; then
+    echo $(( $(cat "$3" 2>/dev/null || echo 0) + 1 )) > "$3"
+  fi
+}
+propose() {
+  running "$D/node.pid" || { echo "node not running (./cmd up)"; exit 1; }
+  local acct="${1:-1}"; local param="${2:-base_emission=9000000}"; local period="${3:-5}"
+  local seed="$D/keys/acct${acct}.seed"; [ -f "$seed" ] || { echo "no seed for account $acct"; exit 1; }
+  local nf="$D/nonce.$acct"; local n; n="$(cat "$nf" 2>/dev/null || echo 0)"
+  "$BIN" encode-gov-proposal --key-file "$seed" --out "$D/gov.bin" --proposer "$acct" \
+    --param "$param" --voting-period "$period" --nonce "$n" >/dev/null
+  gov_submit /gov/proposal "$D/gov.bin" "$nf"
+  echo "→ proposal from account $acct ($param, voting_period=$period). It registers on the next"
+  echo "  block; see the explorer Governance page or ./cmd gov. (Won't pass without weighted voters.)"
+}
+vote() {
+  running "$D/node.pid" || { echo "node not running (./cmd up)"; exit 1; }
+  local acct="${1:-1}"; local pid="${2:-}"; local approve="${3:-true}"
+  [ -n "$pid" ] || { echo "usage: ./cmd vote [acct] <proposal-id> [true|false]"; exit 1; }
+  local seed="$D/keys/acct${acct}.seed"; local nf="$D/nonce.$acct"; local n; n="$(cat "$nf" 2>/dev/null || echo 0)"
+  "$BIN" encode-gov-vote --key-file "$seed" --out "$D/gov.bin" --proposal-id "$pid" \
+    --voter "$acct" --approve "$approve" --nonce "$n" >/dev/null
+  gov_submit /gov/vote "$D/gov.bin" "$nf"
+  echo "→ vote ($approve) on proposal $pid from account $acct."
+}
+gov() { curl -s --max-time 2 "http://127.0.0.1:$RPC_PORT/proposals" || true; echo; }
+
 case "${1:-up}" in
   up|"") up ;;
   down) down ;;
   reset) down; rm -rf "$D"; echo "wiped .localnet" ;;
   status) status ;;
   submit) submit "${2:-1}" ;;
+  propose) propose "${2:-1}" "${3:-base_emission=9000000}" "${4:-5}" ;;
+  vote) vote "${2:-1}" "${3:-}" "${4:-true}" ;;
+  gov) gov ;;
   logs) tail -f "$D/node.log" ;;
-  *) echo "usage: ./cmd [up|down|reset|status|submit [acct]|logs]" >&2; exit 2 ;;
+  *) echo "usage: ./cmd [up|down|reset|status|submit [acct]|propose [acct param period]|vote [acct id approve]|gov|logs]" >&2; exit 2 ;;
 esac
