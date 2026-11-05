@@ -11,7 +11,8 @@ testnet/up.sh             # 2) 后台启动全部验证人(SIGTERM 优雅关闭)
 testnet/smoke.sh 3        # 3) 所有节点到达高度 3 且同一区块哈希(一条链)
 testnet/recover.sh 5      # 4) 备份/恢复 + 快照 fast-sync 演练(§11「备份/恢复演练」)
 testnet/chaos.sh          # 5) 混沌/故障注入:崩溃容错 + 崩溃恢复 + 失去法定数的安全停摆 + 恢复
-testnet/down.sh           # 6) 优雅停止
+testnet/soak.sh           # 6) 长跑稳定性:活性 + 不分叉/不漂移 + 供应守恒且跨节点一致 + 无泄漏 + 干净日志
+testnet/down.sh           # 7) 优雅停止
 ```
 
 ### 混沌演练(M231,`chaos.sh`)
@@ -30,6 +31,22 @@ testnet/down.sh           # 6) 优雅停止
 > 两者的轮次号**不经 gossip 自动对齐**,存活节点仍卡住(`consensus_active=1` 但高度冻结)。**安全性
 > 始终不破**(不分叉、正确停摆),仅**自动活性恢复不完整**;全量重启让每个节点回到待定高度的干净
 > 轮次即恢复。`chaos.sh` 的 Phase B 据此做全量重启。属共识线待修项(轮次追赶),非安全缺陷。
+
+### 长跑稳定性 soak(M232,`soak.sh`)
+
+对**运行中**的测试网持续采样一段时间,每个采样点断言会被泄漏/时钟漂移/状态分叉/日志暴涨
+打破的不变量:**活性**(每节点高度严格递增,无停摆)、**不分叉/不漂移**(所有节点在滞后高度上
+区块哈希 **与 state_root 均一致**)、**供应守恒且跨节点一致**(`/supply conserved=true` 且 supply
+数值全网相同)、**无内存泄漏**(每节点 RSS 增幅 < `LEAK_PCT%`)、**干净日志**(运行期间无
+error/panic 行)。
+
+```sh
+testnet/soak.sh [DURATION_S=180] [INTERVAL_S=10] [LAG=2] [LEAK_PCT=50]
+```
+
+无负载(依赖 `create_empty_blocks` 心跳,数千块无需造 tx)。**tx 负载 soak** 另需明文种子账户
+(测试网发的是加密 keystore,`encode-tx --key-file` 不吃 keystore),列为后续项。真正的上线前
+soak 应为**小时/天级**;本脚本是可重复的**分钟级门禁**。
 
 默认 **4 验证人**(id 21–24,容 1 拜占庭)+ **3 个有余额账户**(id 1–3,tx 作者)+
 3 个评议人(id 10–12)。`gen.sh -n 7 -a 5` 改规模;`--force` 重新生成(**销毁**旧密钥)。

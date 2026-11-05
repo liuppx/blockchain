@@ -223,9 +223,11 @@ RUSTFLAGS="-D warnings" cargo test --release --no-run     # 零编译告警
    多路目标 + 提交的种子语料,nightly CI advisory 跑;见 `node/fuzz/README.md`)。**M231 起**补
    `testnet/chaos.sh`:对 4 验证人测试网注入**崩溃容错**(杀少数、存活 >2/3 继续出块且不分叉)、
    **崩溃恢复**(重启节点追回同一 head)、**失去法定数的安全停摆**(在线 < 法定数时停摆而非分叉)
-   + 恢复——均为 loopback 可达场景(无需 root/iptables)。仍无**真正的网络分区注入**(iptables/
-   tc 延迟·丢包)、**活体拜占庭注入**(进程外双签 → 证据 → 罚没的端到端)、**长跑 soak**(小时/天级
-   内存·磁盘增长、状态不漂移),与**超 loopback 规模**测。见 §10.10 的活性恢复边界。
+   + 恢复——均为 loopback 可达场景(无需 root/iptables)。**M232 起**补 `testnet/soak.sh`:
+   长跑稳定性 soak,每采样点断言活性(高度严格递增)、不分叉/不漂移(跨节点区块哈希 **+ state_root**
+   一致)、供应守恒且跨节点一致、无内存泄漏(RSS 增幅有界)、干净日志。仍无**真正的网络分区注入**
+   (iptables/tc 延迟·丢包)、**活体拜占庭注入**(进程外双签 → 证据 → 罚没的端到端)、**tx 负载下的
+   长跑**(soak 目前无负载;负载需明文种子账户)、与**超 loopback 规模**测。见 §10.10 的活性恢复边界。
 6. **`cargo-audit` 当前 advisory**(依赖树未确认无 RUSTSEC)。
 7. **滚动升级未支持**(只能干净拒连不兼容 peer)。设计见 [`docs/design/rolling-upgrade.md`](design/rolling-upgrade.md)(设计稿,待实现)。
 8. **弱主观性检查点分发**是运维事项(协议只提供验证基元)。
