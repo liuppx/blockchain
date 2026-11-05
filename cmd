@@ -24,12 +24,14 @@ build() {
 }
 
 mint() { "$BIN" keygen --encrypt --out "$1" | awk '$1=="pubkey"{print $2}'; }
+mint_seed() { "$BIN" keygen --out "$1" | awk '$1=="pubkey"{print $2}'; }  # plaintext seed (for encode-tx)
 
 gen() {
   mkdir -p "$D/keys" "$D/data"; chmod 700 "$D"
   echo "generating single-node genesis + config in .localnet/ …"
   local vpk; vpk="$(mint "$D/keys/val21.json")"
-  local a1 a2 a3; a1="$(mint "$D/keys/acct1.json")"; a2="$(mint "$D/keys/acct2.json")"; a3="$(mint "$D/keys/acct3.json")"
+  # Accounts as plaintext seed files so `./cmd submit` can author+sign txs (encode-tx needs a seed).
+  local a1 a2 a3; a1="$(mint_seed "$D/keys/acct1.seed")"; a2="$(mint_seed "$D/keys/acct2.seed")"; a3="$(mint_seed "$D/keys/acct3.seed")"
   {
     echo "# local single-node dev genesis (M200 calibration values)"
     echo "base_emission_micro    = 8000000"
@@ -99,11 +101,35 @@ status() {
   echo "supply : $s"
 }
 
+# Author + submit an ACCEPTED knowledge submission from an account (default 1), so the
+# explorer shows real content: a non-empty block → a minted cNFT + a cognitive-graph node +
+# the author's earnings. Embedding is a unit vector that rotates by nonce to stay novel
+# (novelty drives ΔK > 0 ⇒ accept). Reviews/replication mirror the demo's accepted recipe.
+submit() {
+  running "$D/node.pid" || { echo "node not running (./cmd up)"; exit 1; }
+  local acct="${1:-1}"; local seed="$D/keys/acct${acct}.seed"
+  [ -f "$seed" ] || { echo "no seed for account $acct (./cmd reset to regenerate)"; exit 1; }
+  local nf="$D/nonce.$acct"; local n; n="$(cat "$nf" 2>/dev/null || echo 0)"
+  local dim=$(( n % 8 )); local emb=""
+  for i in 0 1 2 3 4 5 6 7; do [ "$i" = "$dim" ] && emb="$emb${emb:+,}1" || emb="$emb${emb:+,}0"; done
+  "$BIN" encode-tx --key-file "$seed" --out "$D/tx.bin" --author "$acct" --domain 1 \
+    --embedding "$emb" --review 10:0.9 --review 11:0.9 --review 12:0.85 \
+    --repl-success 3 --repl-total 3 --timestamp-days 1.0 --stake 2000000 --fee 0 --nonce "$n" >/dev/null
+  if "$BIN" submit-tx --config "$D/node.toml" --tx "$D/tx.bin"; then
+    echo $((n + 1)) > "$nf"
+    echo "→ submitted from account $acct (nonce $n). Watch http://localhost:$EXPLORER_PORT —"
+    echo "  within a block or two: a new tx, a minted cNFT, and a cognitive-graph node."
+  else
+    echo "submit failed (is the RPC up? ./cmd status)"; exit 1
+  fi
+}
+
 case "${1:-up}" in
   up|"") up ;;
   down) down ;;
   reset) down; rm -rf "$D"; echo "wiped .localnet" ;;
   status) status ;;
+  submit) submit "${2:-1}" ;;
   logs) tail -f "$D/node.log" ;;
-  *) echo "usage: ./cmd [up|down|reset|status|logs]" >&2; exit 2 ;;
+  *) echo "usage: ./cmd [up|down|reset|status|submit [acct]|logs]" >&2; exit 2 ;;
 esac

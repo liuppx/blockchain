@@ -389,11 +389,12 @@ python3 sim/run.py --compare  # baseline 场景 Python vs Rust 后端对比
 
 ```sh
 ./cmd           # 一键:构建 → 起单节点本地网(心跳出块)+ 区块浏览器;打印 URL
+./cmd submit    # 从账户 1 提交一笔知识提交 → 被接受后铸出 cNFT + 认知图谱节点 + 作者增发
 ./cmd status    # 看高度 / 供应
 ./cmd down      # 停止   ·   ./cmd reset 清空 .localnet 重来
 ```
 
-起好后打开 **http://localhost:8080**(区块浏览器,见 [`tools/explorer/`](tools/explorer/README.md))即可实时看区块、交易、账户、验证人、治理、供应。节点 RPC 在 `127.0.0.1:9221`,指标在 `:9121/metrics`。多验证人测试网见 [`testnet/`](testnet/README.md)。
+起好后打开 **http://localhost:8080**(区块浏览器,见 [`tools/explorer/`](tools/explorer/README.md))即可实时看区块、交易、账户、验证人、治理、cNFT、供应;`./cmd submit` 后可在 **cNFTs / Account / Blocks** 页看到新内容。节点 RPC 在 `127.0.0.1:9221`,指标在 `:9121/metrics`。多验证人测试网见 [`testnet/`](testnet/README.md)。
 
 ```bash
 cd node && cargo run --release --bin node -- demo    # 内存演示链
