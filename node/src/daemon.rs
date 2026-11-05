@@ -9347,7 +9347,10 @@ mod tests {
     }
 
     // M221: play the "peer" by writing a forged [min,max] range and reading our side's.
-    async fn negotiate_against_peer_range(peer_min: u32, peer_max: u32) -> (io::Result<u32>, [u32; 2]) {
+    async fn negotiate_against_peer_range(
+        peer_min: u32,
+        peer_max: u32,
+    ) -> (io::Result<u32>, [u32; 2]) {
         let (a, b) = tokio::io::duplex(64);
         let (mut ar, mut aw) = tokio::io::split(a);
         let (mut br, mut bw) = tokio::io::split(b);
@@ -9383,7 +9386,8 @@ mod tests {
     async fn version_negotiation_rejects_older_wire_gen() {
         // SEC-05/M221: a peer entirely on an OLDER generation ([v-1, v-1], outside our
         // supported range) is rejected at the handshake rather than after mis-parsing frames.
-        let (res, _) = negotiate_against_peer_range(PROTOCOL_VERSION - 1, PROTOCOL_VERSION - 1).await;
+        let (res, _) =
+            negotiate_against_peer_range(PROTOCOL_VERSION - 1, PROTOCOL_VERSION - 1).await;
         assert_eq!(res.unwrap_err().kind(), io::ErrorKind::InvalidData);
     }
 

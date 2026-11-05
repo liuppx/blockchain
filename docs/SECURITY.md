@@ -55,7 +55,7 @@ RUSTFLAGS="-D warnings" cargo test --release --no-run     # 零编译告警
 # 其中位锚点测(见 §6)验证共识浮点逐位一致。
 ```
 
-- 测试总数:**node 754(696 lib + 58 bin)+ engine 11**,全绿。2 个 `#[ignore]`(config 的
+- 测试总数:**node 755(697 lib + 58 bin)+ engine 11**,全绿。2 个 `#[ignore]`(config 的
   环境依赖测;M213 的 `seed_fuzz_corpus` 语料生成器,均非安全相关)。
 - `unsafe`:**全仓非测试代码 0 处**(`grep -rn unsafe engine/src node/src`)。
 - 无 `cargo-audit` 门禁(当前 advisory,依赖树未确认无 RUSTSEC —— 见 §10)。
@@ -194,7 +194,10 @@ RUSTFLAGS="-D warnings" cargo test --release --no-run     # 零编译告警
 - **区块/头 wire**:B2 → B3(M171 桥 unbond)→ B4(M179 密钥轮换)→ B5(M185 `contributions_root`
   前缀根)→ B6(M194 治理 op 尾承诺)→ **B7(SEC-05 `unbonding_root` 前缀根)**。per-body 承诺尾
   追加(前缀稳定);B5/B7 加前缀根(硬断)。`decode_certified_header` 固定前缀 **284B** + 10×32B
-  承诺尾。M192 起握手协商 `PROTOCOL_VERSION`,不匹配**显式拒连**(不再静默 mis-parse)。
+  承诺尾。M192 起握手协商 `PROTOCOL_VERSION`,不匹配**显式拒连**(不再静默 mis-parse);
+  **M221 起协商为版本区间** `[MIN_WIRE_VERSION, PROTOCOL_VERSION]`(当前均为 3),取双方最高公共
+  版本、无交集则拒连——为滚动升级铺路(见 [`docs/design/rolling-upgrade.md`](design/rolling-upgrade.md);
+  握手由 4 字节单值改 8 字节区间是一次性引导破坏)。
 - **快照版本**:`SNAPSHOT_VERSION` 当前 **5**(v3 加 cNFT、v4 加 time_decay、v5 加治理提案)。
   旧版严格拒绝。
 - **升级**:当前只支持"同版本运行 / 异版本干净拒连",**不支持多版本并存滚动升级**(需多 wire
