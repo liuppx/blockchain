@@ -1,7 +1,12 @@
 # 设计:滚动升级 / Rolling upgrade (multi-wire) — production-readiness §10 #7
 
 > 状态:**设计稿**,供评审后分片实现。对应 [`docs/SECURITY.md` §10 第 7 项](../SECURITY.md)
-> 与 DEPLOYMENT §9「不支持多版本并存滚动升级」。**本文不改代码。**
+> 与 DEPLOYMENT §9「不支持多版本并存滚动升级」。
+>
+> **实现进度**:**S1 已落地(M221)**——传输层版本**区间协商**(`[MIN_WIRE_VERSION,
+> PROTOCOL_VERSION]`,取最高公共版本,无交集拒连),替代 M192 的单值严格相等。当前区间 `[3,3]`
+> ⇒ 功能等价,但握手由 4 字节改 8 字节(一次性引导破坏)。剩余 S2–S4(按高度解码分派、激活机制、
+> 首次 B8 滚动升级演练)待 real wire 升级需求时推进。
 
 ## 1. 动机
 
@@ -92,9 +97,12 @@
 
 ## 9. 分片实现计划
 
-- **S1(版本区间,零 wire 破坏)**:`MIN_WIRE/MAX_WIRE` + `negotiate_version` 改区间协商 +
-  `GossipMsg` 版本化(当前仅一版,故行为不变);测试同版本/区间相交/不相交。**一次性握手破坏**
-  (旧节点发 4 字节单值 vs 新发 8 字节区间)——与 M192 同性质,是引导协商的那一次破。
+- **S1(版本区间,零 wire 破坏)✅ M221**:`MIN_WIRE_VERSION` + `negotiate_version` 改区间协商
+  (写 `[MIN_WIRE_VERSION, PROTOCOL_VERSION]`、读对端、取最高公共版本、无交集 `InvalidData` 拒连、
+  返回协商版本供 S2 选 gossip 编解码)。当前区间 `[3,3]` ⇒ 功能等价。一次性握手破坏(4→8 字节)
+  同 M192 性质。回归:`version_negotiation_{accepts_matching_peers,agrees_on_highest_common,
+  rejects_disjoint_ranges,rejects_older_wire_gen}`;localnet/daemon 集成测试经真实 `handle_conn`
+  仍收敛。
 - **S2(按高度解码分派)**:`decode_block`/`decode_certified_header` 接 `height`(或代际),引入
   代际表;当前仅 B7,分派表单条目,行为不变;为将来新增代际留位。
 - **S3(激活机制)**:genesis `[[upgrades]]` 时刻表解析 + `seal`/apply 按 H\* 选编码;(可选)治理
