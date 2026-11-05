@@ -1,54 +1,10 @@
-<!doctype html>
-<html lang="en">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>zhixing — block explorer (L1)</title>
-<style>
-  :root { --bg:#0d1117; --panel:#161b22; --line:#30363d; --fg:#e6edf3; --mut:#8b949e; --acc:#58a6ff; --ok:#3fb950; --bad:#f85149; }
-  * { box-sizing:border-box; }
-  body { margin:0; background:var(--bg); color:var(--fg); font:14px/1.5 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace; }
-  header { background:var(--panel); border-bottom:1px solid var(--line); padding:10px 16px; display:flex; gap:10px; align-items:center; flex-wrap:wrap; }
-  header h1 { font-size:16px; margin:0 12px 0 0; }
-  input, button { background:#0d1117; color:var(--fg); border:1px solid var(--line); border-radius:6px; padding:6px 10px; font:inherit; }
-  button { cursor:pointer; } button:hover { border-color:var(--acc); }
-  #rpc { width:230px; }
-  main { padding:16px; max-width:1100px; margin:0 auto; }
-  .grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(170px,1fr)); gap:10px; margin-bottom:16px; }
-  .card { background:var(--panel); border:1px solid var(--line); border-radius:8px; padding:12px; }
-  .card .k { color:var(--mut); font-size:12px; } .card .v { font-size:18px; word-break:break-all; }
-  section { background:var(--panel); border:1px solid var(--line); border-radius:8px; margin-bottom:16px; }
-  section h2 { margin:0; padding:10px 14px; border-bottom:1px solid var(--line); font-size:14px; }
-  .body { padding:12px 14px; }
-  table { width:100%; border-collapse:collapse; } td,th { text-align:left; padding:6px 8px; border-bottom:1px solid var(--line); font-weight:normal; }
-  th { color:var(--mut); font-size:12px; }
-  a.link { color:var(--acc); cursor:pointer; text-decoration:none; } a.link:hover { text-decoration:underline; }
-  .mut { color:var(--mut); } .mono { word-break:break-all; }
-  .tabs { display:flex; gap:6px; flex-wrap:wrap; margin-bottom:12px; }
-  .tabs button.on { border-color:var(--acc); color:var(--acc); }
-  .err { color:var(--bad); } .hash { color:var(--mut); }
-  kv { display:block; } kv b { color:var(--mut); font-weight:normal; display:inline-block; min-width:140px; }
-</style>
-</head>
-<body>
-<header>
-  <h1>zhixing explorer</h1>
-  <input id="rpc" value="http://127.0.0.1:9221" title="node [rpc] listen address">
-  <button onclick="connect()">Connect</button>
-  <span id="conn" class="mut"></span>
-</header>
-<main>
-  <div class="grid" id="overview"></div>
-
-  <div class="tabs" id="tabs"></div>
-  <section id="view"><div class="body mut">Connect to a node's RPC endpoint to begin.</div></section>
-</main>
-
-<script>
 "use strict";
-// Minimal, dependency-free L1 block explorer. Talks directly to a node's read RPC
-// (CORS is enabled on the node, M223), parsing the JSON representation of each endpoint.
-let RPC = "http://127.0.0.1:9221";
+// zhixing block explorer (L1) — dependency-free. Reads a node's JSON RPC. The RPC base
+// defaults to "/rpc" (this project's server proxies it to the node, avoiding CORS/mixed
+// content); you can also point it straight at a node (e.g. http://127.0.0.1:9221) when the
+// node's CORS is on (M223). Field names track `daemon.rs`'s `json_*` renderers; list
+// endpoints use the {total,cursor,items:[…]} page envelope; u64s are lossless quoted strings.
+let RPC = "/rpc";
 let timer = null;
 
 async function j(path) {
@@ -63,7 +19,7 @@ function setView(html) { el("view").innerHTML = "<div class='body'>" + html + "<
 function card(k, v) { return `<div class='card'><div class='k'>${k}</div><div class='v'>${v}</div></div>`; }
 
 async function connect() {
-  RPC = el("rpc").value.replace(/\/+$/, "");
+  RPC = el("rpc").value.replace(/\/+$/, "") || "/rpc";
   try {
     await refreshOverview();
     el("conn").textContent = "connected"; el("conn").className = "mut";
@@ -92,10 +48,11 @@ const TABS = [
   ["validators", "Validators"], ["proposals", "Governance"], ["cnfts", "cNFTs"], ["supply", "Supply"],
 ];
 function renderTabs() {
-  el("tabs").innerHTML = TABS.map(([k,l]) => `<button id='tab-${k}' onclick="showTab('${k}')">${l}</button>`).join("");
+  el("tabs").innerHTML = TABS.map(([k,l]) => `<button id='tab-${k}' data-tab='${k}'>${l}</button>`).join("");
+  el("tabs").querySelectorAll("button").forEach(b => b.addEventListener("click", () => showTab(b.dataset.tab)));
 }
 function showTab(k) {
-  TABS.forEach(([t]) => el("tab-"+t).className = (t===k ? "on" : ""));
+  TABS.forEach(([t]) => { const b = el("tab-"+t); if (b) b.className = (t===k ? "on" : ""); });
   ({ blocks:tabBlocks, tx:tabTx, account:tabAccount, validators:tabValidators,
      proposals:tabProposals, cnfts:tabCnfts, supply:tabSupply })[k]();
 }
@@ -108,13 +65,14 @@ async function tabBlocks() {
   for (let hgt = tip; hgt >= from; hgt--) {
     try {
       const b = await j("/block/" + hgt);
-      rows.push(`<tr><td><a class='link' onclick="showBlock(${hgt})">#${esc(b.height)}</a></td>
+      rows.push(`<tr><td><a class='link' data-blk='${hgt}'>#${esc(b.height)}</a></td>
         <td class='hash'>${esc(short(b.hash))}</td><td>${esc(b.proposer)}</td><td>${esc(b.txs)}</td>
         <td class='mut'>${esc(b.timestamp_days)}</td></tr>`);
     } catch (e) { /* pruned/absent: skip */ }
   }
   setView(`<h2 style='border:0;padding:0 0 8px'>Latest blocks (tip #${tip})</h2>
     <table><tr><th>height</th><th>hash</th><th>proposer</th><th>txs</th><th>ts(days)</th></tr>${rows.join("")}</table>`);
+  el("view").querySelectorAll("a[data-blk]").forEach(a => a.addEventListener("click", () => showBlock(Number(a.dataset.blk))));
 }
 
 async function showBlock(hgt) {
@@ -124,9 +82,9 @@ async function showBlock(hgt) {
     let txs = [];
     try { txs = (await j(`/block/${hgt}/txs`)).items || []; } catch (e) {}
     const txrows = txs.length ? txs.map(t =>
-      `<tr><td><a class='link' onclick="showTxHash('${esc(t.hash)}')">${esc(short(t.hash))}</a></td><td>${esc(t.author)}</td></tr>`
+      `<tr><td><a class='link' data-tx='${esc(t.hash)}'>${esc(short(t.hash))}</a></td><td>${esc(t.author)}</td></tr>`
     ).join("") : "<tr><td class='mut' colspan=2>(empty block)</td></tr>";
-    setView(`<p><a class='link' onclick="showTab('blocks')">← blocks</a></p>
+    setView(`<p><a class='link' id='back'>← blocks</a></p>
       <h2 style='border:0;padding:0 0 8px'>Block #${esc(b.height)}</h2>
       <kv><b>hash</b><span class='mono'>${esc(b.hash)}</span></kv>
       <kv><b>prev_hash</b><span class='mono hash'>${esc(b.prev_hash)}</span></kv>
@@ -138,16 +96,18 @@ async function showBlock(hgt) {
       <kv><b>stake_ops / evidence / val_updates</b>${esc(b.stake_ops)} / ${esc(b.evidence)} / ${esc(b.validator_updates)}</kv>
       <h2 style='border:0;padding:12px 0 8px'>Transactions</h2>
       <table><tr><th>hash</th><th>author</th></tr>${txrows}</table>`);
+    el("back").addEventListener("click", () => showTab("blocks"));
+    el("view").querySelectorAll("a[data-tx]").forEach(a => a.addEventListener("click", () => showTxHash(a.dataset.tx)));
   } catch (e) { setView("<span class='err'>" + esc(e.message) + "</span>"); }
 }
 
 function tabTx() {
   setView(`<kv><b>tx hash (64-hex)</b><input id='txq' size='70' placeholder='content hash'></kv>
-    <p><button onclick="showTxHash(el('txq').value.trim())">Look up</button></p>
+    <p><button id='txgo'>Look up</button></p>
     <div id='txout' class='mut'>Enter a committed tx's content hash.</div>`);
+  el("txgo").addEventListener("click", () => showTxHash(el("txq").value.trim()));
 }
 async function showTxHash(h) {
-  const out = () => el("txout") || el("view");
   try {
     const d = await j(`/tx/${h}/detail`);
     const html = `<kv><b>hash</b><span class='mono'>${esc(d.hash)}</span></kv>
@@ -169,14 +129,16 @@ async function showTxHash(h) {
 
 function tabAccount() {
   setView(`<kv><b>account id (u64)</b><input id='acq' size='20' placeholder='e.g. 1'></kv>
-    <p><button onclick="showAccount(el('acq').value.trim())">Look up</button></p>
+    <p><button id='acgo'>Look up</button></p>
     <div id='acout' class='mut'>Enter an account id. Or see the accounts list below.</div>
     <h2 style='border:0;padding:12px 0 8px'>Accounts</h2><div id='aclist' class='mut'>loading…</div>`);
+  el("acgo").addEventListener("click", () => showAccount(el("acq").value.trim()));
   j("/accounts").then(p => {
     const items = p.items || [];
     el("aclist").innerHTML = `<table><tr><th>id</th><th>balance</th><th>accepted</th><th>earned</th></tr>` +
-      items.map(a => `<tr><td><a class='link' onclick="showAccount('${esc(a.id)}')">${esc(a.id)}</a></td>
+      items.map(a => `<tr><td><a class='link' data-acc='${esc(a.id)}'>${esc(a.id)}</a></td>
         <td>${esc(a.balance)}</td><td>${esc(a.accepted)}</td><td>${esc(a.earned_total)}</td></tr>`).join("") + `</table>`;
+    el("aclist").querySelectorAll("a[data-acc]").forEach(a => a.addEventListener("click", () => showAccount(a.dataset.acc)));
   }).catch(e => el("aclist").innerHTML = `<span class='err'>${esc(e.message)}</span>`);
 }
 async function showAccount(id) {
@@ -223,6 +185,7 @@ async function tabSupply() {
       <kv><b>conserved</b>${s.conserved ? "<span style='color:var(--ok)'>yes</span>" : "<span class='err'>NO</span>"}</kv>`);
   } catch (e) { setView(`<span class='err'>${esc(e.message)}</span>`); }
 }
-</script>
-</body>
-</html>
+
+// Wire up the Connect button and auto-connect on load (default "/rpc" proxy).
+document.getElementById("connectBtn").addEventListener("click", connect);
+connect();

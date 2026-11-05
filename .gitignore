@@ -28,6 +28,9 @@ __pycache__/
 # Testnet kit: generated keystores / configs / data dirs / logs (never commit)
 /testnet/out/
 
+# ./cmd single-node local network state (keystores + data + logs; never commit)
+/.localnet/
+
 # YeYing Project local task state
 /.project/
 .playwright-cli

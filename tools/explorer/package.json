@@ -1,0 +1,11 @@
+{
+  "name": "zhixing-explorer",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Lightweight (L1) block explorer for a zhixing node — static UI + zero-dependency RPC proxy.",
+  "bin": { "zhixing-explorer": "server.js" },
+  "scripts": {
+    "start": "node server.js"
+  },
+  "engines": { "node": ">=18" }
+}

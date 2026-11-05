@@ -1,0 +1,23 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>zhixing — block explorer</title>
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+<header>
+  <h1>zhixing explorer</h1>
+  <input id="rpc" value="/rpc" title="node RPC base — '/rpc' uses this app's proxy; or a direct URL like http://127.0.0.1:9221">
+  <button id="connectBtn">Connect</button>
+  <span id="conn" class="mut"></span>
+</header>
+<main>
+  <div class="grid" id="overview"></div>
+  <div class="tabs" id="tabs"></div>
+  <section id="view"><div class="body mut">Connect to a node's RPC endpoint to begin.</div></section>
+</main>
+<script src="app.js"></script>
+</body>
+</html>
