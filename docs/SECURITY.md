@@ -55,7 +55,7 @@ RUSTFLAGS="-D warnings" cargo test --release --no-run     # 零编译告警
 # 其中位锚点测(见 §6)验证共识浮点逐位一致。
 ```
 
-- 测试总数:**node 766(705 lib + 61 bin)+ engine 11**,全绿。2 个 `#[ignore]`(config 的
+- 测试总数:**node 767(706 lib + 61 bin)+ engine 11**,全绿。2 个 `#[ignore]`(config 的
   环境依赖测;M213 的 `seed_fuzz_corpus` 语料生成器,均非安全相关)。
 - `unsafe`:**全仓非测试代码 0 处**(`grep -rn unsafe engine/src node/src`)。
 - 无 `cargo-audit` 门禁(当前 advisory,依赖树未确认无 RUSTSEC —— 见 §10)。
@@ -249,9 +249,13 @@ RUSTFLAGS="-D warnings" cargo test --release --no-run     # 零编译告警
     从 round 0 开始。法定数恢复后两侧轮次号**不经 gossip 自动对齐**(无轮次追赶 / catch-up),存活
     节点仍卡住(`/metrics` 见 `zhixing_consensus_active=1` 但 `zhixing_height` 冻结),即便所有
     peer 已重连。**安全性始终不破**:无 >2/3 不出块 → 不分叉、正确停摆(供应守恒、state_root 一致)。
-    **仅自动活性恢复受影响**。恢复手段明确:**全量重启验证人集**(含存活节点)即让每个节点回到待定
-    高度的干净轮次,链在同一 head 继续(实测 15→16→… 重新收敛)。属**共识线待修项**(需轮次追赶:
-    节点见到更高轮次的 >2f+1 消息时跳转),非安全缺陷;修复为协议改动,风险较高,留作后续。
+    **仅自动活性恢复受影响**。
+    **M238 已修复**:节点在**对端(重)连接时**(`Cmd::Register`)向其重发**自己对待定高度所有轮次的
+    已签名投票**(`RoundState::my_height_votes`)。重启的节点(round 0)由此跨重连对端观察到 `f+1` 个
+    验证人在更高轮次的投票,触发**既有 L55 轮次跳转**跳到活跃轮次——无新的不安全跳转,仅重投已签名的
+    自有票。实测 `chaos.sh` Phase B 现**只重启被杀节点即自动恢复**(连跑两次,链在同一 head 续至 h13/h34),
+    不再需要全量重启。残余:重发在对端"同高度"时才有效;若对端尚落后高度,先走区块同步,随后新一轮
+    连接/重发对齐(混沌实测稳定)。
 11. **绑定即验证人权力,无在运证明 / 无激活延迟 / 无权力爬坡**(M234 tx-load soak 过程中实测暴露)。
     `apply_block_inner` 对**任何**绑定了质押的账户直接 `ValidatorUpdate { id, power: bonds[id] }`——
     即一笔 `bond` 会**立刻**把该账户注入活跃验证人集,权力 = 绑定额。若该账户的密钥**并未运行验证人

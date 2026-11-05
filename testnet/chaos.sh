@@ -9,9 +9,10 @@
 #            victims; each must CATCH BACK UP to the common head (crash-recovery replay).
 #   Phase B  safety under quorum loss — SIGKILL one MORE (now < quorum online). The chain
 #            must HALT (no block commits without >2/3) — proving it stops rather than
-#            FORKS when quorum is lost. Restart the FULL set; the chain must RESUME on the
-#            same chain from where it halted. (Recovery needs a full-set restart, not just
-#            the crashed nodes — see the round-churn finding in SECURITY.md §10.10.)
+#            FORKS when quorum is lost. Restart ONLY the crashed nodes; the chain must
+#            AUTO-RESUME on the same chain without touching the survivors (M238 §10.10:
+#            on (re)connect a node re-delivers its in-flight-height votes so a laggard
+#            skips up to the live round — before M238 this needed a full-set restart).
 #
 # SIGKILL (not SIGTERM) is deliberate: store.rs fsyncs every record (sync_all per block),
 # so a hard kill leaves clean record boundaries and restart replays cleanly — this tests
@@ -132,24 +133,20 @@ if [ "$he" -gt "$hs" ]; then
 fi
 echo "  PASS: chain HALTED below quorum (no commit without >2/3 ⇒ cannot fork)"
 
-# Recovery requires restarting ALL validators, not just the crashed ones. CHAOS FINDING
-# (M231): nodes that stay UP during a quorum-loss halt churn through consensus round
-# changes (round++ on every propose timeout) for the pending height; the crashed nodes
-# restart at round 0. When quorum returns the round numbers do not reconcile over gossip,
-# so the survivors stay wedged (metrics show consensus_active=1 but height frozen) even
-# though all peers reconnect. SAFETY is never violated (no fork, correct halt); only
-# automatic liveness recovery is incomplete. A full-set restart drops every node back to a
-# clean round for the pending height and the chain resumes. See SECURITY.md §10.10.
-echo "  restarting the FULL validator set (survivors too — see round-churn finding) …"
-"$HERE/down.sh" >/dev/null 2>&1 || true
-sleep 1
+# M238 (§10.10): restart ONLY the crashed nodes and expect AUTOMATIC recovery. Before M238
+# this wedged — survivors churned to a high round during the halt, the restarted nodes came
+# back at round 0, and fire-and-forget gossip never replayed the survivors' past votes, so the
+# L55 round-skip could not fire (a full-set restart was the only cure). M238 re-delivers each
+# node's own in-flight-height votes to any (re)connecting peer, so the restarted nodes observe
+# f+1 at the live round and skip up — the chain resumes WITHOUT touching the survivors.
+echo "  restarting ONLY the crashed node(s) [${victimsB[*]}] — survivors stay up (M238 auto-recovery) …"
 "$HERE/up.sh" >/dev/null
-echo "  waiting for the full set to resume + advance to >= $((he + DELTA))"
+echo "  waiting for the chain to auto-resume + advance to >= $((he + DELTA))"
 wait_min_height $((he + DELTA)) "${ids[@]}" \
-  || { echo "FAIL: chain did not resume after quorum restored" >&2; exit 1; }
+  || { echo "FAIL: chain did not auto-recover after quorum restored (§10.10 regression)" >&2; exit 1; }
 fin="$(min_h "${ids[@]}")"
 assert_no_fork "$fin" "${ids[@]}" || { echo "FAIL: forked after resume" >&2; exit 1; }
-echo "  PASS: quorum restored → chain resumed on the SAME chain at height $fin"
+echo "  PASS: quorum restored → chain AUTO-resumed on the SAME chain at height $fin (no full restart)"
 
 echo
 echo "OK: chaos drill passed — crash tolerance (f=$F_LIVE), crash recovery, quorum-loss"

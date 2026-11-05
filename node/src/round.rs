@@ -221,6 +221,29 @@ impl RoundState {
     pub fn round(&self) -> u32 {
         self.round
     }
+
+    /// M238 (§10.10): this node's own signed votes across every round of the current height,
+    /// for re-delivery to a peer that (re)connected mid-height. A node that was down during a
+    /// quorum-loss halt restarts at round 0 while survivors churned to a high round; because
+    /// consensus gossip is fire-and-forget it never hears those past votes, so the existing L55
+    /// round-skip (jump when `f+1` distinct validators are seen at a higher round) can't fire.
+    /// Re-sending our own already-signed votes lets the laggard observe `f+1` across the
+    /// reconnected peers and skip up — no new unsafe jump, just re-delivery. Bounded by the
+    /// round count reached this height (a handful in practice; timeouts grow with round).
+    pub fn my_height_votes(&self) -> Vec<Msg> {
+        let mut out = Vec::new();
+        for per_round in self.prevotes.values() {
+            if let Some(v) = per_round.get(&self.id) {
+                out.push(Msg::Vote(v.clone()));
+            }
+        }
+        for per_round in self.precommits.values() {
+            if let Some(v) = per_round.get(&self.id) {
+                out.push(Msg::Vote(v.clone()));
+            }
+        }
+        out
+    }
     pub fn decided(&self) -> Option<&Commit> {
         self.decided.as_ref()
     }
@@ -1121,6 +1144,62 @@ mod tests {
             e1.hash(),
             e2.hash(),
             "canonical ordering makes evidence dedup-stable"
+        );
+    }
+
+    #[test]
+    fn my_height_votes_collects_own_votes_across_rounds_and_feeds_the_round_skip() {
+        // M238 (§10.10): a node that churns rounds (quorum lost) accumulates its own nil-votes
+        // per round; `my_height_votes` returns exactly those (all self, this height). Re-feeding
+        // them to a laggard at round 0, alongside a second validator's, triggers the L55 skip.
+        let ids = [1u64, 2, 3, 4]; // f+1 = 2
+        let mut churner = RoundState::new(vset(&ids), 1, 5, block(5));
+        let _ = churner.start(&kp(1));
+        // Drive through rounds 0 and 1 with no peer votes ⇒ every step times out to nil.
+        for r in 0..2u32 {
+            let _ = churner.on_timeout(&kp(1), Step::Propose, r);
+            let _ = churner.on_timeout(&kp(1), Step::Prevote, r);
+            let _ = churner.on_timeout(&kp(1), Step::Precommit, r); // → round r+1
+        }
+        assert!(churner.round() >= 2, "churned past round 1");
+
+        let votes = churner.my_height_votes();
+        assert!(!votes.is_empty(), "accumulated own votes");
+        let mut rounds: Vec<u32> = votes
+            .iter()
+            .map(|m| match m {
+                Msg::Vote(v) => {
+                    assert_eq!(v.validator, 1, "only our own votes");
+                    assert_eq!(v.height, 5, "only this height");
+                    v.round
+                }
+                _ => panic!("only votes"),
+            })
+            .collect();
+        rounds.sort_unstable();
+        rounds.dedup();
+        assert!(
+            rounds.contains(&0) && rounds.contains(&1),
+            "votes span the churned rounds: {rounds:?}"
+        );
+
+        // A laggard stuck at round 0 skips ahead once it sees f+1 (=2) validators at a higher
+        // round — exactly what re-delivering our votes (plus one peer's) achieves.
+        let mut laggard = RoundState::new(vset(&ids), 3, 5, block(5));
+        let _ = laggard.start(&kp(3));
+        assert_eq!(laggard.round(), 0);
+        for v in &votes {
+            let _ = laggard.on_message(&kp(3), v.clone());
+        }
+        // one more validator's round-1 precommit → f+1 at round 1
+        let _ = laggard.on_message(
+            &kp(3),
+            Msg::Vote(Vote::signed(2, 5, 1, NIL, VoteType::Precommit, &kp(2))),
+        );
+        assert!(
+            laggard.round() >= 1,
+            "laggard skipped up from round 0 (now {})",
+            laggard.round()
         );
     }
 }

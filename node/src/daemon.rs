@@ -1710,6 +1710,18 @@ async fn run_actor(mut actor: Actor, mut rx: mpsc::UnboundedReceiver<Cmd>) {
                 let _ = tx.send(GossipMsg::Status {
                     height: actor.node.height(),
                 });
+                // M238 (§10.10): if we are running a consensus instance, re-deliver our own
+                // votes for the in-flight height to the (re)connected peer. A peer that was down
+                // during a quorum-loss halt restarts at round 0 while we churned to a high round;
+                // fire-and-forget gossip never replays those past votes, so its L55 round-skip
+                // can't fire and the chain stays wedged until a full restart. Re-sending our
+                // signed votes lets it observe f+1 across reconnected peers and skip up to the
+                // live round — closing the §10.10 auto-recovery gap without any unsafe jump.
+                if let Some(cons) = actor.cons.as_ref() {
+                    for m in cons.round.my_height_votes() {
+                        let _ = tx.send(GossipMsg::Consensus(Box::new(m)));
+                    }
+                }
                 // M39: kick discovery — hand the new peer our address book (incl.
                 // our own listen addr) so it can learn + dial the rest of the mesh.
                 if actor.peer_exchange {
