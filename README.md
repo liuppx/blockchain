@@ -391,6 +391,7 @@ python3 sim/run.py --compare  # baseline 场景 Python vs Rust 后端对比
 ./cmd           # 一键:构建 → 起单节点本地网(心跳出块)+ 区块浏览器;打印 URL
 ./cmd submit    # 账户2 提交知识 → 被接受后铸出 cNFT + 认知图谱节点 + 作者增发
 ./cmd bond      # 账户1(=验证人+评议人)绑定质押,使其治理投票有权重
+./cmd unbond    # 解绑质押 → 进入解绑队列(冷却后释放,见浏览器 Staking 页)
 ./cmd propose 1 base_emission=12000000  # 发起治理提案 · ./cmd vote 1 <id> true 投票 · ./cmd gov 查看
 ./cmd status    # 看高度 / 供应
 ./cmd down      # 停止   ·   ./cmd reset 清空 .localnet 重来

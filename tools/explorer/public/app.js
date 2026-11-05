@@ -45,7 +45,8 @@ async function refreshOverview() {
 
 const TABS = [
   ["blocks", "Blocks"], ["tx", "Tx lookup"], ["account", "Account"], ["graph", "Graph"],
-  ["cnfts", "cNFTs"], ["validators", "Validators"], ["proposals", "Governance"], ["supply", "Supply"],
+  ["cnfts", "cNFTs"], ["validators", "Validators"], ["staking", "Staking"],
+  ["proposals", "Governance"], ["supply", "Supply"],
 ];
 function renderTabs() {
   el("tabs").innerHTML = TABS.map(([k,l]) => `<button id='tab-${k}' data-tab='${k}'>${l}</button>`).join("");
@@ -54,7 +55,7 @@ function renderTabs() {
 function showTab(k) {
   TABS.forEach(([t]) => { const b = el("tab-"+t); if (b) b.className = (t===k ? "on" : ""); });
   ({ blocks:tabBlocks, tx:tabTx, account:tabAccount, graph:tabGraph, validators:tabValidators,
-     proposals:tabProposals, cnfts:tabCnfts, supply:tabSupply })[k]();
+     staking:tabStaking, proposals:tabProposals, cnfts:tabCnfts, supply:tabSupply })[k]();
 }
 
 async function tabBlocks() {
@@ -171,6 +172,28 @@ const tabProposals = () => listTab("/proposals", "Governance proposals", ["id","
   p => `<tr><td>${esc(p.id)}</td><td>${esc(p.param)}</td><td>${esc(p.value)}</td><td>${esc(p.created_height)}</td><td>${esc(p.voting_period)}</td><td>${esc(p.yes)}/${esc(p.votes)}</td></tr>`);
 const tabCnfts = () => listTab("/cnfts", "cNFT contribution certificates", ["node_id","contributor","domain","reward(µ)","height"],
   c => `<tr><td>${esc(c.node_id)}</td><td>${esc(c.contributor)}</td><td>${esc(c.domain)}</td><td>${esc(c.reward_micro)}</td><td>${esc(c.height)}</td></tr>`);
+
+// Staking lifecycle: live bonds (voting-power stake) + the unbonding queue (bonds in
+// their cooldown, released at mature_height). Fields track daemon.rs json_bonds/json_unbonding.
+async function tabStaking() {
+  setView("<span class='mut'>loading…</span>");
+  try {
+    const [bp, up, info] = await Promise.all([ j("/bonds"), j("/unbonding"), j("/info") ]);
+    const bonds = bp.items || [], unb = up.items || [], tip = Number(info.height);
+    const brows = bonds.length ? bonds.map(b =>
+      `<tr><td>${esc(b.validator_id)}</td><td>${esc(b.bonded)}</td></tr>`).join("")
+      : "<tr><td class='mut' colspan=2>(no active bonds — ./cmd bond)</td></tr>";
+    const urows = unb.length ? unb.map(u => {
+      const left = Number(u.mature_height) - tip;
+      return `<tr><td>${esc(u.account)}</td><td>${esc(u.amount)}</td><td>${esc(u.mature_height)}</td>
+        <td class='mut'>${left > 0 ? "in " + left + " blocks" : "matured"}</td></tr>`;
+    }).join("") : "<tr><td class='mut' colspan=4>(unbonding queue empty — ./cmd unbond)</td></tr>";
+    setView(`<h2 style='border:0;padding:0 0 8px'>Active bonds (total ${esc(bp.total_bonded)} µ$COG)</h2>
+      <table><tr><th>validator_id</th><th>bonded(µ)</th></tr>${brows}</table>
+      <h2 style='border:0;padding:16px 0 8px'>Unbonding queue (tip #${tip})</h2>
+      <table><tr><th>account</th><th>amount(µ)</th><th>mature_height</th><th>status</th></tr>${urows}</table>`);
+  } catch (e) { setView(`<span class='err'>${esc(e.message)}</span>`); }
+}
 
 async function tabSupply() {
   setView("<span class='mut'>loading…</span>");

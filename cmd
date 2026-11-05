@@ -138,6 +138,19 @@ bond() {
   echo "→ account $acct bonded $amount µ\$COG. (See the explorer Validators/Supply pages.)"
 }
 
+# M230: unbond stake from an account (default 1) via POST /stake. The amount leaves active
+# bonds and enters the unbonding queue, released after the cooldown (UNBONDING_PERIOD blocks).
+# Watch the explorer Staking page: the entry shows mature_height and counts down to "matured".
+unbond() {
+  running "$D/node.pid" || { echo "node not running (./cmd up)"; exit 1; }
+  local acct="${1:-1}"; local amount="${2:-2000000}"; local seed="$D/keys/acct${acct}.seed"
+  [ -f "$seed" ] || { echo "no seed for account $acct"; exit 1; }
+  "$BIN" encode-stakeop --key-file "$seed" --out "$D/stake.bin" --account "$acct" --kind unbond --amount "$amount" >/dev/null
+  "$BIN" rpc --config "$D/node.toml" --path /stake --post "$D/stake.bin"
+  echo "→ account $acct unbonding $amount µ\$COG. (See the explorer Staking page — it enters the"
+  echo "  unbonding queue and matures after the cooldown.)"
+}
+
 # M228/M229: governance demo. propose/vote author+sign a gov op (encode-gov-*) and POST it to
 # the node's /gov/* endpoint; gov shows the live proposal list. A proposal PASSES when its
 # yes votes clear >2/3 stake AND >1/2 reputation: run `./cmd bond` once (account 1 — the sole
@@ -181,9 +194,10 @@ case "${1:-up}" in
   status) status ;;
   submit) submit "${2:-2}" ;;
   bond) bond "${2:-1}" "${3:-5000000}" ;;
+  unbond) unbond "${2:-1}" "${3:-2000000}" ;;
   propose) propose "${2:-1}" "${3:-base_emission=9000000}" "${4:-5}" ;;
   vote) vote "${2:-1}" "${3:-}" "${4:-true}" ;;
   gov) gov ;;
   logs) tail -f "$D/node.log" ;;
-  *) echo "usage: ./cmd [up|down|reset|status|submit [acct]|bond [acct amount]|propose [acct param period]|vote [acct id approve]|gov|logs]" >&2; exit 2 ;;
+  *) echo "usage: ./cmd [up|down|reset|status|submit [acct]|bond [acct amount]|unbond [acct amount]|propose [acct param period]|vote [acct id approve]|gov|logs]" >&2; exit 2 ;;
 esac
