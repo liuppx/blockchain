@@ -44,8 +44,8 @@ async function refreshOverview() {
 }
 
 const TABS = [
-  ["blocks", "Blocks"], ["tx", "Tx lookup"], ["account", "Account"],
-  ["validators", "Validators"], ["proposals", "Governance"], ["cnfts", "cNFTs"], ["supply", "Supply"],
+  ["blocks", "Blocks"], ["tx", "Tx lookup"], ["account", "Account"], ["graph", "Graph"],
+  ["cnfts", "cNFTs"], ["validators", "Validators"], ["proposals", "Governance"], ["supply", "Supply"],
 ];
 function renderTabs() {
   el("tabs").innerHTML = TABS.map(([k,l]) => `<button id='tab-${k}' data-tab='${k}'>${l}</button>`).join("");
@@ -53,7 +53,7 @@ function renderTabs() {
 }
 function showTab(k) {
   TABS.forEach(([t]) => { const b = el("tab-"+t); if (b) b.className = (t===k ? "on" : ""); });
-  ({ blocks:tabBlocks, tx:tabTx, account:tabAccount, validators:tabValidators,
+  ({ blocks:tabBlocks, tx:tabTx, account:tabAccount, graph:tabGraph, validators:tabValidators,
      proposals:tabProposals, cnfts:tabCnfts, supply:tabSupply })[k]();
 }
 
@@ -163,6 +163,8 @@ async function listTab(path, title, cols, row) {
     setView(`<h2 style='border:0;padding:0 0 8px'>${title}</h2><table><tr>${head}</tr>${body}</table>`);
   } catch (e) { setView(`<span class='err'>${esc(e.message)}</span>`); }
 }
+const tabGraph = () => listTab("/graph", "Cognitive graph nodes (PoK)", ["node_id","domain","dim","embedding"],
+  g => `<tr><td>${esc(g.node_id)}</td><td>${esc(g.domain)}</td><td>${esc(g.dim)}</td><td class='mono'>[${(g.embedding||[]).map(x => esc(x)).join(", ")}]</td></tr>`);
 const tabValidators = () => listTab("/validators", "Validators", ["id","power","pubkey"],
   v => `<tr><td>${esc(v.validator_id)}</td><td>${esc(v.power)}</td><td class='mono hash'>${esc(short(v.pubkey))}</td></tr>`);
 const tabProposals = () => listTab("/proposals", "Governance proposals", ["id","param","value","created","period","yes/votes"],
