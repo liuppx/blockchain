@@ -634,6 +634,12 @@ enum Cmd {
         hash: crate::Hash,
         reply: oneshot::Sender<Option<u64>>,
     },
+    /// M223: read a committed tx's decoded fields + mined height for `/tx/{hash}/detail`.
+    /// `None` ⇒ unknown/uncommitted hash, or the mining block was pruned (snapshot-boot).
+    QueryTxDetail {
+        hash: crate::Hash,
+        reply: oneshot::Sender<Option<(u64, crate::SubmissionTx)>>,
+    },
     /// M113: read a committed block's header + body counts by height for `/block/{height}`.
     /// `None` ⇒ no such committed block (past the tip, or genesis height 0).
     QueryBlock {
@@ -1974,6 +1980,18 @@ async fn run_actor(mut actor: Actor, mut rx: mpsc::UnboundedReceiver<Cmd>) {
                 // M112: O(1) inclusion lookup against the node-local tx index.
                 let _ = reply.send(actor.tx_index.get(&hash).copied());
             }
+            Cmd::QueryTxDetail { hash, reply } => {
+                // M223: inclusion height (tx index) → committed block (O(1) `block_at`) → the
+                // matching tx body. `None` if unknown/uncommitted or the block was pruned.
+                let detail = actor.tx_index.get(&hash).copied().and_then(|h| {
+                    actor
+                        .node
+                        .block_at(h)
+                        .and_then(|b| b.txs.iter().find(|t| t.hash() == hash).cloned())
+                        .map(|t| (h, t))
+                });
+                let _ = reply.send(detail);
+            }
             Cmd::QueryBlock { height, reply } => {
                 // M113: locate the committed block at `height` and summarize its header + body.
                 // M146: O(1) offset-aware lookup via `block_at` (was a linear scan).
@@ -3251,12 +3269,16 @@ fn http_response(status_line: &str, body: &str) -> String {
 /// JSON from the request's `Accept` header, so shared caches must key on it (lest a JSON
 /// body be replayed to a text client, or vice-versa). M82: the response also negotiates on
 /// `Accept-Charset` (UTF-8-only ⇒ possible `406`), so `Vary` widens to `Accept, Accept-Charset`.
+/// M223: every response carries `Access-Control-Allow-Origin: *` so a browser-based block
+/// explorer can read the (public) JSON API cross-origin. The read face is already public;
+/// write endpoints stay bearer-gated server-side (CORS is browser-enforced, not auth).
 fn http_response_ct(status_line: &str, content_type: &str, body: &str) -> String {
     format!(
         "HTTP/1.1 {}\r\n\
          Content-Type: {}\r\n\
          Content-Length: {}\r\n\
          Vary: Accept, Accept-Charset, Accept-Encoding\r\n\
+         Access-Control-Allow-Origin: *\r\n\
          Connection: close\r\n\
          \r\n\
          {}",
@@ -3536,6 +3558,10 @@ enum GetRoute {
     /// content hash mined? Pairs with `/mempool/{hash}` (pending): a wallet polls both to
     /// follow a submission from pool → block. 64-hex hash; malformed ⇒ 404.
     TxHeight(crate::Hash),
+    /// M223: `GET /tx/{hash}/detail` — the decoded fields of a committed tx (author, domain,
+    /// stake, fee, nonce, review/replication counts, timestamp, embedding dimension) plus its
+    /// mined height, for a block explorer. Unknown/uncommitted hash ⇒ 404; malformed ⇒ 404.
+    TxDetail(crate::Hash),
     /// M113: `GET /block/{height}` — a committed block's header + body counts, the on-wire
     /// companion to the `inspect-block` CLI. A height past the tip (or genesis, height 0,
     /// which has no log block) ⇒ 404. Non-numeric ⇒ 404.
@@ -4023,10 +4049,17 @@ fn route_get(path: &str) -> GetRoute {
                     .unwrap_or(GetRoute::NotFound)
             } else if let Some(rest) = p.strip_prefix("/tx/") {
                 // M112: `/tx/{hash}` is a committed-inclusion read — at which height (if any)
-                // was this tx mined? A malformed hash ⇒ 404.
-                parse_hash(rest)
-                    .map(GetRoute::TxHeight)
-                    .unwrap_or(GetRoute::NotFound)
+                // was this tx mined? M223: `/tx/{hash}/detail` returns the decoded tx fields
+                // (for a block explorer). A malformed hash ⇒ 404.
+                if let Some(h) = rest.strip_suffix("/detail") {
+                    parse_hash(h)
+                        .map(GetRoute::TxDetail)
+                        .unwrap_or(GetRoute::NotFound)
+                } else {
+                    parse_hash(rest)
+                        .map(GetRoute::TxHeight)
+                        .unwrap_or(GetRoute::NotFound)
+                }
             } else if let Some(rest) = p.strip_prefix("/block/") {
                 // M113/M114: `/block/{height}` is the header+counts read; `/block/{height}/txs`
                 // (M114) is the tx-reference list. A non-numeric height ⇒ 404; a height with no
@@ -4348,6 +4381,49 @@ fn json_tx_height(height: Option<u64>) -> String {
     }
 }
 
+/// M223: text render of a committed tx's decoded fields for `GET /tx/{hash}/detail`.
+/// Large/u64 ids keep the lossless quoted form in JSON; the raw embedding vector is omitted
+/// (only its dimension), and the signature is omitted (verifiable via SPV, not an explorer field).
+fn format_tx_detail(height: u64, tx: &crate::SubmissionTx) -> String {
+    format!(
+        "height={height}\nhash={}\nauthor={}\ndomain={}\nstake={}\nfee={}\nnonce={}\n\
+         reviews={}\nrepl_success={}\nrepl_total={}\ntimestamp_days={}\nembedding_dims={}",
+        crate::hash::hex(&tx.hash()),
+        tx.author,
+        tx.domain,
+        tx.stake,
+        tx.fee,
+        tx.nonce,
+        tx.reviews.len(),
+        tx.repl_success,
+        tx.repl_total,
+        json_f32(tx.timestamp_days),
+        tx.embedding.len(),
+    )
+}
+
+/// M223: JSON sibling of [`format_tx_detail`]. u64 ids are lossless quoted strings; small
+/// counts are bare numbers; `timestamp_days` is the bit-exact `json_f32`.
+fn json_tx_detail(height: u64, tx: &crate::SubmissionTx) -> String {
+    format!(
+        "{{\"height\":{},\"hash\":{},\"author\":{},\"domain\":{},\"stake\":{},\"fee\":{},\
+         \"nonce\":{},\"reviews\":{},\"repl_success\":{},\"repl_total\":{},\
+         \"timestamp_days\":{},\"embedding_dims\":{}}}",
+        json_u64(height),
+        json_str(&crate::hash::hex(&tx.hash())),
+        json_u64(tx.author),
+        tx.domain,
+        json_u64(tx.stake),
+        json_u64(tx.fee),
+        json_u64(tx.nonce),
+        tx.reviews.len(),
+        tx.repl_success,
+        tx.repl_total,
+        json_f32(tx.timestamp_days),
+        tx.embedding.len(),
+    )
+}
+
 /// M113: a committed block's header + body counts, for the `/block/{height}` read. The full
 /// tx/op bodies are large and self-addressable (`/tx/{hash}`); this is the lightweight index.
 struct BlockSummary {
@@ -4552,6 +4628,7 @@ const READ_ROUTES: &[&str] = &[
     "/bridge/lock/{id}/proof",
     "/mempool/{hash}",
     "/tx/{hash}",
+    "/tx/{hash}/detail",
     "/block/{height}",
     "/block/{height}/txs",
 ];
@@ -7013,6 +7090,26 @@ async fn serve_rpc_conn(
                     match rx.await {
                         Ok(height) => {
                             ok_body(fmt, &format_tx_height(height), &json_tx_height(height))
+                        }
+                        Err(_) => http_response("503 Service Unavailable", "node stopped"),
+                    }
+                }
+            }
+            GetRoute::TxDetail(hash) => {
+                // M223: decoded tx fields + mined height for a block explorer; 404 if the hash
+                // is unknown/uncommitted (or its block was pruned on a snapshot-booted node).
+                let (reply, rx) = oneshot::channel();
+                if cmd.send(Cmd::QueryTxDetail { hash, reply }).is_err() {
+                    http_response("503 Service Unavailable", "node stopped")
+                } else {
+                    match rx.await {
+                        Ok(Some((height, tx))) => ok_body(
+                            fmt,
+                            &format_tx_detail(height, &tx),
+                            &json_tx_detail(height, &tx),
+                        ),
+                        Ok(None) => {
+                            http_response("404 Not Found", "tx not found in any committed block")
                         }
                         Err(_) => http_response("503 Service Unavailable", "node stopped"),
                     }
@@ -12868,6 +12965,46 @@ mod tests {
             "malformed ⇒ 404: {bad}"
         );
 
+        // M223: `/tx/{hash}/detail` returns the decoded fields (text + JSON); CORS header is
+        // present for a browser explorer; an unknown hash ⇒ 404.
+        let detail = get(rpc_addr, &format!("/tx/{h}/detail")).await;
+        assert!(
+            detail.starts_with("HTTP/1.1 200 OK"),
+            "detail status: {detail}"
+        );
+        assert!(
+            detail.contains("Access-Control-Allow-Origin: *"),
+            "CORS header present: {detail}"
+        );
+        let dbody = body_of(&detail);
+        assert!(
+            dbody.contains(&format!("height={committed}")),
+            "detail body: {dbody}"
+        );
+        assert!(dbody.contains("author=1"), "detail author: {dbody}");
+        assert!(dbody.contains("nonce=0"), "detail nonce: {dbody}");
+        assert!(
+            dbody.contains("embedding_dims="),
+            "detail embedding dims: {dbody}"
+        );
+
+        let detail_json = get(rpc_addr, &format!("/tx/{h}/detail?format=json")).await;
+        let jbody = body_of(&detail_json);
+        assert!(
+            jbody.contains("\"author\":\"1\""),
+            "detail json author: {jbody}"
+        );
+        assert!(
+            jbody.contains(&format!("\"height\":\"{committed}\"")),
+            "detail json height: {jbody}"
+        );
+
+        let detail_absent = get(rpc_addr, &format!("/tx/{other}/detail")).await;
+        assert!(
+            detail_absent.starts_with("HTTP/1.1 404 Not Found"),
+            "unknown tx detail ⇒ 404: {detail_absent}"
+        );
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -15545,6 +15682,15 @@ vote_b.validator=5 vote_b.height=9 vote_b.round=2 vote_b.block_hash={b_h} vote_b
             GetRoute::TxHeight(bytes) => assert_eq!(bytes, [0x9au8; 32]),
             _ => panic!("expected TxHeight for a valid 64-hex hash"),
         }
+        // M223: the `/detail` suffix routes to TxDetail with the same hash.
+        match route_get(&format!("/tx/{h}/detail")) {
+            GetRoute::TxDetail(bytes) => assert_eq!(bytes, [0x9au8; 32]),
+            _ => panic!("expected TxDetail for /tx/{{hash}}/detail"),
+        }
+        assert!(
+            matches!(route_get("/tx/bad/detail"), GetRoute::NotFound),
+            "non-hex /detail ⇒ 404"
+        );
         assert!(
             matches!(route_get("/tx/bad"), GetRoute::NotFound),
             "non-hex ⇒ 404"
@@ -15947,6 +16093,7 @@ vote_b.validator=5 vote_b.height=9 vote_b.round=2 vote_b.block_hash={b_h} vote_b
             "/mempool",
             "/block/{height}",
             "/tx/{hash}",
+            "/tx/{hash}/detail",
         ] {
             assert!(text.lines().any(|l| l == p), "text index lists {p}: {text}");
         }
