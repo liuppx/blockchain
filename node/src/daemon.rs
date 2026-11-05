@@ -481,6 +481,12 @@ enum Cmd {
         op: Box<crate::GovVote>,
         reply: oneshot::Sender<Result<Hash, crate::ChainError>>,
     },
+    /// M229: submit a signed bond/unbond `StakeOp` to a running node (stage + flood), the
+    /// write counterpart to the `/bonds` read. Verifies the signature; `Ok(hash)` once staged.
+    SubmitStakeOp {
+        op: Box<crate::StakeOp>,
+        reply: oneshot::Sender<Result<Hash, crate::ChainError>>,
+    },
     /// M115: a pre-flight validation — run `validate_tx` against current committed state
     /// WITHOUT admitting the tx to the mempool. A wallet checks acceptability before
     /// actually submitting. `Ok(())` ⇒ would be accepted; `Err` ⇒ would be rejected (reason).
@@ -1798,6 +1804,28 @@ async fn run_actor(mut actor: Actor, mut rx: mpsc::UnboundedReceiver<Cmd>) {
                         Ok(h)
                     }
                     Err(e) => Err(e),
+                };
+                let _ = reply.send(res);
+            }
+            Cmd::SubmitStakeOp { op, reply } => {
+                // M229: verify the account's signature, then stage + flood the stake op
+                // (nonce/amount/validator-set rules are enforced at apply, which rolls the
+                // whole block back on failure). Mirrors the gov-op submit path.
+                let res = match actor.node.chain.state.accounts.get(&op.account) {
+                    Some(acct)
+                        if verify(
+                            &acct.pubkey,
+                            &crate::codec::stakeop_signing_bytes(&op),
+                            &op.signature,
+                        ) =>
+                    {
+                        let h = op.hash();
+                        let out = actor.node.submit_local_stake_op(*op);
+                        actor.route(out);
+                        Ok(h)
+                    }
+                    Some(_) => Err(crate::ChainError::BadSignature(op.account)),
+                    None => Err(crate::ChainError::UnknownAccount(op.account)),
                 };
                 let _ = reply.send(res);
             }
@@ -7624,6 +7652,44 @@ async fn serve_rpc_conn(
         let _ = stream.flush().await;
         return;
     }
+    if path == "/stake" {
+        // M229: `POST /stake` carries a raw codec-encoded StakeOp (bond/unbond); the actor
+        // verifies the signature, stages + floods it, and replies the op hash.
+        let op = match crate::codec::decode_stakeop(&body) {
+            Ok(op) => op,
+            Err(e) => {
+                let _ = stream
+                    .write_all(error_body(fmt, "400 Bad Request", &e.to_string()).as_bytes())
+                    .await;
+                let _ = stream.flush().await;
+                return;
+            }
+        };
+        let (reply, rx) = oneshot::channel();
+        if cmd
+            .send(Cmd::SubmitStakeOp {
+                op: Box::new(op),
+                reply,
+            })
+            .is_err()
+        {
+            let _ = stream
+                .write_all(http_response("503 Service Unavailable", "node stopped").as_bytes())
+                .await;
+            return;
+        }
+        let resp = match rx.await {
+            Ok(Ok(h)) => {
+                let hex = crate::hash::hex(&h);
+                ok_body(fmt, &hex, &format!("{{\"hash\":{}}}", json_str(&hex)))
+            }
+            Ok(Err(e)) => error_body(fmt, "422 Unprocessable Entity", &e.to_string()),
+            Err(_) => http_response("503 Service Unavailable", "node stopped"),
+        };
+        let _ = stream.write_all(resp.as_bytes()).await;
+        let _ = stream.flush().await;
+        return;
+    }
 
     // Decode raw codec bytes into a SubmissionTx.
     let tx = match crate::codec::decode_tx(&body) {
@@ -10960,6 +11026,74 @@ mod tests {
         }
         let t = post(rpc_addr, &enc(&prop(1, 999))).await;
         assert!(t.starts_with("HTTP/1.1 429"), "expected 429, got: {t}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn rpc_stake_submit_over_tcp() {
+        // M229: `POST /stake` accepts a signed bond StakeOp (200 + op hash), rejects a
+        // bad signature and an unknown account (422). Verifies the submit endpoint (decode +
+        // sig-verify + stage); applying the bond to `/bonds` is existing staking behavior.
+        let dir = tmp_dir("rpc-stake");
+        let mut cfg = node_config(21, 21461, &[21], dir.clone());
+        let rpc_addr = "127.0.0.1:21492";
+        cfg.rpc = Some(crate::config::RpcConfig {
+            enabled: true,
+            listen: rpc_addr.into(),
+            auth_token: String::new(),
+            enable_tls: false,
+        });
+        let mut genesis = test_genesis();
+        genesis.validators = vec![(21, kp(21).public(), 1)];
+        let _node = Node::start(cfg, genesis, Some(kp(21)), None)
+            .await
+            .expect("start node");
+        tokio::time::sleep(Duration::from_millis(150)).await;
+
+        async fn post(addr: &str, body: &[u8]) -> String {
+            let mut req = format!(
+                "POST /stake HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            )
+            .into_bytes();
+            req.extend_from_slice(body);
+            let mut s = TcpStream::connect(addr).await.expect("connect rpc");
+            s.write_all(&req).await.expect("send");
+            let mut resp = Vec::new();
+            s.read_to_end(&mut resp).await.expect("read");
+            String::from_utf8_lossy(&resp).into_owned()
+        }
+        let bond = |acct: u64, signer: u64| {
+            crate::StakeOp {
+                account: acct,
+                kind: crate::BondKind::Bond,
+                amount: 5 * MICRO,
+                signature: [0u8; 64],
+            }
+            .signed(&kp(signer))
+        };
+
+        // Valid bond from account 1 → 200 + its op hash.
+        let op = bond(1, 1);
+        let t = post(rpc_addr, &crate::codec::encode_stakeop(&op)).await;
+        assert!(t.starts_with("HTTP/1.1 200 OK"), "valid bond: {t}");
+        assert!(
+            t.contains(&crate::hash::hex(&op.hash())),
+            "hash in body: {t}"
+        );
+
+        // Wrong signer (kp(2) signing account 1) → 422 BadSignature.
+        let t = post(rpc_addr, &crate::codec::encode_stakeop(&bond(1, 2))).await;
+        assert!(t.starts_with("HTTP/1.1 422"), "bad sig → 422: {t}");
+
+        // Unknown account (99 not in genesis) → 422 UnknownAccount.
+        let t = post(rpc_addr, &crate::codec::encode_stakeop(&bond(99, 99))).await;
+        assert!(t.starts_with("HTTP/1.1 422"), "unknown account → 422: {t}");
+
+        // Malformed body → 400.
+        let t = post(rpc_addr, b"not-a-stakeop").await;
+        assert!(t.starts_with("HTTP/1.1 400"), "malformed → 400: {t}");
 
         let _ = std::fs::remove_dir_all(&dir);
     }

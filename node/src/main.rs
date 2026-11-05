@@ -328,6 +328,7 @@ fn main() {
         "encode-tx" => cmd_encode_tx(&args),
         "encode-gov-proposal" => cmd_encode_gov_proposal(&args),
         "encode-gov-vote" => cmd_encode_gov_vote(&args),
+        "encode-stakeop" => cmd_encode_stakeop(&args),
         "keygen" => cmd_keygen(&args),
         "encrypt-key" => cmd_encrypt_key(&args),
         "signer" => cmd_signer(&args),
@@ -432,6 +433,7 @@ fn usage() {
     eprintln!("  node encode-tx --key-file F --out F --author N --domain N --stake N --embedding f,..(DIM) --review R:S.. --repl-success N --repl-total N --timestamp-days F [--fee MICRO] [--nonce N] [--config F]  author+sign a tx offline into a submit-tx file; print its hash; M122: --fee paid to the proposer (default 0), --nonce must equal the author's account nonce (default 0)");
     eprintln!("  node encode-gov-proposal --key-file F --out F --proposer N --param name=value --voting-period N [--nonce N]  M228: author+sign a GovProposal (param: base_emission|slash_bps|decay_half_life) into a raw op file for `node rpc --path /gov/proposal --post F`");
     eprintln!("  node encode-gov-vote --key-file F --out F --proposal-id N --voter N --approve true|false [--nonce N]  M228: author+sign a GovVote into a raw op file for `node rpc --path /gov/vote --post F`");
+    eprintln!("  node encode-stakeop --key-file F --out F --account N --kind bond|unbond --amount N  M229: author+sign a bond/unbond StakeOp into a raw op file for `node rpc --path /stake --post F`");
     eprintln!("  node inspect-tx --tx F [--pubkey HEX]  decode a codec-encoded tx file and print its fields + content hash; with --pubkey, also verify the signature (the read-side companion to encode-tx)");
     eprintln!("  node keygen --out F [--seed HEX]  generate (or derive from a 64-hex seed) an ed25519 keypair; write the seed file (for encode-tx --key-file) and print the pubkey");
     eprintln!("  node keygen ... --new-mnemonic [--encrypt]  M169/M175: generate a fresh BIP-39 mnemonic; --encrypt (M175) writes an encrypted Web3SS keystore to --out (prompts for a password) instead of a plaintext seed file");
@@ -4655,6 +4657,42 @@ fn cmd_encode_gov_vote(args: &[String]) {
     let bytes = zhixing_node::codec::encode_gov_vote(&op);
     if let Err(e) = zhixing_node::codec::decode_gov_vote(&bytes) {
         fail_msg("encode-gov-vote self-check", &e);
+    }
+    std::fs::write(out_path, &bytes).unwrap_or_else(|e| fail("write op file", e));
+    println!("encoded {}", hex(&op.hash()));
+    println!("out {out_path}");
+}
+
+/// M229: author + ed25519-sign a bond/unbond `StakeOp` offline, writing raw
+/// `codec::encode_stakeop` bytes to `--out` for `node rpc --path /stake --post <out>`.
+/// The write counterpart to the `/bonds` read — lets an operator change stake on a running
+/// node (amount/nonce/validator rules checked at apply). `--kind bond|unbond`.
+fn cmd_encode_stakeop(args: &[String]) {
+    let key_path = req_arg(args, "--key-file");
+    let out_path = req_arg(args, "--out");
+    let account: u64 = parse_arg(args, "--account");
+    let amount: u64 = parse_arg(args, "--amount");
+    let kind = match req_arg(args, "--kind") {
+        "bond" => BondKind::Bond,
+        "unbond" => BondKind::Unbond,
+        other => fail_msg(
+            "encode-stakeop kind",
+            &format!("`{other}` (use bond|unbond)"),
+        ),
+    };
+    let key_hex = std::fs::read_to_string(key_path).unwrap_or_else(|e| fail("read key file", e));
+    let seed = config::decode_seed(key_hex.trim(), "--key-file")
+        .unwrap_or_else(|e| fail_msg("decode key seed", &e));
+    let op = StakeOp {
+        account,
+        kind,
+        amount,
+        signature: [0u8; 64],
+    }
+    .signed(&Keypair::from_seed(seed));
+    let bytes = zhixing_node::codec::encode_stakeop(&op);
+    if let Err(e) = zhixing_node::codec::decode_stakeop(&bytes) {
+        fail_msg("encode-stakeop self-check", &e);
     }
     std::fs::write(out_path, &bytes).unwrap_or_else(|e| fail("write op file", e));
     println!("encoded {}", hex(&op.hash()));
