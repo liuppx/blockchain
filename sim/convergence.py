@@ -22,6 +22,12 @@
     竞争模式(本设计)下竞争单元与旧共识并存;举报模式(对照)下由多数裁决,证据出现前开拓者
     多半被判错并受罚。
 
+推演轮次(结论见 docs/VISION.md §4b):
+  第一轮  上述草案;发现错误隐蔽时不收敛(审查能力被提交量摊薄)。
+  第二轮  M1 审查义务、M2 精准审查、M3 理性作恶者 → 有界稳态。
+  第三轮  放松四个乐观假设 A1 走过场、A2 抱团、A3 不停手、A4 女巫换号,对策 M4–M7;
+          发现新人分量必须从零起步,否则换号即洗白。
+
 诚实边界:这是方向性模型,所有行为参数都是假设。它回答的是"在这些假设下机制是否收敛、
 哪个开关最关键、在哪里失效",不是对真实网络的预测。
 """
@@ -85,6 +91,18 @@ class Params:
     target_uncertainty: bool = False  # M2 审查对准"影响大而没被查透"的内容
     rational_attackers: bool = False  # M3 作恶者理性:持续亏损即停手
     attacker_quit: float = -5.0
+    # 第三轮:放松第二轮中偏乐观的假设
+    perfunctory_frac: float = 0.0  # A1 义务审查走过场者的比例(其义务审查发现能力 ×0.1)
+    collusion: bool = False  # A2 作恶者抱团:互相引用、用义务审查互相背书
+    sybil: bool = False  # A4 女巫:信誉烧光的作恶账户换成新账户重来
+    sybil_cost: float = 1.0  # 每开一个新账户的成本(最低余额 / 押金)
+    # 第三轮对策
+    examiner_accountability: bool = False  # M4 审查问责:放过可检出错误者事后受罚;审查加分按审查者信誉折算
+    reviewers_adapt: bool = False  # M4 行为响应:走过场者被罚两次后开始认真
+    cite_weight_by_rep: bool = False  # M5 引用分量取决于引用方信誉
+    rep_gated_rate: bool = False  # M6 信誉烧光的账户限流(只限低于阈值者,不误伤偶尔犯错的诚实者)
+    rep_gate_threshold: float = 0.05
+    probation: int = 0  # M7 新人见习期(期数):期内被抽为核验 / 裁决人的权重与提交速率按账龄折算
     penalize_honest_error: bool = False  # True = 朴素规则:范式之错也罚(对照)
 
 
@@ -99,17 +117,20 @@ REP_FOUNDER = 1.0
 
 
 class Agent:
-    __slots__ = ("kind", "rep", "net")
+    __slots__ = ("kind", "rep", "net", "born", "perf", "offenses")
 
-    def __init__(self, kind: int, rep: float):
+    def __init__(self, kind: int, rep: float, born: int = 0, perf: bool = False):
         self.kind = kind
         self.rep = rep
         self.net = 0.0
+        self.born = born
+        self.perf = perf  # 义务审查走过场
+        self.offenses = 0  # 因审查失职被罚的次数
 
 
 class Unit:
     __slots__ = ("author", "kind", "born", "evidence_at", "llm", "verifiers", "infl",
-                 "cred", "active", "pioneer_of", "has_pioneer", "difficulty")
+                 "cred", "active", "pioneer_of", "has_pioneer", "difficulty", "passed_by")
 
     def __init__(self, author: int, kind: int, born: int, llm: bool):
         self.author = author
@@ -124,6 +145,7 @@ class Unit:
         self.pioneer_of = -1  # >=0:这是针对某个范式之错的竞争单元(本身正确)
         self.has_pioneer = False
         self.difficulty = 0.0  # 错误的隐蔽程度 ∈ [0,1):越大越难发现
+        self.passed_by: list[int] = []  # 在错误可检出时检查过却放过它的审查者
 
     @property
     def wrong(self) -> bool:
@@ -144,6 +166,7 @@ class Metrics:
     mal_net: float = 0.0  # 作恶者人均净收益
     mal_rep: float = 0.0  # 作恶者平均信誉(末期)
     units_end: int = 0
+    sybil_resets: int = 0
 
 
 # ---------------------------------------------------------------------------
@@ -159,10 +182,12 @@ class Sim:
         self.agents: list[Agent] = []
         for i in range(p.founders):
             # 创始社区:以诚实为主,有少数不认真者,无作恶者(C6)
-            self.agents.append(Agent(LAZY if i % 6 == 0 else HONEST, REP_FOUNDER))
+            self.agents.append(Agent(LAZY if i % 6 == 0 else HONEST, REP_FOUNDER, born=-10**6,
+                                     perf=(i % 6 != 0) and self.r.random() < p.perfunctory_frac))
         self.units: list[Unit] = []
         self.active: list[int] = []
         self.submitters: list[int] = []
+        self.mal_submitters: list[int] = []
         self.m = Metrics()
 
     # -- helpers ------------------------------------------------------------
@@ -181,9 +206,36 @@ class Sim:
         frac = len(self.agents) / self.p.max_agents
         return 2.0 + 200.0 * frac**2
 
+    def age_factor(self, a: Agent) -> float:
+        """M7 见习期:账龄不足时按比例折算(0→1)。"""
+        if self.p.probation <= 0:
+            return 1.0
+        return min(1.0, max(0.0, (self.t - a.born) / self.p.probation))
+
+    def activity_gate(self, a: Agent) -> float:
+        """提交 / 挑战速率的折算系数:M6 信誉闸门 × M7 见习期。"""
+        g = 1.0
+        if self.p.rep_gated_rate:
+            g *= min(1.0, a.rep / self.p.rep_gate_threshold)
+        if self.p.probation > 0:
+            g *= 0.3 + 0.7 * self.age_factor(a)
+        return g
+
+    def rep_factor(self, ai: int) -> float:
+        """审查加分 / 引用分量按信誉折算(M4 / M5)。
+
+        有见习期(M7)时再乘账龄系数:新人的分量从接近零开始、靠时间与记录挣来。否则女巫换号
+        会把信誉重置到新人基线,而基线默认是满分量,换号就等于洗白(第三轮推演的发现)。
+        """
+        a = self.agents[ai]
+        f = min(1.0, a.rep / REP_BASE)
+        if self.p.probation > 0:
+            f *= max(self.age_factor(a), 0.02)
+        return f
+
     def pick_agents(self, k: int, exclude: int = -1) -> list[int]:
         idx = [i for i in range(len(self.agents)) if i != exclude]
-        w = [max(self.agents[i].rep, 0.01) for i in idx]
+        w = [max(self.agents[i].rep, 0.01) * max(self.age_factor(self.agents[i]), 0.02) for i in idx]
         return self.r.choices(idx, weights=w, k=k)
 
     def penalize(self, ai: int, rep_mult: float, rep_sub: float, money: float,
@@ -211,7 +263,8 @@ class Sim:
         while len(self.agents) < target:
             x = r.random()
             kind = MAL if x < p.frac_malicious else (LAZY if x < p.frac_malicious + p.frac_lazy else HONEST)
-            self.agents.append(Agent(kind, REP_BASE))
+            self.agents.append(Agent(kind, REP_BASE, born=self.t,
+                                     perf=kind != MAL and r.random() < p.perfunctory_frac))
         # 2. 衰减
         self.active = [i for i in self.active if self.units[i].active]
         for i in self.active:
@@ -219,13 +272,23 @@ class Sim:
         if p.rep_decay > 0:
             for a in self.agents:
                 a.rep = REP_BASE + (a.rep - REP_BASE) * (1 - p.rep_decay)
+        # 2b. A4 女巫:信誉烧光的作恶账户换成新账户重来(付开户成本)
+        if p.sybil:
+            for a in self.agents:
+                if a.kind == MAL and a.rep < 0.05:
+                    a.rep = REP_BASE
+                    a.born = self.t
+                    a.net -= p.sybil_cost
+                    self.m.sybil_resets += 1
         # 3. 提交
         new: list[int] = []
         self.submitters: list[int] = []
+        self.mal_submitters: list[int] = []
         for ai, a in enumerate(self.agents):
             if a.kind == MAL and p.rational_attackers and a.net < p.attacker_quit:
                 continue  # 理性作恶者:已经亏损,停手
             rate = p.submit_rate_mal if a.kind == MAL else p.submit_rate_honest
+            rate *= self.activity_gate(a)
             if r.random() >= rate:
                 continue
             if a.kind == MAL:
@@ -253,6 +316,8 @@ class Sim:
             new.append(len(self.units) - 1)
             if a.kind != MAL:
                 self.submitters.append(ai)
+            else:
+                self.mal_submitters.append(ai)
         # 3b. 开拓者:针对仍在册的范式之错提交竞争单元(本身正确)
         for ui in self.active:
             u = self.units[ui]
@@ -333,11 +398,19 @@ class Sim:
             if u.pioneer_of >= 0 and self.t >= self.units[u.pioneer_of].evidence_at:
                 wi *= 3.0  # 新认识越来越多被引用
             w.append(wi)
-        targets = r.choices(pool, weights=w, k=p.cites_per_unit * len(citing))
-        for ti in targets:
-            t = self.units[ti]
-            t.infl += 1.0
-            t.cred = min(1.0, t.cred + 0.01)
+        cset = set(citing)
+        ring = [i for i in self.active if self.units[i].kind == FABRICATED and i not in cset] if p.collusion else []
+        for ci in citing:
+            author = self.units[ci].author
+            inc = self.rep_factor(author) if p.cite_weight_by_rep else 1.0
+            if p.collusion and self.agents[author].kind == MAL and ring:
+                targets = r.choices(ring, k=p.cites_per_unit)  # A2 抱团:互引编造内容
+            else:
+                targets = r.choices(pool, weights=w, k=p.cites_per_unit)
+            for ti in targets:
+                t = self.units[ti]
+                t.infl += inc
+                t.cred = min(1.0, t.cred + 0.01 * inc)
 
     def examine(self):
         p, r = self.p, self.r
@@ -368,17 +441,33 @@ class Sim:
                 ei = r.choice(lazy)
             else:
                 ei = r.choice(self.submitters)
-            skill = p.skill_honest if self.agents[ei].kind == HONEST else p.skill_lazy
+            ag = self.agents[ei]
+            skill = p.skill_honest if ag.kind == HONEST else p.skill_lazy
+            if j >= n_h + n_l and ag.perf:
+                skill *= 0.1  # A1 义务审查走过场
             if self.finds(u, skill):
                 self.challenge_succeeds(ui, ei)
             elif not u.wrong and r.random() < 0.01:
                 self.jury(ui, ei, truth_remove=False)  # 诚实者偶尔的误判挑战
             else:
-                u.cred = min(1.0, u.cred + 0.05)  # 经受住一次检查
+                gain = 0.05 * (self.rep_factor(ei) if p.examiner_accountability else 1.0)
+                u.cred = min(1.0, u.cred + gain)  # 经受住一次检查
+                if self.detectable(u):
+                    u.passed_by.append(ei)  # 错误当时可检出,却被放过
+        # A2 抱团:作恶者把义务审查用来给编造内容背书
+        if p.collusion and self.mal_submitters:
+            fab = [i for i in self.active if self.units[i].kind == FABRICATED]
+            n_om = int(len(self.mal_submitters) * p.review_obligation)
+            if fab and n_om:
+                for ui in r.choices(fab, k=n_om):
+                    ei = r.choice(self.mal_submitters)
+                    gain = 0.05 * (self.rep_factor(ei) if p.examiner_accountability else 1.0)
+                    self.units[ui].cred = min(1.0, self.units[ui].cred + gain)
+                    self.units[ui].passed_by.append(ei)
         # 恶意挑战:作恶者攻击有价值的正确单元
         mal = [i for i, a in enumerate(self.agents) if a.kind == MAL
                and not (p.rational_attackers and a.net < p.attacker_quit)]
-        n_m = int(len(mal) * p.attack_rate_mal)
+        n_m = int(sum(self.activity_gate(self.agents[i]) for i in mal) * p.attack_rate_mal)
         good = [i for i in self.active if not self.units[i].wrong and self.units[i].active]
         if n_m and good:
             gw = [self.units[i].infl + 0.05 for i in good]
@@ -404,6 +493,15 @@ class Sim:
             neg = (1.0, 0.2, p.stake * 0.3)
         for vi in u.verifiers:  # 失职:放过了当时可检出的错误
             self.penalize(vi, *neg, honest_error=honest_err)
+        if p.examiner_accountability:  # M4:事后追究放过该错误的审查者
+            for xi in set(u.passed_by):
+                if xi == ei:
+                    continue
+                self.penalize(xi, 1.0, 0.1, p.stake * 0.2, honest_error=honest_err)
+                a = self.agents[xi]
+                a.offenses += 1
+                if p.reviewers_adapt and a.perf and a.offenses >= 2 and p.accountability:
+                    a.perf = False  # 被罚两次后开始认真审查
 
     def jury(self, ui: int, challenger: int, truth_remove: bool):
         """对一次挑战做多数裁决。truth_remove:正确答案是否应移除该单元。"""
@@ -535,6 +633,42 @@ SCENARIOS_V2: list[tuple[str, str, Params]] = [
     ("v2_naive_dispute", "M1–M3,但用举报模式 + 诚实的错也罚", replace(V2, dispute_mode="report", penalize_honest_error=True)),
 ]
 
+# 第三轮推演:放松第二轮中偏乐观的四个假设(A1–A4),并检验对策(M4–M7)
+WORST = replace(V2, perfunctory_frac=0.7, collusion=True, rational_attackers=False, sybil=True)
+V3_FIX = dict(examiner_accountability=True, reviewers_adapt=True, cite_weight_by_rep=True,
+              rep_gated_rate=True, probation=30)
+SCENARIOS_V3: list[tuple[str, str, Params]] = [
+    # A1 义务审查走过场
+    ("v3_perfunctory", "A1:70% 的人义务审查走过场", replace(V2, perfunctory_frac=0.7)),
+    ("v3_perf_lowvol", "A1 + 自愿审查也很少(每人每期 0.1 次)",
+     replace(V2, perfunctory_frac=0.7, exam_rate_honest=0.1)),
+    ("v3_perf_lowvol_m4s", "上一行 + M4 审查问责(走过场者不改)",
+     replace(V2, perfunctory_frac=0.7, exam_rate_honest=0.1, examiner_accountability=True)),
+    ("v3_perf_lowvol_m4", "上一行 + 被罚两次后认真",
+     replace(V2, perfunctory_frac=0.7, exam_rate_honest=0.1, examiner_accountability=True, reviewers_adapt=True)),
+    # A2 抱团
+    ("v3_collusion", "A2:作恶者抱团(互引 + 互相背书)", replace(V2, collusion=True)),
+    ("v3_collusion_m5", "A2 + M5 引用看信誉 + M4", replace(V2, collusion=True, cite_weight_by_rep=True,
+                                                           examiner_accountability=True)),
+    # A3 不停手
+    ("v3_deep_pocket", "A3:作恶者亏损也不停手", replace(V2, rational_attackers=False)),
+    ("v3_deep_pocket_m6", "A3 + M6 信誉烧光者限流", replace(V2, rational_attackers=False, rep_gated_rate=True)),
+    # A4 女巫
+    ("v3_sybil", "A3 + A4 女巫换号(已有 M6)", replace(V2, rational_attackers=False, sybil=True, rep_gated_rate=True)),
+    ("v3_sybil_m7", "A3 + A4 + M6 + M7 新人见习期",
+     replace(V2, rational_attackers=False, sybil=True, rep_gated_rate=True, probation=30)),
+    # 四个假设同时放松
+    ("v3_worst", "A1–A4 全放松,只有第二轮机制", WORST),
+    ("v3_worst_fixed", "A1–A4 全放松 + M4–M7(作恶者 10%)", replace(WORST, **V3_FIX)),
+    ("v3_worst_fixed_mal20", "同上,作恶者 20%", replace(WORST, frac_malicious=0.20, **V3_FIX)),
+    ("v3_worst_fixed_mal35", "同上,作恶者 35%", replace(WORST, frac_malicious=0.35, **V3_FIX)),
+    ("v3_worst_fixed_cost5", "作恶者 20%,开户成本 ×5", replace(WORST, frac_malicious=0.20, sybil_cost=5.0, **V3_FIX)),
+    ("v3_worst_fixed_cost20", "作恶者 20%,开户成本 ×20", replace(WORST, frac_malicious=0.20, sybil_cost=20.0, **V3_FIX)),
+    # 对策对诚实者的代价
+    ("v3_honest_cost", "无攻击者,开 M4–M7(看对诚实者的代价)", replace(V2, frac_malicious=0.0, **V3_FIX)),
+    ("v3_honest_ref", "无攻击者,第二轮机制(对照)", replace(V2, frac_malicious=0.0)),
+]
+
 
 def run_scenario(p: Params, seeds: int) -> dict:
     ms = [Sim(p, s).run() for s in range(seeds)]
@@ -558,19 +692,22 @@ def run_scenario(p: Params, seeds: int) -> dict:
         "mal_net": avg(lambda m: m.mal_net),
         "mal_rep": avg(lambda m: m.mal_rep),
         "units": avg(lambda m: m.units_end),
+        "sybil": avg(lambda m: m.sybil_resets),
     }
 
 
 def table(results: list[tuple[str, str, dict]]) -> str:
     h = ("| 场景 | 说明 | 加权错误率 10%→25%→50%→末期 | 可检出错误 25%→末期 | 末期错误占数量比 "
-         "| 正确单元被误删 | 诚实者因诚实的错受罚 | 开拓者存活率 | 诚实者人均净收益 | 作恶者人均净收益 | 作恶者末期信誉 |")
-    sep = "|" + "---|" * 11
+         "| 正确单元被误删 | 诚实者因诚实的错受罚 | 开拓者存活率 | 诚实者人均净收益 | 作恶者人均净收益 | 作恶者末期信誉 "
+         "| 在册知识数 | 女巫换号次数 |")
+    sep = "|" + "---|" * 13
     rows = [h, sep]
     for name, desc, x in results:
         rows.append(
             f"| `{name}` | {desc} | {x['e10']:.3f} → {x['e25']:.3f} → {x['e50']:.3f} → **{x['e100']:.3f}** ±{x['e100_sd']:.3f} "
             f"| {x['k25']:.3f} → **{x['k100']:.3f}** | {x['cnt']:.3f} | {x['false_rm']:.1f} | {x['hon_pen']:.1f} "
-            f"| {x['pioneer']:.2f} | {x['hon_net']:+.2f} | {x['mal_net']:+.2f} | {x['mal_rep']:.2f} |"
+            f"| {x['pioneer']:.2f} | {x['hon_net']:+.2f} | {x['mal_net']:+.2f} | {x['mal_rep']:.2f} "
+            f"| {x['units']:.0f} | {x['sybil']:.0f} |"
         )
     return "\n".join(rows)
 
@@ -580,6 +717,7 @@ def main():
     ap.add_argument("--md", action="store_true", help="写出 sim/CONVERGENCE.md")
     ap.add_argument("--seeds", type=int, default=5)
     ap.add_argument("--steps", type=int, default=BASE.steps)
+    ap.add_argument("--round", choices=["1", "2", "3", "all"], default="all")
     args = ap.parse_args()
     def run_all(scen):
         out = []
@@ -588,10 +726,16 @@ def main():
             print(f"  done {name}", flush=True)
         return out
 
-    t1 = table(run_all(SCENARIOS))
-    t2 = table(run_all(SCENARIOS_V2))
-    t = "## 第一轮:VISION §4b 草案(C1–C6 + 责任机制)\n\n" + t1 + \
-        "\n\n## 第二轮:加入 M1 审查义务、M2 精准审查、M3 理性作恶者\n\n" + t2
+    rounds = [
+        ("1", "## 第一轮:VISION §4b 草案(C1–C6 + 责任机制)", SCENARIOS),
+        ("2", "## 第二轮:加入 M1 审查义务、M2 精准审查、M3 理性作恶者", SCENARIOS_V2),
+        ("3", "## 第三轮:放松四个偏乐观假设(A1–A4),检验对策 M4–M7", SCENARIOS_V3),
+    ]
+    parts = []
+    for rid, title, scen in rounds:
+        if args.round in (rid, "all"):
+            parts.append(title + "\n\n" + table(run_all(scen)))
+    t = "\n\n".join(parts)
     print(t)
     if args.md:
         import os
