@@ -24,6 +24,8 @@ python3 sim/run.py --compare # baseline 场景 Python vs Rust 后端对比
 | `RESULTS.md` | 最近一次运行的结果（由 `run.py --md` 自动生成）|
 | `sweep.py` | **参数敏感性扫描**（生产就绪 #7 经济校准）：逐旋钮扫 `base_emission`/`slash_ratio`/`delta_k_min`/`tau_dup`，诚实 vs 对抗场景、多种子取均值。`python3 sim/sweep.py --md` 写 `SWEEP.md` |
 | `SWEEP.md` | 扫描结果（由 `sweep.py --md` 自动生成）|
+| `convergence.py` | **知识质量收敛性仿真**(VISION §4b):准入宽、信任靠挣的机制下,影响力加权错误率是否有界、在哪里失效。两轮场景矩阵,`python3 sim/convergence.py --md` 写 `CONVERGENCE.md` |
+| `CONVERGENCE.md` | 收敛性仿真结果(由 `convergence.py --md` 自动生成)|
 | `CALIBRATION.md` | **主网 genesis 参数建议**（基于 `SWEEP.md` 的取值理由 + 诚实边界）|
 
 ## 设计要点
