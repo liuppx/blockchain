@@ -27,6 +27,8 @@
   第二轮  M1 审查义务、M2 精准审查、M3 理性作恶者 → 有界稳态。
   第三轮  放松四个乐观假设 A1 走过场、A2 抱团、A3 不停手、A4 女巫换号,对策 M4–M7;
           发现新人分量必须从零起步,否则换号即洗白。
+  第四轮  M8 邀请担保(连带责任只针对作恶)、有限预算攻击者、作恶收益吸引更多攻击者;
+          发现关掉责任机制时作恶有利可图,攻击者增多,系统崩溃。
 
 诚实边界:这是方向性模型,所有行为参数都是假设。它回答的是"在这些假设下机制是否收敛、
 哪个开关最关键、在哪里失效",不是对真实网络的预测。
@@ -103,6 +105,11 @@ class Params:
     rep_gated_rate: bool = False  # M6 信誉烧光的账户限流(只限低于阈值者,不误伤偶尔犯错的诚实者)
     rep_gate_threshold: float = 0.05
     probation: int = 0  # M7 新人见习期(期数):期内被抽为核验 / 裁决人的权重与提交速率按账龄折算
+    # 第四轮
+    vouching: bool = False  # M8 邀请担保:新成员(含换号)须由老成员担保,被担保人作恶时担保人连带受罚
+    screen_skill: float = 0.5  # 诚实担保人识破作恶申请人的概率(不认真者为其 0.4 倍)
+    attacker_budget: float = float("inf")  # 每个作恶者的预算:累计亏损超过即停手
+    adaptive_attackers: bool = False  # 作恶有利可图会吸引更多人加入作恶(反之减少)
     penalize_honest_error: bool = False  # True = 朴素规则:范式之错也罚(对照)
 
 
@@ -117,7 +124,7 @@ REP_FOUNDER = 1.0
 
 
 class Agent:
-    __slots__ = ("kind", "rep", "net", "born", "perf", "offenses")
+    __slots__ = ("kind", "rep", "net", "born", "perf", "offenses", "voucher", "burned", "liable")
 
     def __init__(self, kind: int, rep: float, born: int = 0, perf: bool = False):
         self.kind = kind
@@ -126,6 +133,9 @@ class Agent:
         self.born = born
         self.perf = perf  # 义务审查走过场
         self.offenses = 0  # 因审查失职被罚的次数
+        self.voucher = -1  # M8 担保人
+        self.burned = False  # 信誉已烧光(用于触发担保人连带责任)
+        self.liable = 0  # 作为担保人被连带处罚的次数
 
 
 class Unit:
@@ -167,6 +177,9 @@ class Metrics:
     mal_rep: float = 0.0  # 作恶者平均信誉(末期)
     units_end: int = 0
     sybil_resets: int = 0
+    members_end: int = 0
+    mal_member_share: float = 0.0  # 末期成员中作恶者占比
+    rejected_applicants: int = 0
 
 
 # ---------------------------------------------------------------------------
@@ -188,6 +201,8 @@ class Sim:
         self.active: list[int] = []
         self.submitters: list[int] = []
         self.mal_submitters: list[int] = []
+        self.frac_eff = p.frac_malicious  # 申请者中作恶者比例(adaptive 时随收益变化)
+        self.mal_net_mark = 0.0
         self.m = Metrics()
 
     # -- helpers ------------------------------------------------------------
@@ -233,13 +248,60 @@ class Sim:
             f *= max(self.age_factor(a), 0.02)
         return f
 
+    def mal_active(self, a: Agent) -> bool:
+        """作恶者是否仍在行动:理性亏损停手 / 预算耗尽 都会停手。"""
+        if a.kind != MAL:
+            return True
+        if self.p.rational_attackers and a.net < self.p.attacker_quit:
+            return False
+        if -a.net > self.p.attacker_budget:
+            return False
+        return True
+
+    def can_vouch(self, a: Agent) -> bool:
+        return a.rep >= REP_BASE * 0.5 and not a.burned and self.age_factor(a) >= 1.0 and self.mal_active(a)
+
+    def admit(self, applicant_mal: bool) -> int:
+        """M8:为申请人找担保人;返回担保人下标,-1 表示被拒。"""
+        r = self.r
+        if applicant_mal and self.p.collusion:
+            mals = [i for i, a in enumerate(self.agents) if a.kind == MAL and self.can_vouch(a)]
+            if mals:
+                return r.choice(mals)  # 圈内互相担保
+        cands = [i for i, a in enumerate(self.agents) if a.kind != MAL and self.can_vouch(a)]
+        if not cands:
+            return -1
+        vi = r.choices(cands, weights=[self.agents[i].rep for i in cands], k=1)[0]
+        v = self.agents[vi]
+        if applicant_mal:
+            sk = self.p.screen_skill * (1.0 if v.kind == HONEST else 0.4)
+            sk = min(0.9, sk + 0.15 * v.liable)  # 被连带罚过的担保人更谨慎
+            return -1 if r.random() < sk else vi
+        return -1 if r.random() < 0.05 else vi  # 诚实申请人偶尔被误拒
+
+    def vouch_liability(self, ai: int):
+        """M8 连带责任:被担保人**作恶被查实**时(编造、恶意挑战),担保人受罚。
+
+        只针对作恶,不针对失职或诚实的错:担保的是"此人不会作恶",不是"此人从不犯错"。
+        每个被担保人只追究一次。
+        """
+        a = self.agents[ai]
+        if a.burned:
+            return
+        a.burned = True
+        if self.p.vouching and a.voucher >= 0 and self.p.accountability:
+            v = self.agents[a.voucher]
+            v.rep = max(0.0, v.rep - 0.3)
+            v.net -= self.p.stake
+            v.liable += 1
+
     def pick_agents(self, k: int, exclude: int = -1) -> list[int]:
         idx = [i for i in range(len(self.agents)) if i != exclude]
         w = [max(self.agents[i].rep, 0.01) * max(self.age_factor(self.agents[i]), 0.02) for i in idx]
         return self.r.choices(idx, weights=w, k=k)
 
     def penalize(self, ai: int, rep_mult: float, rep_sub: float, money: float,
-                 honest_error: bool = False):
+                 honest_error: bool = False, malicious: bool = False):
         if not self.p.accountability:
             return
         a = self.agents[ai]
@@ -247,6 +309,8 @@ class Sim:
         a.net -= money
         if honest_error and a.kind != MAL:
             self.m.honest_penalized += 1
+        if malicious:
+            self.vouch_liability(ai)
 
     def remove(self, ui: int):
         u = self.units[ui]
@@ -259,12 +323,29 @@ class Sim:
     def step(self):
         p, r = self.p, self.r
         # 1. 增长
+        if p.adaptive_attackers and self.t > 0 and self.t % 10 == 0:
+            mals = [a for a in self.agents if a.kind == MAL]
+            if mals:
+                avg = statistics.mean(a.net for a in mals)
+                gain = avg - self.mal_net_mark  # 最近 10 期作恶者人均收益
+                self.mal_net_mark = avg
+                self.frac_eff *= 1.25 if gain > 0 else 0.9
+                self.frac_eff = min(0.6, max(p.frac_malicious / 4, self.frac_eff))
         target = min(p.max_agents, p.founders + int(p.growth_per_step * self.t))
-        while len(self.agents) < target:
+        attempts = 0
+        while len(self.agents) < target and attempts < 20:
+            attempts += 1
             x = r.random()
-            kind = MAL if x < p.frac_malicious else (LAZY if x < p.frac_malicious + p.frac_lazy else HONEST)
-            self.agents.append(Agent(kind, REP_BASE, born=self.t,
-                                     perf=kind != MAL and r.random() < p.perfunctory_frac))
+            kind = MAL if x < self.frac_eff else (LAZY if x < self.frac_eff + p.frac_lazy else HONEST)
+            voucher = -1
+            if p.vouching:
+                voucher = self.admit(kind == MAL)
+                if voucher < 0:
+                    self.m.rejected_applicants += 1
+                    continue
+            ag = Agent(kind, REP_BASE, born=self.t, perf=kind != MAL and r.random() < p.perfunctory_frac)
+            ag.voucher = voucher
+            self.agents.append(ag)
         # 2. 衰减
         self.active = [i for i in self.active if self.units[i].active]
         for i in self.active:
@@ -275,9 +356,17 @@ class Sim:
         # 2b. A4 女巫:信誉烧光的作恶账户换成新账户重来(付开户成本)
         if p.sybil:
             for a in self.agents:
-                if a.kind == MAL and a.rep < 0.05:
+                if a.kind == MAL and a.rep < 0.05 and self.mal_active(a):
+                    voucher = -1
+                    if p.vouching:
+                        voucher = self.admit(True)  # 换号也要重新找人担保
+                        if voucher < 0:
+                            a.net -= p.sybil_cost * 0.2  # 申请失败也有成本
+                            continue
                     a.rep = REP_BASE
                     a.born = self.t
+                    a.burned = False
+                    a.voucher = voucher
                     a.net -= p.sybil_cost
                     self.m.sybil_resets += 1
         # 3. 提交
@@ -285,8 +374,8 @@ class Sim:
         self.submitters: list[int] = []
         self.mal_submitters: list[int] = []
         for ai, a in enumerate(self.agents):
-            if a.kind == MAL and p.rational_attackers and a.net < p.attacker_quit:
-                continue  # 理性作恶者:已经亏损,停手
+            if not self.mal_active(a):
+                continue  # 理性亏损停手 / 预算耗尽
             rate = p.submit_rate_mal if a.kind == MAL else p.submit_rate_honest
             rate *= self.activity_gate(a)
             if r.random() >= rate:
@@ -369,7 +458,7 @@ class Sim:
                         self.agents[vi].rep += 0.05
                         self.agents[vi].net += 0.1
                 if u.kind == FABRICATED:
-                    self.penalize(u.author, 0.1, 0.0, p.stake)
+                    self.penalize(u.author, 0.1, 0.0, p.stake, malicious=True)
                 else:
                     self.penalize(u.author, 1.0, 0.05, p.stake * 0.3)
             elif u.pioneer_of >= 0:
@@ -465,8 +554,7 @@ class Sim:
                     self.units[ui].cred = min(1.0, self.units[ui].cred + gain)
                     self.units[ui].passed_by.append(ei)
         # 恶意挑战:作恶者攻击有价值的正确单元
-        mal = [i for i, a in enumerate(self.agents) if a.kind == MAL
-               and not (p.rational_attackers and a.net < p.attacker_quit)]
+        mal = [i for i, a in enumerate(self.agents) if a.kind == MAL and self.mal_active(a)]
         n_m = int(sum(self.activity_gate(self.agents[i]) for i in mal) * p.attack_rate_mal)
         good = [i for i in self.active if not self.units[i].wrong and self.units[i].active]
         if n_m and good:
@@ -486,7 +574,7 @@ class Sim:
         if honest_err and not p.penalize_honest_error:
             return  # 诚实的错:当时无从知道,不罚(推翻证据晚于提交与核验)
         if u.kind == FABRICATED:
-            self.penalize(u.author, 0.1, 0.0, p.stake)
+            self.penalize(u.author, 0.1, 0.0, p.stake, malicious=True)
             neg = (1.0, 0.3, p.stake * 0.5)
         else:
             self.penalize(u.author, 1.0, 0.1, p.stake * 0.3, honest_error=honest_err)
@@ -532,13 +620,13 @@ class Sim:
                 self.remove(ui)
                 self.agents[challenger].net += p.stake
             else:
-                self.penalize(challenger, 0.5, 0.0, p.stake)
+                self.penalize(challenger, 0.5, 0.0, p.stake, malicious=challenger_mal)
         else:
             if remove:
                 self.remove(ui)
                 self.agents[challenger].net += p.stake
             else:
-                self.penalize(challenger, 0.5, 0.0, p.stake)
+                self.penalize(challenger, 0.5, 0.0, p.stake, malicious=challenger_mal)
                 u.cred = min(1.0, u.cred + 0.05)
 
     def report_pioneers(self):
@@ -595,6 +683,9 @@ class Sim:
         self.m.hon_net = statistics.mean(a.net for a in hon) if hon else 0.0
         self.m.mal_net = statistics.mean(a.net for a in mal) if mal else 0.0
         self.m.mal_rep = statistics.mean(a.rep for a in mal) if mal else 0.0
+        self.m.members_end = len(self.agents)
+        live_mal = [a for a in mal if self.mal_active(a) and not a.burned]
+        self.m.mal_member_share = len(live_mal) / max(1, len(self.agents))
         return self.m
 
 
@@ -670,6 +761,25 @@ SCENARIOS_V3: list[tuple[str, str, Params]] = [
 ]
 
 
+# 第四轮推演:M8 邀请担保;有限预算的攻击者;作恶有利可图会吸引更多攻击者
+WF = replace(WORST, **V3_FIX)  # 第三轮的"最坏情况 + 全部对策"
+SCENARIOS_V4: list[tuple[str, str, Params]] = [
+    ("v4_ref_20", "对照:第三轮最坏情况 + M4–M7,作恶申请者 20%", replace(WF, frac_malicious=0.20)),
+    ("v4_m8_20", "+ M8 邀请担保,作恶申请者 20%", replace(WF, frac_malicious=0.20, vouching=True)),
+    ("v4_m8_35", "+ M8,作恶申请者 35%", replace(WF, frac_malicious=0.35, vouching=True)),
+    ("v4_m8_50", "+ M8,作恶申请者 50%", replace(WF, frac_malicious=0.50, vouching=True)),
+    ("v4_m8_35_lax", "+ M8 但担保人把关松(识破率 0.2),35%", replace(WF, frac_malicious=0.35, vouching=True, screen_skill=0.2)),
+    ("v4_m8_35_strict", "+ M8 且担保人把关严(识破率 0.8),35%", replace(WF, frac_malicious=0.35, vouching=True, screen_skill=0.8)),
+    ("v4_budget_cost1", "无 M8,攻击者预算 30,开户成本 1,20%", replace(WF, frac_malicious=0.20, attacker_budget=30.0)),
+    ("v4_budget_cost5", "无 M8,攻击者预算 30,开户成本 5,20%", replace(WF, frac_malicious=0.20, attacker_budget=30.0, sybil_cost=5.0)),
+    ("v4_adaptive", "无 M8,作恶有利会吸引更多人(起点 10%)", replace(WF, adaptive_attackers=True)),
+    ("v4_adaptive_m8", "+ M8,作恶有利会吸引更多人(起点 10%)", replace(WF, adaptive_attackers=True, vouching=True)),
+    ("v4_adaptive_noacc", "对照:作恶有利吸引更多人,且关掉责任机制", replace(WF, adaptive_attackers=True, accountability=False)),
+    ("v4_honest_cost_m8", "无攻击者,开 M8(看对增长的代价)", replace(V2, frac_malicious=0.0, vouching=True, **V3_FIX)),
+    ("v4_honest_ref", "无攻击者,M4–M7(对照)", replace(V2, frac_malicious=0.0, **V3_FIX)),
+]
+
+
 def run_scenario(p: Params, seeds: int) -> dict:
     ms = [Sim(p, s).run() for s in range(seeds)]
 
@@ -693,21 +803,23 @@ def run_scenario(p: Params, seeds: int) -> dict:
         "mal_rep": avg(lambda m: m.mal_rep),
         "units": avg(lambda m: m.units_end),
         "sybil": avg(lambda m: m.sybil_resets),
+        "members": avg(lambda m: m.members_end),
+        "malshare": avg(lambda m: m.mal_member_share),
     }
 
 
 def table(results: list[tuple[str, str, dict]]) -> str:
     h = ("| 场景 | 说明 | 加权错误率 10%→25%→50%→末期 | 可检出错误 25%→末期 | 末期错误占数量比 "
          "| 正确单元被误删 | 诚实者因诚实的错受罚 | 开拓者存活率 | 诚实者人均净收益 | 作恶者人均净收益 | 作恶者末期信誉 "
-         "| 在册知识数 | 女巫换号次数 |")
-    sep = "|" + "---|" * 13
+         "| 在册知识数 | 女巫换号次数 | 末期成员数 | 仍在活动的作恶者占比 |")
+    sep = "|" + "---|" * 15
     rows = [h, sep]
     for name, desc, x in results:
         rows.append(
             f"| `{name}` | {desc} | {x['e10']:.3f} → {x['e25']:.3f} → {x['e50']:.3f} → **{x['e100']:.3f}** ±{x['e100_sd']:.3f} "
             f"| {x['k25']:.3f} → **{x['k100']:.3f}** | {x['cnt']:.3f} | {x['false_rm']:.1f} | {x['hon_pen']:.1f} "
             f"| {x['pioneer']:.2f} | {x['hon_net']:+.2f} | {x['mal_net']:+.2f} | {x['mal_rep']:.2f} "
-            f"| {x['units']:.0f} | {x['sybil']:.0f} |"
+            f"| {x['units']:.0f} | {x['sybil']:.0f} | {x['members']:.0f} | {x['malshare']:.2f} |"
         )
     return "\n".join(rows)
 
@@ -717,7 +829,7 @@ def main():
     ap.add_argument("--md", action="store_true", help="写出 sim/CONVERGENCE.md")
     ap.add_argument("--seeds", type=int, default=5)
     ap.add_argument("--steps", type=int, default=BASE.steps)
-    ap.add_argument("--round", choices=["1", "2", "3", "all"], default="all")
+    ap.add_argument("--round", choices=["1", "2", "3", "4", "all"], default="all")
     args = ap.parse_args()
     def run_all(scen):
         out = []
@@ -730,6 +842,7 @@ def main():
         ("1", "## 第一轮:VISION §4b 草案(C1–C6 + 责任机制)", SCENARIOS),
         ("2", "## 第二轮:加入 M1 审查义务、M2 精准审查、M3 理性作恶者", SCENARIOS_V2),
         ("3", "## 第三轮:放松四个偏乐观假设(A1–A4),检验对策 M4–M7", SCENARIOS_V3),
+        ("4", "## 第四轮:M8 邀请担保;有限预算攻击者;作恶收益吸引更多攻击者", SCENARIOS_V4),
     ]
     parts = []
     for rid, title, scen in rounds:
