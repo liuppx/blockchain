@@ -55,7 +55,7 @@ RUSTFLAGS="-D warnings" cargo test --release --no-run     # 零编译告警
 # 其中位锚点测(见 §6)验证共识浮点逐位一致。
 ```
 
-- 测试总数:**node 768(707 lib + 61 bin)+ engine 11**,全绿。2 个 `#[ignore]`(config 的
+- 测试总数:**node 772(711 lib + 61 bin)+ engine 11**,全绿。2 个 `#[ignore]`(config 的
   环境依赖测;M213 的 `seed_fuzz_corpus` 语料生成器,均非安全相关)。
 - `unsafe`:**全仓非测试代码 0 处**(`grep -rn unsafe engine/src node/src`)。
 - 无 `cargo-audit` 门禁(当前 advisory,依赖树未确认无 RUSTSEC —— 见 §10)。
@@ -218,7 +218,7 @@ RUSTFLAGS="-D warnings" cargo test --release --no-run     # 零编译告警
    fail-closed;见 [`docs/design/remote-signer.md`](design/remote-signer.md) 与 DEPLOYMENT §2b。
    仍无 HSM/云 KMS 后端(远程签名器为本地 socket 参考实现)。
 4. **治理刚上线**(M193–198),未经对抗/洪流/临界票数压测。
-5. **无长跑/网络分区/混沌测**;fuzz 有两层:always-on 的 "fuzz-lite"(确定性 PRNG 轰全部 29 个
+5. **无长跑/网络分区/混沌测**;fuzz 有两层:always-on 的 "fuzz-lite"(确定性 PRNG 轰全部 30 个
    `decode_*` 入口,stable CI 门禁)+ **M213 cargo-fuzz**(`node/fuzz/` libFuzzer `decode_all`
    多路目标 + 提交的种子语料,nightly CI advisory 跑;见 `node/fuzz/README.md`)。**M231 起**补
    `testnet/chaos.sh`:对 4 验证人测试网注入**崩溃容错**(杀少数、存活 >2/3 继续出块且不分叉)、
@@ -276,6 +276,12 @@ RUSTFLAGS="-D warnings" cargo test --release --no-run     # 零编译告警
     quorum。**残余**:① 豁免的既有验证人若**后续**增绑超 1/3 再下线仍可影响活性(范围窄,与 §10.2 活性问责
     重叠);② `0` 默认为向后兼容,运营方须**显式**在创世启用;③ 治理动态调参(`GovParam`)为后续项。属
     **已缓解的已知边界**。
+
+12. **既有 op 的签名字节没有域分隔**(2026-11-08 实现知识 op 时发现,纵深防御缺口,未发现可利用路径)。
+    质押、治理、密钥轮换、桥等 op 的签名字节只是各自字段的拼接,不带类型前缀。理论上,若两种 op 的签名字节
+    在长度与布局上恰好一致,一种 op 的签名可被当作另一种 op 的签名重放。目前各 op 的字段长度与布局基本不同,
+    未构造出实际碰撞。**新增的知识 op 已带域前缀** `zhixing-knowledge-op-v1`;既有 op 补域前缀属线上格式变更,
+    建议随测试网的协议版本 4 一并完成。
 
 ## 11. 负责任披露
 

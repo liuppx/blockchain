@@ -32,6 +32,7 @@ pub mod daemon;
 pub mod driver;
 pub mod hash;
 pub mod keystore;
+pub mod knowledge;
 pub mod light;
 pub mod mempool;
 pub mod merkle;
