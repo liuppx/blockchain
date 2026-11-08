@@ -2511,7 +2511,51 @@ impl ChainState {
         if !self.knowledge.members.contains_key(&op.actor) {
             return Err(ChainError::NotAMember(op.actor));
         }
-        self.gov_nonce_window(op.actor, op.nonce)
+        self.gov_nonce_window(op.actor, op.nonce)?;
+        // 现在就能确定"永远无法执行"的 op 直接拒绝,不要先回报成功再在出块时悄悄丢弃
+        // (同 SEC-01 第 3 轮:RPC 不应对不会入块的 op 返回成功,也不应让它占着池位与序号)。
+        // 可能因同一块内更早的 op 而变得有效的条件(例如引用尚未创建的单元)不在这里检查。
+        use crate::knowledge::KnowledgeAction;
+        match &op.action {
+            KnowledgeAction::CreateUnit { domain, .. } => {
+                // 阶段 1 领域只在创世登记,不会新增
+                if !self.knowledge.domains.contains(domain) {
+                    return Err(ChainError::UnknownDomain(*domain));
+                }
+            }
+            KnowledgeAction::Verify { unit, version, .. } => {
+                // 版本的发布者永不改变:发布者核验自己的版本永远无效
+                if let Some(v) = self
+                    .knowledge
+                    .units
+                    .get(unit)
+                    .and_then(|u| u.versions.get((*version as usize).wrapping_sub(1)))
+                {
+                    if v.publisher == op.actor {
+                        return Err(ChainError::SelfVerify {
+                            unit: *unit,
+                            version: *version,
+                        });
+                    }
+                }
+            }
+            KnowledgeAction::Invite { pubkey } => {
+                let next = self.height + 1;
+                if !self.knowledge.is_established(op.actor, next) {
+                    return Err(ChainError::InProbation(op.actor));
+                }
+                let last = self.knowledge.members[&op.actor].last_invite_height;
+                if last != 0 && next < last.saturating_add(self.knowledge.invite_cooldown_blocks) {
+                    return Err(ChainError::InviteCooldown(op.actor));
+                }
+                // 账户不会被删除:已被使用的公钥永远不能再被邀请
+                if self.accounts.values().any(|a| a.pubkey == *pubkey) {
+                    return Err(ChainError::PubkeyInUse);
+                }
+            }
+            KnowledgeAction::PublishVersion { .. } => {}
+        }
+        Ok(())
     }
 
     /// K4:提交区块后的廉价清理:序号已落在窗口之外的知识 op 永远无法执行,丢弃(不做验签)。

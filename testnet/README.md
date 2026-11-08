@@ -57,7 +57,21 @@ testnet/soak.sh [DURATION_S=180] [INTERVAL_S=10] [LAG=2] [LEAK_PCT=50] [load]
 ### 知识单元(测试网阶段 1,K7)
 
 `gen.sh` 生成的创世带 `[knowledge]` 段:登记领域 1(大模型应用开发)与 2(运动健身),**关闭旧的 ΔK 提交路径**
-(`legacy_submissions = false`,自报嵌入向量可被操纵,VISION Q7),见习期 60 块、邀请冷却 30 块(为缩短演练而设得较短)。
+(`legacy_submissions = false`,自报嵌入向量可被操纵,VISION Q7)。时长默认取正式值:**见习期 7 天**(604,800 块)、
+**邀请冷却 1 天**(86,400 块),按每秒一块折算;`gen.sh --drill` 改为 60 / 30 块,便于快速演练邀请。
+
+#### 用第一批成员的公钥开链
+
+成员按 [`MEMBERS.md`](MEMBERS.md) 自己生成密钥,只把公钥发给组织者。组织者把名单填进
+`testnet/members.toml`(格式见 [`members.example.toml`](members.example.toml);该文件含称呼,已加入 .gitignore),然后:
+
+```sh
+testnet/gen.sh --members testnet/members.toml --force    # 账户 1..N = 名单顺序,不生成任何成员密钥
+```
+
+生成时会校验每个公钥(64 位十六进制、不重复)与方向(fitness / llm);称呼只写入链下名单
+`testnet/out/members.md`,不上链。第一批成员即创世成员,不需要见习期;之后加入的人由他们邀请,须经见习期。
+实测:两名成员各用自己的密钥文件,一人创建单元、另一人核验,可信度 0.1 → 0.4;组织者全程不接触任何成员私钥。
 
 ```sh
 # 把运动健身试运行单元导入测试网(作者为账户 1,经令牌保护的 /knowledge 提交,从加密 keystore 签名)

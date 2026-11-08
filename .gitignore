@@ -34,3 +34,6 @@ __pycache__/
 # YeYing Project local task state
 /.project/
 .playwright-cli
+
+# K7: the real testnet member list holds names (personal info); only the example is tracked
+testnet/members.toml

@@ -5,7 +5,13 @@
 # match. This scripts exactly the manual steps of docs/DEPLOYMENT.md §2–§4 so the
 # §11 checklist item "genesis 参数经测试网实测反校" has a reproducible starting point.
 #
-#   testnet/gen.sh [-n VALIDATORS] [-a ACCOUNTS] [--force]
+#   testnet/gen.sh [-n VALIDATORS] [-a ACCOUNTS] [--members FILE] [--drill] [--force]
+#
+#   --members FILE  build the genesis accounts from a member list (testnet/members.example.toml):
+#                   each member generated their OWN key and sent only the public key, so no
+#                   account keystores are created here. Ids 1..N in file order. See testnet/MEMBERS.md.
+#   --drill         short probation / invite cooldown (60 / 30 blocks) for quick rehearsals;
+#                   the default is the real testnet timing (7 days / 1 day at 1 block/s).
 #
 # Everything lands in testnet/out/ (gitignored: it holds keystores + the password).
 set -euo pipefail
@@ -20,14 +26,19 @@ ACCOUNTS=3   # funded accounts (ids 1..) — tx authors for load / calibration
 FORCE=0
 SIGNER_IDS=""   # M219: comma-separated validator ids to run behind a remote `node signer`
 PERMISSIONED=0  # M236: --permissioned ⇒ genesis-pinned mTLS + RFC5705 channel binding
+MEMBERS=""      # K7: --members FILE ⇒ genesis accounts from a member list (members hold their own keys)
+PROBATION_BLOCKS=604800      # 7 days at 1 block/s (VISION §4d; sim round 3: newcomer weight starts near zero)
+INVITE_COOLDOWN_BLOCKS=86400 # 1 day: each member invites at most one person per day
 while [ $# -gt 0 ]; do
   case "$1" in
     -n) N="$2"; shift 2 ;;
     -a) ACCOUNTS="$2"; shift 2 ;;
     --signer) SIGNER_IDS="$2"; shift 2 ;;
     --permissioned) PERMISSIONED=1; shift ;;
+    --members) MEMBERS="$2"; shift 2 ;;
+    --drill) PROBATION_BLOCKS=60; INVITE_COOLDOWN_BLOCKS=30; shift ;;
     --force) FORCE=1; shift ;;
-    *) echo "usage: $0 [-n VALIDATORS] [-a ACCOUNTS] [--signer id1,id2,...] [--permissioned] [--force]" >&2; exit 2 ;;
+    *) echo "usage: $0 [-n VALIDATORS] [-a ACCOUNTS] [--signer id1,id2,...] [--permissioned] [--members FILE] [--drill] [--force]" >&2; exit 2 ;;
   esac
 done
 if [ "$N" -lt 4 ]; then echo "need at least 4 validators (BFT 3f+1)" >&2; exit 2; fi
@@ -71,6 +82,34 @@ mint_key() { # $1 = keystore path  → echoes pubkey hex
   "$BIN" keygen --encrypt --out "$1" | awk '$1=="pubkey"{print $2}'
 }
 
+# K7: parse + validate the member list up front (fail before any key is minted). Emits
+# "id<TAB>focus<TAB>pubkey<TAB>name" lines; ids are 1..N in file order.
+MEMBER_ROWS=""
+if [ -n "$MEMBERS" ]; then
+  [ -f "$MEMBERS" ] || { echo "member list not found: $MEMBERS" >&2; exit 1; }
+  MEMBER_ROWS="$(python3 -I - "$MEMBERS" <<'PYEOF'
+import re, sys, tomllib
+data = tomllib.load(open(sys.argv[1], "rb"))
+ms = data.get("members", [])
+if not ms:
+    sys.exit("member list has no [[members]] entries")
+seen = set()
+for i, m in enumerate(ms, 1):
+    name, focus, pk = m.get("name", "").strip(), m.get("focus", "").strip(), m.get("pubkey", "").strip().lower()
+    if not name:
+        sys.exit(f"member #{i}: name is required")
+    if focus not in ("fitness", "llm"):
+        sys.exit(f"member #{i} ({name}): focus must be fitness or llm, got {focus!r}")
+    if not re.fullmatch(r"[0-9a-f]{64}", pk):
+        sys.exit(f"member #{i} ({name}): pubkey must be 64 hex chars (the line `pubkey ...` printed by keygen)")
+    if pk in seen:
+        sys.exit(f"member #{i} ({name}): duplicate pubkey")
+    seen.add(pk)
+    print(f"{i}\t{focus}\t{pk}\t{name}")
+PYEOF
+)" || exit 1
+fi
+
 GEN="$OUT/genesis.toml"
 {
   echo "# zhixing testnet genesis — shared by every node, byte-identical."
@@ -81,13 +120,22 @@ GEN="$OUT/genesis.toml"
   echo "max_validator_power_bps = 3333   # M235 §10.11: no new validator may exceed 1/3 of power"
   echo "timestamp_days         = 0.0"
   echo
-  for ((i = 1; i <= ACCOUNTS; i++)); do
-    pk="$(mint_key "$OUT/keys/acct$i.json")"
-    echo "[[accounts]]"; echo "id = $i"; echo "balance_micro = 30000000"; echo "pubkey_hex = \"$pk\""; echo
-  done
-  for ((i = 1; i <= ACCOUNTS; i++)); do
-    echo "[[reviewers]]"; echo "id = $((9 + i))"; echo "weight = 1.0"; echo
-  done
+  if [ -n "$MEMBER_ROWS" ]; then
+    # Founding community (C6): members' own public keys. No balance is needed — knowledge ops
+    # carry no fee and mint nothing. No legacy reviewers (the ΔK path is off on the testnet).
+    while IFS=$'\t' read -r mid focus pk name; do
+      echo "# member $mid · $focus"
+      echo "[[accounts]]"; echo "id = $mid"; echo "balance_micro = 0"; echo "pubkey_hex = \"$pk\""; echo
+    done <<< "$MEMBER_ROWS"
+  else
+    for ((i = 1; i <= ACCOUNTS; i++)); do
+      pk="$(mint_key "$OUT/keys/acct$i.json")"
+      echo "[[accounts]]"; echo "id = $i"; echo "balance_micro = 30000000"; echo "pubkey_hex = \"$pk\""; echo
+    done
+    for ((i = 1; i <= ACCOUNTS; i++)); do
+      echo "[[reviewers]]"; echo "id = $((9 + i))"; echo "weight = 1.0"; echo
+    done
+  fi
   for ((i = 1; i <= N; i++)); do
     id=$((20 + i))
     pk="$(mint_key "$OUT/keys/val$id.json")"
@@ -95,11 +143,18 @@ GEN="$OUT/genesis.toml"
   done
   # K7 (testnet stage 1): knowledge units. Domains 1 = LLM app dev, 2 = fitness. The legacy ΔK
   # submission path is OFF on the testnet (self-reported embeddings are gameable, VISION Q7).
-  # Probation ~ 1 day at 1 block/s would be 86400; kept short here so drills finish quickly.
+  # Genesis members are established at once (the founding community); members invited later
+  # serve the probation. Default timing is the real one; --drill shortens it for rehearsals.
   echo "[knowledge]"; echo "domains = [1, 2]"; echo "legacy_submissions = false"
-  echo "probation_blocks = 60"; echo "invite_cooldown_blocks = 30"
+  echo "probation_blocks = $PROBATION_BLOCKS"; echo "invite_cooldown_blocks = $INVITE_COOLDOWN_BLOCKS"
 } > "$GEN"
-chmod 600 "$OUT"/keys/*.json
+# Off-chain member registry (names never go on chain): id ↔ name ↔ focus.
+if [ -n "$MEMBER_ROWS" ]; then
+  { echo "# 成员名单(链下记录,不上链)"; echo; echo "| id | 称呼 | 方向 | 公钥 |"; echo "|---|---|---|---|"
+    while IFS=$'\t' read -r mid focus pk name; do echo "| $mid | $name | $focus | \`$pk\` |"; done <<< "$MEMBER_ROWS"
+  } > "$OUT/members.md"
+fi
+chmod 600 "$OUT"/keys/*.json 2>/dev/null || true
 
 # Per-node config (DEPLOYMENT.md §4/§5). Ports: p2p 90<id>, metrics 91<id>, rpc 92<id>.
 for ((i = 1; i <= N; i++)); do

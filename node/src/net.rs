@@ -5022,6 +5022,109 @@ mod tests {
     }
 
     #[test]
+    fn knowledge_admission_rejects_permanently_invalid_ops_up_front() {
+        // 测试网实测发现:成员核验自己的版本时,RPC 先回报成功、出块时才悄悄丢弃。现在准入时即给出原因,
+        // 且不入池、不占去重槽位。可能在同一块内变得有效的 op(引用尚未创建的单元)仍然放行。
+        use crate::knowledge::*;
+        let ids = [1u64, 2, 3, 21, 22, 23, 24];
+        let seeds: BTreeMap<u64, [u8; 32]> = ids.iter().map(|&id| (id, seed(id))).collect();
+        let mut driver = ChainDriver::new(kgen(), seeds, 4);
+        let mut node = GossipNode::new(1, kgen(), 16, [1]);
+        driver.stage_knowledge_op(kop_create(1, 0, 1));
+        driver.produce(1.0, &BTreeSet::new()).unwrap();
+        let (b, c) = (driver.blocks()[0].clone(), driver.certificates()[0].clone());
+        assert!(node.apply_certified(b, c));
+
+        let mk = |actor: u64, nonce: u64, action| {
+            KnowledgeOp {
+                actor,
+                action,
+                nonce,
+                signature: [0u8; 64],
+            }
+            .signed(&kp(actor))
+        };
+        let self_verify = mk(
+            1,
+            1,
+            KnowledgeAction::Verify {
+                unit: 1,
+                version: 1,
+                verdict: Verdict::Pass,
+                note_hash: [0u8; 32],
+            },
+        );
+        let r = node.submit_local_knowledge_op(self_verify);
+        assert!(
+            matches!(
+                r,
+                Err(ChainError::SelfVerify {
+                    unit: 1,
+                    version: 1
+                })
+            ),
+            "{r:?}"
+        );
+        let bad_domain = mk(
+            2,
+            0,
+            KnowledgeAction::CreateUnit {
+                layer: Layer::Foundation,
+                domain: 9,
+                version: kpayload(4, vec![]),
+            },
+        );
+        assert!(matches!(
+            node.submit_local_knowledge_op(bad_domain),
+            Err(ChainError::UnknownDomain(9))
+        ));
+        let reuse_key = mk(
+            2,
+            0,
+            KnowledgeAction::Invite {
+                pubkey: kp(3).public(),
+            },
+        );
+        assert!(matches!(
+            node.submit_local_knowledge_op(reuse_key),
+            Err(ChainError::PubkeyInUse)
+        ));
+        assert!(node.pending_knowledge_ops().is_empty());
+        assert_eq!(node.seen_knowledge_len(), 0);
+        // 他人核验:放行;引用尚未存在的单元:放行(可能被同一块内更早的 op 创建)
+        let other = mk(
+            2,
+            0,
+            KnowledgeAction::Verify {
+                unit: 1,
+                version: 1,
+                verdict: Verdict::Pass,
+                note_hash: [0u8; 32],
+            },
+        );
+        node.submit_local_knowledge_op(other)
+            .expect("another member may verify");
+        let forward = mk(
+            3,
+            0,
+            KnowledgeAction::CreateUnit {
+                layer: Layer::Application,
+                domain: 2,
+                version: kpayload(
+                    5,
+                    vec![Cite {
+                        unit: 7,
+                        version: 1,
+                        kind: CiteKind::Basis,
+                    }],
+                ),
+            },
+        );
+        node.submit_local_knowledge_op(forward)
+            .expect("a forward cite may resolve within a block");
+    }
+
+    #[test]
     fn knowledge_pool_caps_quota_and_current_nonce_priority() {
         // 镜像治理池 SEC-01 第 3 / 5 轮:按账户配额、全局上限(本地提交同样受限,满池不占去重槽位)、
         // 当前序号的 op 可淘汰停放最远的超前序号 op。
