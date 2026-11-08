@@ -6,6 +6,8 @@
 >
 > **实施进度**:**K1 已完成**——`node/src/knowledge.rs` 类型 + `codec.rs` 编解码(签名带域前缀、正文与引用数量有上限、
 > 字符串严格 UTF-8),已纳入 `decode_all` 模糊测试与 fuzz-lite 守护。
+> **K2 已完成**——区块 `knowledge_ops` + 头部第 11 个承诺(B8 wire,协议版本 4);`KnowledgeState` 折入 `state_root`,
+> 快照 v7;四种操作的完整校验与执行;创世 `[knowledge]` 段(领域登记、旧 ΔK 提交开关、见习期、邀请冷却)。
 
 ## 1. 目标与范围
 

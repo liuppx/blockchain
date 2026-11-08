@@ -145,6 +145,7 @@ fn demo_genesis() -> Genesis {
         decay_half_life_blocks: 0, // M187: decay disabled in the demo (canon unchanged)
         slash_bps: 10_000,
         max_validator_power_bps: 0,
+        knowledge: zhixing_node::knowledge::KnowledgeGenesis::default(),
         timestamp_days: 0.0,
         validators: vset
             .validators()
@@ -239,6 +240,7 @@ fn demo_blocks(chain: &Chain) -> Vec<Block> {
         key_rotations: Vec::new(),
         gov_proposals: Vec::new(),
         gov_votes: Vec::new(),
+        knowledge_ops: Vec::new(),
     };
     trial.seal(&mut b1).expect("seal b1");
     trial.commit(&mut b1).expect("commit b1 on trial");
@@ -286,6 +288,7 @@ fn demo_blocks(chain: &Chain) -> Vec<Block> {
         key_rotations: Vec::new(),
         gov_proposals: Vec::new(),
         gov_votes: Vec::new(),
+        knowledge_ops: Vec::new(),
     };
     trial.seal(&mut b2).expect("seal b2");
     vec![b1, b2]
@@ -3571,6 +3574,7 @@ fn empty_next_block(chain: &Chain, timestamp_days: f32) -> Block {
         key_rotations: Vec::new(),
         gov_proposals: Vec::new(),
         gov_votes: Vec::new(),
+        knowledge_ops: Vec::new(),
     }
 }
 
@@ -5890,8 +5894,8 @@ mod tests {
         }
         assert_eq!(
             hex(&chain.state.state_root()),
-            // M235: re-baselined — the §10.11 share cap folds into state_root (SEC-02 style).
-            "f656223f0db70b2683c3b6cac1ac017f2165d39983e211554010a99730010ddd"
+            // K2(测试网阶段 1):re-baselined — 知识模块状态与内容许可折入 state_root。
+            "2dc33c072c9096461fae803ff8b7da3a3fbf9a960fee813cd2b3c0d3f8710598"
         );
         assert_eq!(
             hex(&chain.state.merkle_root()),
@@ -6984,6 +6988,7 @@ mod tests {
             key_rotations: vec![],
             gov_proposals: Vec::new(),
             gov_votes: Vec::new(),
+            knowledge_ops: Vec::new(),
             proposer: 0,
         }
     }

@@ -356,6 +356,7 @@ mod tests {
             key_rotations: Vec::new(),
             gov_proposals: Vec::new(),
             gov_votes: Vec::new(),
+            knowledge_ops: Vec::new(),
             proposer: 0,
         }
     }

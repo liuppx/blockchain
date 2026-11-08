@@ -157,6 +157,11 @@ pub fn encode_block(b: &Block) -> Vec<u8> {
     for op in &b.gov_votes {
         enc_gov_vote(&mut e, op, true);
     }
+    // 测试网阶段 1(B8 wire):知识单元 op 列表,追加在尾部。
+    e.u64(b.knowledge_ops.len() as u64);
+    for op in &b.knowledge_ops {
+        enc_knowledge_op(&mut e, op, true);
+    }
     e.0
 }
 
@@ -234,6 +239,8 @@ pub fn encode_header(h: &BlockHeader) -> Vec<u8> {
     // votes), appended at the tail — same prefix-stability discipline.
     e.raw(&h.gov_proposals_commitment);
     e.raw(&h.gov_votes_commitment);
+    // 测试网阶段 1(B8 wire):第十一个 per-body 承诺(知识单元 op 列表),追加在尾部。
+    e.raw(&h.knowledge_ops_commitment);
     e.0
 }
 
@@ -304,6 +311,8 @@ pub fn decode_header(buf: &[u8]) -> Result<BlockHeader, CodecError> {
     gov_proposals_commitment.copy_from_slice(d.take(32)?);
     let mut gov_votes_commitment = [0u8; 32];
     gov_votes_commitment.copy_from_slice(d.take(32)?);
+    let mut knowledge_ops_commitment = [0u8; 32];
+    knowledge_ops_commitment.copy_from_slice(d.take(32)?);
     if d.pos != d.buf.len() {
         return Err(CodecError::TrailingBytes);
     }
@@ -330,6 +339,7 @@ pub fn decode_header(buf: &[u8]) -> Result<BlockHeader, CodecError> {
         key_rotations_commitment,
         gov_proposals_commitment,
         gov_votes_commitment,
+        knowledge_ops_commitment,
     })
 }
 
@@ -371,7 +381,7 @@ pub fn decode_certified_header(buf: &[u8]) -> Result<CertifiedHeader, CodecError
     // (no allocation: `header_len` is bounded by `buf.len()`).
     let header_len = match (n_updates as usize)
         .checked_mul(48)
-        .and_then(|u| u.checked_add(284 + 320))
+        .and_then(|u| u.checked_add(284 + 352))
     {
         Some(len) if len <= buf.len() => len, // 604 base + 48 per update
         _ => return Err(CodecError::UnexpectedEof),
@@ -524,6 +534,8 @@ pub struct BlockHeader {
     /// M194 (B6 wire): SHA-256 over the canonical encoding of the governance vote
     /// op list (`Block::gov_votes`). Tenth and last per-body commitment.
     pub gov_votes_commitment: crate::Hash,
+    /// 测试网阶段 1(B8 wire):知识单元 op 列表(`Block::knowledge_ops`)的 SHA-256。第十一个、也是最后一个 per-body 承诺。
+    pub knowledge_ops_commitment: crate::Hash,
 }
 
 impl BlockHeader {
@@ -608,6 +620,12 @@ impl BlockHeader {
             gov_votes_commitment: list_commitment(
                 &b.gov_votes.iter().map(encode_gov_vote).collect::<Vec<_>>(),
             ),
+            knowledge_ops_commitment: list_commitment(
+                &b.knowledge_ops
+                    .iter()
+                    .map(encode_knowledge_op)
+                    .collect::<Vec<_>>(),
+            ),
         }
     }
 
@@ -641,6 +659,7 @@ impl BlockHeader {
         key_rotations: Vec<KeyRotation>,
         gov_proposals: Vec<GovProposal>,
         gov_votes: Vec<GovVote>,
+        knowledge_ops: Vec<crate::knowledge::KnowledgeOp>,
     ) -> Block {
         Block {
             height: self.height,
@@ -665,6 +684,7 @@ impl BlockHeader {
             key_rotations,
             gov_proposals,
             gov_votes,
+            knowledge_ops,
         }
     }
 }
@@ -1228,6 +1248,147 @@ fn dec_knowledge_op(d: &mut Dec) -> Result<crate::knowledge::KnowledgeOp, CodecE
         action,
         nonce,
         signature,
+    })
+}
+
+/// 知识模块状态的规范编码:`state_root` 与快照共用(BTreeMap / BTreeSet 有序迭代 ⇒ 字节规范)。
+pub(crate) fn enc_knowledge_state(e: &mut Enc, k: &crate::knowledge::KnowledgeState) {
+    e.u64(k.units.len() as u64);
+    for (id, u) in &k.units {
+        e.u64(*id);
+        e.u64(u.author);
+        e.u8(u.layer as u8);
+        e.u32(u.domain);
+        e.u64(u.created_height);
+        e.u64(u.versions.len() as u64);
+        for v in &u.versions {
+            e.u32(v.n);
+            e.u64(v.publisher);
+            e.u64(v.published_height);
+            enc_version_payload(e, &v.payload);
+        }
+    }
+    e.u64(k.verifications.len() as u64);
+    for ((unit, version, verifier), v) in &k.verifications {
+        e.u64(*unit);
+        e.u32(*version);
+        e.u64(*verifier);
+        e.u8(v.verdict as u8);
+        e.raw(&v.note_hash);
+        e.u64(v.height);
+    }
+    e.u64(k.members.len() as u64);
+    for (id, m) in &k.members {
+        e.u64(*id);
+        e.u64(m.joined_height);
+        e.u64(m.inviter);
+        e.u64(m.last_invite_height);
+    }
+    e.u64(k.domains.len() as u64);
+    for d in &k.domains {
+        e.u32(*d);
+    }
+    e.u64(k.next_unit_id);
+    e.u64(k.next_account_id);
+    e.u8(k.legacy_submissions as u8);
+    e.u64(k.probation_blocks);
+    e.u64(k.invite_cooldown_blocks);
+}
+
+fn dec_knowledge_state(d: &mut Dec) -> Result<crate::knowledge::KnowledgeState, CodecError> {
+    use crate::knowledge::{
+        KnowledgeState, KnowledgeUnit, Layer, Member, UnitVersion, Verdict, Verification,
+    };
+    use std::collections::{BTreeMap, BTreeSet};
+    let nu = d.count()?;
+    let mut units = BTreeMap::new();
+    for _ in 0..nu {
+        let id = d.u64()?;
+        let author = d.u64()?;
+        let lt = d.u8()?;
+        let layer = Layer::from_u8(lt).ok_or(CodecError::BadEnum(lt as u32))?;
+        let domain = d.u32()?;
+        let created_height = d.u64()?;
+        let nv = d.count()?;
+        let mut versions = Vec::with_capacity(prealloc(nv));
+        for _ in 0..nv {
+            let n = d.u32()?;
+            let publisher = d.u64()?;
+            let published_height = d.u64()?;
+            let payload = dec_version_payload(d)?;
+            versions.push(UnitVersion {
+                n,
+                publisher,
+                payload,
+                published_height,
+            });
+        }
+        units.insert(
+            id,
+            KnowledgeUnit {
+                id,
+                author,
+                layer,
+                domain,
+                created_height,
+                versions,
+            },
+        );
+    }
+    let nver = d.count()?;
+    let mut verifications = BTreeMap::new();
+    for _ in 0..nver {
+        let unit = d.u64()?;
+        let version = d.u32()?;
+        let verifier = d.u64()?;
+        let verdict = match d.u8()? {
+            0 => Verdict::Pass,
+            1 => Verdict::NeedsRevision,
+            other => return Err(CodecError::BadEnum(other as u32)),
+        };
+        let mut note_hash = [0u8; 32];
+        note_hash.copy_from_slice(d.take(32)?);
+        let height = d.u64()?;
+        verifications.insert(
+            (unit, version, verifier),
+            Verification {
+                unit,
+                version,
+                verifier,
+                verdict,
+                note_hash,
+                height,
+            },
+        );
+    }
+    let nm = d.count()?;
+    let mut members = BTreeMap::new();
+    for _ in 0..nm {
+        let id = d.u64()?;
+        members.insert(
+            id,
+            Member {
+                joined_height: d.u64()?,
+                inviter: d.u64()?,
+                last_invite_height: d.u64()?,
+            },
+        );
+    }
+    let nd = d.count()?;
+    let mut domains = BTreeSet::new();
+    for _ in 0..nd {
+        domains.insert(d.u32()?);
+    }
+    Ok(KnowledgeState {
+        units,
+        verifications,
+        members,
+        domains,
+        next_unit_id: d.u64()?,
+        next_account_id: d.u64()?,
+        legacy_submissions: d.u8()? != 0,
+        probation_blocks: d.u64()?,
+        invite_cooldown_blocks: d.u64()?,
     })
 }
 
@@ -1807,7 +1968,9 @@ pub fn decode_account(buf: &[u8]) -> Result<Account, CodecError> {
 ///
 /// v6 (M235): adds `max_validator_power_bps` (§10.11 validator power share cap, folded into
 /// `state_root`). A v5 snapshot lacks it, so v5 is now rejected — regenerate.
-pub const SNAPSHOT_VERSION: u32 = 6;
+///
+/// v7(测试网阶段 1):追加知识模块状态(单元、版本、核验、成员、领域与参数)。v6 快照缺少该段,被拒——重新生成。
+pub const SNAPSHOT_VERSION: u32 = 7;
 
 /// Write the account's state fields into the shared stream (same layout as
 /// [`encode_account`], inlined so the snapshot controls framing).
@@ -1981,6 +2144,8 @@ pub fn encode_snapshot(s: &ChainState) -> Vec<u8> {
             e.u64(*index);
         }
     }
+    // v7:知识模块状态(与 state_root 共用同一份规范编码)。
+    enc_knowledge_state(&mut e, &s.knowledge);
     e.0
 }
 
@@ -2159,10 +2324,12 @@ pub fn decode_snapshot(buf: &[u8]) -> Result<ChainState, CodecError> {
             },
         );
     }
+    let knowledge = dec_knowledge_state(&mut d)?;
     if d.pos != d.buf.len() {
         return Err(CodecError::TrailingBytes);
     }
     Ok(ChainState {
+        knowledge,
         accounts,
         reviewers,
         graph,
@@ -2683,6 +2850,12 @@ pub fn decode_block(buf: &[u8]) -> Result<Block, CodecError> {
     for _ in 0..n_votes {
         gov_votes.push(dec_gov_vote(&mut d)?);
     }
+    // 测试网阶段 1(B8 wire):知识单元 op 列表。
+    let n_kops = d.count()?;
+    let mut knowledge_ops = Vec::with_capacity(prealloc(n_kops));
+    for _ in 0..n_kops {
+        knowledge_ops.push(dec_knowledge_op(&mut d)?);
+    }
     if d.pos != d.buf.len() {
         return Err(CodecError::TrailingBytes);
     }
@@ -2709,6 +2882,7 @@ pub fn decode_block(buf: &[u8]) -> Result<Block, CodecError> {
         key_rotations,
         gov_proposals,
         gov_votes,
+        knowledge_ops,
     })
 }
 
@@ -2942,6 +3116,7 @@ mod tests {
             key_rotations: Vec::new(),
             gov_proposals: Vec::new(),
             gov_votes: Vec::new(),
+            knowledge_ops: Vec::new(),
             proposer: 0,
         }
     }
@@ -3860,6 +4035,7 @@ mod tests {
                 key_rotations_commitment: [0u8; 32],
                 gov_proposals_commitment: [0u8; 32],
                 gov_votes_commitment: [0u8; 32],
+                knowledge_ops_commitment: [0u8; 32],
                 proposer: 0,
             },
             cert_prev: crate::consensus::Commit {
@@ -3890,6 +4066,7 @@ mod tests {
                 key_rotations_commitment: [0u8; 32],
                 gov_proposals_commitment: [0u8; 32],
                 gov_votes_commitment: [0u8; 32],
+                knowledge_ops_commitment: [0u8; 32],
                 proposer: 0,
             },
             cert_new: crate::consensus::Commit {
@@ -4020,6 +4197,7 @@ mod tests {
                         key_rotations_commitment: [0u8; 32],
                         gov_proposals_commitment: [0u8; 32],
                         gov_votes_commitment: [0u8; 32],
+                        knowledge_ops_commitment: [0u8; 32],
                         proposer: 0,
                     },
                     cert_prev: crate::consensus::Commit {
@@ -4050,6 +4228,7 @@ mod tests {
                         key_rotations_commitment: [0u8; 32],
                         gov_proposals_commitment: [0u8; 32],
                         gov_votes_commitment: [0u8; 32],
+                        knowledge_ops_commitment: [0u8; 32],
                         proposer: 0,
                     },
                     cert_new: crate::consensus::Commit {
@@ -4331,6 +4510,7 @@ mod tests {
             decay_half_life_blocks: 0,
             slash_bps: 10_000,
             max_validator_power_bps: 3_333, // M235 (§10.11): snapshot round-trip covers v6 field
+            knowledge: crate::knowledge::KnowledgeGenesis::default(),
             timestamp_days: 1.5,
             validators: vec![(21, pk(21), 3), (22, pk(22), 1)],
             bridge_sources: vec![],
@@ -5001,6 +5181,30 @@ mod tests {
             decode_knowledge_op(&good[..good.len() - 1]),
             Err(CodecError::UnexpectedEof)
         ));
+    }
+
+    #[test]
+    fn block_with_knowledge_ops_round_trips_and_commits() {
+        // 测试网阶段 1(B8 wire):区块携带知识 op,编解码往返;头部承诺覆盖它们,
+        // 且 header.hash() == block.hash() 的 SPV 契约仍成立;改动任何一条 op 都改变区块哈希。
+        let mut b = sample_block();
+        b.knowledge_ops = all_knowledge_actions();
+        let bytes = encode_block(&b);
+        let back = decode_block(&bytes).expect("decode");
+        assert_eq!(encode_block(&back), bytes);
+        assert_eq!(back.knowledge_ops, b.knowledge_ops);
+        let h = BlockHeader::from_block(&b);
+        assert_ne!(h.knowledge_ops_commitment, [0u8; 32]);
+        assert_eq!(h.hash(), b.hash());
+        let hb = encode_header(&h);
+        assert_eq!(encode_header(&decode_header(&hb).unwrap()), hb);
+        let mut b2 = b.clone();
+        b2.knowledge_ops[0].nonce += 1;
+        assert_ne!(
+            b2.hash(),
+            b.hash(),
+            "knowledge ops are bound by the header commitment"
+        );
     }
 
     #[test]

@@ -1024,6 +1024,10 @@ pub struct GenesisConfig {
     /// acquiring ≥1/3 and wedging quorum. Must be ≤ 10000.
     #[serde(default)]
     pub max_validator_power_bps: u32,
+    /// 测试网阶段 1:知识模块参数。可选 `[knowledge]` 段,缺省时保持现有链的行为
+    /// (旧 ΔK 提交开启、无见习期、无邀请冷却、未登记领域)。
+    #[serde(default)]
+    pub knowledge: Option<KnowledgeGenesisConfig>,
     #[serde(default)]
     pub timestamp_days: f32,
     #[serde(default)]
@@ -1148,6 +1152,11 @@ impl GenesisConfig {
             decay_half_life_blocks: self.decay_half_life_blocks,
             slash_bps: self.slash_bps,
             max_validator_power_bps: self.max_validator_power_bps,
+            knowledge: self
+                .knowledge
+                .as_ref()
+                .map(KnowledgeGenesisConfig::to_genesis)
+                .unwrap_or_default(),
             timestamp_days: self.timestamp_days,
             validators,
             bridge_sources: Vec::new(),
@@ -1214,6 +1223,38 @@ pub fn load_node_config(path: &str) -> Result<NodeConfig, ConfigError> {
 }
 
 /// Read + parse a genesis TOML.
+/// 测试网阶段 1:创世 `[knowledge]` 段。
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
+pub struct KnowledgeGenesisConfig {
+    /// 已登记的领域命名空间。
+    #[serde(default)]
+    pub domains: Vec<u32>,
+    /// 是否接受旧的 ΔK 知识提交;测试网应设为 false。
+    #[serde(default = "default_true")]
+    pub legacy_submissions: bool,
+    /// 见习期(区块数)。
+    #[serde(default)]
+    pub probation_blocks: u64,
+    /// 邀请冷却(区块数)。
+    #[serde(default)]
+    pub invite_cooldown_blocks: u64,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+impl KnowledgeGenesisConfig {
+    pub fn to_genesis(&self) -> crate::knowledge::KnowledgeGenesis {
+        crate::knowledge::KnowledgeGenesis {
+            domains: self.domains.clone(),
+            legacy_submissions: self.legacy_submissions,
+            probation_blocks: self.probation_blocks,
+            invite_cooldown_blocks: self.invite_cooldown_blocks,
+        }
+    }
+}
+
 pub fn load_genesis(path: &str) -> Result<GenesisConfig, ConfigError> {
     let s = std::fs::read_to_string(path)?;
     toml::from_str(&s).map_err(|e| ConfigError::Toml(e.to_string()))
@@ -2408,6 +2449,7 @@ mod tests {
             decay_half_life_blocks: 0,
             slash_bps: 10_000,
             max_validator_power_bps: 0,
+            knowledge: None,
             timestamp_days: 0.0,
             validators: (21..=24)
                 .map(|id| ValidatorConfig {
@@ -2458,6 +2500,7 @@ mod tests {
             decay_half_life_blocks: 0,
             slash_bps: 0,
             max_validator_power_bps: 0,
+            knowledge: None,
             timestamp_days: 0.0,
             validators: vec![],
             params: None,
@@ -2795,6 +2838,7 @@ mod tests {
             decay_half_life_blocks: 0,
             slash_bps: 10_000,
             max_validator_power_bps: 0,
+            knowledge: None,
             timestamp_days: 0.0,
             validators: (21..=24)
                 .map(|id| ValidatorConfig {

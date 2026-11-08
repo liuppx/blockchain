@@ -1470,6 +1470,7 @@ impl GossipNode {
                 key_rotations: Vec::new(),
                 gov_proposals: Vec::new(),
                 gov_votes: Vec::new(),
+                knowledge_ops: Vec::new(),
             });
         // M235: include only stake-ops that apply cleanly AND don't trip the §10.11 share cap,
         // so a stale/over-cap bond can't make the whole candidate unsealable and stall
@@ -3646,6 +3647,7 @@ mod tests {
             decay_half_life_blocks: 0,
             slash_bps: 10_000,
             max_validator_power_bps: 0,
+            knowledge: crate::knowledge::KnowledgeGenesis::default(),
             timestamp_days: 0.0,
             validators: [21u64, 22, 23, 24]
                 .iter()
@@ -3879,6 +3881,7 @@ mod tests {
             decay_half_life_blocks: 0,
             slash_bps: 10_000,
             max_validator_power_bps: 0,
+            knowledge: crate::knowledge::KnowledgeGenesis::default(),
             timestamp_days: 0.0,
             validators: vec![(21, kp(21).public(), 1)],
             bridge_sources: vec![],
@@ -3930,6 +3933,7 @@ mod tests {
             decay_half_life_blocks: 0,
             slash_bps: 10_000,
             max_validator_power_bps: 0,
+            knowledge: crate::knowledge::KnowledgeGenesis::default(),
             timestamp_days: 0.0,
             validators: vec![(21, kp(21).public(), 1)],
             bridge_sources: vec![],

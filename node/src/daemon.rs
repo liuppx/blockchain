@@ -172,7 +172,10 @@ async fn read_hello<R: AsyncReadExt + Unpin>(r: &mut R) -> io::Result<u64> {
 /// `unbonding_root`) wire breaks landed while this constant was still `1`, so a B5/B6
 /// node and a B7 node would have passed the handshake and only failed later on
 /// incompatible frames. Every future wire break MUST bump this (CI/review gate).
-pub const PROTOCOL_VERSION: u32 = 3;
+///
+/// 测试网阶段 1(B8 wire):bumped to **4** — blocks carry `knowledge_ops` and headers an 11th
+/// per-body commitment (`knowledge_ops_commitment`). The testnet starts from a fresh genesis.
+pub const PROTOCOL_VERSION: u32 = 4;
 
 /// M221 (rolling-upgrade S1): the LOWEST wire version this build still speaks. Together
 /// with [`PROTOCOL_VERSION`] (the highest) this build advertises the supported range
@@ -181,7 +184,7 @@ pub const PROTOCOL_VERSION: u32 = 3;
 /// rolling upgrade keeps the old version in this range (then drops it a release later —
 /// a sliding window). Equal to `PROTOCOL_VERSION` today ⇒ single-version behavior, but
 /// now negotiated as a range so future upgrades need no coordinated full-network stop.
-pub const MIN_WIRE_VERSION: u32 = 3;
+pub const MIN_WIRE_VERSION: u32 = 4;
 
 /// M192 / M221: exchange supported wire-version *ranges* at connection open and agree on
 /// the highest common version (returned). Writes our `[MIN_WIRE_VERSION, PROTOCOL_VERSION]`,
@@ -9698,6 +9701,7 @@ mod tests {
             decay_half_life_blocks: 0,
             slash_bps: 10_000,
             max_validator_power_bps: 0,
+            knowledge: crate::knowledge::KnowledgeGenesis::default(),
             timestamp_days: 0.0,
             validators: [21u64, 22, 23, 24]
                 .iter()
@@ -11954,6 +11958,7 @@ mod tests {
             decay_half_life_blocks: 0,
             slash_bps: 10_000,
             max_validator_power_bps: 0,
+            knowledge: crate::knowledge::KnowledgeGenesis::default(),
             timestamp_days: 0.0,
             validators: vec![(21, kp(21).public(), 1)],
             bridge_sources: vec![],
@@ -15428,6 +15433,7 @@ mod tests {
             decay_half_life_blocks: 0,
             slash_bps: 10_000,
             max_validator_power_bps: 0,
+            knowledge: crate::knowledge::KnowledgeGenesis::default(),
             timestamp_days: 0.0,
             validators: vec![(21, kp(21).public(), 1)],
             bridge_sources: vec![],
@@ -16603,6 +16609,7 @@ vote_b.validator=5 vote_b.height=9 vote_b.round=2 vote_b.block_hash={b_h} vote_b
             decay_half_life_blocks: 0,
             slash_bps: 10_000,
             max_validator_power_bps: 0,
+            knowledge: crate::knowledge::KnowledgeGenesis::default(),
             timestamp_days: 0.0,
             validators: vec![(21, kp(21).public(), 1)],
             bridge_sources: vec![],
@@ -18399,6 +18406,7 @@ vote_b.validator=5 vote_b.height=9 vote_b.round=2 vote_b.block_hash={b_h} vote_b
             key_rotations_commitment: [0u8; 32],
             gov_proposals_commitment: [0u8; 32],
             gov_votes_commitment: [0u8; 32],
+            knowledge_ops_commitment: [0u8; 32],
             proposer: 0,
         };
         let cert = Commit {
@@ -18629,6 +18637,7 @@ vote_b.validator=5 vote_b.height=9 vote_b.round=2 vote_b.block_hash={b_h} vote_b
             key_rotations_commitment: [0u8; 32],
             gov_proposals_commitment: [0u8; 32],
             gov_votes_commitment: [0u8; 32],
+            knowledge_ops_commitment: [0u8; 32],
             proposer: 0,
         };
         let cert = |height: u64| Commit {
@@ -18769,6 +18778,7 @@ vote_b.validator=5 vote_b.height=9 vote_b.round=2 vote_b.block_hash={b_h} vote_b
             key_rotations_commitment: [0u8; 32],
             gov_proposals_commitment: [0u8; 32],
             gov_votes_commitment: [0u8; 32],
+            knowledge_ops_commitment: [0u8; 32],
             proposer: 0,
         };
         let cert = |height: u64| Commit {
@@ -18872,6 +18882,7 @@ vote_b.validator=5 vote_b.height=9 vote_b.round=2 vote_b.block_hash={b_h} vote_b
             key_rotations_commitment: [0u8; 32],
             gov_proposals_commitment: [0u8; 32],
             gov_votes_commitment: [0u8; 32],
+            knowledge_ops_commitment: [0u8; 32],
             proposer: 0,
         };
         let cert = |height: u64| Commit {
@@ -18981,6 +18992,7 @@ vote_b.validator=5 vote_b.height=9 vote_b.round=2 vote_b.block_hash={b_h} vote_b
             key_rotations: vec![],
             gov_proposals: Vec::new(),
             gov_votes: Vec::new(),
+            knowledge_ops: Vec::new(),
             proposer: 0,
         };
         let j = json_range_blocks(&[(block, cert(7))]);

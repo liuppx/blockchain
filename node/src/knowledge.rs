@@ -9,6 +9,7 @@
 //! - 正文不上链,只存每种语言正文的 SHA-256;内容许可 CC BY 4.0(§4d T2)。
 
 use crate::{codec, sha256, Hash, Keypair, PubKey, Sig};
+use std::collections::{BTreeMap, BTreeSet};
 
 /// 内容许可(协议强制,VISION §4d T2)。所有版本均以此许可发布,提交即视为同意。
 pub const CONTENT_LICENSE: &str = "CC-BY-4.0";
@@ -243,9 +244,92 @@ pub struct Verification {
     pub height: u64,
 }
 
-/// 成员信息:加入高度与邀请人(创世成员的邀请人为 0)。
+/// 成员信息:加入高度、邀请人(创世成员的邀请人为 0)、最近一次邀请他人的高度(0 表示从未邀请)。
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Member {
     pub joined_height: u64,
     pub inviter: u64,
+    pub last_invite_height: u64,
+}
+
+/// 创世时的知识模块参数。默认值保持现有链的行为不变:旧 ΔK 提交路径开启、无见习期、无邀请冷却、
+/// 未登记领域(即不能创建知识单元)。测试网创世显式设置。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct KnowledgeGenesis {
+    /// 已登记的领域命名空间(如 1 = 大模型应用开发,2 = 运动健身)。
+    pub domains: Vec<u32>,
+    /// 是否接受旧的 ΔK 知识提交(`SubmissionTx`)。测试网设为 false(VISION Q7)。
+    pub legacy_submissions: bool,
+    /// 见习期(区块数):新成员在此期间的核验不计入可信度,也不能邀请他人(M7)。
+    pub probation_blocks: u64,
+    /// 邀请冷却(区块数):同一成员两次邀请之间至少间隔的区块数。
+    pub invite_cooldown_blocks: u64,
+}
+
+impl Default for KnowledgeGenesis {
+    fn default() -> Self {
+        KnowledgeGenesis {
+            domains: Vec::new(),
+            legacy_submissions: true,
+            probation_blocks: 0,
+            invite_cooldown_blocks: 0,
+        }
+    }
+}
+
+/// 链上知识模块的全部状态,作为 `ChainState::knowledge` 一个字段,便于整体折入状态根、快照与主网迁移。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct KnowledgeState {
+    pub units: BTreeMap<u64, KnowledgeUnit>,
+    /// 键为 (单元, 版本, 核验人);同一核验人对同一版本以最新一条为准。
+    pub verifications: BTreeMap<(u64, u32, u64), Verification>,
+    pub members: BTreeMap<u64, Member>,
+    pub domains: BTreeSet<u32>,
+    pub next_unit_id: u64,
+    pub next_account_id: u64,
+    pub legacy_submissions: bool,
+    pub probation_blocks: u64,
+    pub invite_cooldown_blocks: u64,
+}
+
+impl KnowledgeState {
+    /// 由创世账户与参数初始化:所有创世账户都是成员(邀请人 0,加入高度 0)。
+    pub fn from_genesis<'a>(
+        g: &KnowledgeGenesis,
+        account_ids: impl Iterator<Item = &'a u64>,
+    ) -> Self {
+        let mut members = BTreeMap::new();
+        let mut max_id = 0u64;
+        for id in account_ids {
+            max_id = max_id.max(*id);
+            members.insert(
+                *id,
+                Member {
+                    joined_height: 0,
+                    inviter: 0,
+                    last_invite_height: 0,
+                },
+            );
+        }
+        KnowledgeState {
+            units: BTreeMap::new(),
+            verifications: BTreeMap::new(),
+            members,
+            domains: g.domains.iter().copied().collect(),
+            next_unit_id: 1,
+            next_account_id: max_id + 1,
+            legacy_submissions: g.legacy_submissions,
+            probation_blocks: g.probation_blocks,
+            invite_cooldown_blocks: g.invite_cooldown_blocks,
+        }
+    }
+
+    /// 成员在 `height` 时是否已过见习期。创世成员始终视为已过见习期。
+    pub fn is_established(&self, id: u64, height: u64) -> bool {
+        match self.members.get(&id) {
+            Some(m) if m.inviter == 0 => true,
+            Some(m) => height >= m.joined_height.saturating_add(self.probation_blocks),
+            None => false,
+        }
+    }
 }
