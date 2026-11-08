@@ -333,3 +333,371 @@ impl KnowledgeState {
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// 可信度(K3,试运行规则 v0,与 tools/kgraph.py 一致)
+// ---------------------------------------------------------------------------
+
+/// 模型生成(含自报"人工核验过的模型生成")且无人核验通过时的自身可信度(万分比)。
+pub const CRED_MODEL: u32 = 1000;
+/// 人工撰写,或已有至少一人核验通过时的基础值。
+pub const CRED_HUMAN: u32 = 2000;
+/// 每多一位计入的核验通过者增加的值。
+pub const CRED_STEP: u32 = 2000;
+/// 自身可信度上限。
+pub const CRED_MAX: u32 = 9000;
+
+/// 一个版本的可信度计算结果。所有值为万分比(10000 = 1.0)。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Credibility {
+    /// 计入的核验通过人数(已过见习期、不是发布者、对该版本的最新结论为"通过")。
+    pub passes: u32,
+    /// 自身可信度。
+    pub self_bps: u32,
+    /// 有效可信度 = min(自身可信度, 所依据的每个版本的有效可信度)。
+    pub effective_bps: u32,
+    /// 决定有效可信度的那个依据(单元, 版本);为 None 表示取决于自身。
+    pub bottleneck: Option<(u64, u32)>,
+    /// 引用已过时的依据:(被引用单元, 引用的版本, 当前版本)。
+    pub stale_cites: Vec<(u64, u32, u32)>,
+}
+
+impl KnowledgeState {
+    fn version(&self, unit: u64, version: u32) -> Option<&UnitVersion> {
+        self.units
+            .get(&unit)?
+            .versions
+            .get((version as usize).checked_sub(1)?)
+    }
+
+    /// 自身可信度与计入的核验通过人数。
+    ///
+    /// 计入条件:对该版本的**最新**结论为"通过";核验发生时核验人已过见习期(按核验高度判断,
+    /// 之后不回溯);核验人不是该版本的发布者(应用时已强制)。核验只对当时的版本有效。
+    /// 自报的"人工核验过的模型生成"在链上无法验证,链上无人核验通过前仍按模型生成计。
+    pub fn self_credibility(&self, unit: u64, version: u32) -> Option<(u32, u32)> {
+        let v = self.version(unit, version)?;
+        let passes = self
+            .verifications
+            .range((unit, version, 0)..=(unit, version, u64::MAX))
+            .filter(|(_, r)| {
+                r.verdict == Verdict::Pass
+                    && r.verifier != v.publisher
+                    && self.is_established(r.verifier, r.height)
+            })
+            .count() as u32;
+        let model = !matches!(v.payload.source, Source::Human);
+        let base = if model && passes == 0 {
+            CRED_MODEL
+        } else {
+            CRED_HUMAN
+        };
+        let bps = base
+            .saturating_add(CRED_STEP.saturating_mul(passes))
+            .min(CRED_MAX);
+        Some((bps, passes))
+    }
+
+    /// 某单元某版本的可信度。版本级引用图天然无环,递归必然终止;记忆化避免重复计算。
+    pub fn credibility(&self, unit: u64, version: u32) -> Option<Credibility> {
+        let mut memo = BTreeMap::new();
+        self.credibility_memo(unit, version, &mut memo)
+    }
+
+    /// 单元当前(最新)版本的可信度。
+    pub fn current_credibility(&self, unit: u64) -> Option<Credibility> {
+        let n = self.units.get(&unit)?.versions.len() as u32;
+        self.credibility(unit, n)
+    }
+
+    fn credibility_memo(
+        &self,
+        unit: u64,
+        version: u32,
+        memo: &mut BTreeMap<(u64, u32), Credibility>,
+    ) -> Option<Credibility> {
+        if let Some(c) = memo.get(&(unit, version)) {
+            return Some(c.clone());
+        }
+        let v = self.version(unit, version)?;
+        let (self_bps, passes) = self.self_credibility(unit, version)?;
+        let mut effective_bps = self_bps;
+        let mut bottleneck = None;
+        let mut stale_cites = Vec::new();
+        for c in v.payload.cites.iter().filter(|c| c.kind == CiteKind::Basis) {
+            // 引用目标在应用时已校验存在;状态被手工破坏时按 0 处理(不可信)。
+            let dep = self
+                .credibility_memo(c.unit, c.version, memo)
+                .map(|d| d.effective_bps)
+                .unwrap_or(0);
+            if dep < effective_bps {
+                effective_bps = dep;
+                bottleneck = Some((c.unit, c.version));
+            }
+            if let Some(u) = self.units.get(&c.unit) {
+                let cur = u.versions.len() as u32;
+                if cur > c.version {
+                    stale_cites.push((c.unit, c.version, cur));
+                }
+            }
+        }
+        let out = Credibility {
+            passes,
+            self_bps,
+            effective_bps,
+            bottleneck,
+            stale_cites,
+        };
+        memo.insert((unit, version), out.clone());
+        Some(out)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 由创世成员 ids 构造知识状态(无见习期,除非另行设置)。
+    fn state(members: &[u64], probation: u64) -> KnowledgeState {
+        let g = KnowledgeGenesis {
+            domains: vec![2],
+            legacy_submissions: false,
+            probation_blocks: probation,
+            invite_cooldown_blocks: 0,
+        };
+        KnowledgeState::from_genesis(&g, members.iter())
+    }
+
+    fn add_unit(k: &mut KnowledgeState, id: u64, publisher: u64, source: Source, cites: Vec<Cite>) {
+        k.units.insert(
+            id,
+            KnowledgeUnit {
+                id,
+                author: publisher,
+                layer: if cites.is_empty() {
+                    Layer::Foundation
+                } else {
+                    Layer::Application
+                },
+                domain: 2,
+                created_height: 1,
+                versions: vec![UnitVersion {
+                    n: 1,
+                    publisher,
+                    payload: VersionPayload {
+                        bodies: vec![Body {
+                            lang: "zh".into(),
+                            hash: [id as u8; 32],
+                        }],
+                        source,
+                        cites,
+                    },
+                    published_height: 1,
+                }],
+            },
+        );
+    }
+
+    fn verify(
+        k: &mut KnowledgeState,
+        unit: u64,
+        version: u32,
+        verifier: u64,
+        verdict: Verdict,
+        height: u64,
+    ) {
+        k.verifications.insert(
+            (unit, version, verifier),
+            Verification {
+                unit,
+                version,
+                verifier,
+                verdict,
+                note_hash: [0u8; 32],
+                height,
+            },
+        );
+    }
+
+    fn model() -> Source {
+        Source::Model("claude-opus-5-5".into())
+    }
+
+    fn basis(unit: u64) -> Cite {
+        Cite {
+            unit,
+            version: 1,
+            kind: CiteKind::Basis,
+        }
+    }
+
+    #[test]
+    fn matches_the_kgraph_pilot_scenario() {
+        // 与 docs/pilot/fitness 上 tools/kgraph.py 的演示场景逐项一致:
+        // 五条基础单元 + 深蹲(依据全部五条);深蹲两人核验,基础单元中"运动前自我评估"无人核验。
+        let mut k = state(&[1, 10, 11, 12, 13], 0);
+        for id in 1..=5 {
+            add_unit(&mut k, id, 1, model(), vec![]);
+        }
+        add_unit(&mut k, 6, 1, model(), (1..=5).map(basis).collect());
+        for (u, vs) in [
+            (6u64, vec![10u64, 11]),
+            (1, vec![12, 13]),
+            (2, vec![12, 13]),
+            (3, vec![12, 13]),
+            (4, vec![12]),
+        ] {
+            for v in vs {
+                verify(&mut k, u, 1, v, Verdict::Pass, 2);
+            }
+        }
+        let eff = |u| k.current_credibility(u).unwrap();
+        assert_eq!(eff(1).effective_bps, 6000); // 渐进超负荷 0.6
+        assert_eq!(eff(4).effective_bps, 4000); // 关节的稳定与灵活 0.4(一人核验)
+        assert_eq!(eff(5).effective_bps, 1000); // 运动前自我评估 0.1(无人核验)
+        let squat = eff(6);
+        assert_eq!(squat.passes, 2);
+        assert_eq!(squat.self_bps, 6000, "squat itself: 0.6");
+        assert_eq!(
+            squat.effective_bps, 1000,
+            "capped by its weakest basis: 0.1"
+        );
+        assert_eq!(
+            squat.bottleneck,
+            Some((5, 1)),
+            "bottleneck = 运动前自我评估"
+        );
+    }
+
+    #[test]
+    fn self_credibility_rules() {
+        let mut k = state(&[1, 2, 3, 4, 5, 6, 7], 0);
+        add_unit(&mut k, 1, 1, Source::Human, vec![]);
+        add_unit(&mut k, 2, 1, model(), vec![]);
+        add_unit(&mut k, 3, 1, Source::ModelVerified("m".into()), vec![]);
+        assert_eq!(
+            k.self_credibility(1, 1),
+            Some((CRED_HUMAN, 0)),
+            "human-written starts at 0.2"
+        );
+        assert_eq!(
+            k.self_credibility(2, 1),
+            Some((CRED_MODEL, 0)),
+            "model-generated starts at 0.1"
+        );
+        assert_eq!(
+            k.self_credibility(3, 1),
+            Some((CRED_MODEL, 0)),
+            "a self-declared 'model, human-verified' label is not an on-chain verification"
+        );
+        // 五人通过 → 0.2 + 5×0.2 = 1.2,封顶 0.9
+        for v in 2..=6 {
+            verify(&mut k, 2, 1, v, Verdict::Pass, 2);
+        }
+        assert_eq!(k.self_credibility(2, 1), Some((CRED_MAX, 5)));
+        // 同一核验人的最新结论改为"需修改",即不再计入
+        verify(&mut k, 2, 1, 6, Verdict::NeedsRevision, 3);
+        assert_eq!(k.self_credibility(2, 1), Some((CRED_MAX, 4)));
+        // 发布者本人的核验不计入(应用时已拒绝,这里防御性地确认)
+        verify(&mut k, 1, 1, 1, Verdict::Pass, 2);
+        assert_eq!(k.self_credibility(1, 1), Some((CRED_HUMAN, 0)));
+        assert_eq!(k.self_credibility(9, 1), None);
+        assert_eq!(k.self_credibility(1, 2), None);
+    }
+
+    #[test]
+    fn probation_is_judged_at_verification_time() {
+        let mut k = state(&[1], 10);
+        k.members.insert(
+            50,
+            Member {
+                joined_height: 5,
+                inviter: 1,
+                last_invite_height: 0,
+            },
+        );
+        add_unit(&mut k, 1, 1, Source::Human, vec![]);
+        verify(&mut k, 1, 1, 50, Verdict::Pass, 14); // 加入后第 9 个区块:仍在见习期
+        assert_eq!(
+            k.self_credibility(1, 1),
+            Some((CRED_HUMAN, 0)),
+            "probation verification not counted"
+        );
+        verify(&mut k, 1, 1, 50, Verdict::Pass, 15); // 加入后第 10 个区块:已过见习期
+        assert_eq!(k.self_credibility(1, 1), Some((CRED_HUMAN + CRED_STEP, 1)));
+    }
+
+    #[test]
+    fn basis_cites_pin_versions_and_report_staleness() {
+        let mut k = state(&[1, 2, 3], 0);
+        add_unit(&mut k, 1, 1, Source::Human, vec![]);
+        verify(&mut k, 1, 1, 2, Verdict::Pass, 2);
+        verify(&mut k, 1, 1, 3, Verdict::Pass, 2); // 单元 1 v1:0.6
+        add_unit(&mut k, 2, 1, Source::Human, vec![basis(1)]);
+        verify(&mut k, 2, 1, 2, Verdict::Pass, 2);
+        verify(&mut k, 2, 1, 3, Verdict::Pass, 2); // 单元 2 自身 0.6
+        assert_eq!(k.current_credibility(2).unwrap().effective_bps, 6000);
+        // 单元 1 发布 v2(无人核验):v1 的核验不带到 v2;单元 2 仍锁定 v1,不受影响,但提示过时
+        let mut v2 = k.units[&1].versions[0].clone();
+        v2.n = 2;
+        k.units.get_mut(&1).unwrap().versions.push(v2);
+        assert_eq!(
+            k.current_credibility(1).unwrap().self_bps,
+            CRED_HUMAN,
+            "v1 verifications do not carry to v2"
+        );
+        let c2 = k.current_credibility(2).unwrap();
+        assert_eq!(c2.effective_bps, 6000, "pinned to v1");
+        assert_eq!(c2.stale_cites, vec![(1, 1, 2)]);
+        // 参见不传递可信度
+        add_unit(
+            &mut k,
+            3,
+            1,
+            Source::Human,
+            vec![Cite {
+                unit: 1,
+                version: 2,
+                kind: CiteKind::SeeAlso,
+            }],
+        );
+        assert_eq!(k.current_credibility(3).unwrap().bottleneck, None);
+    }
+
+    #[test]
+    fn effective_credibility_propagates_through_chains() {
+        // 1 ← 2 ← 3(依据链):最弱的一环决定整条链,并逐级报告瓶颈
+        let mut k = state(&[1, 2, 3, 4], 0);
+        add_unit(&mut k, 1, 1, model(), vec![]); // 0.1
+        add_unit(&mut k, 2, 1, Source::Human, vec![basis(1)]);
+        add_unit(
+            &mut k,
+            3,
+            1,
+            Source::Human,
+            vec![Cite {
+                unit: 2,
+                version: 1,
+                kind: CiteKind::Basis,
+            }],
+        );
+        for u in [2, 3] {
+            for v in [2, 3, 4] {
+                verify(&mut k, u, 1, v, Verdict::Pass, 2);
+            }
+        }
+        let c3 = k.current_credibility(3).unwrap();
+        assert_eq!(c3.self_bps, 8000);
+        assert_eq!(
+            c3.effective_bps, CRED_MODEL,
+            "a weak foundation caps everything built on it"
+        );
+        assert_eq!(c3.bottleneck, Some((2, 1)));
+        assert_eq!(k.current_credibility(2).unwrap().bottleneck, Some((1, 1)));
+        // 打牢地基后,整条链随之上升
+        for v in [2, 3, 4] {
+            verify(&mut k, 1, 1, v, Verdict::Pass, 2);
+        }
+        assert_eq!(k.current_credibility(3).unwrap().effective_bps, 8000);
+    }
+}

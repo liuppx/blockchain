@@ -8,6 +8,8 @@
 > 字符串严格 UTF-8),已纳入 `decode_all` 模糊测试与 fuzz-lite 守护。
 > **K2 已完成**——区块 `knowledge_ops` + 头部第 11 个承诺(B8 wire,协议版本 4);`KnowledgeState` 折入 `state_root`,
 > 快照 v7;四种操作的完整校验与执行;创世 `[knowledge]` 段(领域登记、旧 ΔK 提交开关、见习期、邀请冷却)。
+> **K3 已完成**——`KnowledgeState::credibility` 万分比整数计算(自身可信度、有效可信度、瓶颈、过时引用),
+> 与 `tools/kgraph.py` 的试运行场景逐项一致。
 
 ## 1. 目标与范围
 

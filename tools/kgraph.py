@@ -13,6 +13,12 @@
 纯 Python 标准库:
     python3 tools/kgraph.py docs/pilot/fitness        # 打印报告并写出 <目录>/GRAPH.md
 
+与链上实现(node/src/knowledge.rs,K3)的关系:规则相同,链上用万分比整数计算。两点差别:
+  - 链上"依据"锁定被引用的版本,用该版本的可信度;本工具读的是文件,只有当前版本,
+    所以在引用都指向最新版本时两者一致(引用落后时本工具会给出提示);
+  - 链上按核验发生时核验人是否已过见习期决定是否计入;本工具没有成员数据,所有核验都计入。
+同一场景的一致性由 node 的 `knowledge::tests::matches_the_kgraph_pilot_scenario` 守护。
+
 参数是试运行第 0 版,待试运行数据校准。规则依据见 docs/VISION.md §4a(知识单元)与 §4b(质量收敛)。
 """
 from __future__ import annotations
