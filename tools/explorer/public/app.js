@@ -23,7 +23,7 @@ async function connect() {
   try {
     await refreshOverview();
     el("conn").textContent = "connected"; el("conn").className = "mut";
-    renderTabs(); showTab("blocks");
+    renderTabs(); showTab("knowledge");
     if (timer) clearInterval(timer);
     timer = setInterval(refreshOverview, 4000);  // poll chain tip
   } catch (e) {
@@ -44,7 +44,7 @@ async function refreshOverview() {
 }
 
 const TABS = [
-  ["blocks", "Blocks"], ["tx", "Tx lookup"], ["account", "Account"], ["graph", "Graph"],
+  ["knowledge", "Knowledge"], ["blocks", "Blocks"], ["tx", "Tx lookup"], ["account", "Account"], ["graph", "Graph"],
   ["cnfts", "cNFTs"], ["validators", "Validators"], ["staking", "Staking"],
   ["proposals", "Governance"], ["supply", "Supply"],
 ];
@@ -54,7 +54,7 @@ function renderTabs() {
 }
 function showTab(k) {
   TABS.forEach(([t]) => { const b = el("tab-"+t); if (b) b.className = (t===k ? "on" : ""); });
-  ({ blocks:tabBlocks, tx:tabTx, account:tabAccount, graph:tabGraph, validators:tabValidators,
+  ({ knowledge:tabKnowledge, blocks:tabBlocks, tx:tabTx, account:tabAccount, graph:tabGraph, validators:tabValidators,
      staking:tabStaking, proposals:tabProposals, cnfts:tabCnfts, supply:tabSupply })[k]();
 }
 
@@ -208,6 +208,63 @@ async function tabSupply() {
       <kv><b>bridge_locked</b>${esc(s.bridge_locked)}</kv>
       <kv><b>bridge_minted</b>${esc(s.bridge_minted)}</kv>
       <kv><b>conserved</b>${s.conserved ? "<span style='color:var(--ok)'>yes</span>" : "<span class='err'>NO</span>"}</kv>`);
+  } catch (e) { setView(`<span class='err'>${esc(e.message)}</span>`); }
+}
+
+// K7: knowledge units (testnet stage 1). Credibility is in basis points (10000 = 1.0);
+// effective credibility = min(own, every "basis" citation's effective credibility), so the
+// bottleneck column names the weakest foundation a unit stands on.
+const LAYER_ZH = { foundation: "基础", explanation: "解释", scenario: "场景", application: "应用" };
+function credBar(bps) {
+  const v = Number(bps) / 10000;
+  const pct = Math.round(v * 100);
+  const color = v >= 0.6 ? "var(--ok)" : v >= 0.3 ? "#d9a400" : "#c0392b";
+  return `<span style='display:inline-block;width:80px;height:8px;background:#ddd;vertical-align:middle'>` +
+    `<span style='display:block;width:${pct}%;height:8px;background:${color}'></span></span> ${v.toFixed(1)}`;
+}
+async function tabKnowledge() {
+  setView("<span class='mut'>loading…</span>");
+  try {
+    const items = (await j("/units?limit=500")).items || [];
+    const rows = items.length ? items.map(u => {
+      const c = u.credibility, b = c.bottleneck;
+      const neck = b ? `<a class='link' data-unit='${esc(b.unit)}'>#${esc(b.unit)} v${esc(b.version)}</a>` : "<span class='mut'>—</span>";
+      return `<tr><td><a class='link' data-unit='${esc(u.id)}'>#${esc(u.id)}</a></td>
+        <td>${esc(LAYER_ZH[u.layer] || u.layer)}</td><td>${esc(u.domain)}</td><td>${esc(u.versions)}</td>
+        <td>${esc(c.passes)}</td><td>${credBar(c.self_bps)}</td><td>${credBar(c.effective_bps)}</td><td>${neck}</td></tr>`;
+    }).join("") : "<tr><td class='mut' colspan=8>(no knowledge units yet — ./cmd knowledge)</td></tr>";
+    setView(`<h2 style='border:0;padding:0 0 8px'>Knowledge units</h2>
+      <p class='mut'>有效可信度 = 自身可信度与所依据单元有效可信度的最小值。"被谁卡住"指出它最薄弱的地基。</p>
+      <table><tr><th>unit</th><th>层级</th><th>领域</th><th>版本数</th><th>核验通过</th><th>自身</th><th>有效</th><th>被谁卡住</th></tr>${rows}</table>`);
+    el("view").querySelectorAll("a[data-unit]").forEach(a => a.addEventListener("click", () => showUnit(a.dataset.unit)));
+  } catch (e) { setView(`<span class='err'>${esc(e.message)}</span>`); }
+}
+async function showUnit(id) {
+  setView("<span class='mut'>loading…</span>");
+  try {
+    const u = await j("/unit/" + id);
+    const vers = u.versions.slice().reverse().map(v => {
+      const c = v.credibility;
+      const cites = v.cites.length ? v.cites.map(x =>
+        `<a class='link' data-unit='${esc(x.unit)}'>#${esc(x.unit)} v${esc(x.version)}</a> <span class='mut'>(${x.kind === "basis" ? "依据" : "参见"})</span>`).join("<br>") : "<span class='mut'>—</span>";
+      const stale = c.stale_cites.map(s => `<div class='err'>引用已过时:#${esc(s.unit)} 引用 v${esc(s.cited)},当前 v${esc(s.current)}</div>`).join("");
+      const ver = v.verifications.length ? v.verifications.map(r =>
+        `account ${esc(r.verifier)} · ${r.verdict === "pass" ? "通过" : "需修改"} · height ${esc(r.height)}`).join("<br>") : "<span class='mut'>尚无核验</span>";
+      const bodies = v.bodies.map(b => `${esc(b.lang)}: <span class='mono hash'>${esc(short(b.hash))}</span>`).join("<br>");
+      return `<h2 style='border:0;padding:12px 0 6px'>v${esc(v.n)}</h2>
+        <kv><b>publisher / height</b>account ${esc(v.publisher)} · ${esc(v.published_height)}</kv>
+        <kv><b>来源</b>${esc(v.source)}</kv>
+        <kv><b>正文哈希</b>${bodies}</kv>
+        <kv><b>可信度</b>自身 ${credBar(c.self_bps)} · 有效 ${credBar(c.effective_bps)} · 核验通过 ${esc(c.passes)}</kv>
+        <kv><b>引用</b>${cites}</kv>${stale}
+        <kv><b>核验记录</b>${ver}</kv>`;
+    }).join("");
+    setView(`<p><a class='link' id='kback'>← knowledge</a></p>
+      <h2 style='border:0;padding:0 0 8px'>Unit #${esc(u.id)} · ${esc(LAYER_ZH[u.layer] || u.layer)}</h2>
+      <kv><b>author / created</b>account ${esc(u.author)} · height ${esc(u.created_height)}</kv>
+      <kv><b>domain</b>${esc(u.domain)}</kv><kv><b>license</b>${esc(u.license)}</kv>${vers}`);
+    el("kback").addEventListener("click", () => showTab("knowledge"));
+    el("view").querySelectorAll("a[data-unit]").forEach(a => a.addEventListener("click", () => showUnit(a.dataset.unit)));
   } catch (e) { setView(`<span class='err'>${esc(e.message)}</span>`); }
 }
 

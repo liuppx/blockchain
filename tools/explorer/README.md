@@ -35,6 +35,8 @@ PORT=8080 NODE_RPC=http://127.0.0.1:9221 npm start      # 或: node server.js
 - **Blocks**:最近区块 → 区块详情(头字段 + 交易列表)→ 交易详情。
 - **Tx lookup**:按内容哈希查 `/tx/{hash}/detail`。
 - **Graph**:认知图谱节点(PoK 核心)——node_id / domain / dim / embedding 向量。
+- **Knowledge**(默认首页):知识单元列表(层级、核验通过数、自身 / 有效可信度、"被谁卡住");点进单元看全部版本、
+  正文哈希、引用(依据 / 参见,可点击跳转)、核验记录、过时引用提示。
 - **Account**(查询 + 列表)、**Validators**、**Staking**(活跃质押 + 解绑队列)、**Governance 提案**、**cNFTs**、**Supply**。
 
 ## 边界(L1)

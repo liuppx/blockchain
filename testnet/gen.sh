@@ -93,6 +93,11 @@ GEN="$OUT/genesis.toml"
     pk="$(mint_key "$OUT/keys/val$id.json")"
     echo "[[validators]]"; echo "id = $id"; echo "pubkey_hex = \"$pk\""; echo "power = 1"; echo
   done
+  # K7 (testnet stage 1): knowledge units. Domains 1 = LLM app dev, 2 = fitness. The legacy ΔK
+  # submission path is OFF on the testnet (self-reported embeddings are gameable, VISION Q7).
+  # Probation ~ 1 day at 1 block/s would be 86400; kept short here so drills finish quickly.
+  echo "[knowledge]"; echo "domains = [1, 2]"; echo "legacy_submissions = false"
+  echo "probation_blocks = 60"; echo "invite_cooldown_blocks = 30"
 } > "$GEN"
 chmod 600 "$OUT"/keys/*.json
 
