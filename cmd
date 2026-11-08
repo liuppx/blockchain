@@ -45,6 +45,11 @@ gen() {
     done
     echo; echo "[[reviewers]]"; echo "id = 1"; echo "weight = 1.0"   # account 1 = sole reviewer (reputation weight)
     echo; echo "[[validators]]"; echo "id = 1"; echo "pubkey_hex = \"$a1\""; echo "power = 1"  # account 1 = sole validator
+    # K6: knowledge units (testnet stage 1). Domains 1 = LLM app dev, 2 = fitness. The legacy ΔK
+    # path stays ON locally because `./cmd submit` and the governance demo still use it; the
+    # testnet genesis turns it off. Short probation / invite cooldown so the demo is quick.
+    echo; echo "[knowledge]"; echo "domains = [1, 2]"; echo "legacy_submissions = true"
+    echo "probation_blocks = 5"; echo "invite_cooldown_blocks = 2"
   } > "$D/genesis.toml"
   {
     echo "genesis = \"$D/genesis.toml\""
@@ -187,6 +192,27 @@ vote() {
 }
 gov() { curl -s --max-time 2 "http://127.0.0.1:$RPC_PORT/proposals" || true; echo; }
 
+# K6: knowledge units. `knowledge` imports the fitness pilot (docs/pilot/fitness, domain 2) authored by
+# account 1, storing bodies content-addressed in .localnet/bodies; `kverify` records a verification;
+# `units` lists units with their effective credibility (bps, 10000 = 1.0) and bottleneck.
+knowledge() {
+  running "$D/node.pid" || { echo "node not running (./cmd up)"; exit 1; }
+  python3 "$ROOT/tools/kimport.py" --dir "$ROOT/docs/pilot/fitness" --domain 2 \
+    --config "$D/node.toml" --rpc "http://127.0.0.1:$RPC_PORT" --key "1=$D/keys/acct1.seed" \
+    --store "$D/bodies" --map "$D/kimport-fitness.json" --bin "$BIN"
+}
+kverify() {  # $1=account $2=unit $3=version $4=pass|needs-revision
+  running "$D/node.pid" || { echo "node not running (./cmd up)"; exit 1; }
+  local acct="${1:-2}" unit="${2:-}" ver="${3:-1}" verdict="${4:-pass}"
+  [ -n "$unit" ] || { echo "usage: ./cmd kverify [acct] <unit> [version] [pass|needs-revision]"; exit 1; }
+  local n; n="$(curl -s -H 'Accept: application/json' "http://127.0.0.1:$RPC_PORT/account/$acct" | sed -E 's/.*"nonce":"([0-9]+)".*/\1/')"
+  "$BIN" encode-knowledge-op --key-file "$D/keys/acct${acct}.seed" --out "$D/kop.bin" --actor "$acct" --nonce "$n" \
+    --action verify --unit "$unit" --version "$ver" --verdict "$verdict" >/dev/null
+  "$BIN" rpc --config "$D/node.toml" --path /knowledge --post "$D/kop.bin"
+  echo "→ account $acct verified unit $unit v$ver: $verdict (see ./cmd units after the next block)"
+}
+units() { curl -s --max-time 2 "http://127.0.0.1:$RPC_PORT/units" || true; echo; }
+
 case "${1:-up}" in
   up|"") up ;;
   down) down ;;
@@ -198,6 +224,9 @@ case "${1:-up}" in
   propose) propose "${2:-1}" "${3:-base_emission=9000000}" "${4:-5}" ;;
   vote) vote "${2:-1}" "${3:-}" "${4:-true}" ;;
   gov) gov ;;
+  knowledge) knowledge ;;
+  kverify) kverify "${2:-2}" "${3:-}" "${4:-1}" "${5:-pass}" ;;
+  units) units ;;
   logs) tail -f "$D/node.log" ;;
-  *) echo "usage: ./cmd [up|down|reset|status|submit [acct]|bond [acct amount]|unbond [acct amount]|propose [acct param period]|vote [acct id approve]|gov|logs]" >&2; exit 2 ;;
+  *) echo "usage: ./cmd [up|down|reset|status|submit [acct]|bond [acct amount]|unbond [acct amount]|propose [acct param period]|vote [acct id approve]|gov|knowledge|kverify [acct unit ver verdict]|units|logs]" >&2; exit 2 ;;
 esac

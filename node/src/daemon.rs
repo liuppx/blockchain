@@ -4584,7 +4584,7 @@ fn proof_kind_label(k: ProofKind) -> &'static str {
 fn format_account(id: u64, a: &Account) -> String {
     format!(
         "id={id} balance={} staked_total={} earned_total={} slashed_total={} \
-         submissions={} accepted={} pubkey={}",
+         submissions={} accepted={} pubkey={} nonce={}",
         a.balance,
         a.staked_total,
         a.earned_total,
@@ -4592,6 +4592,7 @@ fn format_account(id: u64, a: &Account) -> String {
         a.submissions,
         a.accepted,
         crate::hash::hex(&a.pubkey),
+        a.nonce,
     )
 }
 
@@ -5089,7 +5090,7 @@ fn json_routes() -> String {
 fn json_account(id: u64, a: &Account) -> String {
     format!(
         "{{\"id\":{},\"balance\":{},\"staked_total\":{},\"earned_total\":{},\
-         \"slashed_total\":{},\"submissions\":{},\"accepted\":{},\"pubkey\":{}}}",
+         \"slashed_total\":{},\"submissions\":{},\"accepted\":{},\"pubkey\":{},\"nonce\":{}}}",
         json_u64(id),
         json_u64(a.balance),
         json_u64(a.staked_total),
@@ -5098,6 +5099,7 @@ fn json_account(id: u64, a: &Account) -> String {
         json_u64(a.submissions),
         json_u64(a.accepted),
         json_str(&crate::hash::hex(&a.pubkey)),
+        json_u64(a.nonce),
     )
 }
 
@@ -12123,13 +12125,13 @@ mod tests {
             slashed_total: 5,
             submissions: 6,
             accepted: 7,
-            nonce: 0,
+            nonce: 9,
         };
         assert_eq!(
             format_account(1, &a),
             format!(
                 "id=1 balance=12 staked_total=3 earned_total=4 slashed_total=5 \
-                 submissions=6 accepted=7 pubkey={}",
+                 submissions=6 accepted=7 pubkey={} nonce=9",
                 crate::hash::hex(&[0xab; 32])
             )
         );

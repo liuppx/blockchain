@@ -393,6 +393,7 @@ python3 sim/run.py --compare  # baseline 场景 Python vs Rust 后端对比
 ./cmd bond      # 账户1(=验证人+评议人)绑定质押,使其治理投票有权重
 ./cmd unbond    # 解绑质押 → 进入解绑队列(冷却后释放,见浏览器 Staking 页)
 ./cmd propose 1 base_emission=12000000  # 发起治理提案 · ./cmd vote 1 <id> true 投票 · ./cmd gov 查看
+./cmd knowledge # 导入运动健身试运行知识单元 · ./cmd kverify 2 <unit> 核验 · ./cmd units 看链上可信度
 ./cmd status    # 看高度 / 供应
 ./cmd down      # 停止   ·   ./cmd reset 清空 .localnet 重来
 ```

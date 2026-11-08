@@ -15,6 +15,9 @@
 > 排序并跳过不可执行的 op;单块上限 256 条为共识规则。
 > **K5 已完成**——`POST /knowledge`(200 / 400 / 409 / 422 / 429,受 RPC 令牌保护);`GET /units`(分页,附当前可信度)、
 > `/unit/{id}`(全部版本、引用、核验、逐版本可信度与瓶颈)、`/members`;CLI `node encode-knowledge-op`、`node hash-content [--store DIR]`。
+> **K6 已完成**——`tools/kimport.py` 导入工具 + `./cmd knowledge / kverify / units`;本地链实测导入运动健身 6 个单元,
+> 链上可信度与 `kgraph` 演示一致(深蹲自身 0.6、有效 0.1、瓶颈为运动前自我评估),补核后深蹲升至 0.4、瓶颈转移。
+> `/account/{id}` 新增 `nonce` 字段,工具从链上读取序号。
 
 ## 1. 目标与范围
 
