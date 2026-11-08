@@ -332,6 +332,8 @@ fn main() {
         "encode-tx" => cmd_encode_tx(&args),
         "encode-gov-proposal" => cmd_encode_gov_proposal(&args),
         "encode-gov-vote" => cmd_encode_gov_vote(&args),
+        "encode-knowledge-op" => cmd_encode_knowledge_op(&args),
+        "hash-content" => cmd_hash_content(&args),
         "encode-stakeop" => cmd_encode_stakeop(&args),
         "keygen" => cmd_keygen(&args),
         "encrypt-key" => cmd_encrypt_key(&args),
@@ -437,6 +439,8 @@ fn usage() {
     eprintln!("  node encode-tx --key-file F --out F --author N --domain N --stake N --embedding f,..(DIM) --review R:S.. --repl-success N --repl-total N --timestamp-days F [--fee MICRO] [--nonce N] [--config F]  author+sign a tx offline into a submit-tx file; print its hash; M122: --fee paid to the proposer (default 0), --nonce must equal the author's account nonce (default 0); M233: --key-file is a raw 64-hex seed OR an encrypted keystore (ZHIXING_KEYSTORE_PASSWORD) — same for encode-stakeop/encode-gov-*");
     eprintln!("  node encode-gov-proposal --key-file F --out F --proposer N --param name=value --voting-period N [--nonce N]  M228: author+sign a GovProposal (param: base_emission|slash_bps|decay_half_life) into a raw op file for `node rpc --path /gov/proposal --post F`");
     eprintln!("  node encode-gov-vote --key-file F --out F --proposal-id N --voter N --approve true|false [--nonce N]  M228: author+sign a GovVote into a raw op file for `node rpc --path /gov/vote --post F`");
+    eprintln!("  node encode-knowledge-op --key-file F --out F --actor N [--nonce N] --action create|publish|verify|invite ...  K5: author+sign a knowledge op for `node rpc --path /knowledge --post F`. create: --layer foundation|explanation|scenario|application --domain N --body LANG:SHA256HEX.. --source human|model:ID|model-verified:ID [--cite UNIT:VER:basis|see-also ..]; publish: --unit N + body/source/cite; verify: --unit N --version N --verdict pass|needs-revision [--note-hash HEX]; invite: --pubkey HEX");
+    eprintln!("  node hash-content --file F [--store DIR]  K5: print the SHA-256 of a knowledge body file (the hash a version records on chain); --store copies it to DIR/<hash> (content-addressed body store)");
     eprintln!("  node encode-stakeop --key-file F --out F --account N --kind bond|unbond --amount N  M229: author+sign a bond/unbond StakeOp into a raw op file for `node rpc --path /stake --post F`");
     eprintln!("  node inspect-tx --tx F [--pubkey HEX]  decode a codec-encoded tx file and print its fields + content hash; with --pubkey, also verify the signature (the read-side companion to encode-tx)");
     eprintln!("  node keygen --out F [--seed HEX]  generate (or derive from a 64-hex seed) an ed25519 keypair; write the seed file (for encode-tx --key-file) and print the pubkey");
@@ -4689,6 +4693,179 @@ fn cmd_encode_gov_vote(args: &[String]) {
     println!("out {out_path}");
 }
 
+/// K5:解析知识层级。
+fn parse_layer(s: &str) -> Result<zhixing_node::knowledge::Layer, String> {
+    use zhixing_node::knowledge::Layer;
+    match s {
+        "foundation" => Ok(Layer::Foundation),
+        "explanation" => Ok(Layer::Explanation),
+        "scenario" => Ok(Layer::Scenario),
+        "application" => Ok(Layer::Application),
+        _ => Err(format!(
+            "unknown layer {s:?} (foundation|explanation|scenario|application)"
+        )),
+    }
+}
+
+/// K5:解析来源:`human` | `model:<id>` | `model-verified:<id>`。
+fn parse_source(s: &str) -> Result<zhixing_node::knowledge::Source, String> {
+    use zhixing_node::knowledge::Source;
+    if s == "human" {
+        return Ok(Source::Human);
+    }
+    if let Some(m) = s.strip_prefix("model-verified:") {
+        return Ok(Source::ModelVerified(m.to_string()));
+    }
+    if let Some(m) = s.strip_prefix("model:") {
+        return Ok(Source::Model(m.to_string()));
+    }
+    Err(format!(
+        "unknown source {s:?} (human|model:ID|model-verified:ID)"
+    ))
+}
+
+/// K5:解析 32 字节哈希(64 位十六进制)。
+fn parse_hash32(s: &str) -> Result<[u8; 32], String> {
+    let b = hex_decode(s).ok_or_else(|| format!("bad hex {s:?}"))?;
+    b.try_into()
+        .map_err(|_| format!("hash must be 32 bytes (64 hex chars): {s:?}"))
+}
+
+/// K5:解析正文:`LANG:SHA256HEX`。
+fn parse_body(s: &str) -> Result<zhixing_node::knowledge::Body, String> {
+    let (lang, h) = s
+        .split_once(':')
+        .ok_or_else(|| format!("body must be LANG:HASH, got {s:?}"))?;
+    Ok(zhixing_node::knowledge::Body {
+        lang: lang.to_string(),
+        hash: parse_hash32(h)?,
+    })
+}
+
+/// K5:解析引用:`UNIT:VERSION:basis|see-also`。
+fn parse_cite(s: &str) -> Result<zhixing_node::knowledge::Cite, String> {
+    use zhixing_node::knowledge::{Cite, CiteKind};
+    let parts: Vec<&str> = s.split(':').collect();
+    let [u, v, k] = parts.as_slice() else {
+        return Err(format!("cite must be UNIT:VERSION:KIND, got {s:?}"));
+    };
+    let kind = match *k {
+        "basis" => CiteKind::Basis,
+        "see-also" => CiteKind::SeeAlso,
+        _ => return Err(format!("cite kind must be basis|see-also, got {k:?}")),
+    };
+    Ok(Cite {
+        unit: u.parse().map_err(|_| format!("bad cite unit {u:?}"))?,
+        version: v.parse().map_err(|_| format!("bad cite version {v:?}"))?,
+        kind,
+    })
+}
+
+/// K5:由命令行旗标组装一个版本内容(正文、来源、引用)。
+fn version_payload_from_args(args: &[String]) -> zhixing_node::knowledge::VersionPayload {
+    let bodies = multi_arg(args, "--body")
+        .iter()
+        .map(|b| parse_body(b).unwrap_or_else(|e| fail_msg("encode-knowledge-op body", &e)))
+        .collect();
+    let source = parse_source(req_arg(args, "--source"))
+        .unwrap_or_else(|e| fail_msg("encode-knowledge-op source", &e));
+    let cites = multi_arg(args, "--cite")
+        .iter()
+        .map(|c| parse_cite(c).unwrap_or_else(|e| fail_msg("encode-knowledge-op cite", &e)))
+        .collect();
+    zhixing_node::knowledge::VersionPayload {
+        bodies,
+        source,
+        cites,
+    }
+}
+
+/// K5:离线编写并签名一条知识 op,把规范编码写入 `--out`,供 `node rpc --path /knowledge --post <out>`。
+/// `--key-file` 可以是 64 位十六进制种子或加密 keystore(M233)。写出前先做结构检查与解码自检。
+fn cmd_encode_knowledge_op(args: &[String]) {
+    use zhixing_node::knowledge::{KnowledgeAction, KnowledgeOp, Verdict};
+    let key_path = req_arg(args, "--key-file");
+    let out_path = req_arg(args, "--out");
+    let actor: u64 = parse_arg(args, "--actor");
+    let nonce: u64 = opt_arg(args, "--nonce")
+        .map(|s| {
+            s.parse()
+                .unwrap_or_else(|_| fail_msg("encode-knowledge-op nonce", &"not a number"))
+        })
+        .unwrap_or(0);
+    let action = match req_arg(args, "--action") {
+        "create" => KnowledgeAction::CreateUnit {
+            layer: parse_layer(req_arg(args, "--layer"))
+                .unwrap_or_else(|e| fail_msg("encode-knowledge-op layer", &e)),
+            domain: parse_arg(args, "--domain"),
+            version: version_payload_from_args(args),
+        },
+        "publish" => KnowledgeAction::PublishVersion {
+            unit: parse_arg(args, "--unit"),
+            version: version_payload_from_args(args),
+        },
+        "verify" => KnowledgeAction::Verify {
+            unit: parse_arg(args, "--unit"),
+            version: parse_arg(args, "--version"),
+            verdict: match req_arg(args, "--verdict") {
+                "pass" => Verdict::Pass,
+                "needs-revision" => Verdict::NeedsRevision,
+                other => fail_msg(
+                    "encode-knowledge-op verdict",
+                    &format!("{other:?} (pass|needs-revision)"),
+                ),
+            },
+            note_hash: opt_arg(args, "--note-hash")
+                .map(|h| {
+                    parse_hash32(h)
+                        .unwrap_or_else(|e| fail_msg("encode-knowledge-op note-hash", &e))
+                })
+                .unwrap_or([0u8; 32]),
+        },
+        "invite" => KnowledgeAction::Invite {
+            pubkey: parse_hash32(req_arg(args, "--pubkey"))
+                .unwrap_or_else(|e| fail_msg("encode-knowledge-op pubkey", &e)),
+        },
+        other => fail_msg(
+            "encode-knowledge-op action",
+            &format!("{other:?} (create|publish|verify|invite)"),
+        ),
+    };
+    let seed = read_seed_from_key_file(key_path);
+    let op = KnowledgeOp {
+        actor,
+        action,
+        nonce,
+        signature: [0u8; 64],
+    }
+    .signed(&Keypair::from_seed(seed));
+    if let Err(e) = op.is_well_formed() {
+        fail_msg("encode-knowledge-op", &e);
+    }
+    let bytes = zhixing_node::codec::encode_knowledge_op(&op);
+    if let Err(e) = zhixing_node::codec::decode_knowledge_op(&bytes) {
+        fail_msg("encode-knowledge-op self-check", &e);
+    }
+    std::fs::write(out_path, &bytes).unwrap_or_else(|e| fail("write op file", e));
+    println!("encoded {}", hex(&op.hash()));
+    println!("out {out_path}");
+}
+
+/// K5:计算知识正文文件的 SHA-256(版本在链上记录的正是这个哈希)。`--store DIR` 时把文件复制为
+/// `DIR/<hash>`,形成以哈希为文件名的内容寻址正文仓库(测试网阶段正文存放于 Git 仓库)。
+fn cmd_hash_content(args: &[String]) {
+    let path = req_arg(args, "--file");
+    let bytes = std::fs::read(path).unwrap_or_else(|e| fail("read content file", e));
+    let h = hex(&zhixing_node::sha256(&bytes));
+    if let Some(dir) = opt_arg(args, "--store") {
+        std::fs::create_dir_all(dir).unwrap_or_else(|e| fail("create store dir", e));
+        let dest = std::path::Path::new(dir).join(&h);
+        std::fs::write(&dest, &bytes).unwrap_or_else(|e| fail("write to store", e));
+        println!("stored {}", dest.display());
+    }
+    println!("sha256 {h}");
+}
+
 /// M229: author + ed25519-sign a bond/unbond `StakeOp` offline, writing raw
 /// `codec::encode_stakeop` bytes to `--out` for `node rpc --path /stake --post <out>`.
 /// The write counterpart to the `/bonds` read — lets an operator change stake on a running
@@ -6023,6 +6200,39 @@ mod tests {
     fn parse_review_rejects_bad_format() {
         assert!(parse_review("10-0.9").is_err()); // no colon
         assert!(parse_review("x:0.9").is_err()); // non-u64 reviewer
+    }
+
+    #[test]
+    fn knowledge_cli_parsers() {
+        use zhixing_node::knowledge::*;
+        assert_eq!(parse_layer("scenario"), Ok(Layer::Scenario));
+        assert!(parse_layer("theory").is_err());
+        assert_eq!(parse_source("human"), Ok(Source::Human));
+        assert_eq!(
+            parse_source("model:claude-opus-5-5"),
+            Ok(Source::Model("claude-opus-5-5".into()))
+        );
+        assert_eq!(
+            parse_source("model-verified:m"),
+            Ok(Source::ModelVerified("m".into()))
+        );
+        assert!(parse_source("ai").is_err());
+        let h = "ab".repeat(32);
+        assert_eq!(parse_body(&format!("zh:{h}")).unwrap().lang, "zh");
+        assert!(parse_body("zh").is_err(), "missing hash");
+        assert!(parse_body("zh:abcd").is_err(), "short hash");
+        assert_eq!(
+            parse_cite("3:2:basis"),
+            Ok(Cite {
+                unit: 3,
+                version: 2,
+                kind: CiteKind::Basis
+            })
+        );
+        assert_eq!(parse_cite("3:1:see-also").unwrap().kind, CiteKind::SeeAlso);
+        assert!(parse_cite("3:basis").is_err());
+        assert!(parse_cite("3:1:depends").is_err());
+        assert!(parse_hash32("zz").is_err());
     }
 
     #[test]
