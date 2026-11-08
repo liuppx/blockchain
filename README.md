@@ -436,7 +436,7 @@ cargo test --release                                 # 647 项单元测试（见
 
 ## 里程碑变更日志（M6–M171）
 
-截至 K3，node 有 **783** 项单元测试（722 lib + 61 bin，另 2 个 `#[ignore]`），engine 另有 **11** 项。生产就绪自评见 [`docs/PRODUCTION-READINESS-2026-11.md`](docs/PRODUCTION-READINESS-2026-11.md)（结论:受控/许可制测试网可行,高价值主网前仍需独立审计 + 经济校准 + 规模化测试）。早期里程碑（M6–M23）主题：确定性/守恒/回滚/持久化/Merkle/BFT/认证链/最终性复验/动态验证人集/P2P gossip/质押绑定/等价双签罚没/块级 ops 走 gossip/轻客户端跟随验证人集/验证人集 Merkle 承诺入头/头部轻同步传输/钱包 SPV 账户证明。此后逐里程碑：
+截至 K4，node 有 **790** 项单元测试（729 lib + 61 bin，另 2 个 `#[ignore]`），engine 另有 **11** 项。生产就绪自评见 [`docs/PRODUCTION-READINESS-2026-11.md`](docs/PRODUCTION-READINESS-2026-11.md)（结论:受控/许可制测试网可行,高价值主网前仍需独立审计 + 经济校准 + 规模化测试）。早期里程碑（M6–M23）主题：确定性/守恒/回滚/持久化/Merkle/BFT/认证链/最终性复验/动态验证人集/P2P gossip/质押绑定/等价双签罚没/块级 ops 走 gossip/轻客户端跟随验证人集/验证人集 Merkle 承诺入头/头部轻同步传输/钱包 SPV 账户证明。此后逐里程碑：
 
 - **M24** 泛化批量化证明请求总线：Account/Reviewer/Validator 同一 GetProof 对、单一 verify_proof_against_header 验证器、reviewer_proof 闭合审阅人路径、MAX_PROOF_BATCH=32 上限
 - **M25** 图节点 cert-signed 包含证明

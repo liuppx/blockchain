@@ -1304,6 +1304,17 @@ pub enum ChainError {
     PubkeyInUse,
     /// 本链不接受旧的 ΔK 知识提交(测试网创世关闭)。
     LegacySubmissionsDisabled,
+    /// 区块携带的知识 op 超过单块上限。
+    TooManyKnowledgeOps(usize),
+    /// 知识 op 待处理池已满(且没有可淘汰的超前序号 op)。节点本地背压,非共识错误。
+    KnowledgePoolFull,
+    /// 该账户在知识 op 待处理池中的配额已满。节点本地背压,非共识错误。
+    KnowledgeAccountQuotaExceeded {
+        account: u64,
+        limit: usize,
+    },
+    /// 该知识 op 已在待处理池中(去重)。
+    KnowledgeAlreadySeen,
     /// A bond/unbond op with a zero amount (never meaningful).
     ZeroStake(u64),
     /// An unbond of more than the account currently has bonded.
@@ -1535,6 +1546,17 @@ impl std::fmt::Display for ChainError {
             ChainError::LegacySubmissionsDisabled => {
                 write!(f, "this chain does not accept legacy ΔK submissions")
             }
+            ChainError::TooManyKnowledgeOps(n) => write!(
+                f,
+                "block carries {n} knowledge ops (max {})",
+                crate::knowledge::MAX_KNOWLEDGE_OPS_PER_BLOCK
+            ),
+            ChainError::KnowledgePoolFull => write!(f, "knowledge op pool is full"),
+            ChainError::KnowledgeAccountQuotaExceeded { account, limit } => write!(
+                f,
+                "account {account} already has {limit} knowledge ops pending"
+            ),
+            ChainError::KnowledgeAlreadySeen => write!(f, "knowledge op already pending"),
             ChainError::ValidatorPowerShareExceeded { id, power, cap_bps } => write!(
                 f,
                 "new validator {id} power {power} exceeds the {cap_bps} bps share cap of total voting power"
@@ -2067,6 +2089,9 @@ impl ChainState {
         }
         // 测试网阶段 1:知识单元 op(创建 / 发布版本 / 核验 / 邀请),按区块内顺序执行;
         // 任何一条失败,整个区块回滚(与其他 op 一致)。
+        if block.knowledge_ops.len() > crate::knowledge::MAX_KNOWLEDGE_OPS_PER_BLOCK {
+            return Err(ChainError::TooManyKnowledgeOps(block.knowledge_ops.len()));
+        }
         for op in &block.knowledge_ops {
             self.apply_knowledge_op(op, new_height)?;
         }
@@ -2461,6 +2486,69 @@ impl ChainState {
         }
         self.accounts.get_mut(&op.actor).unwrap().nonce += 1;
         Ok(())
+    }
+
+    /// K4:知识 op 进入待处理池的准入检查(gossip 与本地 / RPC 提交共用)。
+    /// 只检查与区块位置无关的条件:结构、账户存在、签名、成员资格、序号窗口。
+    /// 依赖区块内先后顺序的条件(被引用的单元是否已存在等)留给出块前的过滤与最终执行。
+    pub(crate) fn knowledge_op_admissible(
+        &self,
+        op: &crate::knowledge::KnowledgeOp,
+    ) -> Result<(), ChainError> {
+        op.is_well_formed()
+            .map_err(ChainError::KnowledgeMalformed)?;
+        let acct = self
+            .accounts
+            .get(&op.actor)
+            .ok_or(ChainError::UnknownAccount(op.actor))?;
+        if !crypto::verify(
+            &acct.pubkey,
+            &codec::knowledge_op_signing_bytes(op),
+            &op.signature,
+        ) {
+            return Err(ChainError::BadSignature(op.actor));
+        }
+        if !self.knowledge.members.contains_key(&op.actor) {
+            return Err(ChainError::NotAMember(op.actor));
+        }
+        self.gov_nonce_window(op.actor, op.nonce)
+    }
+
+    /// K4:提交区块后的廉价清理:序号已落在窗口之外的知识 op 永远无法执行,丢弃(不做验签)。
+    pub(crate) fn knowledge_op_not_stale(&self, op: &crate::knowledge::KnowledgeOp) -> bool {
+        self.gov_nonce_window(op.actor, op.nonce).is_ok()
+    }
+
+    /// K4:选出出块者可以放进候选区块的知识 op,避免一条无法执行的 op 让整个候选块无法封装
+    /// (镜像 SEC-01 的治理过滤)。先在试算副本上执行本块已选入的治理 op(它们与知识 op
+    /// 共用账户序号,且在区块内先执行),再按(账户, 序号)排序依次试执行知识 op,
+    /// 使同一账户的连续 op 能在同一块内依序落地;最多选入单块上限条。
+    pub(crate) fn filter_applicable_knowledge(
+        &self,
+        height: u64,
+        gov_proposals: &[GovProposal],
+        gov_votes: &[GovVote],
+        ops: &[crate::knowledge::KnowledgeOp],
+    ) -> Vec<crate::knowledge::KnowledgeOp> {
+        let mut trial = self.clone();
+        for op in gov_proposals {
+            let _ = trial.apply_gov_proposal(op, height);
+        }
+        for op in gov_votes {
+            let _ = trial.apply_gov_vote(op, height);
+        }
+        let mut sorted: Vec<&crate::knowledge::KnowledgeOp> = ops.iter().collect();
+        sorted.sort_by_key(|op| (op.actor, op.nonce));
+        let mut kept = Vec::new();
+        for op in sorted {
+            if kept.len() >= crate::knowledge::MAX_KNOWLEDGE_OPS_PER_BLOCK {
+                break;
+            }
+            if trial.apply_knowledge_op(op, height).is_ok() {
+                kept.push(op.clone());
+            }
+        }
+        kept
     }
 
     /// 引用校验:被引用的单元与版本必须已存在,且不能引用自身所在的单元。
@@ -5753,6 +5841,27 @@ mod tests {
         chain.commit(&mut b).expect("invite after cooldown");
         assert!(chain.state.accounts.contains_key(&5));
         assert!(chain.state.supply_conserved());
+    }
+
+    #[test]
+    fn a_block_over_the_knowledge_op_cap_is_rejected() {
+        // 共识规则(不只是诚实出块者的自我约束):超过单块上限的区块整块拒绝,且在执行任何 op 之前。
+        let mut chain = Chain::new(kgenesis(0, 0, true));
+        let op = kop(
+            &chain,
+            1,
+            create(crate::knowledge::Layer::Foundation, 2, vec![]),
+        );
+        let mut b = kblock(
+            &chain,
+            vec![op; crate::knowledge::MAX_KNOWLEDGE_OPS_PER_BLOCK + 1],
+        );
+        let e = chain.commit(&mut b).expect_err("over the cap");
+        assert!(
+            matches!(e, ChainError::TooManyKnowledgeOps(n) if n == crate::knowledge::MAX_KNOWLEDGE_OPS_PER_BLOCK + 1),
+            "{e}"
+        );
+        assert_eq!(chain.state.height, 0);
     }
 
     #[test]

@@ -23,6 +23,10 @@ pub const MAX_LANG_LEN: usize = 16;
 /// 模型标识的最大字节数(如 `claude-opus-5-5`)。
 pub const MAX_MODEL_ID_LEN: usize = 64;
 
+/// 单个区块最多携带的知识 op 数。共识规则:超过即整块拒绝(不只是诚实出块者的自我约束),
+/// 限定单块的应用开销与体积。
+pub const MAX_KNOWLEDGE_OPS_PER_BLOCK: usize = 256;
+
 /// 签名域分隔标签:知识 op 的签名字节以此为前缀,保证它的签名不能被挪用为任何其他 op 的签名。
 pub const SIGN_DOMAIN: &[u8] = b"zhixing-knowledge-op-v1";
 
