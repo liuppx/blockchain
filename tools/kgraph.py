@@ -5,7 +5,8 @@
   1. 完整性检查:引用目标是否存在、"依据"关系是否成环、引用的版本是否落后于当前版本;
   2. 计算可信度:
        自身可信度  模型生成且未经人核验 0.1;人工撰写未核验 0.2;
-                   每多一位独立的人对**当前版本**核验通过,+0.2,上限 0.9。
+                   每多一位独立的人对**当前版本**核验通过,+0.2,上限 0.9;
+                   每一位"需修改"抵消一位"通过"(按净通过人数计算)。
        有效可信度  = min(自身可信度, 它所"依据"的每个单元的有效可信度)。
                    一条知识不可能比它的地基更可信;"参见"不传递可信度。
   3. 给出优先核验顺序:哪个单元卡住了最多下游单元,先核验它收益最大。
@@ -126,10 +127,22 @@ def parse(path: str) -> Unit:
     return u
 
 
+def verdicts(u: Unit) -> tuple[set, set]:
+    """对当前版本的(通过者, 需修改者);同一核验人以表中最后一条结论为准。"""
+    last = {}
+    for v in u.verifs:
+        if v.version == u.version:
+            last[v.who] = v.verdict
+    passed = {w for w, d in last.items() if "通过" in d}
+    needs = {w for w, d in last.items() if "需修改" in d}
+    return passed, needs
+
+
 def self_credibility(u: Unit) -> float:
-    passed = {v.who for v in u.verifs if v.version == u.version and "通过" in v.verdict}
-    base = C_MODEL if "模型生成" in u.source and not passed else C_HUMAN
-    return min(C_MAX, base + C_STEP * len(passed))
+    passed, needs = verdicts(u)
+    net = max(0, len(passed) - len(needs))  # 每一位"需修改"抵消一位"通过"
+    base = C_MODEL if "模型生成" in u.source and net == 0 else C_HUMAN
+    return min(C_MAX, base + C_STEP * net)
 
 
 def analyze(units: dict[str, Unit]) -> dict:
@@ -220,7 +233,7 @@ def report(units: dict[str, Unit], issues: dict) -> str:
     out += ["| 单元 | 层级 | 来源 | 当前版本 | 核验通过人数 | 自身可信度 | 有效可信度 | 被谁卡住 |",
             "|---|---|---|---|---|---|---|---|"]
     for u in us:
-        passed = len({v.who for v in u.verifs if v.version == u.version and "通过" in v.verdict})
+        passed = len(verdicts(u)[0])
         neck = units[u.bottleneck].title if u.bottleneck in units else (u.bottleneck or "—(取决于自身)")
         out.append(f"| [{u.title}]({u.file}) | {u.layer} | {u.source} | {u.version} | {passed} "
                    f"| {u.c_self:.1f} | **{u.c_eff:.1f}** | {neck} |")

@@ -3472,8 +3472,9 @@ fn json_credibility(c: &crate::knowledge::Credibility) -> String {
         .collect::<Vec<_>>()
         .join(",");
     format!(
-        "{{\"passes\":{},\"self_bps\":{},\"effective_bps\":{},\"bottleneck\":{},\"stale_cites\":[{}]}}",
+        "{{\"passes\":{},\"needs\":{},\"self_bps\":{},\"effective_bps\":{},\"bottleneck\":{},\"stale_cites\":[{}]}}",
         json_u64(c.passes as u64),
+        json_u64(c.needs as u64),
         json_u64(c.self_bps as u64),
         json_u64(c.effective_bps as u64),
         json_bottleneck(c.bottleneck),
@@ -3486,7 +3487,7 @@ fn format_unit_listing(units: &[UnitSummary]) -> String {
         .iter()
         .map(|u| {
             format!(
-                "id={} layer={} domain={} author={} created_height={} versions={} passes={} self_bps={} effective_bps={} bottleneck={}",
+                "id={} layer={} domain={} author={} created_height={} versions={} passes={} needs={} self_bps={} effective_bps={} bottleneck={}",
                 u.id,
                 layer_name(u.layer),
                 u.domain,
@@ -3494,6 +3495,7 @@ fn format_unit_listing(units: &[UnitSummary]) -> String {
                 u.created_height,
                 u.versions,
                 u.cred.passes,
+                u.cred.needs,
                 u.cred.self_bps,
                 u.cred.effective_bps,
                 format_bottleneck(u.cred.bottleneck)
@@ -3536,12 +3538,13 @@ fn format_unit_detail(d: &UnitDetail) -> String {
     )];
     for (v, (cred, verifs)) in u.versions.iter().zip(&d.versions) {
         out.push(format!(
-            "version={} publisher={} published_height={} source={} passes={} self_bps={} effective_bps={} bottleneck={}",
+            "version={} publisher={} published_height={} source={} passes={} needs={} self_bps={} effective_bps={} bottleneck={}",
             v.n,
             v.publisher,
             v.published_height,
             source_name(&v.payload.source),
             cred.passes,
+            cred.needs,
             cred.self_bps,
             cred.effective_bps,
             format_bottleneck(cred.bottleneck)

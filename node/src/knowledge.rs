@@ -356,6 +356,8 @@ pub const CRED_MAX: u32 = 9000;
 pub struct Credibility {
     /// 计入的核验通过人数(已过见习期、不是发布者、对该版本的最新结论为"通过")。
     pub passes: u32,
+    /// 计入的"需修改"人数(条件同上)。每一位抵消一位"通过"。
+    pub needs: u32,
     /// 自身可信度。
     pub self_bps: u32,
     /// 有效可信度 = min(自身可信度, 所依据的每个版本的有效可信度)。
@@ -374,30 +376,46 @@ impl KnowledgeState {
             .get((version as usize).checked_sub(1)?)
     }
 
-    /// 自身可信度与计入的核验通过人数。
+    /// 计入的(通过人数, 需修改人数)。
     ///
-    /// 计入条件:对该版本的**最新**结论为"通过";核验发生时核验人已过见习期(按核验高度判断,
-    /// 之后不回溯);核验人不是该版本的发布者(应用时已强制)。核验只对当时的版本有效。
-    /// 自报的"人工核验过的模型生成"在链上无法验证,链上无人核验通过前仍按模型生成计。
-    pub fn self_credibility(&self, unit: u64, version: u32) -> Option<(u32, u32)> {
+    /// 计入条件:对该版本的**最新**结论;核验发生时核验人已过见习期(按核验高度判断,之后不回溯);
+    /// 核验人不是该版本的发布者(应用时已强制)。核验只对当时的版本有效。
+    pub fn verdict_counts(&self, unit: u64, version: u32) -> Option<(u32, u32)> {
         let v = self.version(unit, version)?;
-        let passes = self
+        let (mut passes, mut needs) = (0u32, 0u32);
+        for (_, r) in self
             .verifications
             .range((unit, version, 0)..=(unit, version, u64::MAX))
-            .filter(|(_, r)| {
-                r.verdict == Verdict::Pass
-                    && r.verifier != v.publisher
-                    && self.is_established(r.verifier, r.height)
-            })
-            .count() as u32;
+        {
+            if r.verifier == v.publisher || !self.is_established(r.verifier, r.height) {
+                continue;
+            }
+            match r.verdict {
+                Verdict::Pass => passes += 1,
+                Verdict::NeedsRevision => needs += 1,
+            }
+        }
+        Some((passes, needs))
+    }
+
+    /// 自身可信度与计入的核验通过人数。
+    ///
+    /// 每一位计入的"需修改"抵消一位"通过"(经济仿真 `sim/economy.py` 的确立规则:通过多于需修改):
+    /// 可信度按**净通过人数** `max(0, 通过 − 需修改)` 计算。否则一个版本即使多数核验人认为有错,
+    /// 可信度也照样按通过的人数上升。
+    /// 自报的"人工核验过的模型生成"在链上无法验证,链上无人净通过前仍按模型生成计。
+    pub fn self_credibility(&self, unit: u64, version: u32) -> Option<(u32, u32)> {
+        let v = self.version(unit, version)?;
+        let (passes, needs) = self.verdict_counts(unit, version)?;
+        let net = passes.saturating_sub(needs);
         let model = !matches!(v.payload.source, Source::Human);
-        let base = if model && passes == 0 {
+        let base = if model && net == 0 {
             CRED_MODEL
         } else {
             CRED_HUMAN
         };
         let bps = base
-            .saturating_add(CRED_STEP.saturating_mul(passes))
+            .saturating_add(CRED_STEP.saturating_mul(net))
             .min(CRED_MAX);
         Some((bps, passes))
     }
@@ -425,6 +443,7 @@ impl KnowledgeState {
         }
         let v = self.version(unit, version)?;
         let (self_bps, passes) = self.self_credibility(unit, version)?;
+        let needs = self.verdict_counts(unit, version).map_or(0, |(_, n)| n);
         let mut effective_bps = self_bps;
         let mut bottleneck = None;
         let mut stale_cites = Vec::new();
@@ -447,6 +466,7 @@ impl KnowledgeState {
         }
         let out = Credibility {
             passes,
+            needs,
             self_bps,
             effective_bps,
             bottleneck,
@@ -599,14 +619,38 @@ mod tests {
             verify(&mut k, 2, 1, v, Verdict::Pass, 2);
         }
         assert_eq!(k.self_credibility(2, 1), Some((CRED_MAX, 5)));
-        // 同一核验人的最新结论改为"需修改",即不再计入
+        // 同一核验人的最新结论改为"需修改":不再计入通过,并抵消一位通过 → 净 3 → 0.2 + 0.6 = 0.8
         verify(&mut k, 2, 1, 6, Verdict::NeedsRevision, 3);
-        assert_eq!(k.self_credibility(2, 1), Some((CRED_MAX, 4)));
+        assert_eq!(
+            k.self_credibility(2, 1),
+            Some((CRED_HUMAN + 3 * CRED_STEP, 4))
+        );
+        assert_eq!(k.verdict_counts(2, 1), Some((4, 1)));
         // 发布者本人的核验不计入(应用时已拒绝,这里防御性地确认)
         verify(&mut k, 1, 1, 1, Verdict::Pass, 2);
         assert_eq!(k.self_credibility(1, 1), Some((CRED_HUMAN, 0)));
         assert_eq!(k.self_credibility(9, 1), None);
         assert_eq!(k.self_credibility(1, 2), None);
+    }
+
+    #[test]
+    fn needs_revision_offsets_passes() {
+        let mut k = state(&[1, 2, 3, 4, 5], 0);
+        add_unit(&mut k, 1, 1, model(), vec![]);
+        verify(&mut k, 1, 1, 2, Verdict::Pass, 2);
+        verify(&mut k, 1, 1, 3, Verdict::Pass, 2);
+        assert_eq!(
+            k.self_credibility(1, 1),
+            Some((CRED_HUMAN + 2 * CRED_STEP, 2))
+        );
+        // 两人认为需修改:与两位通过相互抵消,回到"无人净通过"的模型生成起点
+        verify(&mut k, 1, 1, 4, Verdict::NeedsRevision, 3);
+        verify(&mut k, 1, 1, 5, Verdict::NeedsRevision, 3);
+        let c = k.credibility(1, 1).unwrap();
+        assert_eq!((c.passes, c.needs, c.self_bps), (2, 2, CRED_MODEL));
+        // 需修改多于通过:不会低于起点
+        verify(&mut k, 1, 1, 2, Verdict::NeedsRevision, 4);
+        assert_eq!(k.self_credibility(1, 1), Some((CRED_MODEL, 1)));
     }
 
     #[test]

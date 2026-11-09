@@ -310,11 +310,11 @@ async function tabKnowledge() {
       return `<tr><td><a class='link' data-unit='${esc(u.id)}'>#${esc(u.id)}</a></td>
         <td><a class='link' data-unit='${esc(u.id)}' data-title='${esc(u.id)}'><span class='mut'>…</span></a></td>
         <td>${esc(LAYER_ZH[u.layer] || u.layer)}</td><td>${esc(domainName(u.domain))}</td><td>${esc(u.versions)}</td>
-        <td>${esc(c.passes)}</td><td>${credBar(c.self_bps)}</td><td>${credBar(c.effective_bps)}</td><td>${neck}</td></tr>`;
+        <td>${esc(c.passes)}${Number(c.needs) ? ` <span class='err'>−${esc(c.needs)}</span>` : ""}</td><td>${credBar(c.self_bps)}</td><td>${credBar(c.effective_bps)}</td><td>${neck}</td></tr>`;
     }).join("") : "<tr><td class='mut' colspan=9>(no knowledge units yet — ./cmd knowledge)</td></tr>";
     setView(`<h2 style='border:0;padding:0 0 8px'>Knowledge units</h2>
       <p class='mut'>有效可信度 = 自身可信度与所依据单元有效可信度的最小值。"被谁卡住"指出它最薄弱的地基。</p>
-      <table><tr><th>unit</th><th>标题</th><th>层级</th><th>领域</th><th>版本数</th><th>核验通过</th><th>自身</th><th>有效</th><th>被谁卡住</th></tr>${rows}</table>`);
+      <table><tr><th>unit</th><th>标题</th><th>层级</th><th>领域</th><th>版本数</th><th>核验通过 / 需修改</th><th>自身</th><th>有效</th><th>被谁卡住</th></tr>${rows}</table>`);
     el("view").querySelectorAll("a[data-unit]").forEach(a => a.addEventListener("click", () => showUnit(a.dataset.unit)));
     // titles live in the bodies: latest version's first body, verified against its hash
     el("view").querySelectorAll("a[data-title]").forEach(async a => {
@@ -344,7 +344,7 @@ async function showUnit(id) {
         <kv><b>来源</b>${esc(v.source)}</kv>
         <kv><b>正文哈希</b>${bodies}</kv>
         ${v.bodies.map(b => `<div class='bodyslot' data-hash='${esc(b.hash)}'><span class='mut'>正文加载中…</span></div>`).join("")}
-        <kv><b>可信度</b>自身 ${credBar(c.self_bps)} · 有效 ${credBar(c.effective_bps)} · 核验通过 ${esc(c.passes)}</kv>
+        <kv><b>可信度</b>自身 ${credBar(c.self_bps)} · 有效 ${credBar(c.effective_bps)} · 核验通过 ${esc(c.passes)}${Number(c.needs) ? ` · <span class='err'>需修改 ${esc(c.needs)}(每一位抵消一位通过)</span>` : ""}</kv>
         <kv><b>引用</b>${cites}</kv>${stale}
         <kv><b>核验记录</b>${ver}</kv>`;
     }).join("");
