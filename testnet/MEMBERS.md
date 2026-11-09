@@ -95,6 +95,20 @@ python3 tools/kimport.py --rpc $RPC --bodies https://blockchain.yeying.pub/bodie
 在浏览器的 Knowledge 页点开单元即可阅读正文;每个单元有固定链接,例如
 `https://blockchain.yeying.pub/#unit/3`,可以直接发给别人请他核验。
 
+### 被依据的单元更新了怎么办
+
+"依据"锁定被引用单元的某个版本。它发布新版本后,浏览器会在下游单元上显示"引用已过时",
+下游的有效可信度也会被旧版本卡住。确认新版本没有改变你的单元赖以成立的内容后,发布一个跟进版本:
+
+```sh
+python3 tools/kfollow.py --rpc $RPC                       # 列出所有依据已过时的单元
+python3 tools/kfollow.py --rpc $RPC --unit 6              # 查看要做的改动(不提交)
+python3 tools/kfollow.py --rpc $RPC --unit 6 --key 你的编号=zhixing-member.json --yes
+```
+
+任何成员都可以跟进任何单元(你会被记录为该版本的发布者)。如果新版本确实影响了你的单元,
+应该修改正文后发布新版本,而不是只跟进版本号。
+
 ### 核验时请注意
 
 - 先读单元末尾的"核验要点",逐条确认;
