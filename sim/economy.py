@@ -97,6 +97,10 @@ class Params:
     rent_tax: float = 0.0  # >0:租金改为收入的固定比例(税),休眠改由"使用"判定(重要性低于 i_alive)
     i_alive: float = 0.05
     treasury_floor: float = 0.0  # >0:知识奖励池每期至少 floor × 知识量,不足由国库补足
+    # 第六轮:针对知识量的攻击
+    mal_pump: bool = False  # 作恶者持续为已确立的自己人单元追加"通过",把可信度推到上限
+    pump_actions: int = 3  # 每名作恶者每期额外的追加通过次数
+    k_cred_cap: float = 0.9  # 知识量中可信度的计入上限(0.6 = 2 位净通过即饱和)
     # 冲击(用于检验死亡螺旋)
     shock_step: int = -1  # 这一期有 shock_frac 的已确立单元被证伪退出
     shock_frac: float = 0.0
@@ -334,7 +338,7 @@ class Sim:
         for u in live:  # live 按 id 递增,依据的单元 id 更小,一遍即可
             if u.established < 0:
                 continue
-            c = min(0.9, 0.2 + 0.2 * len(self.counted(u.passes, u)))
+            c = min(self.p.k_cred_cap, 0.2 + 0.2 * len(self.counted(u.passes, u)))
             for b in u.basis:
                 if b in eff:
                     c = min(c, eff[b])
@@ -344,6 +348,14 @@ class Sim:
             if u.mal:
                 kmal += v
         return k, kmal
+
+    def k_amp(self) -> float:
+        """作恶单元在知识量中的份额 ÷ 其在已确立在册单元中的份额。1 = 与诚实单元同等分量;>1 = 被放大。"""
+        live = [u for u in self.units if self.live(u) and u.established >= 0]
+        if not live or not self.k_hist or not self.k_hist[-1]:
+            return float("nan")
+        ms = sum(1 for u in live if u.mal) / len(live)
+        return (self.kmal_hist[-1] / self.k_hist[-1]) / ms if ms else float("nan")
 
     # -- 发放 -----------------------------------------------------------------
     def lock(self, a: Agent, amt: float, uid, review=False):
@@ -536,6 +548,15 @@ class Sim:
                 else:
                     wrote[a.id] += 1
                     self.write(a)
+        if p.mal_pump:  # 额外行动(不占用写/核验预算):为已确立的自己人单元追加"通过";指派模式下只有被指派者计入
+            est = [u for u in self.live_ring if u.established >= 0]
+            for a in self.agents:
+                if a.kind != "mal" or not est:
+                    continue
+                for _ in range(p.pump_actions):
+                    u = r.choice(est)
+                    if u.author != a.id and a.id not in u.passes:
+                        u.passes.append(a.id)
         self.distribute()
         if p.rational:
             for a in self.agents:
@@ -605,6 +626,7 @@ class Sim:
             "k_peak": max(self.k_hist) if self.k_hist else 0.0,
             "m_end": self.m_hist[-1] if self.m_hist else 0.0,
             "kmal": (self.kmal_hist[-1] / kend) if kend else 0.0,
+            "kmal_amp": self.k_amp(),
             "spiral": self.dormant_good_post / max(1, self.good_at_shock) if p.shock_step >= 0 else 0.0,
         }
         return mon | {
@@ -700,6 +722,7 @@ COLS = [
 
 V3 = {"assigned": True, "share_exp": 0.5, "unit_cap": 5.0}
 EL = {"assigned": True, "share_exp": 0.5, "elastic": True}
+EL2 = EL | {"rent_tax": 0.10, "treasury_floor": 0.5}
 ELASTIC = [
     ("fixed", "固定上限(上一版 v3:按半衰期增发 + 与活动挂钩)", V3),
     ("elastic", "弹性供应:锚定知识量,前馈跟随 + PI 纠偏,收缩每期 ≤0.5%", EL),
@@ -726,6 +749,14 @@ ELASTIC = [
     ("el2_shrink", "el2 + 第 5 年起社区萎缩", EL | {"rent_tax": 0.10, "treasury_floor": 0.5, "shrink_step": 60, "shock_step": 60}),
     ("el2_mal20", "el2 + 作恶者 20%", EL | {"rent_tax": 0.10, "treasury_floor": 0.5, "frac_mal": 0.20}),
     ("fixed2_nofee", "固定上限 + 租金改税、休眠看使用 + 外部付费不到来", V3 | {"rent_tax": 0.10, "fee_max": 0.0}),
+    # 第六轮:针对知识量的攻击(作恶者 20%)
+    ("k_naive", "作恶者 20%,不针对知识量(对照)", EL2 | {"frac_mal": 0.20, "assigned": False}),
+    ("k_pump", "作恶者 20% 追加通过,把自己人单元的可信度推到上限;无指派", EL2 | {"frac_mal": 0.20, "assigned": False, "mal_pump": True}),
+    ("k_pump_cap", "同上 + 知识量中可信度 2 位净通过即饱和(上限 0.6)", EL2 | {"frac_mal": 0.20, "assigned": False, "mal_pump": True, "k_cred_cap": 0.6}),
+    ("k_pump_assigned", "同上攻击 + 核验人随机指派(只有被指派者计入)", EL2 | {"frac_mal": 0.20, "mal_pump": True}),
+    ("k_pump_both", "同上攻击 + 指派 + 饱和", EL2 | {"frac_mal": 0.20, "mal_pump": True, "k_cred_cap": 0.6}),
+    ("k_pump_35", "作恶者 35% 追加通过,指派 + 饱和", EL2 | {"frac_mal": 0.35, "mal_pump": True, "k_cred_cap": 0.6}),
+    ("k_honest_cap", "无攻击,仅饱和(检验饱和对诚实网络的代价)", EL2 | {"k_cred_cap": 0.6}),
 ]
 
 ECOLS = [
@@ -738,6 +769,7 @@ ECOLS = [
     ("m_end", "末期货币量", "{:.0f}"),
     ("spiral", "冲击后被租金挤出的好单元", "{:.3f}"),
     ("kmal", "知识量中作恶单元占比", "{:.3f}"),
+    ("kmal_amp", "作恶单元的知识量放大倍数", "{:.2f}"),
     ("mal_share", "作恶者收入占比", "{:.3f}"),
     ("mal_pop", "作恶者人数占比", "{:.2f}"),
     ("err_in_est", "已确立单元中的错误", "{:.3f}"),
@@ -789,7 +821,10 @@ ELASTIC_READING = """## 第四轮:弹性供应(锚定知识量)
 - **年度供应变化**:第 4 年起每年货币量的相对变化;负值即净销毁(通缩)。
 - **冲击后被租金挤出的好单元**:冲击发生后,正确且被引用过的单元因付不起租金而休眠的比例。用来检验死亡螺旋:
   知识减少 → 收缩货币 → 租金升高 → 更多单元休眠 → 知识再减少。
-- **知识量中作恶单元占比**:作恶者能把多少"刷出来的知识"算进锚定物。"""
+- **知识量中作恶单元占比**:作恶者能把多少"刷出来的知识"算进锚定物。
+- **作恶单元的知识量放大倍数**(第六轮):作恶单元在知识量中的份额 ÷ 其在已确立单元中的份额。
+  1 表示每个作恶单元与诚实单元分量相同;大于 1 表示"可信度泵"(确立后继续互相追加通过)放大了分量。
+  `k_*` 场景中追加通过是作恶者的**额外**行动,不占用写与核验的预算,以便单独衡量放大效应。"""
 
 
 def main():
