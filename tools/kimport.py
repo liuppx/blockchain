@@ -16,7 +16,8 @@
      <store>/<哈希>,即测试网的内容寻址正文仓库;
   3. 按"依据"关系的拓扑序创建单元("依据"按规则无环)。链上一个版本只能引用已存在的版本,
      所以指向尚未创建单元的"参见"先不写入,全部创建完后,再为引用方**发布 v2** 把它补上
-     ——这正是版本化(U1)的用法;
+     ——这正是版本化(U1)的用法;依据了被更新单元的下游单元也随之发布新版本,让依据指向当前版本
+     (否则核验当前版本后,下游的有效可信度仍被旧版本卡住);
   4. 每条 op 用 `node encode-knowledge-op` 签名,用 `node rpc --path /knowledge --post` 提交
      (自动带上配置里的 RPC 令牌);不给 `--config` 时直接 HTTP POST 到 `--rpc`/knowledge,
      令牌取自环境变量 ZHIXING_RPC_TOKEN。等待入块后再提交下一条;序号每次从链上读取。
@@ -198,18 +199,32 @@ def main():
         ids[f] = expect_id
         print(f"created  unit {expect_id:>3}  {u.title}  ({layer})")
 
-    # 补上先前无法写入的"参见":发布 v2,引用列表为完整列表
-    for f, later in deferred.items():
+    # 第二遍,按"依据"的拓扑序:为需要的单元发布一个新版本,引用全部指向**当前**版本。
+    # 需要的情况:(1) 有先前无法写入的"参见";(2) 它所依据的单元在这一遍里刚发布了新版本。
+    # 可信度按版本计算,"依据"锁定被引用的版本;若依据仍指向旧版本,审查者核验当前版本后,
+    # 下游单元的有效可信度仍会被旧版本卡住。拓扑序保证处理到某单元时,它所依据的单元都已是最终版本。
+    ver = {f: 1 for f in ids}
+    for f in order:
         u = units[f]
+        bumped = [c.target for c in u.cites if c.kind == "依据" and ver[c.target] > 1]
+        if f not in deferred and not bumped:
+            continue
         cites = []
         for c in u.cites:
             kind = "basis" if c.kind == "依据" else "see-also"
-            cites += ["--cite", f"{ids[c.target]}:1:{kind}"]
+            cites += ["--cite", f"{ids[c.target]}:{ver[c.target]}:{kind}"]
         submit(["--action", "publish", "--unit", str(ids[f]), "--body", f"zh:{hashes[f]}",
                 "--source", source_arg(u.source), *cites])
-        wait_until(lambda: len((get_json(a.rpc, f"/unit/{ids[f]}") or {}).get("versions", [])) >= 2,
-                   f"unit {ids[f]} v2")
-        print(f"published unit {ids[f]:>3} v2  {u.title}  (补上参见: {', '.join(units[t].title for t, _ in later)})")
+        n = ver[f] + 1
+        wait_until(lambda: len((get_json(a.rpc, f"/unit/{ids[f]}") or {}).get("versions", [])) >= n,
+                   f"unit {ids[f]} v{n}")
+        ver[f] = n
+        why = []
+        if f in deferred:
+            why.append("补上参见: " + ", ".join(units[t].title for t, _ in deferred[f]))
+        if bumped:
+            why.append("依据跟进到新版本: " + ", ".join(units[t].title for t in bumped))
+        print(f"published unit {ids[f]:>3} v{n}  {u.title}  ({'; '.join(why)})")
 
     if a.map:
         json.dump({"domain": a.domain, "units": ids, "body_sha256": hashes}, open(a.map, "w"),
