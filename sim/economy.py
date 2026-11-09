@@ -84,6 +84,24 @@ class Params:
     assign_k: int = 4
     share_exp: float = 1.0  # 分配权重 = 重要性^share_exp;0.5 即边际递减
     unit_cap: float = 0.0  # >0:每期增发不超过 unit_cap × 在册已确立单元数,未发出的额度顺延(总量不变)
+    # 第四轮:弹性供应(锚定知识量)
+    elastic: bool = False
+    k_money: float = 200.0  # 每单位知识量对应的目标货币量
+    k_imp_cap: float = 3.0  # 知识量中单元的 √重要性 上限
+    kp: float = 0.10  # 比例增益(每期,按相对偏差)
+    ki: float = 0.01  # 积分增益
+    r_max: float = 0.005  # 每期供应量变化上限(相对)
+    k_smooth: int = 3  # 知识量取最近几期的均值
+    rent_mult_max: float = 3.0  # 收缩时租金最多提高到几倍
+    feedforward: bool = True  # 增发直接跟随知识量的增长
+    rent_tax: float = 0.0  # >0:租金改为收入的固定比例(税),休眠改由"使用"判定(重要性低于 i_alive)
+    i_alive: float = 0.05
+    treasury_floor: float = 0.0  # >0:知识奖励池每期至少 floor × 知识量,不足由国库补足
+    # 冲击(用于检验死亡螺旋)
+    shock_step: int = -1  # 这一期有 shock_frac 的已确立单元被证伪退出
+    shock_frac: float = 0.0
+    shrink_step: int = -1  # 从这一期起社区萎缩:不再有新人,行动数降为 shrink_actions
+    shrink_actions: int = 1
 
 
 @dataclass
@@ -137,6 +155,13 @@ class Sim:
         self.minted = self.burned = self.treasury = self.fees = 0.0
         self.carry = 0.0
         self.minted_y1 = 0.0
+        self.k_hist: list[float] = []
+        self.m_hist: list[float] = []
+        self.kmal_hist: list[float] = []
+        self.integ = 0.0
+        self.last_burn = 0.0
+        self.dormant_good_post = 0
+        self.good_at_shock = 0
         self.paid_flow: dict[int, tuple] = {}
         self.t = 0
         self.ring_units: set[int] = set()
@@ -301,6 +326,25 @@ class Sim:
         a.slashed += cut
         return cut
 
+    # -- 知识量 ---------------------------------------------------------------
+    def knowledge_volume(self, live) -> tuple[float, float]:
+        """K = Σ 有效可信度 × min(√重要性, 上限);有效可信度 = min(自身, 所依据单元的有效可信度)。"""
+        eff: dict[int, float] = {}
+        k = kmal = 0.0
+        for u in live:  # live 按 id 递增,依据的单元 id 更小,一遍即可
+            if u.established < 0:
+                continue
+            c = min(0.9, 0.2 + 0.2 * len(self.counted(u.passes, u)))
+            for b in u.basis:
+                if b in eff:
+                    c = min(c, eff[b])
+            eff[u.id] = c
+            v = c * min(math.sqrt(max(0.0, self.importance(u))), self.p.k_imp_cap)
+            k += v
+            if u.mal:
+                kmal += v
+        return k, kmal
+
     # -- 发放 -----------------------------------------------------------------
     def lock(self, a: Agent, amt: float, uid, review=False):
         if amt <= 0:
@@ -314,17 +358,55 @@ class Sim:
     def distribute(self):
         p, t = self.p, self.t
         live = [u for u in self.units if self.live(u)]
-        emission = p.e0 * 2 ** (-t / p.emission_half_life)
-        if p.unit_cap > 0:
-            avail = emission + self.carry
-            emission = min(avail, p.unit_cap * len(live))
-            self.carry = avail - emission
+        kv, kmal = self.knowledge_volume(live)
+        self.k_hist.append(kv)
+        self.kmal_hist.append(kmal)
         fee = p.fee_max / (1 + math.exp(-(t - p.fee_mid) / p.fee_width)) if p.fee_max else 0.0
+        burned_before = self.burned
+        rent_mult, rent_burn, fee_burn = 1.0, 0.5, 0.0
+        if p.elastic:
+            ks = statistics.mean(self.k_hist[-p.k_smooth:])
+            ks_prev = statistics.mean(self.k_hist[-p.k_smooth - 1:-1]) if len(self.k_hist) > 1 else 0.0
+            target = p.k_money * ks
+            m = self.minted - self.burned
+            base = max(m, target, p.k_money)
+            e = (target - m) / base
+            self.integ = max(-5.0, min(5.0, self.integ + e))
+            correction = max(-p.r_max, min(p.r_max, p.kp * e + p.ki * self.integ)) * base
+            # 前馈:知识量增长多少,货币就跟着增发多少(不受速度上限约束);
+            # 知识量减少时同样跟着收缩,但收缩与纠偏合计每期不超过 r_max,避免一次冲击引发剧烈通缩。
+            ff = p.k_money * (ks - ks_prev) if p.feedforward else 0.0
+            desired = ff + correction
+            if desired < 0:
+                desired = max(desired, -p.r_max * base)
+            if desired >= 0:
+                emission = desired + self.last_burn  # 抵消上期销毁,使净变化≈期望值
+            else:
+                emission = 0.0
+                need = -desired
+                fee_burn = min(fee, need)
+                need -= fee_burn
+                rent_base = (p.rent * len(live) if p.rent_tax <= 0 else p.rent_tax * max(1e-9, fee + self.last_burn)) or 1e-9
+                rent_mult = 1.0 + min(p.rent_mult_max - 1.0, need / rent_base)
+                rent_burn = 1.0
+        else:
+            emission = p.e0 * 2 ** (-t / p.emission_half_life)
+            if p.unit_cap > 0:
+                avail = emission + self.carry
+                emission = min(avail, p.unit_cap * len(live))
+                self.carry = avail - emission
         self.minted += emission
+        self.burned += fee_burn
         self.fees += fee
-        total = emission + fee
+        total = emission + fee - fee_burn
         pool, rpool = total * p.split_pool, total * p.split_review
         self.treasury += total - pool - rpool
+        if p.treasury_floor > 0:
+            floor = p.treasury_floor * kv
+            if pool < floor:
+                draw = min(self.treasury, floor - pool)
+                self.treasury -= draw
+                pool += draw
         imps = {u.id: self.importance(u) ** p.share_exp for u in live}
         s = sum(imps.values())
         got: dict[int, float] = {}
@@ -344,16 +426,27 @@ class Sim:
             inc = got.get(u.id, 0.0)
             u.income = (u.income + [inc])[-12:]
             u.total_income += inc
-            net = inc - p.rent if not u.dormant else 0.0
+            if p.rent_tax > 0:
+                rent = min(inc, inc * p.rent_tax * rent_mult)
+            else:
+                rent = p.rent * rent_mult
+            net = inc - rent if not u.dormant else 0.0
             if not u.dormant:
-                self.burned += min(inc, p.rent) * 0.5
-                self.treasury += min(inc, p.rent) * 0.5
+                self.burned += min(inc, rent) * rent_burn
+                self.treasury += min(inc, rent) * (1 - rent_burn)
             if net > 0:
                 self.lock(self.agents[u.author], net, u.id)
-            if not u.dormant and t - u.born >= 12 and sum(u.income) < 12 * p.rent:
+            if p.rent_tax > 0:
+                unused = u.established >= 0 and t - u.established >= 12 and self.importance(u) < p.i_alive
+                dies = not u.dormant and unused
+            else:
+                dies = not u.dormant and t - u.born >= 12 and sum(u.income) < 12 * rent
+            if dies:
                 u.dormant = True
                 if u.correct and u.established >= 0 and u.cited:
                     self.dormant_good += 1
+                    if 0 <= p.shock_step <= t:
+                        self.dormant_good_post += 1
         cs = sum(self.review_credits.values())
         if cs > 0:
             for i, c in self.review_credits.items():
@@ -363,6 +456,8 @@ class Sim:
         self.review_credits = {}
         if live:
             self.per_unit_reward[t] = pool / len(live)
+        self.m_hist.append(self.minted - self.burned)
+        self.last_burn = self.burned - burned_before
         # 释放
         fpaid = allflow = 0.0
         for a in self.agents:
@@ -386,7 +481,17 @@ class Sim:
     # -- 主循环 ---------------------------------------------------------------
     def step(self):
         p, r = self.p, self.r
-        if len(self.agents) < p.max_agents:
+        if self.t == p.shock_step:  # 外部冲击:一批已确立单元被证伪退出(如一个领域的认识被推翻)
+            est = [u for u in self.units if u.established >= 0 and not u.removed and not u.dormant]
+            self.good_at_shock = sum(1 for u in est if u.correct and u.cited)
+            for u in r.sample(est, int(len(est) * p.shock_frac)):
+                u.removed = True
+        shrinking = 0 <= p.shrink_step <= self.t
+        if shrinking:
+            actions = p.shrink_actions
+        else:
+            actions = p.actions
+        if len(self.agents) < p.max_agents and not shrinking:
             n = int(p.growth) + (1 if r.random() < p.growth % 1 else 0)
             for _ in range(n):
                 x = r.random()
@@ -424,7 +529,7 @@ class Sim:
         before_w = {a.id: a.earned_write for a in self.agents}
         before_r = {a.id: a.earned_review for a in self.agents}
         for a in self.agents:
-            for _ in range(p.actions):
+            for _ in range(actions):
                 if r.random() < a.f_review:
                     reviewed[a.id] += 1
                     self.review(a)
@@ -483,7 +588,26 @@ class Sim:
             return sum(x.paid for x in self.agents if x.founder) / allp if allp else 0.0
 
         cap = p.e0 * p.emission_half_life / math.log(2)
-        return {
+        mk = [m / k for m, k in zip(self.m_hist, self.k_hist) if k > 0]
+        mk_tail = mk[36:] if len(mk) > 48 else mk
+        yearly = []
+        for y in range(3, p.steps // 12):
+            a0, a1 = self.m_hist[y * 12 - 1], self.m_hist[min(len(self.m_hist) - 1, y * 12 + 11)]
+            if a0 > 0:
+                yearly.append((a1 - a0) / a0)
+        kend = self.k_hist[-1] if self.k_hist else 0.0
+        mon = {
+            "mk_cv": statistics.pstdev(mk_tail) / statistics.mean(mk_tail) if mk_tail and statistics.mean(mk_tail) else float("nan"),
+            "mk_end": (self.m_hist[-1] / kend) if kend else float("nan"),
+            "infl_max": max((abs(x) for x in yearly), default=0.0),
+            "infl_min": min(yearly, default=0.0),
+            "k_end": kend,
+            "k_peak": max(self.k_hist) if self.k_hist else 0.0,
+            "m_end": self.m_hist[-1] if self.m_hist else 0.0,
+            "kmal": (self.kmal_hist[-1] / kend) if kend else 0.0,
+            "spiral": self.dormant_good_post / max(1, self.good_at_shock) if p.shock_step >= 0 else 0.0,
+        }
+        return mon | {
             "correct_share": inc_correct / inc_all,
             "mal_share": paid["mal"] / tot_paid,
             "mal_pop": n_mal / n_all,
@@ -574,15 +698,67 @@ COLS = [
 ]
 
 
+V3 = {"assigned": True, "share_exp": 0.5, "unit_cap": 5.0}
+EL = {"assigned": True, "share_exp": 0.5, "elastic": True}
+ELASTIC = [
+    ("fixed", "固定上限(上一版 v3:按半衰期增发 + 与活动挂钩)", V3),
+    ("elastic", "弹性供应:锚定知识量,前馈跟随 + PI 纠偏,收缩每期 ≤0.5%", EL),
+    ("elastic_noff", "弹性,无前馈(只靠 PI,纠偏每期 ≤0.5%)", EL | {"feedforward": False}),
+    ("fixed_shock", "固定上限 + 第 5 年 30% 的已确立知识被证伪", V3 | {"shock_step": 60, "shock_frac": 0.3}),
+    ("elastic_shock", "弹性 + 第 5 年 30% 的已确立知识被证伪", EL | {"shock_step": 60, "shock_frac": 0.3}),
+    ("fixed_shrink", "固定上限 + 第 5 年起社区萎缩(无新人,活跃度降到 1/3)", V3 | {"shrink_step": 60, "shock_step": 60}),
+    ("elastic_shrink", "弹性 + 第 5 年起社区萎缩", EL | {"shrink_step": 60, "shock_step": 60}),
+    ("fixed_shock8", "固定上限 + 第 8 年(网络成熟后)50% 的已确立知识被证伪", V3 | {"shock_step": 96, "shock_frac": 0.5}),
+    ("elastic_shock8", "弹性 + 第 8 年 50% 的已确立知识被证伪", EL | {"shock_step": 96, "shock_frac": 0.5}),
+    ("elastic_shock8_hard", "弹性 + 第 8 年冲击,收缩不设上限(检验螺旋)", EL | {"shock_step": 96, "shock_frac": 0.5, "r_max": 1.0}),
+    ("elastic_nofee", "弹性 + 外部付费不到来", EL | {"fee_max": 0.0}),
+    ("elastic_mal20", "弹性 + 作恶者 20%(试图刷高知识量)", EL | {"frac_mal": 0.20}),
+    ("fixed_mal20", "固定上限 + 作恶者 20%", V3 | {"frac_mal": 0.20}),
+    ("elastic_fast", "弹性,调节过猛:增益 ×10、每期上限 5%", EL | {"kp": 1.0, "ki": 0.1, "r_max": 0.05}),
+    ("elastic_nocap", "弹性,不设每期变化上限", EL | {"r_max": 1.0}),
+    ("elastic_raw_k", "弹性,但知识量不平滑(取当期值)", EL | {"k_smooth": 1}),
+    # 第五轮:存活看使用,不看钱;国库托底
+    ("el2", "弹性 + 租金改为收入的 10%(税),休眠看使用 + 国库托底", EL | {"rent_tax": 0.10, "treasury_floor": 0.5}),
+    ("el2_nofee", "el2 + 外部付费不到来", EL | {"rent_tax": 0.10, "treasury_floor": 0.5, "fee_max": 0.0}),
+    ("el2_tax_only_nofee", "仅租金改税(无国库托底)+ 外部付费不到来", EL | {"rent_tax": 0.10, "fee_max": 0.0}),
+    ("el2_shock8_hard", "el2 + 第 8 年 50% 知识被证伪,收缩不设上限", EL | {"rent_tax": 0.10, "treasury_floor": 0.5, "shock_step": 96, "shock_frac": 0.5, "r_max": 1.0}),
+    ("el2_shock8", "el2 + 第 8 年 50% 知识被证伪", EL | {"rent_tax": 0.10, "treasury_floor": 0.5, "shock_step": 96, "shock_frac": 0.5}),
+    ("el2_shrink", "el2 + 第 5 年起社区萎缩", EL | {"rent_tax": 0.10, "treasury_floor": 0.5, "shrink_step": 60, "shock_step": 60}),
+    ("el2_mal20", "el2 + 作恶者 20%", EL | {"rent_tax": 0.10, "treasury_floor": 0.5, "frac_mal": 0.20}),
+    ("fixed2_nofee", "固定上限 + 租金改税、休眠看使用 + 外部付费不到来", V3 | {"rent_tax": 0.10, "fee_max": 0.0}),
+]
+
+ECOLS = [
+    ("mk_cv", "每单位知识的货币量波动(变异系数)", "{:.3f}"),
+    ("mk_end", "末期 货币量/知识量", "{:.0f}"),
+    ("infl_max", "年度供应变化最大幅度", "{:.3f}"),
+    ("infl_min", "年度供应变化最低值", "{:+.3f}"),
+    ("k_peak", "知识量峰值", "{:.0f}"),
+    ("k_end", "末期知识量", "{:.0f}"),
+    ("m_end", "末期货币量", "{:.0f}"),
+    ("spiral", "冲击后被租金挤出的好单元", "{:.3f}"),
+    ("kmal", "知识量中作恶单元占比", "{:.3f}"),
+    ("mal_share", "作恶者收入占比", "{:.3f}"),
+    ("mal_pop", "作恶者人数占比", "{:.2f}"),
+    ("err_in_est", "已确立单元中的错误", "{:.3f}"),
+    ("pur5", "第5年每单元奖励", "{:.2f}"),
+    ("pur10", "第10年每单元奖励", "{:.2f}"),
+    ("dormant_good", "休眠的好单元(全程)", "{:.3f}"),
+    ("founder_y1", "创始者占当年收入 第1年", "{:.2f}"),
+    ("founder_stock", "创始者持有累计收入", "{:.2f}"),
+]
+
+
 def run_scenario(p: Params, seeds: int) -> dict:
     ms = [Sim(p, s).run() for s in range(seeds)]
     return {k: statistics.mean(m[k] for m in ms) for k in ms[0]}
 
 
-def table(results) -> str:
-    head = "| 场景 | 说明 | " + " | ".join(c[1] for c in COLS) + " |"
-    sep = "|---|---|" + "---|" * len(COLS)
-    rows = [f"| `{n}` | {d} | " + " | ".join(f.format(m[k]) for k, _, f in COLS) + " |" for n, d, m in results]
+def table(results, cols=None) -> str:
+    cols = cols or COLS
+    head = "| 场景 | 说明 | " + " | ".join(c[1] for c in cols) + " |"
+    sep = "|---|---|" + "---|" * len(cols)
+    rows = [f"| `{n}` | {d} | " + " | ".join(f.format(m[k]) for k, _, f in cols) + " |" for n, d, m in results]
     return "\n".join([head, sep, *rows])
 
 
@@ -603,29 +779,51 @@ READING = """## 怎么读这张表
 """
 
 
+ELASTIC_READING = """## 第四轮:弹性供应(锚定知识量)
+
+知识量 K = Σ 已确立在册单元的 有效可信度 × min(√重要性, 3)。目标货币量 M* = k × K(取最近 3 期均值)。
+每期按相对偏差做比例 + 积分调节:低于目标就增发;高于目标就停止增发,并依次销毁部分外部付费、提高租金(最多 3 倍)
+且租金全部销毁。**只从资金流里销毁,不动任何账户余额。**每期供应变化不超过 0.5%。
+
+- **每单位知识的货币量波动**:第 4 年起 M/K 的变异系数。越小,说明货币量越紧地跟着知识量走。
+- **年度供应变化**:第 4 年起每年货币量的相对变化;负值即净销毁(通缩)。
+- **冲击后被租金挤出的好单元**:冲击发生后,正确且被引用过的单元因付不起租金而休眠的比例。用来检验死亡螺旋:
+  知识减少 → 收缩货币 → 租金升高 → 更多单元休眠 → 知识再减少。
+- **知识量中作恶单元占比**:作恶者能把多少"刷出来的知识"算进锚定物。"""
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--seeds", type=int, default=4)
     ap.add_argument("--steps", type=int, default=120)
     ap.add_argument("--md", action="store_true")
     ap.add_argument("--only", help="逗号分隔的场景名")
+    ap.add_argument("--suite", choices=("rules", "elastic", "all"), default="all")
     a = ap.parse_args()
     base = Params(steps=a.steps)
     only = set(a.only.split(",")) if a.only else None
-    out = []
-    for name, desc, over in SCENARIOS:
-        if only and name not in only:
-            continue
-        out.append((name, desc, run_scenario(replace(base, **over), a.seeds)))
-        print(f"done {name}", flush=True)
-    t = table(out)
-    print(t)
+
+    def run(scen):
+        out = []
+        for name, desc, over in scen:
+            if only and name not in only:
+                continue
+            out.append((name, desc, run_scenario(replace(base, **over), a.seeds)))
+            print(f"done {name}", flush=True)
+        return out
+
+    rules = run(SCENARIOS) if a.suite in ("rules", "all") else []
+    el = run(ELASTIC) if a.suite in ("elastic", "all") else []
+    t1 = table(rules) if rules else ""
+    t2 = table(el, ECOLS) if el else ""
+    print(t1 + "\n\n" + t2)
     if a.md:
         with open("sim/ECONOMY.md", "w", encoding="utf-8") as f:
             f.write("<!-- 由 sim/economy.py --md 自动生成,勿手改 -->\n")
             f.write(f"# 知识经济仿真结果({a.seeds} 种子均值,{a.steps} 期 = {a.steps // 12} 年)\n\n")
             f.write(READING + "\n\n")
-            f.write(t + "\n")
+            f.write("## 第一至三轮:分配规则\n\n" + t1 + "\n\n")
+            f.write(ELASTIC_READING + "\n\n" + t2 + "\n")
 
 
 if __name__ == "__main__":
