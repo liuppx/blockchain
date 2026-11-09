@@ -60,6 +60,9 @@ umask 077
 printf 'ZHIXING_KEYSTORE_PASSWORD=%s\n' "$(cat "$DEST/testnet/out/password")" > /etc/zhixing/env
 chmod 600 /etc/zhixing/env
 chown -R zhixing:zhixing "$DEST/testnet/out"
+printf 'BODY_TOKEN=%s\n' "$(grep '^RPC_TOKEN=' "$DEST/testnet/out/tokens.env" | cut -d= -f2)" > /etc/zhixing/explorer.env
+chmod 600 /etc/zhixing/explorer.env
+install -d -o zhixing -g zhixing -m 755 "$DEST/bodies"
 
 install -m 644 "$DEST/deploy/systemd/zhixing-node@.service" /etc/systemd/system/
 install -m 644 "$DEST/deploy/systemd/zhixing-explorer.service" /etc/systemd/system/

@@ -69,8 +69,31 @@ curl -s -X POST -H "Authorization: Bearer $ZHIXING_RPC_TOKEN" \
   -H 'Content-Type: application/octet-stream' --data-binary @op.bin $RPC/knowledge
 ```
 
-每提交一条,序号加一;等它入块(约 1 秒)再签下一条。批量导入一个目录下的单元文件,可以用
-`tools/kimport.py --rpc $RPC --key 你的编号=zhixing-member.json --dir ... --domain ...`(它会自动取序号、等待入块)。
+每提交一条,序号加一;等它入块(约 1 秒)再签下一条。
+
+### 正文放在哪里
+
+链上只记录正文的 **SHA-256 哈希**;正文本身放在测试网的**正文仓库** `https://blockchain.yeying.pub/bodies/<哈希>`。
+浏览器打开单元时会取回正文、在你的浏览器里重新计算哈希,一致才显示("✓ 正文与链上哈希一致")。
+所以**创建单元或发布新版本时,要先上传正文**(仓库只接受哈希相符的内容,别人无法替换你的正文):
+
+```sh
+H=$(shasum -a 256 单元文件.md | cut -c1-64)   # 与 node hash-content --file 单元文件.md 相同
+curl -s -X PUT -H "Authorization: Bearer $ZHIXING_RPC_TOKEN" --data-binary @单元文件.md \
+  https://blockchain.yeying.pub/bodies/$H
+```
+
+批量导入一个目录下的单元文件,用 `tools/kimport.py`,它会自动上传正文、取序号、等待入块:
+
+```sh
+python3 tools/kimport.py --rpc $RPC --bodies https://blockchain.yeying.pub/bodies \
+  --key 你的编号=zhixing-member.json --dir 单元目录 --domain 领域编号   # 1 大模型应用开发,2 运动健身
+```
+
+### 怎么阅读与核验
+
+在浏览器的 Knowledge 页点开单元即可阅读正文;每个单元有固定链接,例如
+`https://blockchain.yeying.pub/#unit/3`,可以直接发给别人请他核验。
 
 ### 核验时请注意
 

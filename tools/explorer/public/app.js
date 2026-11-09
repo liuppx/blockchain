@@ -23,7 +23,9 @@ async function connect() {
   try {
     await refreshOverview();
     el("conn").textContent = "connected"; el("conn").className = "mut";
-    renderTabs(); showTab("knowledge");
+    renderTabs();
+    const deep = /^#unit\/(\d+)$/.exec(location.hash);   // shareable link: …/#unit/3
+    if (deep) showUnit(deep[1]); else showTab("knowledge");
     if (timer) clearInterval(timer);
     timer = setInterval(refreshOverview, 4000);  // poll chain tip
   } catch (e) {
@@ -215,6 +217,8 @@ async function tabSupply() {
 // effective credibility = min(own, every "basis" citation's effective credibility), so the
 // bottleneck column names the weakest foundation a unit stands on.
 const LAYER_ZH = { foundation: "基础", explanation: "解释", scenario: "场景", application: "应用" };
+const DOMAIN_ZH = { 1: "大模型应用开发", 2: "运动健身" }; // testnet genesis [knowledge] domains
+const domainName = d => DOMAIN_ZH[d] ? `${DOMAIN_ZH[d]} (${d})` : String(d);
 function credBar(bps) {
   const v = Number(bps) / 10000;
   const pct = Math.round(v * 100);
@@ -222,6 +226,80 @@ function credBar(bps) {
   return `<span style='display:inline-block;width:80px;height:8px;background:#ddd;vertical-align:middle'>` +
     `<span style='display:block;width:${pct}%;height:8px;background:${color}'></span></span> ${v.toFixed(1)}`;
 }
+
+// ---- knowledge bodies: fetched from the content-addressed store, re-hashed in the browser ----
+const bodyCache = new Map();
+async function sha256hex(buf) {
+  const d = await crypto.subtle.digest("SHA-256", buf);
+  return Array.from(new Uint8Array(d)).map(b => b.toString(16).padStart(2, "0")).join("");
+}
+// → {text, ok} | null. ok=false ⇒ bytes don't match the on-chain hash (never shown as content).
+async function fetchBody(hash) {
+  if (bodyCache.has(hash)) return bodyCache.get(hash);
+  const p = (async () => {
+    const r = await fetch("/bodies/" + hash);
+    if (!r.ok) return null;
+    const buf = await r.arrayBuffer();
+    return { ok: (await sha256hex(buf)) === hash, text: new TextDecoder().decode(buf) };
+  })().catch(() => null);
+  bodyCache.set(hash, p);
+  return p;
+}
+function bodyTitle(text) { const m = /^#\s+(.+)$/m.exec(text); return m ? m[1].trim() : ""; }
+// Minimal, escape-first markdown (headings, tables, lists, quotes, code, **bold**, `code`, links).
+function mdInline(s) {
+  return esc(s)
+    .replace(/`([^`]+)`/g, "<code>$1</code>")
+    .replace(/\*\*([^*]+)\*\*/g, "<b>$1</b>")
+    .replace(/\[([^\]]+)\]\((https?:\/\/[^)\s]+)\)/g, "<a href='$2' rel='noopener noreferrer' target='_blank'>$1</a>");
+}
+function renderMd(text) {
+  const lines = text.replace(/\r\n/g, "\n").split("\n"), out = [];
+  let i = 0;
+  const cells = l => l.trim().replace(/^\||\|$/g, "").split("|").map(c => c.trim());
+  while (i < lines.length) {
+    const l = lines[i];
+    if (/^```/.test(l)) {
+      const buf = []; i++;
+      while (i < lines.length && !/^```/.test(lines[i])) buf.push(lines[i++]);
+      i++; out.push(`<pre>${esc(buf.join("\n"))}</pre>`); continue;
+    }
+    const h = /^(#{1,6})\s+(.*)$/.exec(l);
+    if (h) { const n = Math.min(h[1].length + 2, 6); out.push(`<h${n} class='md'>${mdInline(h[2])}</h${n}>`); i++; continue; }
+    if (/^\s*\|/.test(l)) {
+      const rows = [];
+      while (i < lines.length && /^\s*\|/.test(lines[i])) rows.push(lines[i++]);
+      const body = rows.filter((r, k) => !(k === 1 && /^[\s|:-]+$/.test(r)));
+      const [head, ...rest] = body;
+      out.push(`<table class='md'><tr>${cells(head).map(c => `<th>${mdInline(c)}</th>`).join("")}</tr>` +
+        rest.map(r => `<tr>${cells(r).map(c => `<td>${mdInline(c)}</td>`).join("")}</tr>`).join("") + "</table>");
+      continue;
+    }
+    if (/^\s*([-*]|\d+\.)\s+/.test(l)) {
+      const ordered = /^\s*\d+\./.test(l), items = [];
+      while (i < lines.length && /^\s*([-*]|\d+\.)\s+/.test(lines[i])) items.push(lines[i++].replace(/^\s*([-*]|\d+\.)\s+/, ""));
+      const t = ordered ? "ol" : "ul";
+      out.push(`<${t} class='md'>${items.map(x => `<li>${mdInline(x)}</li>`).join("")}</${t}>`); continue;
+    }
+    if (/^>\s?/.test(l)) {
+      const buf = [];
+      while (i < lines.length && /^>\s?/.test(lines[i])) buf.push(lines[i++].replace(/^>\s?/, ""));
+      out.push(`<blockquote class='md'>${mdInline(buf.join(" "))}</blockquote>`); continue;
+    }
+    if (!l.trim()) { i++; continue; }
+    const buf = [];
+    while (i < lines.length && lines[i].trim() && !/^(#{1,6}\s|```|\s*\||\s*([-*]|\d+\.)\s|>)/.test(lines[i])) buf.push(lines[i++]);
+    out.push(`<p class='md'>${buf.map(mdInline).join("<br>")}</p>`);
+  }
+  return out.join("");
+}
+async function fillBody(slot, hash) {
+  const b = await fetchBody(hash);
+  if (!b) { slot.innerHTML = "<span class='mut'>正文未上传到正文仓库(链上只有哈希)</span>"; return; }
+  if (!b.ok) { slot.innerHTML = "<span class='err'>正文与链上哈希不一致,已拒绝显示</span>"; return; }
+  slot.innerHTML = "<div class='ok'>✓ 正文与链上哈希一致</div><div class='mdbody'>" + renderMd(b.text) + "</div>";
+}
+
 async function tabKnowledge() {
   setView("<span class='mut'>loading…</span>");
   try {
@@ -230,16 +308,26 @@ async function tabKnowledge() {
       const c = u.credibility, b = c.bottleneck;
       const neck = b ? `<a class='link' data-unit='${esc(b.unit)}'>#${esc(b.unit)} v${esc(b.version)}</a>` : "<span class='mut'>—</span>";
       return `<tr><td><a class='link' data-unit='${esc(u.id)}'>#${esc(u.id)}</a></td>
-        <td>${esc(LAYER_ZH[u.layer] || u.layer)}</td><td>${esc(u.domain)}</td><td>${esc(u.versions)}</td>
+        <td><a class='link' data-unit='${esc(u.id)}' data-title='${esc(u.id)}'><span class='mut'>…</span></a></td>
+        <td>${esc(LAYER_ZH[u.layer] || u.layer)}</td><td>${esc(domainName(u.domain))}</td><td>${esc(u.versions)}</td>
         <td>${esc(c.passes)}</td><td>${credBar(c.self_bps)}</td><td>${credBar(c.effective_bps)}</td><td>${neck}</td></tr>`;
-    }).join("") : "<tr><td class='mut' colspan=8>(no knowledge units yet — ./cmd knowledge)</td></tr>";
+    }).join("") : "<tr><td class='mut' colspan=9>(no knowledge units yet — ./cmd knowledge)</td></tr>";
     setView(`<h2 style='border:0;padding:0 0 8px'>Knowledge units</h2>
       <p class='mut'>有效可信度 = 自身可信度与所依据单元有效可信度的最小值。"被谁卡住"指出它最薄弱的地基。</p>
-      <table><tr><th>unit</th><th>层级</th><th>领域</th><th>版本数</th><th>核验通过</th><th>自身</th><th>有效</th><th>被谁卡住</th></tr>${rows}</table>`);
+      <table><tr><th>unit</th><th>标题</th><th>层级</th><th>领域</th><th>版本数</th><th>核验通过</th><th>自身</th><th>有效</th><th>被谁卡住</th></tr>${rows}</table>`);
     el("view").querySelectorAll("a[data-unit]").forEach(a => a.addEventListener("click", () => showUnit(a.dataset.unit)));
+    // titles live in the bodies: latest version's first body, verified against its hash
+    el("view").querySelectorAll("a[data-title]").forEach(async a => {
+      try {
+        const u = await j("/unit/" + a.dataset.title), v = u.versions[u.versions.length - 1];
+        const b = v && v.bodies[0] ? await fetchBody(v.bodies[0].hash) : null;
+        a.innerHTML = b && b.ok && bodyTitle(b.text) ? esc(bodyTitle(b.text)) : "<span class='mut'>(正文未上传)</span>";
+      } catch (_) { a.innerHTML = "<span class='mut'>?</span>"; }
+    });
   } catch (e) { setView(`<span class='err'>${esc(e.message)}</span>`); }
 }
 async function showUnit(id) {
+  history.replaceState(null, "", "#unit/" + id);
   setView("<span class='mut'>loading…</span>");
   try {
     const u = await j("/unit/" + id);
@@ -255,6 +343,7 @@ async function showUnit(id) {
         <kv><b>publisher / height</b>account ${esc(v.publisher)} · ${esc(v.published_height)}</kv>
         <kv><b>来源</b>${esc(v.source)}</kv>
         <kv><b>正文哈希</b>${bodies}</kv>
+        ${v.bodies.map(b => `<div class='bodyslot' data-hash='${esc(b.hash)}'><span class='mut'>正文加载中…</span></div>`).join("")}
         <kv><b>可信度</b>自身 ${credBar(c.self_bps)} · 有效 ${credBar(c.effective_bps)} · 核验通过 ${esc(c.passes)}</kv>
         <kv><b>引用</b>${cites}</kv>${stale}
         <kv><b>核验记录</b>${ver}</kv>`;
@@ -262,8 +351,10 @@ async function showUnit(id) {
     setView(`<p><a class='link' id='kback'>← knowledge</a></p>
       <h2 style='border:0;padding:0 0 8px'>Unit #${esc(u.id)} · ${esc(LAYER_ZH[u.layer] || u.layer)}</h2>
       <kv><b>author / created</b>account ${esc(u.author)} · height ${esc(u.created_height)}</kv>
-      <kv><b>domain</b>${esc(u.domain)}</kv><kv><b>license</b>${esc(u.license)}</kv>${vers}`);
-    el("kback").addEventListener("click", () => showTab("knowledge"));
+      <kv><b>domain</b>${esc(domainName(u.domain))}</kv><kv><b>license</b>${esc(u.license)}</kv>${vers}`);
+    el("kback").addEventListener("click", () => { history.replaceState(null, "", location.pathname); showTab("knowledge"); });
+    // latest version expanded; older versions' bodies load too (they are usually the same text)
+    el("view").querySelectorAll(".bodyslot").forEach(sl => fillBody(sl, sl.dataset.hash));
     el("view").querySelectorAll("a[data-unit]").forEach(a => a.addEventListener("click", () => showUnit(a.dataset.unit)));
   } catch (e) { setView(`<span class='err'>${esc(e.message)}</span>`); }
 }

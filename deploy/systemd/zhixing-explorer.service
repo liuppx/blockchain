@@ -10,6 +10,10 @@ Group=zhixing
 Environment=PORT=8080
 Environment=HOST=127.0.0.1
 Environment=NODE_RPC=http://127.0.0.1:9221
+# 正文仓库(内容寻址,GET 公开;PUT 需令牌且哈希必须一致)
+Environment=BODY_DIR=/opt/zhixing/bodies
+# BODY_TOKEN(= RPC 写令牌,root 600)
+EnvironmentFile=/etc/zhixing/explorer.env
 ExecStart=/usr/local/bin/node /opt/zhixing/tools/explorer/server.js
 Restart=on-failure
 RestartSec=3
@@ -17,6 +21,7 @@ NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict
 ProtectHome=true
+ReadWritePaths=/opt/zhixing/bodies
 
 [Install]
 WantedBy=multi-user.target

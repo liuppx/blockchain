@@ -7,7 +7,8 @@
 
     # 远程测试网(HTTPS,经 nginx):不需要节点配置,令牌从环境变量读取,不出现在命令行
     ZHIXING_RPC_TOKEN=... python3 tools/kimport.py --dir docs/pilot/fitness --domain 2 \\
-        --rpc https://blockchain.yeying.pub/rpc --key 2=zhixing-member.json
+        --rpc https://blockchain.yeying.pub/rpc --bodies https://blockchain.yeying.pub/bodies \\
+        --key 2=zhixing-member.json
 
 做的事:
   1. 用 tools/kgraph.py 的同一个解析器读取单元文件(两个工具对文件的理解完全一致);
@@ -103,6 +104,7 @@ def main():
     ap.add_argument("--rpc", default="http://127.0.0.1:9221")
     ap.add_argument("--key", required=True, help="作者账户:ID=种子文件或 keystore")
     ap.add_argument("--store", help="内容寻址正文仓库目录")
+    ap.add_argument("--bodies", help="远程正文仓库 URL(如 https://blockchain.yeying.pub/bodies),提交前先上传正文;令牌同 ZHIXING_RPC_TOKEN")
     ap.add_argument("--map", help="写出 单元文件 → 链上 id 的映射(JSON)")
     ap.add_argument("--bin", default=os.path.join(os.path.dirname(__file__), "..", "node", "target", "release", "node"))
     a = ap.parse_args()
@@ -122,6 +124,17 @@ def main():
         if acct is None:
             sys.exit(f"account {actor} not found on chain")
         return int(acct["nonce"])
+
+    def upload_body(h: str, data: bytes) -> None:
+        token = os.environ.get("ZHIXING_RPC_TOKEN", "")
+        req = urllib.request.Request(a.bodies.rstrip("/") + "/" + h, data=data, method="PUT",
+                                     headers={"Authorization": "Bearer " + token,
+                                              "Content-Type": "text/markdown; charset=utf-8"})
+        try:
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                print(f"  body {h[:12]}… {resp.read().decode().strip()}")
+        except urllib.error.HTTPError as e:
+            sys.exit(f"body upload failed: HTTP {e.code} {e.read().decode(errors='replace').strip()}")
 
     def submit(argv: list[str]) -> str:
         with tempfile.NamedTemporaryFile(suffix=".bin", delete=False) as t:
@@ -163,6 +176,8 @@ def main():
         if a.store:
             os.makedirs(a.store, exist_ok=True)
             open(os.path.join(a.store, h), "wb").write(data)
+        if a.bodies:
+            upload_body(h, data)
         cites, later = [], []
         for c in u.cites:
             kind = "basis" if c.kind == "依据" else "see-also"
