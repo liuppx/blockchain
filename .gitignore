@@ -37,3 +37,4 @@ __pycache__/
 
 # K7: the real testnet member list holds names (personal info); only the example is tracked
 testnet/members.toml
+node/target-linux/

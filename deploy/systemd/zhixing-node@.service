@@ -1,0 +1,28 @@
+[Unit]
+Description=知行图测试网验证节点 n%i
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=zhixing
+Group=zhixing
+# ZHIXING_KEYSTORE_PASSWORD(只有 root 可读,systemd 读取后注入,不进入命令行)
+EnvironmentFile=/etc/zhixing/env
+Environment=RUST_LOG=info
+ExecStart=/opt/zhixing/node/target/release/node run --config /opt/zhixing/testnet/out/n%i/node.toml
+# 验证节点必须优雅退出(SIGTERM),日志按记录 fsync,不要用 SIGKILL
+KillSignal=SIGTERM
+TimeoutStopSec=30
+Restart=on-failure
+RestartSec=3
+LimitNOFILE=65536
+# 加固
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/zhixing/testnet/out
+
+[Install]
+WantedBy=multi-user.target

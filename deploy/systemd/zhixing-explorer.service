@@ -1,0 +1,22 @@
+[Unit]
+Description=知行图测试网区块浏览器
+After=network-online.target zhixing-node@21.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=zhixing
+Group=zhixing
+Environment=PORT=8080
+Environment=HOST=127.0.0.1
+Environment=NODE_RPC=http://127.0.0.1:9221
+ExecStart=/usr/local/bin/node /opt/zhixing/tools/explorer/server.js
+Restart=on-failure
+RestartSec=3
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+
+[Install]
+WantedBy=multi-user.target

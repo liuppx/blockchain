@@ -5,6 +5,10 @@
         --config .localnet/node.toml --rpc http://127.0.0.1:9221 \\
         --key 1=.localnet/keys/acct1.seed [--store .localnet/bodies] [--map .localnet/kimport.json]
 
+    # 远程测试网(HTTPS,经 nginx):不需要节点配置,令牌从环境变量读取,不出现在命令行
+    ZHIXING_RPC_TOKEN=... python3 tools/kimport.py --dir docs/pilot/fitness --domain 2 \\
+        --rpc https://blockchain.yeying.pub/rpc --key 2=zhixing-member.json
+
 做的事:
   1. 用 tools/kgraph.py 的同一个解析器读取单元文件(两个工具对文件的理解完全一致);
   2. 正文哈希 = 单元文件字节的 SHA-256(与 `node hash-content` 相同);`--store` 时把文件存为
@@ -13,7 +17,8 @@
      所以指向尚未创建单元的"参见"先不写入,全部创建完后,再为引用方**发布 v2** 把它补上
      ——这正是版本化(U1)的用法;
   4. 每条 op 用 `node encode-knowledge-op` 签名,用 `node rpc --path /knowledge --post` 提交
-     (自动带上配置里的 RPC 令牌),等待入块后再提交下一条;序号每次从链上读取。
+     (自动带上配置里的 RPC 令牌);不给 `--config` 时直接 HTTP POST 到 `--rpc`/knowledge,
+     令牌取自环境变量 ZHIXING_RPC_TOKEN。等待入块后再提交下一条;序号每次从链上读取。
 
 纯 Python 标准库。作者账户由 `--key ID=SEEDFILE` 指定(种子文件或加密 keystore 均可,后者需
 ZHIXING_KEYSTORE_PASSWORD)。
@@ -49,7 +54,7 @@ def source_arg(src: str) -> str:
 def get_json(rpc: str, path: str):
     req = urllib.request.Request(rpc + path, headers={"Accept": "application/json"})
     try:
-        with urllib.request.urlopen(req, timeout=3) as r:
+        with urllib.request.urlopen(req, timeout=10) as r:
             return json.loads(r.read().decode())
     except urllib.error.HTTPError as e:
         if e.code == 404:
@@ -94,7 +99,7 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("--dir", required=True)
     ap.add_argument("--domain", type=int, required=True)
-    ap.add_argument("--config", required=True, help="节点配置(提供 RPC 地址与令牌给 node rpc)")
+    ap.add_argument("--config", help="本地节点配置(经 node rpc 提交);不给则直接 POST 到 --rpc,令牌取自 ZHIXING_RPC_TOKEN")
     ap.add_argument("--rpc", default="http://127.0.0.1:9221")
     ap.add_argument("--key", required=True, help="作者账户:ID=种子文件或 keystore")
     ap.add_argument("--store", help="内容寻址正文仓库目录")
@@ -126,12 +131,26 @@ def main():
                              capture_output=True, text=True)
         if enc.returncode != 0:
             sys.exit("encode failed: " + enc.stderr.strip())
-        r = subprocess.run([a.bin, "rpc", "--config", a.config, "--path", "/knowledge", "--post", out],
-                           capture_output=True, text=True)
+        if a.config:
+            r = subprocess.run([a.bin, "rpc", "--config", a.config, "--path", "/knowledge", "--post", out],
+                               capture_output=True, text=True)
+            os.unlink(out)
+            if r.returncode != 0:
+                sys.exit("submit failed: " + (r.stderr or r.stdout).strip())
+            return r.stdout.strip()
+        with open(out, "rb") as fh:
+            body = fh.read()
         os.unlink(out)
-        if r.returncode != 0:
-            sys.exit("submit failed: " + (r.stderr or r.stdout).strip())
-        return r.stdout.strip()
+        headers = {"Content-Type": "application/octet-stream"}
+        token = os.environ.get("ZHIXING_RPC_TOKEN", "")
+        if token:
+            headers["Authorization"] = "Bearer " + token
+        req = urllib.request.Request(a.rpc + "/knowledge", data=body, headers=headers, method="POST")
+        try:
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                return resp.read().decode().strip()
+        except urllib.error.HTTPError as e:
+            sys.exit(f"submit failed: HTTP {e.code} {e.read().decode(errors='replace').strip()}")
 
     ids: dict[str, int] = {}
     hashes: dict[str, str] = {}

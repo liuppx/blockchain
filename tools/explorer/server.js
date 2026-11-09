@@ -13,6 +13,7 @@ const path = require("path");
 const { URL } = require("url");
 
 const PORT = Number(process.env.PORT || 8080);
+const HOST = process.env.HOST || "127.0.0.1"; // behind a reverse proxy; set HOST=0.0.0.0 to expose directly
 const NODE_RPC = (process.env.NODE_RPC || "http://127.0.0.1:9221").replace(/\/+$/, "");
 const PUBLIC = path.join(__dirname, "public");
 
@@ -51,6 +52,6 @@ function proxy(req, res) {
 http.createServer((req, res) => {
   if (req.url === "/rpc" || req.url.startsWith("/rpc/") || req.url.startsWith("/rpc?")) return proxy(req, res);
   return serveStatic(req, res);
-}).listen(PORT, () => {
-  console.log(`zhixing explorer → http://localhost:${PORT}  (proxying /rpc → ${NODE_RPC})`);
+}).listen(PORT, HOST, () => {
+  console.log(`zhixing explorer → http://${HOST}:${PORT}  (proxying /rpc → ${NODE_RPC})`);
 });

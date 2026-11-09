@@ -49,18 +49,28 @@ node keygen --new-mnemonic --encrypt --out zhixing-member.json
 
 ### 怎么提交
 
-所有操作都用你的密钥文件签名,然后提交到测试网节点(地址和令牌由组织者提供):
+测试网地址:**https://blockchain.yeying.pub**(浏览器)。提交接口是 `https://blockchain.yeying.pub/rpc/knowledge`,
+需要一个**写入令牌**,由组织者私下发给你(它只用来防止刷写入,不代表你的身份;你的身份由你的密钥签名证明)。
+
+所有操作都用你的密钥文件在**你自己的电脑上**签名,然后提交:
 
 ```sh
 export ZHIXING_KEYSTORE_PASSWORD='你的密码'     # 或者不设置,运行时会提示输入
+export ZHIXING_RPC_TOKEN='组织者发给你的写入令牌'
+RPC=https://blockchain.yeying.pub/rpc
 
-# 例:核验 5 号单元的第 1 版,结论"通过"(--actor 填你的账户编号,--nonce 填你当前的序号)
+# 查你的当前序号(nonce):
+curl -s $RPC/account/你的编号
+
+# 例:核验 5 号单元的第 1 版,结论"通过"
 node encode-knowledge-op --key-file zhixing-member.json --out op.bin \
   --actor 你的编号 --nonce 你的序号 --action verify --unit 5 --version 1 --verdict pass
-node rpc --config 测试网节点配置.toml --path /knowledge --post op.bin
+curl -s -X POST -H "Authorization: Bearer $ZHIXING_RPC_TOKEN" \
+  -H 'Content-Type: application/octet-stream' --data-binary @op.bin $RPC/knowledge
 ```
 
-你的当前序号可以在浏览器的账户页查到,或请求 `GET /account/你的编号`。
+每提交一条,序号加一;等它入块(约 1 秒)再签下一条。批量导入一个目录下的单元文件,可以用
+`tools/kimport.py --rpc $RPC --key 你的编号=zhixing-member.json --dir ... --domain ...`(它会自动取序号、等待入块)。
 
 ### 核验时请注意
 
