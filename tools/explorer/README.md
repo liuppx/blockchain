@@ -55,6 +55,8 @@ PORT=8080 NODE_RPC=http://127.0.0.1:9221 npm start      # 或: node server.js
   种子用成员口令加密(PBKDF2-SHA256 60 万次 → AES-256-GCM)后存在 `localStorage`,解锁后的签名密钥只在内存里。
 - **与节点逐字节一致**:`node --test tools/explorer/test/signer.test.mjs` 用同一助记词对照 Rust 程序
   (`node keygen` / `node encode-knowledge-op`)的公钥与签名后的 op,CI 中为必过项。
+- **导入**:助记词,或 `node keygen --encrypt` 写的密钥文件(Web3 Secret Storage v3:scrypt + AES-128-CTR + Keccak-256 MAC;
+  scrypt 与 Keccak 为纯 JS 实现,对照 RFC 7914 / 官方向量与 Rust 程序生成的文件检验)。
 - **目前支持**:核验(通过 / 需修改,"通过"须先勾选单元的全部核验要点)与邀请。创建单元、发布版本需要上传正文,仍用 `tools/kimport.py`。
 - 提交需要写入令牌(组织者私下提供),保存在本机 `localStorage`。
 - 需要较新的浏览器(WebCrypto Ed25519:Chrome / Edge 137+、Firefox 129+、Safari 17+)与 HTTPS(或 localhost)。

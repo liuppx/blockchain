@@ -111,9 +111,11 @@
       setView(`<h2 style='border:0;padding:0 0 8px'>我的身份</h2>
         <p>你的身份是一把密钥。它<b>只保存在这个浏览器里</b>,用你设置的口令加密;组织者和其他任何人都拿不到。</p>
         <p><button id='idGen'>生成新身份</button> <span class='mut'>第一次加入测试网选这个</span></p>
-        <p><button id='idImp'>用助记词导入</button> <span class='mut'>已经用 <code>node keygen</code> 生成过,或在别的浏览器里生成过</span></p>`);
+        <p><button id='idImp'>用助记词导入</button> <span class='mut'>手上有 12 或 24 个词的助记词</span></p>
+        <p><button id='idFile'>导入密钥文件</button> <span class='mut'>用 <code>node keygen --encrypt</code> 生成的 .json 文件,例如 <code>alice.json</code></span></p>`);
       el("idGen").addEventListener("click", async () => { pending = await S.generateMnemonic(); showGenerate(); });
       el("idImp").addEventListener("click", showImport);
+      el("idFile").addEventListener("click", showImportFile);
       return;
     }
     const acct = session && session.account;
@@ -190,6 +192,30 @@
         el("impWords").value = "";
         showIdentity();
       } catch (e) { msg("impMsg", e.message, "err"); }
+    });
+  }
+
+  function showImportFile() {
+    setView(`<h2 style='border:0;padding:0 0 8px'>导入密钥文件</h2>
+      <p class='mut'>选择 <code>node keygen --encrypt</code> 生成的 .json 密钥文件。文件只在这个页面里读取和解密,不会上传到任何地方。</p>
+      <p><input id='ksFile' type='file' accept='.json,application/json'></p>
+      <p>密钥文件的口令:<input id='ksPw' type='password' autocomplete='off'></p>
+      <p>本机加密口令(至少 8 个字符,每次核验前解锁时用;可以与上面相同):<input id='ksLocal' type='password' autocomplete='new-password'></p>
+      <p><button id='ksGo'>导入</button> <button id='ksCancel'>取消</button> <span id='ksMsg'></span></p>`);
+    el("ksCancel").addEventListener("click", showIdentity);
+    el("ksGo").addEventListener("click", async () => {
+      const f = el("ksFile").files[0];
+      if (!f) return msg("ksMsg", "请先选择密钥文件", "err");
+      if (f.size > 64 * 1024) return msg("ksMsg", "这个文件太大,不像是密钥文件", "err");
+      if ((el("ksLocal").value || "").length < 8) return msg("ksMsg", "本机加密口令至少 8 个字符", "err");
+      msg("ksMsg", "解密中…密钥文件用了很强的加密,需要几秒到十几秒,页面可能短暂没有响应");
+      await new Promise((ok) => setTimeout(ok, 50)); // 让提示先显示出来
+      try {
+        const seed = await S.decryptKeystore(await f.text(), el("ksPw").value);
+        await saveSeed(seed, el("ksLocal").value);
+        el("ksPw").value = ""; el("ksLocal").value = "";
+        showIdentity();
+      } catch (e) { msg("ksMsg", e.message, "err"); }
     });
   }
 

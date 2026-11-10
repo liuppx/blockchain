@@ -105,3 +105,41 @@ test("不支持的操作与错误参数被拒绝", async () => {
   assert.throws(() => S.encodeOp(1, { type: "verify", unit: 1, version: 1, verdict: "maybe" }, 0), /verdict/);
   assert.throws(() => S.encodeOp(1, { type: "invite", pubkey: "abcd" }, 0), /64 位/);
 });
+
+// ---- 导入节点的加密密钥文件 ---------------------------------------------------------
+
+test("Keccak-256 官方向量(以太坊用的原始 Keccak,不是 SHA3-256)", () => {
+  const h = (s) => S.bytesToHex(S.keccak256(new TextEncoder().encode(s)));
+  assert.equal(h(""), "c5d2460186f7233c927e7db2dcc703c0e500b653ca82273b7bfad8045d85a470");
+  assert.equal(h("abc"), "4e03657aea45a94fc7d47ba826c8d667c0d1e6e33a64a036ec44f58fa12d6c45");
+  // 跨越一个分组(136 字节)的输入
+  assert.equal(S.bytesToHex(S.keccak256(new Uint8Array(200))).length, 64);
+});
+
+test("scrypt RFC 7914 测试向量", async () => {
+  const e = new TextEncoder();
+  const v = await S.scrypt(e.encode("password"), e.encode("NaCl"), 1024, 8, 16, 64);
+  assert.equal(S.bytesToHex(v),
+    "fdbabe1c9d3472007856e7190d01e9fe7c6ad7cbc8237830e77376634b3731622eaf30d92e22a3886ff109279d9830dac727afb94a83ee6d8360cbdfa2cc0640");
+  const v2 = await S.scrypt(e.encode("pleaseletmein"), e.encode("SodiumChloride"), 16384, 8, 1, 64);
+  assert.equal(S.bytesToHex(v2),
+    "7023bdcb3afd7348461c06cd81fd38ebfda8fbba904f8e3ea9b543f6545da1f2d5432955613f0fcf62d49705242a9af9e61e85dc0d651e40dfcf017b45575887");
+});
+
+test("解开 Rust 程序写的密钥文件(keygen --encrypt),种子与助记词推出的一致", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "zxks-"));
+  try {
+    execFileSync(BIN, ["keygen", "--mnemonic", ZERO24, "--encrypt", "--out", "ks.json"],
+      { cwd: dir, env: { ...process.env, ZHIXING_KEYSTORE_PASSWORD: "ks-password-123" }, stdio: "ignore" });
+    const json = readFileSync(join(dir, "ks.json"), "utf8");
+    const seed = await S.decryptKeystore(json, "ks-password-123");
+    assert.equal(S.bytesToHex(seed), S.bytesToHex(await S.mnemonicToSeed(ZERO24)));
+    await assert.rejects(S.decryptKeystore(json, "wrong-password"), /口令不对/);
+    await assert.rejects(S.decryptKeystore("{not json", "x"), /无法解析/);
+    const evil = JSON.parse(json);
+    evil.crypto.kdfparams.n = 2 ** 24; // 恶意文件:要求 4 GB 内存
+    await assert.rejects(S.decryptKeystore(JSON.stringify(evil), "x"), /超出支持范围/);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
