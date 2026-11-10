@@ -48,7 +48,13 @@ function proxy(req, res) {
   const target = new URL(NODE_RPC + sub);
   const opts = {
     hostname: target.hostname, port: target.port || 80, path: target.pathname + target.search,
-    method: req.method, headers: { "Accept": req.headers["accept"] || "application/json", "Host": target.host },
+    method: req.method,
+    headers: Object.fromEntries(Object.entries({
+      "Accept": req.headers["accept"] || "application/json", "Host": target.host,
+      // 成员提交核验时需要:写入令牌与请求体类型 / 长度
+      "Authorization": req.headers["authorization"], "Content-Type": req.headers["content-type"],
+      "Content-Length": req.headers["content-length"],
+    }).filter(([, v]) => v !== undefined)),
   };
   const up = http.request(opts, (upRes) => {
     res.writeHead(upRes.statusCode || 502, { "Content-Type": upRes.headers["content-type"] || "text/plain" });

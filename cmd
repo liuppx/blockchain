@@ -76,7 +76,8 @@ up() {
   if command -v node >/dev/null 2>&1; then
     if running "$D/explorer.pid"; then echo "explorer already running (pid $(cat "$D/explorer.pid"))";
     else
-      PORT="$EXPLORER_PORT" NODE_RPC="http://127.0.0.1:$RPC_PORT" \
+      mkdir -p "$D/bodies"   # 正文仓库:./cmd knowledge 用 --store 写入这里,浏览器从 /bodies/<哈希> 读取
+      PORT="$EXPLORER_PORT" NODE_RPC="http://127.0.0.1:$RPC_PORT" BODY_DIR="$D/bodies" \
         nohup node "$ROOT/tools/explorer/server.js" >> "$D/explorer.log" 2>&1 &
       echo $! > "$D/explorer.pid"; echo "explorer started (pid $!)"
     fi

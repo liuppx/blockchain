@@ -30,3 +30,10 @@ kv { display:block; } kv b { color:var(--mut); font-weight:normal; display:inlin
 .mdbody pre { background:#0d1117; padding:8px; overflow-x:auto; }
 .mdbody blockquote.md { border-left:3px solid var(--line); margin:8px 0; padding-left:10px; color:var(--mut); }
 .mdbody code { background:#1f242d; padding:0 3px; border-radius:3px; }
+/* member: identity & review */
+ol.mnemonic { display:grid; grid-template-columns:repeat(4, minmax(140px,1fr)); gap:6px 18px; background:var(--panel);
+  border:1px solid var(--line); border-radius:6px; padding:12px 12px 12px 40px; font-size:16px; }
+ol.checklist li { margin:6px 0; line-height:1.6; }
+#idBtn { margin-left:auto; }
+textarea { background:#0d1117; color:var(--fg); border:1px solid var(--line); border-radius:6px; padding:6px 10px; font:inherit; }
+button:disabled { opacity:.45; cursor:not-allowed; }

@@ -46,3 +46,15 @@ PORT=8080 NODE_RPC=http://127.0.0.1:9221 npm start      # 或: node server.js
 - 实时靠轮询 `/height`,无 WebSocket。
 - 字段名对齐节点 `daemon.rs` 的 `json_*` 渲染器;列表走 `{total,cursor,items}` 分页信封;
   u64 为无损引号串原样显示。
+
+## 成员功能:在浏览器里核验与邀请
+
+`public/signer.js` + `public/member.js` 让成员不装任何程序,在浏览器里持有密钥、核验知识单元、邀请新成员。
+
+- **私钥只在本机**:助记词(BIP-39)→ 种子 → ed25519 密钥,全部用浏览器内置的 WebCrypto 完成;
+  种子用成员口令加密(PBKDF2-SHA256 60 万次 → AES-256-GCM)后存在 `localStorage`,解锁后的签名密钥只在内存里。
+- **与节点逐字节一致**:`node --test tools/explorer/test/signer.test.mjs` 用同一助记词对照 Rust 程序
+  (`node keygen` / `node encode-knowledge-op`)的公钥与签名后的 op,CI 中为必过项。
+- **目前支持**:核验(通过 / 需修改,"通过"须先勾选单元的全部核验要点)与邀请。创建单元、发布版本需要上传正文,仍用 `tools/kimport.py`。
+- 提交需要写入令牌(组织者私下提供),保存在本机 `localStorage`。
+- 需要较新的浏览器(WebCrypto Ed25519:Chrome / Edge 137+、Firefox 129+、Safari 17+)与 HTTPS(或 localhost)。

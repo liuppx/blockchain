@@ -331,7 +331,7 @@ async function showUnit(id) {
   setView("<span class='mut'>loading…</span>");
   try {
     const u = await j("/unit/" + id);
-    const vers = u.versions.slice().reverse().map(v => {
+    const vers = u.versions.slice().reverse().map((v, vi) => {
       const c = v.credibility;
       const cites = v.cites.length ? v.cites.map(x =>
         `<a class='link' data-unit='${esc(x.unit)}'>#${esc(x.unit)} v${esc(x.version)}</a> <span class='mut'>(${x.kind === "basis" ? "依据" : "参见"})</span>`).join("<br>") : "<span class='mut'>—</span>";
@@ -346,7 +346,7 @@ async function showUnit(id) {
         ${v.bodies.map(b => `<div class='bodyslot' data-hash='${esc(b.hash)}'><span class='mut'>正文加载中…</span></div>`).join("")}
         <kv><b>可信度</b>自身 ${credBar(c.self_bps)} · 有效 ${credBar(c.effective_bps)} · 核验通过 ${esc(c.passes)}${Number(c.needs) ? ` · <span class='err'>需修改 ${esc(c.needs)}(每一位抵消一位通过)</span>` : ""}</kv>
         <kv><b>引用</b>${cites}</kv>${stale}
-        <kv><b>核验记录</b>${ver}</kv>`;
+        <kv><b>核验记录</b>${ver}</kv>${vi === 0 ? "<div id='reviewSlot'></div>" : ""}`;
     }).join("");
     setView(`<p><a class='link' id='kback'>← knowledge</a></p>
       <h2 style='border:0;padding:0 0 8px'>Unit #${esc(u.id)} · ${esc(LAYER_ZH[u.layer] || u.layer)}</h2>
@@ -355,9 +355,16 @@ async function showUnit(id) {
     el("kback").addEventListener("click", () => { history.replaceState(null, "", location.pathname); showTab("knowledge"); });
     // latest version expanded; older versions' bodies load too (they are usually the same text)
     el("view").querySelectorAll(".bodyslot").forEach(sl => fillBody(sl, sl.dataset.hash));
+    if (window.ZXMember) ZXMember.attachReview(u);
     el("view").querySelectorAll("a[data-unit]").forEach(a => a.addEventListener("click", () => showUnit(a.dataset.unit)));
   } catch (e) { setView(`<span class='err'>${esc(e.message)}</span>`); }
 }
+
+// 同一标签页里粘贴或修改单元链接(#unit/N)时也要跳转
+window.addEventListener("hashchange", () => {
+  const m = /^#unit\/(\d+)$/.exec(location.hash);
+  if (m) showUnit(m[1]);
+});
 
 // Wire up the Connect button and auto-connect on load (default "/rpc" proxy).
 document.getElementById("connectBtn").addEventListener("click", connect);

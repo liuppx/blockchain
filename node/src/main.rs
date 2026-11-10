@@ -3959,11 +3959,19 @@ fn derive_pubkey(seed_hex: &str, field: &str) -> Result<String, config::ConfigEr
 /// seed — e.g. driving tx load against the production-parity testnet (`testnet/soak.sh`).
 fn read_seed_from_key_file(path: &str) -> [u8; 32] {
     let contents = std::fs::read_to_string(path).unwrap_or_else(|e| fail("read key file", e));
-    let trimmed = contents.trim();
     // A raw seed is exactly 64 hex chars; anything else is treated as keystore JSON.
-    if trimmed.len() == 64 && trimmed.bytes().all(|b| b.is_ascii_hexdigit()) {
-        return config::decode_seed(trimmed, "--key-file")
-            .unwrap_or_else(|e| fail_msg("decode key seed", &e));
+    // `keygen --mnemonic` / `--new-mnemonic` (without `--encrypt`) write `# ...` comment lines
+    // (mnemonic, pubkey) above the seed, so ignore comment and blank lines first.
+    let seed_lines: Vec<&str> = contents
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty() && !l.starts_with('#'))
+        .collect();
+    if let [only] = seed_lines.as_slice() {
+        if only.len() == 64 && only.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return config::decode_seed(only, "--key-file")
+                .unwrap_or_else(|e| fail_msg("decode key seed", &e));
+        }
     }
     let password = read_keystore_password_from("ZHIXING_KEYSTORE_PASSWORD", path);
     zhixing_node::keystore::decrypt_seed(&contents, &password)
@@ -6109,6 +6117,19 @@ mod tests {
         std::fs::write(&raw, format!("{}\n", zhixing_node::hash::hex(&seed))).unwrap();
         assert_eq!(read_seed_from_key_file(raw.to_str().unwrap()), seed);
         let _ = std::fs::remove_file(&raw);
+
+        // (1b) the seed file `keygen --mnemonic` writes: `#` comment lines above the seed
+        let commented = dir.join(format!("zx-m233-{}-commented", std::process::id()));
+        std::fs::write(
+            &commented,
+            format!(
+                "# zhixing-node validator key (M169 · BIP-39)\n# mnemonic: abandon ...\n# pubkey: x\n{}\n",
+                zhixing_node::hash::hex(&seed)
+            ),
+        )
+        .unwrap();
+        assert_eq!(read_seed_from_key_file(commented.to_str().unwrap()), seed);
+        let _ = std::fs::remove_file(&commented);
 
         // (2) Web3 Secret Storage v3 encrypted keystore, password via env (unattended)
         let ks = zhixing_node::keystore::encrypt_seed(&seed, "pw-m233").unwrap();

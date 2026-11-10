@@ -85,7 +85,11 @@ echo "-- genesis identity:"; sed 's/^/   /' "$DEST/testnet/out/genesis-identity.
 REMOTE
 
 echo "== public smoke"
-sleep 2
+# 节点重启后要先重放全部历史区块,RPC 在此期间返回 502;最多等 3 分钟
+for _ in $(seq 1 90); do
+  curl -fsS -o /dev/null "https://blockchain.yeying.pub/rpc/height" 2>/dev/null && break
+  sleep 2
+done
 curl -fsS "https://blockchain.yeying.pub/rpc/height" && echo "  ← https /rpc/height"
 curl -fsS -o /dev/null -w '%{http_code}  ← https / (explorer)\n' "https://blockchain.yeying.pub/"
 echo "RPC 写令牌在服务器上:$DEST/testnet/out/tokens.env(RPC_TOKEN),请勿贴到公开渠道"

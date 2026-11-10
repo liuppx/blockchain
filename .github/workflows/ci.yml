@@ -67,6 +67,18 @@ jobs:
           (cd engine && cargo test --release)
           (cd node && cargo test --release -- --test-threads=1)
 
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22   # WebCrypto Ed25519 (used by the browser signer)
+
+      - name: browser signer matches the node byte-for-byte (gate)
+        # tools/explorer/public/signer.js signs knowledge ops in members' browsers. Cross-check it
+        # against the Rust binary: same mnemonic → same seed/pubkey, same op → identical signed bytes.
+        run: |
+          (cd node && cargo build --release)
+          node --version
+          node --test tools/explorer/test/signer.test.mjs
+
   audit:
     name: cargo-audit (dependency advisories)
     runs-on: ubuntu-latest
