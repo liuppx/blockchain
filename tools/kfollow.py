@@ -62,9 +62,22 @@ def plan(rpc: str, u: dict) -> tuple[list[str], list[str]]:
     return args, changes
 
 
+TESTNET = "https://blockchain.yeying.pub/rpc"
+
+
 def main():
+    try:
+        run()
+    except urllib.error.URLError as e:
+        if isinstance(e, urllib.error.HTTPError):
+            raise
+        sys.exit(f"连不上节点 RPC({e.reason})。\n"
+                 f"测试网请加 --rpc {TESTNET};不加时默认连本地链 http://127.0.0.1:9221(需先 ./cmd up)。")
+
+
+def run():
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
-    ap.add_argument("--rpc", default="http://127.0.0.1:9221")
+    ap.add_argument("--rpc", default="http://127.0.0.1:9221", help=f"节点 RPC;测试网为 {TESTNET}")
     ap.add_argument("--unit", type=int, help="要跟进的单元;不给则只列出所有依据已过时的单元")
     ap.add_argument("--key", help="你的账户:ID=密钥文件(keystore 需要 ZHIXING_KEYSTORE_PASSWORD 或交互输入)")
     ap.add_argument("--yes", action="store_true", help="确认签名并提交(默认只显示改动)")
@@ -95,6 +108,8 @@ def main():
         return
     if not a.key or "=" not in a.key:
         sys.exit("--yes 需要 --key ID=密钥文件")
+    if a.rpc.startswith("https://") and not os.environ.get("ZHIXING_RPC_TOKEN"):
+        sys.exit("提交到测试网需要写入令牌:请先设置环境变量 ZHIXING_RPC_TOKEN")
     actor, keyfile = a.key.split("=", 1)
     nonce = get_json(a.rpc, f"/account/{actor}")["nonce"]
     with tempfile.NamedTemporaryFile(suffix=".bin", delete=False) as t:
