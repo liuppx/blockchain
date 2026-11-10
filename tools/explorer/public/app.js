@@ -313,18 +313,69 @@ async function tabKnowledge() {
         <td>${esc(c.passes)}${Number(c.needs) ? ` <span class='err'>−${esc(c.needs)}</span>` : ""}</td><td>${credBar(c.self_bps)}</td><td>${credBar(c.effective_bps)}</td><td>${neck}</td></tr>`;
     }).join("") : "<tr><td class='mut' colspan=9>(no knowledge units yet — ./cmd knowledge)</td></tr>";
     setView(`<h2 style='border:0;padding:0 0 8px'>Knowledge units</h2>
+      <div id='reviewQueue'></div>
       <p class='mut'>有效可信度 = 自身可信度与所依据单元有效可信度的最小值。"被谁卡住"指出它最薄弱的地基。</p>
       <table><tr><th>unit</th><th>标题</th><th>层级</th><th>领域</th><th>版本数</th><th>核验通过 / 需修改</th><th>自身</th><th>有效</th><th>被谁卡住</th></tr>${rows}</table>`);
     el("view").querySelectorAll("a[data-unit]").forEach(a => a.addEventListener("click", () => showUnit(a.dataset.unit)));
+    // 详情只取一次:标题与"先核验哪个"都要用
+    const details = await Promise.all(items.map(u => j("/unit/" + u.id).catch(() => null)));
+    const titles = {};
+    await Promise.all(details.filter(Boolean).map(async u => {
+      const v = u.versions[u.versions.length - 1];
+      const b = v && v.bodies[0] ? await fetchBody(v.bodies[0].hash) : null;
+      titles[u.id] = b && b.ok ? bodyTitle(b.text) : "";
+    }));
     // titles live in the bodies: latest version's first body, verified against its hash
-    el("view").querySelectorAll("a[data-title]").forEach(async a => {
-      try {
-        const u = await j("/unit/" + a.dataset.title), v = u.versions[u.versions.length - 1];
-        const b = v && v.bodies[0] ? await fetchBody(v.bodies[0].hash) : null;
-        a.innerHTML = b && b.ok && bodyTitle(b.text) ? esc(bodyTitle(b.text)) : "<span class='mut'>(正文未上传)</span>";
-      } catch (_) { a.innerHTML = "<span class='mut'>?</span>"; }
+    el("view").querySelectorAll("a[data-title]").forEach(a => {
+      const t = titles[a.dataset.title];
+      a.innerHTML = t ? esc(t) : "<span class='mut'>(正文未上传)</span>";
     });
+    renderQueue(details.filter(Boolean), titles);
   } catch (e) { setView(`<span class='err'>${esc(e.message)}</span>`); }
+}
+
+// "先核验哪个":按"有多少单元直接或间接依据它"排序(与 tools/kgraph.py 的优先核验顺序同一规则)。
+// 核验地基,能抬高的下游单元最多;一个单元的有效可信度不会超过它所依据的单元。
+function reviewQueue(details, me) {
+  const latest = u => u.versions[u.versions.length - 1];
+  const basisOf = {};
+  details.forEach(u => { basisOf[u.id] = latest(u).cites.filter(c => c.kind === "basis").map(c => String(c.unit)); });
+  const downstream = id => {
+    let n = 0;
+    details.forEach(u => {
+      if (u.id === id) return;
+      const seen = new Set(), todo = [...basisOf[u.id]];
+      while (todo.length) {
+        const x = todo.pop();
+        if (x === id) { n++; return; }
+        if (seen.has(x)) continue;
+        seen.add(x); todo.push(...(basisOf[x] || []));
+      }
+    });
+    return n;
+  };
+  return details.map(u => {
+    const v = latest(u), c = v.credibility;
+    return { id: u.id, layer: u.layer, domain: u.domain, version: v.n, publisher: String(v.publisher),
+      passes: Number(c.passes), needs: Number(c.needs), down: downstream(u.id),
+      mine: me && String(v.publisher) === String(me), done: me && v.verifications.some(r => String(r.verifier) === String(me)) };
+  }).filter(q => !q.mine && !q.done && q.passes - q.needs < 4)  // 已有 4 位净通过(0.9 封顶附近)的不再优先
+    .sort((a, b) => (b.down - a.down) || ((a.passes - a.needs) - (b.passes - b.needs)) || (Number(a.id) - Number(b.id)));
+}
+
+function renderQueue(details, titles) {
+  const box = el("reviewQueue");
+  if (!box) return;
+  const me = window.ZXMember && ZXMember.account();
+  const q = reviewQueue(details, me).slice(0, 6);
+  const who = me ? `(已排除你发布的和你核验过的)` : `(在「我的身份」里解锁后,会排除你发布的和你核验过的)`;
+  box.innerHTML = q.length
+    ? `<h3 class='md'>先核验这些 <span class='mut' style='font-weight:normal'>${who}</span></h3><ol class='queue'>` + q.map(x =>
+        `<li><a class='link' data-unit='${esc(x.id)}'>#${esc(x.id)} ${esc(titles[x.id] || "")}</a>
+         <span class='mut'>· ${esc(LAYER_ZH[x.layer] || x.layer)} · ${esc(domainName(x.domain))} · v${esc(x.version)} ·
+         ${x.down ? `<b>${x.down}</b> 个单元依据它` : "没有单元依据它"} · 已有 ${x.passes} 位通过${x.needs ? `、${x.needs} 位需修改` : ""}</span></li>`).join("") + "</ol>"
+    : (me ? "<p class='mut'>暂时没有需要你核验的单元。</p>" : "");
+  box.querySelectorAll("a[data-unit]").forEach(a => a.addEventListener("click", () => showUnit(a.dataset.unit)));
 }
 async function showUnit(id) {
   history.replaceState(null, "", "#unit/" + id);

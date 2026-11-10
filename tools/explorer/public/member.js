@@ -299,6 +299,6 @@
     else status();
   }
 
-  window.ZXMember = { attachReview, showIdentity };
+  window.ZXMember = { attachReview, showIdentity, account: () => (session && session.account ? session.account.id : null) };
   init();
 })();

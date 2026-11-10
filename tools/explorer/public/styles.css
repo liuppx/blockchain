@@ -37,3 +37,5 @@ ol.checklist li { margin:6px 0; line-height:1.6; }
 #idBtn { margin-left:auto; }
 textarea { background:#0d1117; color:var(--fg); border:1px solid var(--line); border-radius:6px; padding:6px 10px; font:inherit; }
 button:disabled { opacity:.45; cursor:not-allowed; }
+ol.queue li { margin:6px 0; }
+#reviewQueue { margin-bottom:12px; }
