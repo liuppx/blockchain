@@ -299,6 +299,12 @@
     else status();
   }
 
-  window.ZXMember = { attachReview, showIdentity, account: () => (session && session.account ? session.account.id : null) };
+  window.ZXMember = {
+    attachReview, showIdentity, submit, waitNonce,
+    account: () => (session && session.account ? session.account.id : null),
+    unlocked: () => !!session,
+    hasVault: () => !!S.store.loadVault(),
+    unlock,
+  };
   init();
 })();

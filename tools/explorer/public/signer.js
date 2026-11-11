@@ -100,9 +100,46 @@
 
   // ---- 知识 op 编码(codec.rs enc_knowledge_op)----------------------------------
   const VERDICT = { pass: 0, "needs-revision": 1 };
+  const LAYER = { foundation: 0, explanation: 1, scenario: 2, application: 3 };
+  const CITE_KIND = { basis: 0, "see-also": 1 };
+  const MAX_CITES = 32, MAX_BODIES = 16, MAX_LANG_LEN = 16, MAX_MODEL_ID_LEN = 64;
+
+  function encodeVersionPayload(p) {
+    const bodies = p.bodies || [];
+    if (bodies.length > MAX_BODIES) throw new Error(`正文最多 ${MAX_BODIES} 个`);
+    const parts = [u64(bodies.length)];
+    for (const b of bodies) {
+      if (!b.lang || enc.encode(b.lang).length > MAX_LANG_LEN) throw new Error(`语言标签需 1–${MAX_LANG_LEN} 字节`);
+      parts.push(u32(enc.encode(b.lang).length), enc.encode(b.lang));
+      parts.push(hexToBytes(b.hash));
+    }
+    // 来源:0 = 人工撰写;1 = 模型生成(带标识);2 = 自报的"人工核验过的模型生成"
+    const src = p.source || { type: "human" };
+    if (src.type === "human") parts.push(u8(0));
+    else if (src.type === "model") {
+      if (!src.id || enc.encode(src.id).length > MAX_MODEL_ID_LEN) throw new Error(`模型标识需 1–${MAX_MODEL_ID_LEN} 字节`);
+      parts.push(u8(1), u32(enc.encode(src.id).length), enc.encode(src.id));
+    } else if (src.type === "model-verified") {
+      if (!src.id || enc.encode(src.id).length > MAX_MODEL_ID_LEN) throw new Error(`模型标识需 1–${MAX_MODEL_ID_LEN} 字节`);
+      parts.push(u8(2), u32(enc.encode(src.id).length), enc.encode(src.id));
+    } else throw new Error("来源只能是 human / model / model-verified");
+    const cites = p.cites || [];
+    if (cites.length > MAX_CITES) throw new Error(`引用最多 ${MAX_CITES} 条`);
+    parts.push(u64(cites.length));
+    for (const c of cites) {
+      if (!(c.kind in CITE_KIND)) throw new Error("引用类型只能是 basis / see-also");
+      parts.push(u64(c.unit), u32(c.version), u8(CITE_KIND[c.kind]));
+    }
+    return concat(...parts);
+  }
 
   function encodeAction(a) {
     switch (a.type) {
+      case "create":
+        if (!(a.layer in LAYER)) throw new Error("层级只能是 foundation / explanation / scenario / application");
+        return concat(u8(0), u8(LAYER[a.layer]), u32(a.domain), encodeVersionPayload(a));
+      case "publish":
+        return concat(u8(1), u64(a.unit), encodeVersionPayload(a));
       case "verify": {
         if (!(a.verdict in VERDICT)) throw new Error("verdict 只能是 pass / needs-revision");
         const note = a.noteHash ? hexToBytes(a.noteHash) : new Uint8Array(32);
@@ -115,7 +152,7 @@
         return concat(u8(3), pk);
       }
       default:
-        throw new Error("浏览器签名器目前只支持 verify 与 invite");
+        throw new Error("不认识的操作:" + a.type);
     }
   }
 

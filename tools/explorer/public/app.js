@@ -313,10 +313,12 @@ async function tabKnowledge() {
         <td>${esc(c.passes)}${Number(c.needs) ? ` <span class='err'>−${esc(c.needs)}</span>` : ""}</td><td>${credBar(c.self_bps)}</td><td>${credBar(c.effective_bps)}</td><td>${neck}</td></tr>`;
     }).join("") : "<tr><td class='mut' colspan=9>(no knowledge units yet — ./cmd knowledge)</td></tr>";
     setView(`<h2 style='border:0;padding:0 0 8px'>Knowledge units</h2>
+      <div id='authorSlot'></div>
       <div id='reviewQueue'></div>
       <p class='mut'>有效可信度 = 自身可信度与所依据单元有效可信度的最小值。"被谁卡住"指出它最薄弱的地基。</p>
       <table><tr><th>unit</th><th>标题</th><th>层级</th><th>领域</th><th>版本数</th><th>核验通过 / 需修改</th><th>自身</th><th>有效</th><th>被谁卡住</th></tr>${rows}</table>`);
     el("view").querySelectorAll("a[data-unit]").forEach(a => a.addEventListener("click", () => showUnit(a.dataset.unit)));
+    if (window.ZXAuthor) ZXAuthor.attachKnowledge();
     // 详情只取一次:标题与"先核验哪个"都要用
     const details = await Promise.all(items.map(u => j("/unit/" + u.id).catch(() => null)));
     const titles = {};
@@ -397,7 +399,7 @@ async function showUnit(id) {
         ${v.bodies.map(b => `<div class='bodyslot' data-hash='${esc(b.hash)}'><span class='mut'>正文加载中…</span></div>`).join("")}
         <kv><b>可信度</b>自身 ${credBar(c.self_bps)} · 有效 ${credBar(c.effective_bps)} · 核验通过 ${esc(c.passes)}${Number(c.needs) ? ` · <span class='err'>需修改 ${esc(c.needs)}(每一位抵消一位通过)</span>` : ""}</kv>
         <kv><b>引用</b>${cites}</kv>${stale}
-        <kv><b>核验记录</b>${ver}</kv>${vi === 0 ? "<div id='reviewSlot'></div>" : ""}`;
+        <kv><b>核验记录</b>${ver}</kv>${vi === 0 ? "<div id='reviseSlot'></div><div id='reviewSlot'></div>" : ""}`;
     }).join("");
     setView(`<p><a class='link' id='kback'>← knowledge</a></p>
       <h2 style='border:0;padding:0 0 8px'>Unit #${esc(u.id)} · ${esc(LAYER_ZH[u.layer] || u.layer)}</h2>
@@ -407,6 +409,7 @@ async function showUnit(id) {
     // latest version expanded; older versions' bodies load too (they are usually the same text)
     el("view").querySelectorAll(".bodyslot").forEach(sl => fillBody(sl, sl.dataset.hash));
     if (window.ZXMember) ZXMember.attachReview(u);
+    if (window.ZXAuthor) ZXAuthor.attachUnit(u);
     el("view").querySelectorAll("a[data-unit]").forEach(a => a.addEventListener("click", () => showUnit(a.dataset.unit)));
   } catch (e) { setView(`<span class='err'>${esc(e.message)}</span>`); }
 }

@@ -77,12 +77,14 @@ up() {
     if running "$D/explorer.pid"; then echo "explorer already running (pid $(cat "$D/explorer.pid"))";
     else
       mkdir -p "$D/bodies"   # 正文仓库:./cmd knowledge 用 --store 写入这里,浏览器从 /bodies/<哈希> 读取
-      PORT="$EXPLORER_PORT" NODE_RPC="http://127.0.0.1:$RPC_PORT" BODY_DIR="$D/bodies" \
+      # 本地开发链的正文上传令牌(浏览器"写新单元"要用;本地浏览器服务只监听 127.0.0.1)
+      PORT="$EXPLORER_PORT" NODE_RPC="http://127.0.0.1:$RPC_PORT" BODY_DIR="$D/bodies" BODY_TOKEN="local-dev-token" \
         nohup node "$ROOT/tools/explorer/server.js" >> "$D/explorer.log" 2>&1 &
       echo $! > "$D/explorer.pid"; echo "explorer started (pid $!)"
     fi
     echo
     echo "  explorer : http://localhost:$EXPLORER_PORT"
+    echo "  写入令牌 : local-dev-token   (仅本地开发链;浏览器「我的身份」里填写)"
   else
     echo "  (node.js not found — open tools/explorer/public/index.html and set RPC to http://127.0.0.1:$RPC_PORT)"
   fi

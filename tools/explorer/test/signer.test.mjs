@@ -76,10 +76,25 @@ const CASES = [
   { action: { type: "invite", pubkey: "1de352e44cd333672593f2334a730e180aaf290de89aa16d480de594e34e2961" },
     actor: 1, nonce: 0,
     args: ["--action", "invite", "--pubkey", "1de352e44cd333672593f2334a730e180aaf290de89aa16d480de594e34e2961"] },
+  { action: { type: "create", layer: "foundation", domain: 2,
+      bodies: [{ lang: "zh", hash: "11".repeat(32) }], source: { type: "human" }, cites: [] }, actor: 2, nonce: 24,
+    args: ["--action", "create", "--layer", "foundation", "--domain", "2", "--body", "zh:" + "11".repeat(32), "--source", "human"] },
+  { action: { type: "create", layer: "application", domain: 1,
+      bodies: [{ lang: "zh", hash: "22".repeat(32) }, { lang: "en", hash: "33".repeat(32) }],
+      source: { type: "model", id: "claude-opus-5-5" },
+      cites: [{ unit: 8, version: 2, kind: "basis" }, { unit: 9, version: 2, kind: "basis" }, { unit: 14, version: 1, kind: "see-also" }] },
+    actor: 1, nonce: 3,
+    args: ["--action", "create", "--layer", "application", "--domain", "1", "--body", "zh:" + "22".repeat(32),
+      "--body", "en:" + "33".repeat(32), "--source", "model:claude-opus-5-5",
+      "--cite", "8:2:basis", "--cite", "9:2:basis", "--cite", "14:1:see-also"] },
+  { action: { type: "publish", unit: 6, bodies: [{ lang: "zh", hash: "44".repeat(32) }],
+      source: { type: "model-verified", id: "m" }, cites: [{ unit: 1, version: 2, kind: "basis" }] }, actor: 2, nonce: 99,
+    args: ["--action", "publish", "--unit", "6", "--body", "zh:" + "44".repeat(32), "--source", "model-verified:m",
+      "--cite", "1:2:basis"] },
 ];
 
 for (const c of CASES) {
-  test(`签名后的 op 与节点逐字节一致:${c.action.type} actor=${c.actor} nonce=${c.nonce}`, async () => {
+  test(`签名后的 op 与节点逐字节一致:${c.action.type}${c.action.layer ? "/" + c.action.layer : ""} actor=${c.actor} nonce=${c.nonce}`, async () => {
     await withRustKey(ZERO24, async ({ dir }) => {
       rust(["encode-knowledge-op", "--key-file", "k.seed", "--out", "op.bin",
         "--actor", String(c.actor), "--nonce", String(c.nonce), ...c.args], dir);
@@ -101,7 +116,10 @@ test("本机加密保存:口令正确才能解开,错误口令被拒", async () 
 });
 
 test("不支持的操作与错误参数被拒绝", async () => {
-  assert.throws(() => S.encodeOp(1, { type: "create" }, 0), /只支持/);
+  assert.throws(() => S.encodeOp(1, { type: "delete" }, 0), /不认识的操作/);
+  assert.throws(() => S.encodeOp(1, { type: "create", layer: "theory", domain: 1 }, 0), /层级/);
+  assert.throws(() => S.encodeOp(1, { type: "publish", unit: 1, bodies: [{ lang: "中文中文中文", hash: "11".repeat(32) }] }, 0), /字节/);
+  assert.throws(() => S.encodeOp(1, { type: "publish", unit: 1, cites: [{ unit: 1, version: 1, kind: "depends" }] }, 0), /引用类型/);
   assert.throws(() => S.encodeOp(1, { type: "verify", unit: 1, version: 1, verdict: "maybe" }, 0), /verdict/);
   assert.throws(() => S.encodeOp(1, { type: "invite", pubkey: "abcd" }, 0), /64 位/);
 });

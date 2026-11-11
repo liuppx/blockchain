@@ -39,3 +39,11 @@ textarea { background:#0d1117; color:var(--fg); border:1px solid var(--line); bo
 button:disabled { opacity:.45; cursor:not-allowed; }
 ol.queue li { margin:6px 0; }
 #reviewQueue { margin-bottom:12px; }
+/* author */
+.auSplit { display:grid; grid-template-columns:1fr 1fr; gap:14px; }
+.auSplit textarea { width:100%; min-height:520px; font:13px/1.6 ui-monospace,Menlo,monospace; }
+.auPreview { max-height:560px; overflow:auto; border:1px solid var(--line); border-radius:6px; padding:8px 12px; background:var(--panel); }
+#authorSlot { margin-bottom:10px; }
+#reviseSlot { margin:10px 0; }
+@media (max-width: 900px) { .auSplit { grid-template-columns:1fr; } }
+select { background:#0d1117; color:var(--fg); border:1px solid var(--line); border-radius:6px; padding:5px 8px; font:inherit; }
