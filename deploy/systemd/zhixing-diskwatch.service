@@ -1,0 +1,6 @@
+[Unit]
+Description=知行图测试网磁盘看守(估算剩余天数;空间不足时停止验证节点)
+
+[Service]
+Type=oneshot
+ExecStart=/opt/zhixing/deploy/diskwatch.sh

@@ -10,9 +10,10 @@ Internet ─443─▶ nginx ─┬─ /rpc/ ─▶ 127.0.0.1:9221  (n21 RPC;GET 
 | 文件 | 作用 |
 |---|---|
 | `deploy.sh` | 同步并安装;`--genesis` 首次开链(在服务器上生成验证人密钥,销毁旧链) |
-| `nginx/blockchain.conf` | 站点配置(TLS 用现有 Let's Encrypt 证书,RPC 限流 10 r/s/IP) |
+| `nginx/blockchain.conf` | 站点配置(TLS 用现有 Let's Encrypt 证书,读写分开限流:写入 5 r/s/IP、读取 50 r/s/IP) |
 | `systemd/zhixing-node@.service` | 验证节点(`systemctl status zhixing-node@21`) |
 | `systemd/zhixing-explorer.service` | 浏览器 |
+| `diskwatch.sh` + `systemd/zhixing-diskwatch.{service,timer}` | 磁盘看守:每 10 分钟估算剩余天数(浏览器顶部提醒),剩余不足 1.5 GB 时优雅停止验证节点,保护主机上的其他服务 |
 
 ## 构建(本机 → linux x86_64)
 
@@ -44,3 +45,10 @@ cat /opt/zhixing/testnet/out/tokens.env   # RPC 写令牌(只私下发给成员)
 - 密钥库密码在 `/etc/zhixing/env`(root 600),由 systemd 注入;链数据与密钥在 `/opt/zhixing/testnet/out/`。
 - 4 个验证节点在同一台机器上:这是**测试网**的取舍(机器宕机即全链停),不是生产拓扑。
 - 旧的 nginx 配置在首次部署时备份到 `/root/blockchain.conf.pre-zhixing.<时间>`。
+
+## 磁盘
+
+4 个验证节点每秒出一个块(含空块:见习期与邀请冷却按区块数计算,需要高度持续增长),合计每天约 250 MB。
+`diskwatch.sh` 把估算写入 `/opt/zhixing/status/disk.json`,浏览器在剩余不足 14 天时显示提醒;剩余空间低于 1.5 GB 时
+停止验证节点(链暂停、数据完整),腾出空间后 `systemctl start zhixing-node@{21,22,23,24}` 恢复。
+根治方案是重开链并把出块间隔改为 10 秒、按比例换算见习期与冷却期(增长降到约 25 MB/天),暂未执行。

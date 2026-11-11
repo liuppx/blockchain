@@ -28,9 +28,29 @@ async function connect() {
     if (deep) showUnit(deep[1]); else showTab("knowledge");
     if (timer) clearInterval(timer);
     timer = setInterval(refreshOverview, 4000);  // poll chain tip
+    refreshOpsBanner(); setInterval(refreshOpsBanner, 60000);
   } catch (e) {
     el("conn").textContent = "error: " + e.message; el("conn").className = "err";
   }
+}
+
+// 运维提醒:磁盘看守(deploy/diskwatch.sh)估算的剩余天数;只在需要关注时显示
+async function refreshOpsBanner() {
+  let b = el("opsBanner");
+  if (!b) {
+    b = document.createElement("div"); b.id = "opsBanner";
+    document.querySelector("main").prepend(b);
+  }
+  try {
+    const r = await fetch("/status/disk.json", { cache: "no-store" });
+    if (!r.ok) { b.innerHTML = ""; return; }
+    const d = await r.json();
+    if (d.level === "stopped") {
+      b.innerHTML = `<div class='banner bad'>服务器磁盘空间不足(剩余 ${Math.round(d.free_mb)} MB),测试网验证节点已暂停以保护主机上的其他服务。数据完整;腾出空间后重新启动即可恢复。</div>`;
+    } else if (d.level === "warn") {
+      b.innerHTML = `<div class='banner warn'>运维提醒:按当前速度(每天约 ${Math.round(d.growth_mb_per_day)} MB),约 ${esc(d.days_left)} 天后服务器磁盘将不足,测试网届时会自动暂停。需要组织者处理(扩容或重开链)。</div>`;
+    } else b.innerHTML = "";
+  } catch (_) { b.innerHTML = ""; }
 }
 
 async function refreshOverview() {

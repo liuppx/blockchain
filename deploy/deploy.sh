@@ -66,7 +66,10 @@ install -d -o zhixing -g zhixing -m 755 "$DEST/bodies"
 
 install -m 644 "$DEST/deploy/systemd/zhixing-node@.service" /etc/systemd/system/
 install -m 644 "$DEST/deploy/systemd/zhixing-explorer.service" /etc/systemd/system/
+install -m 644 "$DEST/deploy/systemd/zhixing-diskwatch.service" "$DEST/deploy/systemd/zhixing-diskwatch.timer" /etc/systemd/system/
+chmod 755 "$DEST/deploy/diskwatch.sh"
 systemctl daemon-reload
+systemctl enable --now zhixing-diskwatch.timer
 
 conf=/etc/nginx/conf.d/blockchain.conf
 if [ -f "$conf" ] && ! grep -q '知行图测试网' "$conf"; then

@@ -23,6 +23,7 @@ const HOST = process.env.HOST || "127.0.0.1"; // behind a reverse proxy; set HOS
 const NODE_RPC = (process.env.NODE_RPC || "http://127.0.0.1:9221").replace(/\/+$/, "");
 const PUBLIC = path.join(__dirname, "public");
 const BODY_DIR = process.env.BODY_DIR || "";
+const STATUS_DIR = process.env.STATUS_DIR || ""; // 运维状态(如 deploy/diskwatch.sh 写的 disk.json),只读公开
 const BODY_TOKEN = process.env.BODY_TOKEN || "";
 const MAX_BODY = 64 * 1024; // matches the node's RPC body cap
 
@@ -106,8 +107,18 @@ function bodies(req, res) {
   });
 }
 
+function status(req, res) {
+  const m = /^\/status\/([a-z]+\.json)$/.exec(new URL(req.url, "http://x").pathname);
+  if (!STATUS_DIR || !m || req.method !== "GET") return res.writeHead(404).end();
+  fs.readFile(path.join(STATUS_DIR, m[1]), (err, buf) => {
+    if (err) return res.writeHead(404).end();
+    res.writeHead(200, { "Content-Type": "application/json", "Cache-Control": "no-store" }).end(buf);
+  });
+}
+
 http.createServer((req, res) => {
   if (req.url.startsWith("/bodies/")) return bodies(req, res);
+  if (req.url.startsWith("/status/")) return status(req, res);
   if (req.url === "/rpc" || req.url.startsWith("/rpc/") || req.url.startsWith("/rpc?")) return proxy(req, res);
   return serveStatic(req, res);
 }).listen(PORT, HOST, () => {

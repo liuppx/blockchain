@@ -1,0 +1,9 @@
+[Unit]
+Description=每 10 分钟运行一次知行图测试网磁盘看守
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=10min
+
+[Install]
+WantedBy=timers.target
