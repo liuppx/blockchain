@@ -87,16 +87,6 @@ record() { # name status ms message
 
 now_ms() { date +%s%3N; }
 
-# 重试:每次都重新检查
-retry() { # fn
-  local attempt=0
-  while true; do
-    if "$@"; then return 0; fi
-    if [[ "$attempt" -ge "$RETRIES" ]]; then return 1; fi
-    attempt=$((attempt+1)); sleep "$INTERVAL"
-  done
-}
-
 rpc_get() { # port path
   curl -fsS --max-time "$TIMEOUT" "http://127.0.0.1:$1$2" 2>/dev/null
 }
@@ -203,21 +193,52 @@ if [[ "$WAIT" -gt 0 ]]; then
   done
 fi
 
+run_once() {
+  PASSED=0; WARNED=0; FAILED=0; SKIPPED=0
+  CHECK_NAMES=(); CHECK_STATUSES=(); CHECK_MS=(); CHECK_MSGS=()
+  local st=pass
+  case "$LEVEL" in
+    liveness) { check_liveness && check_rpc_ports; } || st=fail ;;
+    readiness) { check_rpc_ports && check_readiness; } || st=fail ;;
+    dependency) check_dependency || st=fail ;;
+    all)
+      # liveness 已包含 RPC 端口检查,readiness 这里不再重复
+      { check_liveness && check_rpc_ports; } || st=fail
+      check_readiness || st=fail
+      check_dependency || st=fail
+      ;;
+  esac
+  [[ "$FAILED" -eq 0 ]] || st=fail
+  STATUS="$st"
+  [[ "$st" = pass ]]
+}
+
+# 重试:每次都重新执行全部检查,不复用上一次的结果;只输出最后一次的明细
 STATUS=pass
-case "$LEVEL" in
-  liveness) run_level liveness || STATUS=fail ;;
-  readiness) run_level readiness || STATUS=fail ;;
-  dependency) run_level dependency || STATUS=fail ;;
-  all)
-    # liveness 已包含 RPC 端口检查,readiness 这里不再重复
-    check_liveness && check_rpc_ports || STATUS=fail
-    check_readiness || STATUS=fail
-    check_dependency || STATUS=fail
-    ;;
-esac
+attempt=0
+while true; do
+  if [[ "$attempt" -gt 0 ]]; then
+    log "attempt $attempt/$RETRIES failed; retrying in ${INTERVAL}s"
+  fi
+  if [[ "$attempt" -lt "$RETRIES" ]]; then
+    # 非最后一次:静默执行
+    saved_quiet="$QUIET"; QUIET=true
+    if run_once; then QUIET="$saved_quiet"; break; fi
+    QUIET="$saved_quiet"
+    attempt=$((attempt+1)); sleep "$INTERVAL"
+    continue
+  fi
+  run_once || true
+  break
+done
+if [[ "$STATUS" = pass && "$attempt" -lt "$RETRIES" && "$QUIET" != true ]]; then
+  # 成功的那一次是静默执行的,补打明细
+  for i in "${!CHECK_NAMES[@]}"; do
+    printf '[%s] %s: %s (%s ms)\n' "${CHECK_STATUSES[$i]}" "${CHECK_NAMES[$i]}" "${CHECK_MSGS[$i]}" "${CHECK_MS[$i]}"
+  done
+fi
 
 DURATION_MS=$(( $(now_ms) - START_MS ))
-if [[ "$FAILED" -gt 0 ]]; then STATUS=fail; fi
 SUMMARY="RESULT status=$STATUS passed=$PASSED warned=$WARNED failed=$FAILED skipped=$SKIPPED duration_ms=$DURATION_MS"
 [[ "$QUIET" = true ]] || printf '%s\n' "$SUMMARY"
 
