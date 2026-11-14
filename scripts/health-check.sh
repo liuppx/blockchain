@@ -129,42 +129,45 @@ check_rpc_ports() {
 }
 
 check_readiness() {
-  local h0 h1 t0 t1 same=1 heights=()
+  local id t0 t1 h ok=1 before=() after=()
   t0=$(now_ms)
-  local id
-  for id in $NODES; do
-    h0="$(rpc_get "92$id" /height || true)"
-    [[ -n "$h0" ]] || h0="?"
-    heights+=("$h0")
-  done
-  # 高度必须推进(链在出块)
+  for id in $NODES; do h="$(rpc_get "92$id" /height || true)"; before+=("${h:-?}"); done
   sleep 3
-  for id in $NODES; do
-    h1="$(rpc_get "92$id" /height || true)"
-    if [[ -n "$h1" && "$h1" != "?" && "${h0:-?}" != "?" ]]; then
-      if [[ "$h1" -le "${h0:-0}" ]]; then same=0; fi
-    else
-      same=0
-    fi
+  for id in $NODES; do h="$(rpc_get "92$id" /height || true)"; after+=("${h:-?}"); done
+  local i
+  for i in "${!before[@]}"; do
+    if [[ ! "${before[$i]}" =~ ^[0-9]+$ || ! "${after[$i]}" =~ ^[0-9]+$ || "${after[$i]}" -le "${before[$i]}" ]]; then ok=0; fi
   done
   t1=$(now_ms)
-  if [[ "$same" = 1 ]]; then
-    record "chain:progress" PASS $((t1-t0)) "heights advancing: ${heights[*]}"
+  if [[ "$ok" = 1 ]]; then
+    record "chain:progress" PASS $((t1-t0)) "heights advancing: ${before[*]} -> ${after[*]}"
   else
-    record "chain:progress" FAIL $((t1-t0)) "heights not advancing on all nodes: ${heights[*]}"
+    record "chain:progress" FAIL $((t1-t0)) "heights not advancing on all nodes: ${before[*]} -> ${after[*]}"
   fi
-  # 4 个节点的 head 必须一致
-  local heads=() h
-  for id in $NODES; do h="$(rpc_get "92$id" /head || true)"; heads+=("${h:-?}"); done
-  local uniq
-  uniq="$(printf '%s\n' "${heads[@]}" | sort -u | wc -l)"
-  t0=$(now_ms); t1=$(now_ms)
-  if [[ "$uniq" = 1 && "${heads[0]}" != "?" ]]; then
-    record "chain:agreement" PASS $((t1-t0)) "all nodes share head ${heads[0]:0:16}…"
+  # 一致性:在所有节点都已有的同一高度(最低高度减 1)比较区块哈希,而不是比较各自不断前进的 head
+  local min="" hashes=() hh uniq
+  for h in "${after[@]}"; do
+    [[ "$h" =~ ^[0-9]+$ ]] || continue
+    if [[ -z "$min" || "$h" -lt "$min" ]]; then min="$h"; fi
+  done
+  t0=$(now_ms)
+  if [[ -z "$min" || "$min" -lt 2 ]]; then
+    t1=$(now_ms); record "chain:agreement" FAIL $((t1-t0)) "no common height to compare"; return 1
+  fi
+  local at=$((min - 1))
+  for id in $NODES; do
+    hh="$(rpc_get "92$id" "/block/$at" | sed -n 's/^hash=//p' || true)"
+    hashes+=("${hh:-?}")
+  done
+  uniq="$(printf '%s\n' "${hashes[@]}" | sort -u | wc -l)"
+  t1=$(now_ms)
+  if [[ "$uniq" = 1 && "${hashes[0]}" != "?" ]]; then
+    record "chain:agreement" PASS $((t1-t0)) "all nodes agree on block $at (${hashes[0]:0:16}…)"
   else
-    record "chain:agreement" FAIL $((t1-t0)) "nodes disagree: ${heads[*]}"
+    record "chain:agreement" FAIL $((t1-t0)) "nodes disagree on block $at: ${hashes[*]}"
+    ok=0
   fi
-  [[ "$same" = 1 && "$uniq" = 1 ]]
+  [[ "$ok" = 1 ]]
 }
 
 check_dependency() {
@@ -206,9 +209,10 @@ case "$LEVEL" in
   readiness) run_level readiness || STATUS=fail ;;
   dependency) run_level dependency || STATUS=fail ;;
   all)
-    run_level liveness || STATUS=fail
-    run_level readiness || STATUS=fail
-    run_level dependency || STATUS=fail
+    # liveness 已包含 RPC 端口检查,readiness 这里不再重复
+    check_liveness && check_rpc_ports || STATUS=fail
+    check_readiness || STATUS=fail
+    check_dependency || STATUS=fail
     ;;
 esac
 
