@@ -12,6 +12,15 @@
 # - 节点 RPC/指标/P2P 全部只监听 127.0.0.1,对外只有 nginx 的 443(/rpc/ 与浏览器)。
 set -euo pipefail
 
+# 2026-11-14 起:验证节点已迁到 221.130.30.75(见 docs/design/spec-node-migration-v0.1.md),
+# 旧机 122.9.144.27 只运行浏览器、正文仓库与 nginx。本脚本会在旧机上安装并启动验证节点——
+# 同一组验证人密钥在两台机器上同时出块就是双签,所以默认拒绝执行。
+if [ "${ZHIXING_ALLOW_LEGACY_DEPLOY:-0}" != 1 ]; then
+  echo "deploy/deploy.sh 已停用:节点在 221.130.30.75 上由 /opt/deploy/zhixing-testnet/scripts/starter.sh 管理。" >&2
+  echo "旧机只保留浏览器;见 docs/design/spec-node-migration-v0.1.md。" >&2
+  exit 1
+fi
+
 HERE="$(cd "$(dirname "$0")" && pwd)"
 ROOT="$(cd "$HERE/.." && pwd)"
 HOST="${HOST:-root@122.9.144.27}"
