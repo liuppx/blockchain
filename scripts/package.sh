@@ -79,7 +79,10 @@ else
   command -v docker >/dev/null 2>&1 || fail "need docker to cross-compile for x86_64"
   docker run --rm -v "$WORKTREE_DIR:/src" -v zhixing-cargo-registry:/usr/local/cargo/registry \
     -w /src/node rust:1.90-bookworm sh -c '
-      apt-get update -qq >/dev/null && apt-get install -y -qq gcc-x86_64-linux-gnu libc6-dev-amd64-cross >/dev/null 2>&1
+      set -e
+      apt-get update -qq >/dev/null
+      apt-get install -y -qq gcc-x86-64-linux-gnu libc6-dev-amd64-cross >/dev/null
+      command -v x86_64-linux-gnu-gcc >/dev/null
       rustup target add x86_64-unknown-linux-gnu >/dev/null 2>&1
       export CC_x86_64_unknown_linux_gnu=x86_64-linux-gnu-gcc
       export CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER=x86_64-linux-gnu-gcc
