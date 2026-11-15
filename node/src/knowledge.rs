@@ -738,7 +738,6 @@ mod tests {
     }
 
     #[test]
-    #[test]
     fn supersedes_marks_the_old_unit_and_blocks_cycles() {
         let mut k = state(&[1, 2, 3], 0);
         add_unit(&mut k, 1, 1, model(), vec![]); // 被取代的旧单元
@@ -760,7 +759,6 @@ mod tests {
         assert_eq!(c2.passes, 0, "取代关系本身不应带来通过计数");
     }
 
-    #[test]
     #[test]
     fn competing_units_coexist_rather_than_being_retired() {
         // §4b:竞争单元与原单元**并存**,链上显示为一处"断层";旧单元不因被挑战就作废。
@@ -825,7 +823,6 @@ mod tests {
     }
 
     #[test]
-    #[test]
     fn dormant_when_nobody_verified_or_cites_it() {
         let mut k = state(&[1, 2, 3], 0);
         add_unit(&mut k, 1, 1, model(), vec![]);
@@ -843,7 +840,6 @@ mod tests {
         );
     }
 
-    #[test]
     #[test]
     fn cited_units_stay_active() {
         let mut k = state(&[1, 2, 3], 0);
