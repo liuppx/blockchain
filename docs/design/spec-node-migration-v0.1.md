@@ -50,15 +50,15 @@
 
 | 规范要求 | 本项目实现 |
 |---|---|
-| `scripts/package.sh` + `scripts/package-api.json`(v1) | 在隔离 worktree 中按 `--ref` 构建 `node` 发布二进制,产出 `zhixing-testnet-v<ver>-<commit7>.tar.gz` 与 `release-manifest.json`(`type: service`) |
+| `scripts/package.sh` + `scripts/package-api.json`(v1) | 在隔离 worktree 中按 `--ref` 构建 `node` 发布二进制,产出 `zhixing-testnet-service-v<ver>-<commit7>.tar.gz` 与 `release-manifest.json`(`type: service`) |
 | 包内 `scripts/starter.sh [start\|stop\|restart]` | 管理 4 个验证节点进程;stop:SIGTERM → 等 `STOP_TIMEOUT_SECONDS`(30)→ SIGKILL → 再确认退出;只清除已确认退出进程的 PID 文件 |
 | `scripts/health-check.sh --level liveness\|readiness\|dependency\|all` | liveness:4 个进程在、RPC 端口在听;readiness:4 个节点高度推进且 head 一致;dependency:磁盘余量;支持 `--format json`、退出码 0–4 |
 | `scripts/test.sh --suite smoke` | 只读冒烟:读高度/版本/知识单元/成员,检查供应守恒;不写链 |
 | `scripts/upgrade.sh prepare\|copy-config\|post-copy\|finalize` | `copy-config` 迁移 `config/`(节点配置、创世、密钥库、密码文件) |
-| 部署目录 | `/opt/deploy/zhixing-testnet-v<ver>-<commit7>/`,软链接 `/opt/deploy/zhixing-testnet` |
+| 部署目录 | `/opt/deploy/zhixing-testnet-service-v<ver>-<commit7>/`,软链接 `/opt/deploy/zhixing-testnet` |
 | 持久数据 | `/data/zhixing-testnet/n2{1..4}/`(区块日志、证书日志) |
 | 操作日志 | `/opt/logs/zhixing-testnet-*.log`(单文件 ≤ 1 MB 截断) |
-| 安装包 | `/opt/package/zhixing-testnet-v<ver>-<commit7>.tar.gz` + `.sha256sum` |
+| 安装包 | `/opt/package/zhixing-testnet-service-v<ver>-<commit7>.tar.gz` + `.sha256sum` |
 
 **配置与密钥不进安装包**:节点配置、创世、验证人密钥库、密钥库密码放在部署目录的 `config/`(权限 700/600),
 首次安装时从旧机迁入,升级时由 `copy-config` 带到新版本目录。密码不出现在命令行或日志里。
@@ -137,7 +137,7 @@ DNS 不切换、浏览器留在旧机、通道采用 SSH 转发、旧机节点�
 | 16:22 | 新机按已提交源码构建 `node` | 与旧二进制的差别:包含 `02c592b`(`--key-file` 接受带注释种子文件) |
 | 16:25–16:38 | 传输 | 旧机出口仅约 0.17 MB/s,经本机中转;传完 n21 全部数据与配置后改为**只取 n22 最后 5 个区块**(块记录固定 376 字节、证书 416 字节,共 3960 字节) |
 | 16:40 | 拼装并校验 | n21 日志 + n22 尾部 → 全量重放:高度 419195、head、state_root 与旧机完全一致,快照字节哈希相同(`cd50544f…`);所有配置、密钥库、密码逐文件 SHA-256 与源一致 |
-| 16:43 | 安装 | `/opt/deploy/zhixing-testnet-v0.1.0-967d1b2/`、软链接 `/opt/deploy/zhixing-testnet`、数据 `/data/zhixing-testnet/n2{1..4}`;节点配置改写为新路径,端口不变、只监听 127.0.0.1 |
+| 16:43 | 安装 | `/opt/deploy/zhixing-testnet-service-v0.1.0-967d1b2/`、软链接 `/opt/deploy/zhixing-testnet`、数据 `/data/zhixing-testnet/n2{1..4}`;节点配置改写为新路径,端口不变、只监听 127.0.0.1 |
 | 16:44 | 再次确认旧机无节点进程后启动 | 约 100 秒重放后 4 个节点在 419210 一致,继续出块 |
 | 16:47 | 通道 | 旧机 `zhixing-tunnel.service`:`127.0.0.1:19221 → 新机 127.0.0.1:9221`;新机 `zhixing-tunnel` 账户 `restrict,port-forwarding,permitopen="127.0.0.1:9221"`。验证:该密钥执行命令被拒、转发到 9222 被拒(administratively prohibited) |
 | 16:48 | 旧机 nginx `/rpc/` 与浏览器 `NODE_RPC` 改指 19221 | 原配置备份在 `/opt/backup/*.pre-tunnel.*` |
@@ -185,8 +185,8 @@ DNS 不切换、浏览器留在旧机、通道采用 SSH 转发、旧机节点�
 
 ### 现状(2026-11-14 17:25)
 
-- 新机:`/opt/deploy/zhixing-testnet` → `zhixing-testnet-v0.1.2-979dda7`;上一版本 `v0.1.0-967d1b2` 保留用于回退;
-  安装包 `/opt/package/zhixing-testnet-v0.1.2-979dda7.tar.gz`(SHA-256 `7eeb9bb0…`)
+- 新机:`/opt/deploy/zhixing-testnet` → `zhixing-testnet-service-v0.1.2-979dda7`;上一版本 `v0.1.0-967d1b2` 保留用于回退;
+  安装包 `/opt/package/zhixing-testnet-service-v0.1.2-979dda7.tar.gz`(SHA-256 `7eeb9bb0…`)
 - 冒烟:本机与公网(经通道)均 6/6 通过
 - 运维文档:`deploy/README.md` 已按新拓扑重写
 

@@ -15,8 +15,8 @@
 
 | 项 | 位置 |
 |---|---|
-| 安装包 | `/opt/package/zhixing-testnet-v<版本>-<commit>.tar.gz` + `.sha256sum` + `release-manifest.json` |
-| 当前版本 | `/opt/deploy/zhixing-testnet` → `zhixing-testnet-v<版本>-<commit>/`(保留上一版本目录用于回退) |
+| 安装包 | `/opt/package/zhixing-testnet-service-v<版本>-<commit>.tar.gz` + `.sha256sum` + `release-manifest.json` |
+| 当前版本 | `/opt/deploy/zhixing-testnet` → `zhixing-testnet-service-v<版本>-<commit>/`(保留上一版本目录用于回退) |
 | 配置与密钥 | `<版本目录>/config/`(700):创世、`node2{1..4}.toml`、`keys/`(验证人密钥库,600)、`password`、`tokens.env` |
 | 链数据 | `/data/zhixing-testnet/n2{1..4}/`(不随版本移动) |
 | 操作日志 | `/opt/logs/zhixing-testnet-{starter,health}.log`(各 ≤ 1 MB) |
@@ -48,7 +48,7 @@ scripts/package.sh --ref <commit> --source-commit <commit> --version <x.y.z> --o
 ### 升级(手动执行升级器的流程)
 
 ```sh
-CUR=/opt/deploy/zhixing-testnet-v<旧>; TGT=/opt/deploy/zhixing-testnet-v<新>
+CUR=/opt/deploy/zhixing-testnet-service-v<旧>; TGT=/opt/deploy/zhixing-testnet-service-v<新>
 cd /opt/package && sha256sum -c <包>.sha256sum && tar -xzf <包> -C /opt/deploy/
 bash $TGT/scripts/upgrade.sh prepare $CUR $TGT
 bash $CUR/scripts/starter.sh stop                         # 必须返回 0(确认已退出)

@@ -11,7 +11,7 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-UNIT_ID="zhixing-testnet"
+UNIT_ID="zhixing-testnet-service"
 
 REF=""
 SOURCE_COMMIT=""
@@ -149,7 +149,8 @@ cat > "$OUTPUT_DIR/release-manifest.json" <<EOF
         "health_check": "scripts/health-check.sh",
         "test": "scripts/test.sh"
       },
-      "data_dir": "/data/zhixing-testnet"
+      "data_dir": "/data/zhixing-testnet",
+      "service_target": {"module":"zhixing-testnet", "path":"/opt/deploy/zhixing-testnet"}
     }
   ]
 }
