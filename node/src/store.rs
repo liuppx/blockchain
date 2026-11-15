@@ -24,6 +24,49 @@ use crate::consensus::Commit;
 use crate::validator::ValidatorSet;
 use crate::Block;
 
+/// 独占锁住一个数据目录:同一数据目录上不允许同时运行两个节点。
+///
+/// 为什么需要:同一组验证人密钥在两处同时出块就是双签。脚本层(`scripts/starter.sh`)已经用
+/// `flock` 防了一层,但**直接运行二进制**绕过脚本时就没有保护。节点自己持锁才覆盖所有启动方式。
+///
+/// 用 `std` 的文件锁(`flock(2)`):锁由内核管理,进程退出(含被 kill)时自动释放,不依赖清理逻辑。
+/// 锁文件本身不含任何秘密,只是一个占位。
+pub struct DataDirLock {
+    /// 持有文件句柄即持有锁:句柄关闭(进程退出)时内核自动释放。
+    #[allow(dead_code)]
+    file: std::fs::File,
+}
+
+impl DataDirLock {
+    /// 取得数据目录的独占锁;已被别人持有时返回错误(不等待)。
+    pub fn acquire(data_dir: &str) -> io::Result<Self> {
+        if data_dir.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "node data_dir is empty; refusing to run without a data directory lock",
+            ));
+        }
+        std::fs::create_dir_all(data_dir)?;
+        let path = Path::new(data_dir).join(".node.lock");
+        let file = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(false)
+            .open(&path)?;
+        file.try_lock().map_err(|e| {
+            io::Error::new(
+                io::ErrorKind::AddrInUse,
+                format!(
+                    "data dir {data_dir} is locked by another node process ({e}); \
+                     refusing to start a second node on the same data directory"
+                ),
+            )
+        })?;
+        Ok(Self { file })
+    }
+}
+
 /// Ensure the parent directory of `path` exists, then touch the file so a fresh
 /// log reads back empty rather than erroring.
 fn open_touch(path: &Path) -> io::Result<()> {
@@ -195,6 +238,32 @@ impl HeaderLog {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn data_dir_lock_refuses_a_second_holder() {
+        // 同一数据目录上第二个节点必须被拒绝(防双签);第一个释放后才能再取得。
+        let dir = std::env::temp_dir().join(format!("zx-lock-{}", std::process::id()));
+        let d = dir.to_str().unwrap().to_string();
+        let first = DataDirLock::acquire(&d).expect("first lock");
+        let second = DataDirLock::acquire(&d);
+        assert!(
+            second.is_err(),
+            "second node on the same data dir must be refused"
+        );
+        let err = second.err().unwrap();
+        assert_eq!(err.kind(), io::ErrorKind::AddrInUse);
+        assert!(err.to_string().contains("locked by another node"), "{err}");
+        drop(first);
+        let third = DataDirLock::acquire(&d).expect("lock is free again after release");
+        drop(third);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn data_dir_lock_rejects_an_empty_data_dir() {
+        assert!(DataDirLock::acquire("").is_err());
+    }
+
     use super::*;
     use crate::{Review, SubmissionTx, MICRO};
     use zhixing_engine::DIM;

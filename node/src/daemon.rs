@@ -854,6 +854,10 @@ pub struct Metrics {
 #[derive(Clone)]
 pub struct Node {
     cmd: mpsc::UnboundedSender<Cmd>,
+    /// 数据目录的独占锁,随节点存活。同一数据目录上不允许第二个节点进程(防双签);
+    /// 进程退出(含被 kill)时由内核自动释放。
+    /// `Arc`:`Node` 可以克隆(多个句柄),锁只有一份,最后一个句柄释放时才解锁。
+    _data_dir_lock: Option<std::sync::Arc<crate::store::DataDirLock>>,
 }
 
 /// M140/M141: decode + verify a snapshot-boot config into `(state, tip_head_hash)`. The
@@ -8548,6 +8552,10 @@ impl Node {
             ));
         }
 
+        // 先锁数据目录,再打开日志:第二个节点在这里就失败,不会读写同一份链数据。
+        // 无论从哪个路径、经不经过 starter 脚本启动,同一数据目录只能有一个节点(防双签)。
+        let data_dir_lock = crate::store::DataDirLock::acquire(&cfg.node.data_dir)?;
+
         // logs + boot recovery
         let bpath = format!("{}/blocks.log", cfg.node.data_dir);
         let cpath = format!("{}/certs.log", cfg.node.data_dir);
@@ -8911,7 +8919,10 @@ impl Node {
             });
         }
 
-        Ok(Node { cmd: cmd_tx })
+        Ok(Node {
+            cmd: cmd_tx,
+            _data_dir_lock: Some(std::sync::Arc::new(data_dir_lock)),
+        })
     }
 }
 
