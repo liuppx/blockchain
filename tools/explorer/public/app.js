@@ -66,7 +66,7 @@ async function refreshOverview() {
 }
 
 const TABS = [
-  ["knowledge", "Knowledge"], ["terrain", "地形图"], ["blocks", "Blocks"], ["tx", "Tx lookup"],
+  ["knowledge", "Knowledge"], ["terrain", "地形图"], ["gaps", "缺口"], ["blocks", "Blocks"], ["tx", "Tx lookup"],
   ["account", "Account"], ["graph", "Graph"],
   ["cnfts", "cNFTs"], ["validators", "Validators"], ["staking", "Staking"],
   ["proposals", "Governance"], ["supply", "Supply"],
@@ -78,6 +78,7 @@ function renderTabs() {
 function showTab(k) {
   TABS.forEach(([t]) => { const b = el("tab-"+t); if (b) b.className = (t===k ? "on" : ""); });
   ({ knowledge:tabKnowledge, terrain:() => window.ZXTerrain ? ZXTerrain.show() : setView("<span class='mut'>地形图未加载</span>"),
+     gaps:() => window.ZXExplore ? ZXExplore.showGaps() : setView("<span class='mut'>缺口视图未加载</span>"),
      blocks:tabBlocks, tx:tabTx, account:tabAccount, graph:tabGraph, validators:tabValidators,
      staking:tabStaking, proposals:tabProposals, cnfts:tabCnfts, supply:tabSupply })[k]();
 }
@@ -479,12 +480,14 @@ async function showUnit(id) {
       <h2 style='border:0;padding:0 0 8px'>Unit #${esc(u.id)} · ${esc(LAYER_ZH[u.layer] || u.layer)}</h2>
       <kv><b>author / created</b>account ${esc(u.author)} · height ${esc(u.created_height)}</kv>
       <kv><b>domain</b>${esc(domainName(u.domain))}</kv><kv><b>license</b>${esc(u.license)}</kv>
-      <kv><b>状态</b>${lifecycleLabel(u.lifecycle) || "活跃"}</kv>${vers}`);
+      <kv><b>状态</b>${lifecycleLabel(u.lifecycle) || "活跃"}</kv>${vers}
+      <div id='exploreSlot'></div>`);
     el("kback").addEventListener("click", () => { history.replaceState(null, "", location.pathname); showTab("knowledge"); });
     // latest version expanded; older versions' bodies load too (they are usually the same text)
     el("view").querySelectorAll(".bodyslot").forEach(sl => fillBody(sl, sl.dataset.hash));
     if (window.ZXMember) ZXMember.attachReview(u);
     if (window.ZXAuthor) ZXAuthor.attachUnit(u);
+    if (window.ZXExplore) ZXExplore.attachExplore(u);
     el("view").querySelectorAll("a[data-unit]").forEach(a => a.addEventListener("click", () => showUnit(a.dataset.unit)));
   } catch (e) { setView(`<span class='err'>${esc(e.message)}</span>`); }
 }

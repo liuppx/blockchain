@@ -165,6 +165,35 @@ async function assign(req, res) {
   }
 }
 
+// GET /explore?unit=N      该单元的上游(谁建立在它之上)与地基(它站在谁之上)
+// GET /gaps[?domain=N]     缺口:无人依据、也无人核验的单元(可以填的"山谷")
+// GET /coverage            按领域的覆盖情况
+async function explore(req, res) {
+  const u = new URL(req.url, "http://x");
+  const json = (obj, code = 200) => res.writeHead(code, {
+    "Content-Type": "application/json; charset=utf-8", "Cache-Control": "no-store",
+  }).end(JSON.stringify(obj));
+  try {
+    await INDEX.ensureFresh(15000);
+    if (req.url.startsWith("/gaps")) {
+      const domain = u.searchParams.get("domain");
+      return json({ gaps: INDEX.gaps(domain ? { domain } : {}) });
+    }
+    if (req.url.startsWith("/coverage")) {
+      return json({ coverage: INDEX.coverage() });
+    }
+    const unit = u.searchParams.get("unit");
+    if (!unit) return json({ error: "missing unit" }, 400);
+    return json({
+      unit: String(unit),
+      upstream: INDEX.upstream(unit),
+      downstream: INDEX.downstream(unit),
+    });
+  } catch (e) {
+    return json({ error: "explore failed: " + e.message }, 500);
+  }
+}
+
 // GET /terrain   认知地形图:把引用关系投影成地形(峰/高原/山脊/山谷/断层)
 async function terrain(req, res) {
   try {
@@ -210,12 +239,19 @@ function status(req, res) {
   });
 }
 
+function apiPathOf(req) { return new URL(req.url, "http://x").pathname; }
+
 http.createServer((req, res) => {
   if (req.url.startsWith("/bodies/")) return bodies(req, res);
   if (req.url.startsWith("/status/")) return status(req, res);
   if (req.url === "/search" || req.url.startsWith("/search?")) return search(req, res);
-  if (req.url.startsWith("/assign")) return assign(req, res);
+  if (apiPathOf(req) === "/assign" || apiPathOf(req) === "/assign/pending") return assign(req, res);
   if (req.url === "/terrain" || req.url.startsWith("/terrain?")) return terrain(req, res);
+  // 精确匹配 API 路径:不能用 startsWith("/explore"),否则会吞掉静态文件 /explore.js
+  const apiPath = new URL(req.url, "http://x").pathname;
+  if (apiPath === "/explore" || apiPath === "/gaps" || apiPath === "/coverage") {
+    return explore(req, res);
+  }
   if (req.url === "/export/units" || req.url.startsWith("/export/units?")) return exportUnits(req, res);
   if (req.url === "/rpc" || req.url.startsWith("/rpc/") || req.url.startsWith("/rpc?")) return proxy(req, res);
   return serveStatic(req, res);
