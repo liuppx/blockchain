@@ -13,8 +13,8 @@
 # 防双签(同一验证人密钥同时运行两份 = 双签):
 # 1. 识别"本节点进程"不依赖 PID 文件和路径字符串:扫描所有 `node run --config X`,读出 X 的 data_dir,
 #    与本节点的 data_dir(解析为真实路径)比较。经软链接或其他版本目录启动的同一节点也能识别。
-# 2. 每个节点进程持有 <data_dir>/.node.lock 上的 flock;同一数据目录的第二份进程无法启动(内核保证,
-#    即使 PID 文件丢失或脚本判断出错)。
+# 2. 每个节点进程由**节点程序自己**持有 <data_dir>/.node.lock 的独占锁;同一数据目录的第二份进程
+#    无法启动(内核保证,即使 PID 文件丢失或脚本判断出错),手工启动二进制同样受保护。
 # 3. 发现同一数据目录已有进程在运行时,start 拒绝启动;stop 停掉它(无论它从哪个目录启动)。
 set -euo pipefail
 
@@ -114,10 +114,10 @@ start_node() {
     fail "n$id: data dir $dd is already used by pid(s) ${running% } (another copy?) — refusing to start a second instance"
   fi
   rm -f "$(pid_file "$id")"
-  # 子 shell 先取得数据目录锁,再 exec 成节点进程:锁随节点进程存活,$! 就是节点进程本身
+  # 数据目录锁由**节点程序自己**持有(见 node/src/store.rs 的 DataDirLock):
+  # 节点启动时对 <data_dir>/.node.lock 取独占锁,取不到就直接失败。
+  # 脚本不再另取一把锁——同一文件的两把 flock 会互相冲突,而且脚本的锁覆盖不到手工启动。
   (
-    exec 9>"$dd/.node.lock"
-    flock -n 9 || { echo "n$id: lock $dd/.node.lock is held by another process" >&2; exit 75; }
     RUST_LOG="${RUST_LOG:-info}" exec "$BIN" run --config "$cfg"
   ) >> "$LOG_DIR/n$id.log" 2>&1 < /dev/null &
   echo $! > "$(pid_file "$id")"
@@ -126,7 +126,6 @@ start_node() {
 
 do_start() {
   [[ -x "$BIN" ]] || fail "missing binary $BIN"
-  command -v flock >/dev/null 2>&1 || fail "flock is required (util-linux)"
   mkdir -p "$RUN_DIR" "$LOG_DIR"
   load_password
   local id
