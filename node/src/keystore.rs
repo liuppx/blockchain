@@ -396,7 +396,9 @@ fn decode_hex_vec(s: &str, field: &str) -> Result<Vec<u8>, KeystoreError> {
         return Err(KeystoreError::BadHex(format!("{field}: odd length")));
     }
     let mut out = Vec::with_capacity(bytes.len() / 2);
-    for pair in bytes.chunks_exact(2) {
+    let (pairs, remainder) = bytes.as_chunks::<2>();
+    debug_assert!(remainder.is_empty());
+    for pair in pairs {
         let hi = hex_nibble(pair[0]).ok_or_else(|| KeystoreError::BadHex(field.to_string()))?;
         let lo = hex_nibble(pair[1]).ok_or_else(|| KeystoreError::BadHex(field.to_string()))?;
         out.push((hi << 4) | lo);
@@ -438,6 +440,22 @@ fn format_uuid_v4(b: &[u8; 16]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn decode_hex_vec_decodes_pairs_and_rejects_malformed_input() {
+        assert_eq!(
+            decode_hex_vec("00aF10", "salt").unwrap(),
+            [0x00, 0xaf, 0x10]
+        );
+        assert!(matches!(
+            decode_hex_vec("abc", "salt"),
+            Err(KeystoreError::BadHex(_))
+        ));
+        assert!(matches!(
+            decode_hex_vec("0g", "salt"),
+            Err(KeystoreError::BadHex(_))
+        ));
+    }
 
     #[test]
     fn mac_hash_is_keccak256_not_sha3() {

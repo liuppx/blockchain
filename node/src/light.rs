@@ -594,6 +594,7 @@ impl ValidatorTracker {
             key_rotations: Vec::new(),
             gov_proposals: Vec::new(),
             gov_votes: Vec::new(),
+            knowledge_ops: Vec::new(),
         }
         .hash();
         ValidatorTracker {
@@ -1527,6 +1528,7 @@ mod tests {
             decay_half_life_blocks: 0,
             slash_bps: 10_000,
             max_validator_power_bps: 0,
+            knowledge: crate::knowledge::KnowledgeGenesis::default(),
             timestamp_days: 0.0,
             validators: vec![
                 (21, kp(21).public(), 1),

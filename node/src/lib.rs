@@ -32,6 +32,7 @@ pub mod daemon;
 pub mod driver;
 pub mod hash;
 pub mod keystore;
+pub mod knowledge;
 pub mod light;
 pub mod mempool;
 pub mod merkle;
@@ -874,6 +875,9 @@ pub struct Block {
     /// opened in an earlier (or the same) block. Committed via the header
     /// projection's `gov_votes_commitment`.
     pub gov_votes: Vec<GovVote>,
+    /// 测试网阶段 1(B8 wire):知识单元 op(创建单元 / 发布版本 / 核验 / 邀请),
+    /// 由头部 `knowledge_ops_commitment` 承诺。见 `docs/design/knowledge-units-onchain.md`。
+    pub knowledge_ops: Vec<crate::knowledge::KnowledgeOp>,
 }
 
 impl Block {
@@ -1073,6 +1077,8 @@ pub struct ChainState {
     /// (a consensus rule, like `slash_bps`), so a tampered value can't match a cert-signed
     /// root. Governance-adjustable via `GovParam` is a future item; set at genesis for now.
     pub max_validator_power_bps: u32,
+    /// 测试网阶段 1:知识单元、版本、核验、成员与参数。折入 `state_root`(见 `codec::enc_knowledge_state`)。
+    pub knowledge: crate::knowledge::KnowledgeState,
     pub supply: u64,   // total $COG in existence (micro)
     pub treasury: u64, // slashed stake pool (redistributed, not burned)
     /// Total micro-$COG bonded as validator stake (backs voting power). Equals
@@ -1155,6 +1161,8 @@ pub struct Genesis {
     /// so a key that never runs a node can't acquire ≥1/3 and permanently wedge quorum.
     /// See [`ChainState::max_validator_power_bps`].
     pub max_validator_power_bps: u32,
+    /// 测试网阶段 1:知识模块参数(领域登记、旧 ΔK 提交开关、见习期、邀请冷却)。
+    pub knowledge: crate::knowledge::KnowledgeGenesis,
     pub timestamp_days: f32,
     /// The initial validator set (id, pubkey, voting power). Consensus over
     /// height 1 uses exactly this set; later heights evolve it on-chain.
@@ -1267,6 +1275,46 @@ pub enum ChainError {
         power: u64,
         cap_bps: u32,
     },
+    // --- 测试网阶段 1:知识单元 op ---
+    /// 知识 op 结构不合法(语言标签、引用、版本号等)。
+    KnowledgeMalformed(&'static str),
+    /// 发起者不是成员。
+    NotAMember(u64),
+    /// 领域未登记。
+    UnknownDomain(u32),
+    /// 知识单元不存在。
+    UnknownUnit(u64),
+    /// 版本不存在。
+    UnknownVersion {
+        unit: u64,
+        version: u32,
+    },
+    /// 版本引用了自身所在的单元。
+    SelfCite(u64),
+    /// 核验人就是该版本的发布者。
+    SelfVerify {
+        unit: u64,
+        version: u32,
+    },
+    /// 成员仍在见习期,不能执行该操作(邀请)。
+    InProbation(u64),
+    /// 邀请过于频繁(冷却期内)。
+    InviteCooldown(u64),
+    /// 被邀请的公钥已被某个账户使用。
+    PubkeyInUse,
+    /// 本链不接受旧的 ΔK 知识提交(测试网创世关闭)。
+    LegacySubmissionsDisabled,
+    /// 区块携带的知识 op 超过单块上限。
+    TooManyKnowledgeOps(usize),
+    /// 知识 op 待处理池已满(且没有可淘汰的超前序号 op)。节点本地背压,非共识错误。
+    KnowledgePoolFull,
+    /// 该账户在知识 op 待处理池中的配额已满。节点本地背压,非共识错误。
+    KnowledgeAccountQuotaExceeded {
+        account: u64,
+        limit: usize,
+    },
+    /// 该知识 op 已在待处理池中(去重)。
+    KnowledgeAlreadySeen,
     /// A bond/unbond op with a zero amount (never meaningful).
     ZeroStake(u64),
     /// An unbond of more than the account currently has bonded.
@@ -1481,6 +1529,34 @@ impl std::fmt::Display for ChainError {
             ChainError::ValidatorPowerOverflow => {
                 write!(f, "validator updates would exceed the total-power cap")
             }
+            ChainError::KnowledgeMalformed(why) => write!(f, "malformed knowledge op: {why}"),
+            ChainError::NotAMember(a) => write!(f, "account {a} is not a member"),
+            ChainError::UnknownDomain(d) => write!(f, "knowledge domain {d} is not registered"),
+            ChainError::UnknownUnit(u) => write!(f, "knowledge unit {u} does not exist"),
+            ChainError::UnknownVersion { unit, version } => {
+                write!(f, "knowledge unit {unit} has no version {version}")
+            }
+            ChainError::SelfCite(u) => write!(f, "a version of unit {u} cannot cite its own unit"),
+            ChainError::SelfVerify { unit, version } => {
+                write!(f, "the publisher of unit {unit} v{version} cannot verify it")
+            }
+            ChainError::InProbation(a) => write!(f, "member {a} is still in probation"),
+            ChainError::InviteCooldown(a) => write!(f, "member {a} invited too recently"),
+            ChainError::PubkeyInUse => write!(f, "that public key is already used by an account"),
+            ChainError::LegacySubmissionsDisabled => {
+                write!(f, "this chain does not accept legacy ΔK submissions")
+            }
+            ChainError::TooManyKnowledgeOps(n) => write!(
+                f,
+                "block carries {n} knowledge ops (max {})",
+                crate::knowledge::MAX_KNOWLEDGE_OPS_PER_BLOCK
+            ),
+            ChainError::KnowledgePoolFull => write!(f, "knowledge op pool is full"),
+            ChainError::KnowledgeAccountQuotaExceeded { account, limit } => write!(
+                f,
+                "account {account} already has {limit} knowledge ops pending"
+            ),
+            ChainError::KnowledgeAlreadySeen => write!(f, "knowledge op already pending"),
             ChainError::ValidatorPowerShareExceeded { id, power, cap_bps } => write!(
                 f,
                 "new validator {id} power {power} exceeds the {cap_bps} bps share cap of total voting power"
@@ -1755,7 +1831,10 @@ impl ChainState {
                 },
             );
         }
+        let knowledge =
+            crate::knowledge::KnowledgeState::from_genesis(&g.knowledge, accounts.keys());
         let mut state = ChainState {
+            knowledge,
             accounts,
             reviewers,
             graph,
@@ -1833,6 +1912,7 @@ impl ChainState {
             key_rotations: Vec::new(),
             gov_proposals: Vec::new(),
             gov_votes: Vec::new(),
+            knowledge_ops: Vec::new(),
         }
         .hash();
         // M31: now that the genesis block hash is known, store it on
@@ -2006,6 +2086,14 @@ impl ChainState {
         }
         for op in &block.gov_votes {
             self.apply_gov_vote(op, new_height)?;
+        }
+        // 测试网阶段 1:知识单元 op(创建 / 发布版本 / 核验 / 邀请),按区块内顺序执行;
+        // 任何一条失败,整个区块回滚(与其他 op 一致)。
+        if block.knowledge_ops.len() > crate::knowledge::MAX_KNOWLEDGE_OPS_PER_BLOCK {
+            return Err(ChainError::TooManyKnowledgeOps(block.knowledge_ops.len()));
+        }
+        for op in &block.knowledge_ops {
+            self.apply_knowledge_op(op, new_height)?;
         }
 
         // on-chain validator-set transition: explicit updates PLUS the changes
@@ -2239,6 +2327,300 @@ impl ChainState {
     /// M194: record a `GovVote` on an open proposal (checks sig + strict nonce;
     /// rejects an unknown or closed proposal). Last-write-wins per voter (keyed by
     /// account id); the strict nonce both prevents replay and orders re-votes.
+    /// 测试网阶段 1:执行一条知识 op。所有检查都在任何状态修改之前完成。
+    /// 设计见 `docs/design/knowledge-units-onchain.md` §3。
+    pub(crate) fn apply_knowledge_op(
+        &mut self,
+        op: &crate::knowledge::KnowledgeOp,
+        height: u64,
+    ) -> Result<(), ChainError> {
+        use crate::knowledge::{KnowledgeAction, KnowledgeUnit, Member, UnitVersion, Verification};
+        op.is_well_formed()
+            .map_err(ChainError::KnowledgeMalformed)?;
+        let acct = self
+            .accounts
+            .get(&op.actor)
+            .ok_or(ChainError::UnknownAccount(op.actor))?;
+        if !crypto::verify(
+            &acct.pubkey,
+            &codec::knowledge_op_signing_bytes(op),
+            &op.signature,
+        ) {
+            return Err(ChainError::BadSignature(op.actor));
+        }
+        if op.nonce != acct.nonce {
+            return Err(ChainError::BadNonce {
+                account: op.actor,
+                expected: acct.nonce,
+                got: op.nonce,
+            });
+        }
+        if !self.knowledge.members.contains_key(&op.actor) {
+            return Err(ChainError::NotAMember(op.actor));
+        }
+        match &op.action {
+            KnowledgeAction::CreateUnit {
+                layer,
+                domain,
+                version,
+            } => {
+                if !self.knowledge.domains.contains(domain) {
+                    return Err(ChainError::UnknownDomain(*domain));
+                }
+                self.check_knowledge_cites(None, &version.cites)?;
+                let id = self.knowledge.next_unit_id;
+                self.knowledge.units.insert(
+                    id,
+                    KnowledgeUnit {
+                        id,
+                        author: op.actor,
+                        layer: *layer,
+                        domain: *domain,
+                        created_height: height,
+                        versions: vec![UnitVersion {
+                            n: 1,
+                            publisher: op.actor,
+                            payload: version.clone(),
+                            published_height: height,
+                        }],
+                    },
+                );
+                self.knowledge.next_unit_id += 1;
+            }
+            KnowledgeAction::PublishVersion { unit, version } => {
+                let n = {
+                    let u = self
+                        .knowledge
+                        .units
+                        .get(unit)
+                        .ok_or(ChainError::UnknownUnit(*unit))?;
+                    u.versions.len() as u32 + 1
+                };
+                self.check_knowledge_cites(Some(*unit), &version.cites)?;
+                self.knowledge
+                    .units
+                    .get_mut(unit)
+                    .unwrap()
+                    .versions
+                    .push(UnitVersion {
+                        n,
+                        publisher: op.actor,
+                        payload: version.clone(),
+                        published_height: height,
+                    });
+            }
+            KnowledgeAction::Verify {
+                unit,
+                version,
+                verdict,
+                note_hash,
+            } => {
+                let u = self
+                    .knowledge
+                    .units
+                    .get(unit)
+                    .ok_or(ChainError::UnknownUnit(*unit))?;
+                let v = u.versions.get((*version as usize).wrapping_sub(1)).ok_or(
+                    ChainError::UnknownVersion {
+                        unit: *unit,
+                        version: *version,
+                    },
+                )?;
+                if v.publisher == op.actor {
+                    return Err(ChainError::SelfVerify {
+                        unit: *unit,
+                        version: *version,
+                    });
+                }
+                // 见习期成员的核验照样记录,但不计入可信度(由可信度计算排除,K3)。
+                self.knowledge.verifications.insert(
+                    (*unit, *version, op.actor),
+                    Verification {
+                        unit: *unit,
+                        version: *version,
+                        verifier: op.actor,
+                        verdict: *verdict,
+                        note_hash: *note_hash,
+                        height,
+                    },
+                );
+            }
+            KnowledgeAction::Invite { pubkey } => {
+                if !self.knowledge.is_established(op.actor, height) {
+                    return Err(ChainError::InProbation(op.actor));
+                }
+                let last = self.knowledge.members[&op.actor].last_invite_height;
+                if last != 0 && height < last.saturating_add(self.knowledge.invite_cooldown_blocks)
+                {
+                    return Err(ChainError::InviteCooldown(op.actor));
+                }
+                if self.accounts.values().any(|a| a.pubkey == *pubkey) {
+                    return Err(ChainError::PubkeyInUse);
+                }
+                let mut id = self.knowledge.next_account_id;
+                while self.accounts.contains_key(&id) {
+                    id += 1; // 防御:跳过任何已被占用的 id
+                }
+                self.accounts.insert(
+                    id,
+                    Account {
+                        pubkey: *pubkey,
+                        ..Default::default()
+                    },
+                );
+                self.knowledge.members.insert(
+                    id,
+                    Member {
+                        joined_height: height,
+                        inviter: op.actor,
+                        last_invite_height: 0,
+                    },
+                );
+                self.knowledge
+                    .members
+                    .get_mut(&op.actor)
+                    .unwrap()
+                    .last_invite_height = height;
+                self.knowledge.next_account_id = id + 1;
+            }
+        }
+        self.accounts.get_mut(&op.actor).unwrap().nonce += 1;
+        Ok(())
+    }
+
+    /// K4:知识 op 进入待处理池的准入检查(gossip 与本地 / RPC 提交共用)。
+    /// 只检查与区块位置无关的条件:结构、账户存在、签名、成员资格、序号窗口。
+    /// 依赖区块内先后顺序的条件(被引用的单元是否已存在等)留给出块前的过滤与最终执行。
+    pub(crate) fn knowledge_op_admissible(
+        &self,
+        op: &crate::knowledge::KnowledgeOp,
+    ) -> Result<(), ChainError> {
+        op.is_well_formed()
+            .map_err(ChainError::KnowledgeMalformed)?;
+        let acct = self
+            .accounts
+            .get(&op.actor)
+            .ok_or(ChainError::UnknownAccount(op.actor))?;
+        if !crypto::verify(
+            &acct.pubkey,
+            &codec::knowledge_op_signing_bytes(op),
+            &op.signature,
+        ) {
+            return Err(ChainError::BadSignature(op.actor));
+        }
+        if !self.knowledge.members.contains_key(&op.actor) {
+            return Err(ChainError::NotAMember(op.actor));
+        }
+        self.gov_nonce_window(op.actor, op.nonce)?;
+        // 现在就能确定"永远无法执行"的 op 直接拒绝,不要先回报成功再在出块时悄悄丢弃
+        // (同 SEC-01 第 3 轮:RPC 不应对不会入块的 op 返回成功,也不应让它占着池位与序号)。
+        // 可能因同一块内更早的 op 而变得有效的条件(例如引用尚未创建的单元)不在这里检查。
+        use crate::knowledge::KnowledgeAction;
+        match &op.action {
+            KnowledgeAction::CreateUnit { domain, .. } => {
+                // 阶段 1 领域只在创世登记,不会新增
+                if !self.knowledge.domains.contains(domain) {
+                    return Err(ChainError::UnknownDomain(*domain));
+                }
+            }
+            KnowledgeAction::Verify { unit, version, .. } => {
+                // 版本的发布者永不改变:发布者核验自己的版本永远无效
+                if let Some(v) = self
+                    .knowledge
+                    .units
+                    .get(unit)
+                    .and_then(|u| u.versions.get((*version as usize).wrapping_sub(1)))
+                {
+                    if v.publisher == op.actor {
+                        return Err(ChainError::SelfVerify {
+                            unit: *unit,
+                            version: *version,
+                        });
+                    }
+                }
+            }
+            KnowledgeAction::Invite { pubkey } => {
+                let next = self.height + 1;
+                if !self.knowledge.is_established(op.actor, next) {
+                    return Err(ChainError::InProbation(op.actor));
+                }
+                let last = self.knowledge.members[&op.actor].last_invite_height;
+                if last != 0 && next < last.saturating_add(self.knowledge.invite_cooldown_blocks) {
+                    return Err(ChainError::InviteCooldown(op.actor));
+                }
+                // 账户不会被删除:已被使用的公钥永远不能再被邀请
+                if self.accounts.values().any(|a| a.pubkey == *pubkey) {
+                    return Err(ChainError::PubkeyInUse);
+                }
+            }
+            KnowledgeAction::PublishVersion { .. } => {}
+        }
+        Ok(())
+    }
+
+    /// K4:提交区块后的廉价清理:序号已落在窗口之外的知识 op 永远无法执行,丢弃(不做验签)。
+    pub(crate) fn knowledge_op_not_stale(&self, op: &crate::knowledge::KnowledgeOp) -> bool {
+        self.gov_nonce_window(op.actor, op.nonce).is_ok()
+    }
+
+    /// K4:选出出块者可以放进候选区块的知识 op,避免一条无法执行的 op 让整个候选块无法封装
+    /// (镜像 SEC-01 的治理过滤)。先在试算副本上执行本块已选入的治理 op(它们与知识 op
+    /// 共用账户序号,且在区块内先执行),再按(账户, 序号)排序依次试执行知识 op,
+    /// 使同一账户的连续 op 能在同一块内依序落地;最多选入单块上限条。
+    pub(crate) fn filter_applicable_knowledge(
+        &self,
+        height: u64,
+        gov_proposals: &[GovProposal],
+        gov_votes: &[GovVote],
+        ops: &[crate::knowledge::KnowledgeOp],
+    ) -> Vec<crate::knowledge::KnowledgeOp> {
+        let mut trial = self.clone();
+        for op in gov_proposals {
+            let _ = trial.apply_gov_proposal(op, height);
+        }
+        for op in gov_votes {
+            let _ = trial.apply_gov_vote(op, height);
+        }
+        let mut sorted: Vec<&crate::knowledge::KnowledgeOp> = ops.iter().collect();
+        sorted.sort_by_key(|op| (op.actor, op.nonce));
+        let mut kept = Vec::new();
+        for op in sorted {
+            if kept.len() >= crate::knowledge::MAX_KNOWLEDGE_OPS_PER_BLOCK {
+                break;
+            }
+            if trial.apply_knowledge_op(op, height).is_ok() {
+                kept.push(op.clone());
+            }
+        }
+        kept
+    }
+
+    /// 引用校验:被引用的单元与版本必须已存在,且不能引用自身所在的单元。
+    /// 新版本只能引用已存在的版本,所以版本级引用图天然无环(无需额外检测)。
+    fn check_knowledge_cites(
+        &self,
+        own: Option<u64>,
+        cites: &[crate::knowledge::Cite],
+    ) -> Result<(), ChainError> {
+        for c in cites {
+            if Some(c.unit) == own {
+                return Err(ChainError::SelfCite(c.unit));
+            }
+            let u = self
+                .knowledge
+                .units
+                .get(&c.unit)
+                .ok_or(ChainError::UnknownUnit(c.unit))?;
+            if c.version as usize > u.versions.len() {
+                return Err(ChainError::UnknownVersion {
+                    unit: c.unit,
+                    version: c.version,
+                });
+            }
+        }
+        Ok(())
+    }
+
     fn apply_gov_vote(&mut self, op: &GovVote, height: u64) -> Result<(), ChainError> {
         let acct = self
             .accounts
@@ -2935,6 +3317,11 @@ impl ChainState {
     /// Validates: non-empty + well-scored reviews, known reviewers, known account, authentic
     /// signature, and balance covering `stake` then `stake + fee`.
     pub(crate) fn validate_tx_ignoring_nonce(&self, tx: &SubmissionTx) -> Result<(), ChainError> {
+        // 测试网阶段 1:创世可关闭旧的 ΔK 提交路径(自报嵌入向量可被操纵,VISION Q7)。
+        // 放在这里同时覆盖内存池准入与区块执行(apply_tx → validate_tx → 本函数)。
+        if !self.knowledge.legacy_submissions {
+            return Err(ChainError::LegacySubmissionsDisabled);
+        }
         if tx.reviews.is_empty() {
             return Err(ChainError::EmptyReviews(tx.author));
         }
@@ -3259,6 +3646,9 @@ impl ChainState {
         e.u64(self.decay_half_life_blocks);
         e.u32(self.slash_bps);
         e.u32(self.max_validator_power_bps); // M235 (§10.11): consensus rule, fold like slash_bps
+                                             // 测试网阶段 1:知识模块全部状态 + 内容许可(许可是协议常量,折入后主网迁移时可一并验证)。
+        codec::enc_knowledge_state(&mut e, &self.knowledge);
+        e.string(crate::knowledge::CONTENT_LICENSE);
         let p = &self.params;
         e.f32(p.tau_dup);
         e.u64(p.n_review_min as u64);
@@ -3877,6 +4267,7 @@ mod tests {
             decay_half_life_blocks: 0,
             slash_bps: 10_000,
             max_validator_power_bps: 0,
+            knowledge: crate::knowledge::KnowledgeGenesis::default(),
             timestamp_days: 0.0,
             validators: vec![
                 (21, kp(21).public(), 1),
@@ -3957,6 +4348,7 @@ mod tests {
             key_rotations: Vec::new(),
             gov_proposals: Vec::new(),
             gov_votes: Vec::new(),
+            knowledge_ops: Vec::new(),
         };
         // best-effort seal: valid blocks get the correct commitments; blocks the
         // negative tests build to fail earlier keep [0;32] and still fail at
@@ -5094,6 +5486,459 @@ mod tests {
         assert_eq!(kept[0].account, 2);
     }
 
+    // --- 测试网阶段 1:知识单元 op(K2)------------------------------------------
+
+    fn kgenesis(probation: u64, cooldown: u64, legacy: bool) -> Genesis {
+        let mut g = base_genesis();
+        g.knowledge = crate::knowledge::KnowledgeGenesis {
+            domains: vec![2],
+            legacy_submissions: legacy,
+            probation_blocks: probation,
+            invite_cooldown_blocks: cooldown,
+        };
+        g
+    }
+
+    fn payload(cites: Vec<crate::knowledge::Cite>) -> crate::knowledge::VersionPayload {
+        use crate::knowledge::*;
+        VersionPayload {
+            bodies: vec![Body {
+                lang: "zh".into(),
+                hash: [7u8; 32],
+            }],
+            source: Source::Model("claude-opus-5-5".into()),
+            cites,
+        }
+    }
+
+    fn kop(
+        chain: &Chain,
+        actor: u64,
+        action: crate::knowledge::KnowledgeAction,
+    ) -> crate::knowledge::KnowledgeOp {
+        crate::knowledge::KnowledgeOp {
+            actor,
+            action,
+            nonce: chain.state.accounts[&actor].nonce,
+            signature: [0u8; 64],
+        }
+        .signed(&kp(actor))
+    }
+
+    fn kblock(chain: &Chain, ops: Vec<crate::knowledge::KnowledgeOp>) -> Block {
+        let mut b = block(chain, chain.state.height + 1, vec![]);
+        b.knowledge_ops = ops;
+        let _ = chain.seal(&mut b);
+        b
+    }
+
+    fn create(
+        layer: crate::knowledge::Layer,
+        domain: u32,
+        cites: Vec<crate::knowledge::Cite>,
+    ) -> crate::knowledge::KnowledgeAction {
+        crate::knowledge::KnowledgeAction::CreateUnit {
+            layer,
+            domain,
+            version: payload(cites),
+        }
+    }
+
+    #[test]
+    fn knowledge_create_publish_verify_flow() {
+        use crate::knowledge::*;
+        let mut chain = Chain::new(kgenesis(0, 0, true));
+        let r0 = chain.state.state_root();
+        // 账户 1 创建基础单元 1;账户 2 创建应用单元 2,依据单元 1 的 v1
+        let a = kop(&chain, 1, create(Layer::Foundation, 2, vec![]));
+        let mut b = kblock(&chain, vec![a]);
+        chain.commit(&mut b).expect("create base");
+        let cite = Cite {
+            unit: 1,
+            version: 1,
+            kind: CiteKind::Basis,
+        };
+        let c = kop(&chain, 2, create(Layer::Application, 2, vec![cite]));
+        let mut b = kblock(&chain, vec![c]);
+        chain.commit(&mut b).expect("create app");
+        // 账户 3 为单元 1 发布 v2(任何成员都可修订),账户 2 核验单元 1 的 v2
+        let p = kop(
+            &chain,
+            3,
+            KnowledgeAction::PublishVersion {
+                unit: 1,
+                version: payload(vec![]),
+            },
+        );
+        let mut b = kblock(&chain, vec![p]);
+        chain.commit(&mut b).expect("publish v2");
+        let v = kop(
+            &chain,
+            2,
+            KnowledgeAction::Verify {
+                unit: 1,
+                version: 2,
+                verdict: Verdict::Pass,
+                note_hash: [0u8; 32],
+            },
+        );
+        let mut b = kblock(&chain, vec![v]);
+        chain.commit(&mut b).expect("verify");
+
+        let k = &chain.state.knowledge;
+        assert_eq!(k.next_unit_id, 3);
+        let u1 = &k.units[&1];
+        assert_eq!(
+            (u1.author, u1.layer, u1.versions.len()),
+            (1, Layer::Foundation, 2)
+        );
+        assert_eq!(
+            u1.versions[1].publisher, 3,
+            "v2 attributed to its publisher"
+        );
+        assert_eq!(
+            k.units[&2].versions[0].payload.cites[0].kind,
+            CiteKind::Basis
+        );
+        assert_eq!(k.verifications[&(1, 2, 2)].verdict, Verdict::Pass);
+        assert_eq!(
+            chain.state.accounts[&2].nonce, 2,
+            "knowledge ops advance the account nonce"
+        );
+        assert_ne!(
+            chain.state.state_root(),
+            r0,
+            "knowledge state is folded into state_root"
+        );
+        assert!(
+            chain.state.supply_conserved(),
+            "knowledge ops never mint or move money"
+        );
+    }
+
+    #[test]
+    fn knowledge_op_rejections_roll_the_block_back() {
+        use crate::knowledge::*;
+        let mut chain = Chain::new(kgenesis(0, 0, true));
+        let a = kop(&chain, 1, create(Layer::Foundation, 2, vec![]));
+        let mut b = kblock(&chain, vec![a]);
+        chain.commit(&mut b).unwrap();
+        let h = chain.state.height;
+
+        let reject = |chain: &mut Chain, op: KnowledgeOp| -> ChainError {
+            let mut b = kblock(chain, vec![op]);
+            chain.commit(&mut b).expect_err("must reject")
+        };
+        let e = {
+            let op = kop(&chain, 1, create(Layer::Foundation, 9, vec![]));
+            reject(&mut chain, op)
+        };
+        assert!(matches!(e, ChainError::UnknownDomain(9)), "{e}");
+        let e = {
+            let op = kop(
+                &chain,
+                1,
+                create(
+                    Layer::Foundation,
+                    2,
+                    vec![Cite {
+                        unit: 9,
+                        version: 1,
+                        kind: CiteKind::Basis,
+                    }],
+                ),
+            );
+            reject(&mut chain, op)
+        };
+        assert!(matches!(e, ChainError::UnknownUnit(9)), "{e}");
+        let e = {
+            let op = kop(
+                &chain,
+                1,
+                create(
+                    Layer::Foundation,
+                    2,
+                    vec![Cite {
+                        unit: 1,
+                        version: 2,
+                        kind: CiteKind::Basis,
+                    }],
+                ),
+            );
+            reject(&mut chain, op)
+        };
+        assert!(
+            matches!(
+                e,
+                ChainError::UnknownVersion {
+                    unit: 1,
+                    version: 2
+                }
+            ),
+            "cannot cite a future version: {e}"
+        );
+        let e = {
+            let op = kop(
+                &chain,
+                2,
+                KnowledgeAction::PublishVersion {
+                    unit: 1,
+                    version: payload(vec![Cite {
+                        unit: 1,
+                        version: 1,
+                        kind: CiteKind::SeeAlso,
+                    }]),
+                },
+            );
+            reject(&mut chain, op)
+        };
+        assert!(matches!(e, ChainError::SelfCite(1)), "{e}");
+        let e = {
+            let op = kop(
+                &chain,
+                1,
+                KnowledgeAction::Verify {
+                    unit: 1,
+                    version: 1,
+                    verdict: Verdict::Pass,
+                    note_hash: [0u8; 32],
+                },
+            );
+            reject(&mut chain, op)
+        };
+        assert!(
+            matches!(
+                e,
+                ChainError::SelfVerify {
+                    unit: 1,
+                    version: 1
+                }
+            ),
+            "{e}"
+        );
+        let e = {
+            let op = kop(
+                &chain,
+                2,
+                KnowledgeAction::Verify {
+                    unit: 1,
+                    version: 5,
+                    verdict: Verdict::Pass,
+                    note_hash: [0u8; 32],
+                },
+            );
+            reject(&mut chain, op)
+        };
+        assert!(matches!(e, ChainError::UnknownVersion { .. }), "{e}");
+        // 错误序号、错误签名
+        let mut bad = kop(&chain, 2, create(Layer::Foundation, 2, vec![]));
+        bad.nonce += 1;
+        let bad = bad.signed(&kp(2));
+        assert!(matches!(
+            reject(&mut chain, bad),
+            ChainError::BadNonce { .. }
+        ));
+        let forged = crate::knowledge::KnowledgeOp {
+            actor: 2,
+            ..kop(&chain, 2, create(Layer::Foundation, 2, vec![]))
+        }
+        .signed(&kp(3));
+        assert!(matches!(
+            reject(&mut chain, forged),
+            ChainError::BadSignature(2)
+        ));
+        // 结构不合法(重复语言)
+        let mut v = payload(vec![]);
+        v.bodies.push(v.bodies[0].clone());
+        let e = {
+            let op = kop(
+                &chain,
+                2,
+                KnowledgeAction::PublishVersion {
+                    unit: 1,
+                    version: v,
+                },
+            );
+            reject(&mut chain, op)
+        };
+        assert!(matches!(e, ChainError::KnowledgeMalformed(_)), "{e}");
+        // 非成员
+        chain.state.knowledge.members.remove(&3);
+        let e = {
+            let op = kop(&chain, 3, create(Layer::Foundation, 2, vec![]));
+            reject(&mut chain, op)
+        };
+        assert!(matches!(e, ChainError::NotAMember(3)), "{e}");
+
+        assert_eq!(chain.state.height, h, "every rejected block rolled back");
+        assert_eq!(chain.state.knowledge.units.len(), 1);
+    }
+
+    #[test]
+    fn knowledge_invites_respect_probation_cooldown_and_unique_keys() {
+        use crate::knowledge::*;
+        let mut chain = Chain::new(kgenesis(10, 5, true));
+        // 创世成员 1 邀请新成员(公钥 kp(50)),新账户 id = 最大创世 id + 1 = 4
+        let inv = kop(
+            &chain,
+            1,
+            KnowledgeAction::Invite {
+                pubkey: kp(50).public(),
+            },
+        );
+        let mut b = kblock(&chain, vec![inv]);
+        chain.commit(&mut b).expect("invite");
+        let joined = chain.state.height;
+        assert_eq!(chain.state.accounts[&4].pubkey, kp(50).public());
+        assert_eq!(
+            chain.state.accounts[&4].balance, 0,
+            "invited accounts start with no funds"
+        );
+        assert_eq!(
+            chain.state.knowledge.members[&4],
+            Member {
+                joined_height: joined,
+                inviter: 1,
+                last_invite_height: 0
+            }
+        );
+        assert!(!chain.state.knowledge.is_established(4, joined + 9));
+        assert!(chain.state.knowledge.is_established(4, joined + 10));
+
+        let reject = |chain: &mut Chain, op: KnowledgeOp| -> ChainError {
+            let mut b = kblock(chain, vec![op]);
+            chain.commit(&mut b).expect_err("must reject")
+        };
+        // 见习期内不能邀请
+        let op = KnowledgeOp {
+            actor: 4,
+            action: KnowledgeAction::Invite {
+                pubkey: kp(51).public(),
+            },
+            nonce: 0,
+            signature: [0u8; 64],
+        }
+        .signed(&kp(50));
+        assert!(matches!(reject(&mut chain, op), ChainError::InProbation(4)));
+        // 冷却期内不能再邀请
+        let e = {
+            let op = kop(
+                &chain,
+                1,
+                KnowledgeAction::Invite {
+                    pubkey: kp(52).public(),
+                },
+            );
+            reject(&mut chain, op)
+        };
+        assert!(matches!(e, ChainError::InviteCooldown(1)), "{e}");
+        // 已被使用的公钥不能再邀请(换另一个已过冷却期的成员来邀请)
+        let e = {
+            let op = kop(
+                &chain,
+                2,
+                KnowledgeAction::Invite {
+                    pubkey: kp(1).public(),
+                },
+            );
+            reject(&mut chain, op)
+        };
+        assert!(matches!(e, ChainError::PubkeyInUse), "{e}");
+        // 见习期内的新成员可以创建单元,其核验照样被记录
+        let mk = KnowledgeOp {
+            actor: 4,
+            action: create(Layer::Foundation, 2, vec![]),
+            nonce: 0,
+            signature: [0u8; 64],
+        }
+        .signed(&kp(50));
+        let mut b = kblock(&chain, vec![mk]);
+        chain
+            .commit(&mut b)
+            .expect("a member in probation may still create");
+        let vf = KnowledgeOp {
+            actor: 4,
+            action: KnowledgeAction::Verify {
+                unit: 1,
+                version: 1,
+                verdict: Verdict::Pass,
+                note_hash: [0u8; 32],
+            },
+            nonce: 1,
+            signature: [0u8; 64],
+        };
+        let e = reject(&mut chain, vf.clone().signed(&kp(50)));
+        assert!(matches!(e, ChainError::SelfVerify { .. }), "own unit: {e}");
+        // 冷却期过后可以再邀请
+        while chain.state.height < joined + 5 {
+            let mut b = kblock(&chain, vec![]);
+            chain.commit(&mut b).unwrap();
+        }
+        let inv2 = kop(
+            &chain,
+            1,
+            KnowledgeAction::Invite {
+                pubkey: kp(53).public(),
+            },
+        );
+        let mut b = kblock(&chain, vec![inv2]);
+        chain.commit(&mut b).expect("invite after cooldown");
+        assert!(chain.state.accounts.contains_key(&5));
+        assert!(chain.state.supply_conserved());
+    }
+
+    #[test]
+    fn a_block_over_the_knowledge_op_cap_is_rejected() {
+        // 共识规则(不只是诚实出块者的自我约束):超过单块上限的区块整块拒绝,且在执行任何 op 之前。
+        let mut chain = Chain::new(kgenesis(0, 0, true));
+        let op = kop(
+            &chain,
+            1,
+            create(crate::knowledge::Layer::Foundation, 2, vec![]),
+        );
+        let mut b = kblock(
+            &chain,
+            vec![op; crate::knowledge::MAX_KNOWLEDGE_OPS_PER_BLOCK + 1],
+        );
+        let e = chain.commit(&mut b).expect_err("over the cap");
+        assert!(
+            matches!(e, ChainError::TooManyKnowledgeOps(n) if n == crate::knowledge::MAX_KNOWLEDGE_OPS_PER_BLOCK + 1),
+            "{e}"
+        );
+        assert_eq!(chain.state.height, 0);
+    }
+
+    #[test]
+    fn legacy_submissions_can_be_disabled_at_genesis() {
+        let mut chain = Chain::new(kgenesis(0, 0, false));
+        let mut b = block(&chain, 1, vec![novel_tx(1, 1, 0, 1.0)]);
+        let e = chain
+            .commit(&mut b)
+            .expect_err("legacy ΔK submissions disabled");
+        assert!(matches!(e, ChainError::LegacySubmissionsDisabled), "{e}");
+        // 默认开启:现有链行为不变
+        let mut chain = Chain::new(kgenesis(0, 0, true));
+        let mut b = block(&chain, 1, vec![novel_tx(1, 1, 0, 1.0)]);
+        chain
+            .commit(&mut b)
+            .expect("legacy path still works when enabled");
+    }
+
+    #[test]
+    fn state_root_covers_knowledge_state() {
+        let chain = Chain::new(kgenesis(0, 0, true));
+        let r0 = chain.state.state_root();
+        let mut a = chain.state.clone();
+        a.knowledge.probation_blocks += 1;
+        assert_ne!(r0, a.state_root(), "parameters fold into state_root");
+        let mut b = chain.state.clone();
+        b.knowledge.domains.insert(7);
+        assert_ne!(r0, b.state_root(), "domain registry folds into state_root");
+        let mut c = chain.state.clone();
+        c.knowledge.legacy_submissions = !c.knowledge.legacy_submissions;
+        assert_ne!(r0, c.state_root(), "legacy switch folds into state_root");
+    }
+
     #[test]
     fn state_root_covers_max_validator_power_bps() {
         // §10.11 cap is a consensus rule folded into state_root (SEC-02 style), so a tampered
@@ -5392,6 +6237,7 @@ mod tests {
             key_rotations: Vec::new(),
             gov_proposals: Vec::new(),
             gov_votes: Vec::new(),
+            knowledge_ops: Vec::new(),
             proposer: 0,
         };
         live.seal(&mut b2).unwrap();
@@ -6626,6 +7472,7 @@ mod tests {
             key_rotations: Vec::new(),
             gov_proposals: Vec::new(),
             gov_votes: Vec::new(),
+            knowledge_ops: Vec::new(),
         };
         match chain.commit(&mut b2) {
             Err(ChainError::BadNonce {

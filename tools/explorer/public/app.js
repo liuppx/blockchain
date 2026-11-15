@@ -23,12 +23,34 @@ async function connect() {
   try {
     await refreshOverview();
     el("conn").textContent = "connected"; el("conn").className = "mut";
-    renderTabs(); showTab("blocks");
+    renderTabs();
+    const deep = /^#unit\/(\d+)$/.exec(location.hash);   // shareable link: …/#unit/3
+    if (deep) showUnit(deep[1]); else showTab("knowledge");
     if (timer) clearInterval(timer);
     timer = setInterval(refreshOverview, 4000);  // poll chain tip
+    refreshOpsBanner(); setInterval(refreshOpsBanner, 60000);
   } catch (e) {
     el("conn").textContent = "error: " + e.message; el("conn").className = "err";
   }
+}
+
+// 运维提醒:磁盘看守(deploy/diskwatch.sh)估算的剩余天数;只在需要关注时显示
+async function refreshOpsBanner() {
+  let b = el("opsBanner");
+  if (!b) {
+    b = document.createElement("div"); b.id = "opsBanner";
+    document.querySelector("main").prepend(b);
+  }
+  try {
+    const r = await fetch("/status/disk.json", { cache: "no-store" });
+    if (!r.ok) { b.innerHTML = ""; return; }
+    const d = await r.json();
+    if (d.level === "stopped") {
+      b.innerHTML = `<div class='banner bad'>服务器磁盘空间不足(剩余 ${Math.round(d.free_mb)} MB),测试网验证节点已暂停以保护主机上的其他服务。数据完整;腾出空间后重新启动即可恢复。</div>`;
+    } else if (d.level === "warn") {
+      b.innerHTML = `<div class='banner warn'>运维提醒:按当前速度(每天约 ${Math.round(d.growth_mb_per_day)} MB),约 ${esc(d.days_left)} 天后服务器磁盘将不足,测试网届时会自动暂停。需要组织者处理(扩容或重开链)。</div>`;
+    } else b.innerHTML = "";
+  } catch (_) { b.innerHTML = ""; }
 }
 
 async function refreshOverview() {
@@ -44,7 +66,7 @@ async function refreshOverview() {
 }
 
 const TABS = [
-  ["blocks", "Blocks"], ["tx", "Tx lookup"], ["account", "Account"], ["graph", "Graph"],
+  ["knowledge", "Knowledge"], ["blocks", "Blocks"], ["tx", "Tx lookup"], ["account", "Account"], ["graph", "Graph"],
   ["cnfts", "cNFTs"], ["validators", "Validators"], ["staking", "Staking"],
   ["proposals", "Governance"], ["supply", "Supply"],
 ];
@@ -54,7 +76,7 @@ function renderTabs() {
 }
 function showTab(k) {
   TABS.forEach(([t]) => { const b = el("tab-"+t); if (b) b.className = (t===k ? "on" : ""); });
-  ({ blocks:tabBlocks, tx:tabTx, account:tabAccount, graph:tabGraph, validators:tabValidators,
+  ({ knowledge:tabKnowledge, blocks:tabBlocks, tx:tabTx, account:tabAccount, graph:tabGraph, validators:tabValidators,
      staking:tabStaking, proposals:tabProposals, cnfts:tabCnfts, supply:tabSupply })[k]();
 }
 
@@ -210,6 +232,259 @@ async function tabSupply() {
       <kv><b>conserved</b>${s.conserved ? "<span style='color:var(--ok)'>yes</span>" : "<span class='err'>NO</span>"}</kv>`);
   } catch (e) { setView(`<span class='err'>${esc(e.message)}</span>`); }
 }
+
+// K7: knowledge units (testnet stage 1). Credibility is in basis points (10000 = 1.0);
+// effective credibility = min(own, every "basis" citation's effective credibility), so the
+// bottleneck column names the weakest foundation a unit stands on.
+const LAYER_ZH = { foundation: "基础", explanation: "解释", scenario: "场景", application: "应用" };
+const DOMAIN_ZH = { 1: "大模型应用开发", 2: "运动健身" }; // testnet genesis [knowledge] domains
+const domainName = d => DOMAIN_ZH[d] ? `${DOMAIN_ZH[d]} (${d})` : String(d);
+function credBar(bps) {
+  const v = Number(bps) / 10000;
+  const pct = Math.round(v * 100);
+  const color = v >= 0.6 ? "var(--ok)" : v >= 0.3 ? "#d9a400" : "#c0392b";
+  return `<span style='display:inline-block;width:80px;height:8px;background:#ddd;vertical-align:middle'>` +
+    `<span style='display:block;width:${pct}%;height:8px;background:${color}'></span></span> ${v.toFixed(1)}`;
+}
+
+// ---- knowledge bodies: fetched from the content-addressed store, re-hashed in the browser ----
+const bodyCache = new Map();
+async function sha256hex(buf) {
+  const d = await crypto.subtle.digest("SHA-256", buf);
+  return Array.from(new Uint8Array(d)).map(b => b.toString(16).padStart(2, "0")).join("");
+}
+// → {text, ok} | null. ok=false ⇒ bytes don't match the on-chain hash (never shown as content).
+async function fetchBody(hash) {
+  if (bodyCache.has(hash)) return bodyCache.get(hash);
+  const p = (async () => {
+    const r = await fetch("/bodies/" + hash);
+    if (!r.ok) return null;
+    const buf = await r.arrayBuffer();
+    return { ok: (await sha256hex(buf)) === hash, text: new TextDecoder().decode(buf) };
+  })().catch(() => null);
+  bodyCache.set(hash, p);
+  return p;
+}
+function bodyTitle(text) { const m = /^#\s+(.+)$/m.exec(text); return m ? m[1].trim() : ""; }
+// Minimal, escape-first markdown (headings, tables, lists, quotes, code, **bold**, `code`, links).
+function mdInline(s) {
+  return esc(s)
+    .replace(/`([^`]+)`/g, "<code>$1</code>")
+    .replace(/\*\*([^*]+)\*\*/g, "<b>$1</b>")
+    .replace(/\[([^\]]+)\]\((https?:\/\/[^)\s]+)\)/g, "<a href='$2' rel='noopener noreferrer' target='_blank'>$1</a>");
+}
+function renderMd(text) {
+  const lines = text.replace(/\r\n/g, "\n").split("\n"), out = [];
+  let i = 0;
+  const cells = l => l.trim().replace(/^\||\|$/g, "").split("|").map(c => c.trim());
+  while (i < lines.length) {
+    const l = lines[i];
+    if (/^```/.test(l)) {
+      const buf = []; i++;
+      while (i < lines.length && !/^```/.test(lines[i])) buf.push(lines[i++]);
+      i++; out.push(`<pre>${esc(buf.join("\n"))}</pre>`); continue;
+    }
+    const h = /^(#{1,6})\s+(.*)$/.exec(l);
+    if (h) { const n = Math.min(h[1].length + 2, 6); out.push(`<h${n} class='md'>${mdInline(h[2])}</h${n}>`); i++; continue; }
+    if (/^\s*\|/.test(l)) {
+      const rows = [];
+      while (i < lines.length && /^\s*\|/.test(lines[i])) rows.push(lines[i++]);
+      const body = rows.filter((r, k) => !(k === 1 && /^[\s|:-]+$/.test(r)));
+      const [head, ...rest] = body;
+      out.push(`<table class='md'><tr>${cells(head).map(c => `<th>${mdInline(c)}</th>`).join("")}</tr>` +
+        rest.map(r => `<tr>${cells(r).map(c => `<td>${mdInline(c)}</td>`).join("")}</tr>`).join("") + "</table>");
+      continue;
+    }
+    if (/^\s*([-*]|\d+\.)\s+/.test(l)) {
+      const ordered = /^\s*\d+\./.test(l), items = [];
+      while (i < lines.length && /^\s*([-*]|\d+\.)\s+/.test(lines[i])) items.push(lines[i++].replace(/^\s*([-*]|\d+\.)\s+/, ""));
+      const t = ordered ? "ol" : "ul";
+      out.push(`<${t} class='md'>${items.map(x => `<li>${mdInline(x)}</li>`).join("")}</${t}>`); continue;
+    }
+    if (/^>\s?/.test(l)) {
+      const buf = [];
+      while (i < lines.length && /^>\s?/.test(lines[i])) buf.push(lines[i++].replace(/^>\s?/, ""));
+      out.push(`<blockquote class='md'>${mdInline(buf.join(" "))}</blockquote>`); continue;
+    }
+    if (!l.trim()) { i++; continue; }
+    const buf = [];
+    while (i < lines.length && lines[i].trim() && !/^(#{1,6}\s|```|\s*\||\s*([-*]|\d+\.)\s|>)/.test(lines[i])) buf.push(lines[i++]);
+    out.push(`<p class='md'>${buf.map(mdInline).join("<br>")}</p>`);
+  }
+  return out.join("");
+}
+async function fillBody(slot, hash) {
+  const b = await fetchBody(hash);
+  if (!b) { slot.innerHTML = "<span class='mut'>正文未上传到正文仓库(链上只有哈希)</span>"; return; }
+  if (!b.ok) { slot.innerHTML = "<span class='err'>正文与链上哈希不一致,已拒绝显示</span>"; return; }
+  slot.innerHTML = "<div class='ok'>✓ 正文与链上哈希一致</div><div class='mdbody'>" + renderMd(b.text) + "</div>";
+}
+
+async function tabKnowledge() {
+  setView("<span class='mut'>loading…</span>");
+  try {
+    const items = (await j("/units?limit=500")).items || [];
+    const rows = items.length ? items.map(u => {
+      const c = u.credibility, b = c.bottleneck;
+      const neck = b ? `<a class='link' data-unit='${esc(b.unit)}'>#${esc(b.unit)} v${esc(b.version)}</a>` : "<span class='mut'>—</span>";
+      return `<tr><td><a class='link' data-unit='${esc(u.id)}'>#${esc(u.id)}</a></td>
+        <td><a class='link' data-unit='${esc(u.id)}' data-title='${esc(u.id)}'><span class='mut'>…</span></a></td>
+        <td>${esc(LAYER_ZH[u.layer] || u.layer)}</td><td>${esc(domainName(u.domain))}</td><td>${esc(u.versions)}</td>
+        <td>${esc(c.passes)}${Number(c.needs) ? ` <span class='err'>−${esc(c.needs)}</span>` : ""}</td><td>${credBar(c.self_bps)}</td><td>${credBar(c.effective_bps)}</td><td>${neck}</td></tr>`;
+    }).join("") : "<tr><td class='mut' colspan=9>(no knowledge units yet — ./cmd knowledge)</td></tr>";
+    setView(`<h2 style='border:0;padding:0 0 8px'>Knowledge units</h2>
+      <div class='searchbar'>
+        <input id='kSearch' placeholder='搜索标题与正文(中英文均可)' size='40' autocomplete='off'>
+        <select id='kDomain'><option value=''>全部领域</option><option value='1'>大模型应用开发</option><option value='2'>运动健身</option></select>
+        <select id='kLayer'><option value=''>全部层级</option><option value='foundation'>基础</option><option value='explanation'>解释</option><option value='scenario'>场景</option><option value='application'>应用</option></select>
+        <button id='kSearchGo'>搜索</button>
+        <a id='kExport' class='link' href='/export/units' download>导出全部(JSONL)</a>
+      </div>
+      <div id='kSearchOut'></div>
+      <div id='authorSlot'></div>
+      <div id='reviewQueue'></div>
+      <p class='mut'>有效可信度 = 自身可信度与所依据单元有效可信度的最小值。"被谁卡住"指出它最薄弱的地基。</p>
+      <table><tr><th>unit</th><th>标题</th><th>层级</th><th>领域</th><th>版本数</th><th>核验通过 / 需修改</th><th>自身</th><th>有效</th><th>被谁卡住</th></tr>${rows}</table>`);
+    el("view").querySelectorAll("a[data-unit]").forEach(a => a.addEventListener("click", () => showUnit(a.dataset.unit)));
+    if (window.ZXAuthor) ZXAuthor.attachKnowledge();
+    wireSearch();
+    // 详情只取一次:标题与"先核验哪个"都要用
+    const details = await Promise.all(items.map(u => j("/unit/" + u.id).catch(() => null)));
+    const titles = {};
+    await Promise.all(details.filter(Boolean).map(async u => {
+      const v = u.versions[u.versions.length - 1];
+      const b = v && v.bodies[0] ? await fetchBody(v.bodies[0].hash) : null;
+      titles[u.id] = b && b.ok ? bodyTitle(b.text) : "";
+    }));
+    // titles live in the bodies: latest version's first body, verified against its hash
+    el("view").querySelectorAll("a[data-title]").forEach(a => {
+      const t = titles[a.dataset.title];
+      a.innerHTML = t ? esc(t) : "<span class='mut'>(正文未上传)</span>";
+    });
+    renderQueue(details.filter(Boolean), titles);
+  } catch (e) { setView(`<span class='err'>${esc(e.message)}</span>`); }
+}
+
+// "先核验哪个":按"有多少单元直接或间接依据它"排序(与 tools/kgraph.py 的优先核验顺序同一规则)。
+// 核验地基,能抬高的下游单元最多;一个单元的有效可信度不会超过它所依据的单元。
+function reviewQueue(details, me) {
+  const latest = u => u.versions[u.versions.length - 1];
+  const basisOf = {};
+  details.forEach(u => { basisOf[u.id] = latest(u).cites.filter(c => c.kind === "basis").map(c => String(c.unit)); });
+  const downstream = id => {
+    let n = 0;
+    details.forEach(u => {
+      if (u.id === id) return;
+      const seen = new Set(), todo = [...basisOf[u.id]];
+      while (todo.length) {
+        const x = todo.pop();
+        if (x === id) { n++; return; }
+        if (seen.has(x)) continue;
+        seen.add(x); todo.push(...(basisOf[x] || []));
+      }
+    });
+    return n;
+  };
+  return details.map(u => {
+    const v = latest(u), c = v.credibility;
+    return { id: u.id, layer: u.layer, domain: u.domain, version: v.n, publisher: String(v.publisher),
+      passes: Number(c.passes), needs: Number(c.needs), down: downstream(u.id),
+      mine: me && String(v.publisher) === String(me), done: me && v.verifications.some(r => String(r.verifier) === String(me)) };
+  }).filter(q => !q.mine && !q.done && q.passes - q.needs < 4)  // 已有 4 位净通过(0.9 封顶附近)的不再优先
+    .sort((a, b) => (b.down - a.down) || ((a.passes - a.needs) - (b.passes - b.needs)) || (Number(a.id) - Number(b.id)));
+}
+
+function renderQueue(details, titles) {
+  const box = el("reviewQueue");
+  if (!box) return;
+  const me = window.ZXMember && ZXMember.account();
+  const q = reviewQueue(details, me).slice(0, 6);
+  const who = me ? `(已排除你发布的和你核验过的)` : `(在「我的身份」里解锁后,会排除你发布的和你核验过的)`;
+  box.innerHTML = q.length
+    ? `<h3 class='md'>先核验这些 <span class='mut' style='font-weight:normal'>${who}</span></h3><ol class='queue'>` + q.map(x =>
+        `<li><a class='link' data-unit='${esc(x.id)}'>#${esc(x.id)} ${esc(titles[x.id] || "")}</a>
+         <span class='mut'>· ${esc(LAYER_ZH[x.layer] || x.layer)} · ${esc(domainName(x.domain))} · v${esc(x.version)} ·
+         ${x.down ? `<b>${x.down}</b> 个单元依据它` : "没有单元依据它"} · 已有 ${x.passes} 位通过${x.needs ? `、${x.needs} 位需修改` : ""}</span></li>`).join("") + "</ol>"
+    : (me ? "<p class='mut'>暂时没有需要你核验的单元。</p>" : "");
+  box.querySelectorAll("a[data-unit]").forEach(a => a.addEventListener("click", () => showUnit(a.dataset.unit)));
+}
+// 全文检索:走浏览器服务的 /search(正文在正文仓库,链上只有哈希)
+function wireSearch() {
+  const go = () => runSearch();
+  el("kSearchGo").addEventListener("click", go);
+  el("kSearch").addEventListener("keydown", (e) => { if (e.key === "Enter") go(); });
+  el("kDomain").addEventListener("change", go);
+  el("kLayer").addEventListener("change", go);
+}
+
+async function runSearch() {
+  const q = el("kSearch").value.trim();
+  const domain = el("kDomain").value, layer = el("kLayer").value;
+  const out = el("kSearchOut");
+  if (!q && !domain && !layer) { out.innerHTML = ""; return; }
+  out.innerHTML = "<span class='mut'>搜索中…</span>";
+  const p = new URLSearchParams();
+  if (q) p.set("q", q);
+  if (domain) p.set("domain", domain);
+  if (layer) p.set("layer", layer);
+  try {
+    const r = await fetch("/search?" + p.toString());
+    if (!r.ok) throw new Error("HTTP " + r.status);
+    const d = await r.json();
+    if (!d.items.length) { out.innerHTML = "<p class='mut'>没有匹配的单元。</p>"; return; }
+    out.innerHTML = `<p class='mut'>${d.total} 条结果</p><table><tr><th>单元</th><th>标题</th><th>层级</th><th>领域</th><th>命中</th><th>有效可信度</th></tr>` +
+      d.items.map((i) => `<tr>
+        <td><a class='link' data-unit='${esc(i.id)}'>#${esc(i.id)}</a></td>
+        <td><a class='link' data-unit='${esc(i.id)}'>${esc(i.title || "(正文未上传)")}</a></td>
+        <td>${esc(LAYER_ZH[i.layer] || i.layer)}</td><td>${esc(domainName(i.domain))}</td>
+        <td class='mut'>${esc(i.excerpt.slice(0, 160))}</td>
+        <td>${credBar(i.credibility ? i.credibility.effective_bps : 0)}</td></tr>`).join("") + "</table>";
+    out.querySelectorAll("a[data-unit]").forEach((a) => a.addEventListener("click", () => showUnit(a.dataset.unit)));
+  } catch (e) {
+    out.innerHTML = `<span class='err'>搜索失败:${esc(e.message)}</span>`;
+  }
+}
+
+async function showUnit(id) {
+  history.replaceState(null, "", "#unit/" + id);
+  setView("<span class='mut'>loading…</span>");
+  try {
+    const u = await j("/unit/" + id);
+    const vers = u.versions.slice().reverse().map((v, vi) => {
+      const c = v.credibility;
+      const cites = v.cites.length ? v.cites.map(x =>
+        `<a class='link' data-unit='${esc(x.unit)}'>#${esc(x.unit)} v${esc(x.version)}</a> <span class='mut'>(${x.kind === "basis" ? "依据" : "参见"})</span>`).join("<br>") : "<span class='mut'>—</span>";
+      const stale = c.stale_cites.map(s => `<div class='err'>引用已过时:#${esc(s.unit)} 引用 v${esc(s.cited)},当前 v${esc(s.current)}</div>`).join("");
+      const ver = v.verifications.length ? v.verifications.map(r =>
+        `account ${esc(r.verifier)} · ${r.verdict === "pass" ? "通过" : "需修改"} · height ${esc(r.height)}`).join("<br>") : "<span class='mut'>尚无核验</span>";
+      const bodies = v.bodies.map(b => `${esc(b.lang)}: <span class='mono hash'>${esc(short(b.hash))}</span>`).join("<br>");
+      return `<h2 style='border:0;padding:12px 0 6px'>v${esc(v.n)}</h2>
+        <kv><b>publisher / height</b>account ${esc(v.publisher)} · ${esc(v.published_height)}</kv>
+        <kv><b>来源</b>${esc(v.source)}</kv>
+        <kv><b>正文哈希</b>${bodies}</kv>
+        ${v.bodies.map(b => `<div class='bodyslot' data-hash='${esc(b.hash)}'><span class='mut'>正文加载中…</span></div>`).join("")}
+        <kv><b>可信度</b>自身 ${credBar(c.self_bps)} · 有效 ${credBar(c.effective_bps)} · 核验通过 ${esc(c.passes)}${Number(c.needs) ? ` · <span class='err'>需修改 ${esc(c.needs)}(每一位抵消一位通过)</span>` : ""}</kv>
+        <kv><b>引用</b>${cites}</kv>${stale}
+        <kv><b>核验记录</b>${ver}</kv>${vi === 0 ? "<div id='reviseSlot'></div><div id='reviewSlot'></div>" : ""}`;
+    }).join("");
+    setView(`<p><a class='link' id='kback'>← knowledge</a></p>
+      <h2 style='border:0;padding:0 0 8px'>Unit #${esc(u.id)} · ${esc(LAYER_ZH[u.layer] || u.layer)}</h2>
+      <kv><b>author / created</b>account ${esc(u.author)} · height ${esc(u.created_height)}</kv>
+      <kv><b>domain</b>${esc(domainName(u.domain))}</kv><kv><b>license</b>${esc(u.license)}</kv>${vers}`);
+    el("kback").addEventListener("click", () => { history.replaceState(null, "", location.pathname); showTab("knowledge"); });
+    // latest version expanded; older versions' bodies load too (they are usually the same text)
+    el("view").querySelectorAll(".bodyslot").forEach(sl => fillBody(sl, sl.dataset.hash));
+    if (window.ZXMember) ZXMember.attachReview(u);
+    if (window.ZXAuthor) ZXAuthor.attachUnit(u);
+    el("view").querySelectorAll("a[data-unit]").forEach(a => a.addEventListener("click", () => showUnit(a.dataset.unit)));
+  } catch (e) { setView(`<span class='err'>${esc(e.message)}</span>`); }
+}
+
+// 同一标签页里粘贴或修改单元链接(#unit/N)时也要跳转
+window.addEventListener("hashchange", () => {
+  const m = /^#unit\/(\d+)$/.exec(location.hash);
+  if (m) showUnit(m[1]);
+});
 
 // Wire up the Connect button and auto-connect on load (default "/rpc" proxy).
 document.getElementById("connectBtn").addEventListener("click", connect);

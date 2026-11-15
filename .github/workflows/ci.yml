@@ -67,6 +67,30 @@ jobs:
           (cd engine && cargo test --release)
           (cd node && cargo test --release -- --test-threads=1)
 
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22   # WebCrypto Ed25519 (used by the browser signer)
+
+      - name: browser signer matches the node byte-for-byte (gate)
+        # tools/explorer/public/signer.js signs knowledge ops in members' browsers. Cross-check it
+        # against the Rust binary: same mnemonic → same seed/pubkey, same op → identical signed bytes.
+        run: |
+          (cd node && cargo build --release)
+          node --version
+          node --test tools/explorer/test/signer.test.mjs
+
+      - name: browser end-to-end (member flows in a real browser)
+        # 起一条本地链,导入知识单元,然后用 Chrome 走一遍成员流程:身份 → 写作 → 修订 →
+        # 核验 → 邀请 → 检索 → 导出。没有 Chrome 时整个套件跳过(不算失败)。
+        run: |
+          (cd node && cargo build --release)
+          cd tools/explorer && npm ci --no-audit --no-fund
+          cd ../..
+          ./cmd up
+          sleep 5
+          node --test tools/explorer/test/browser.e2e.mjs
+          ./cmd down
+
   audit:
     name: cargo-audit (dependency advisories)
     runs-on: ubuntu-latest

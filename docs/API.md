@@ -1,0 +1,167 @@
+# 知行图测试网 · 公开 API / Public API
+
+> 面向外部开发者与 AI 应用。基址:`https://blockchain.yeying.pub`
+> - 节点 RPC:`https://blockchain.yeying.pub/rpc/`
+> - 浏览器服务(检索、导出、正文仓库):`https://blockchain.yeying.pub/`
+>
+> 所有读取接口**公开,无需令牌**;写入接口需要 `Authorization: Bearer <写入令牌>`(令牌由组织者私下提供)。
+> 协议强制所有知识内容以 **CC BY 4.0** 许可开放:任何人可使用(含商用),只需署名。
+
+## 1. 约定
+
+| 项 | 说明 |
+|---|---|
+| 编码 | UTF-8;`Content-Type: application/json` 或 `text/plain` |
+| 数值 | u64 以**字符串**返回(如 `"height":"419273"`),避免 JS 精度丢失 |
+| 协商 | 加 `Accept: application/json` 得到 JSON;默认 `text/plain`(逐行键值,便于 grep) |
+| 分页 | 列表接口带 `?limit=`(默认 100,上限 1000)与游标 `?cursor=`;响应含 `total` 与 `cursor` |
+| 错误 | 非 2xx 时 body 为 `{"error":"..."}`(JSON)或纯文本;写入被拒常用 401(缺令牌)/409(重复)/422(规则不满足)/429(限流) |
+| 链上不存正文 | 链上只有正文的 SHA-256 哈希;正文在**正文仓库**(`/bodies/<hash>`),浏览器取回后自行校验哈希 |
+
+## 2. 链状态
+
+| 端点 | 说明 |
+|---|---|
+| `GET /rpc/height` | 当前高度 |
+| `GET /rpc/head` | 区块头哈希 |
+| `GET /rpc/genesis` | 创世摘要(genesis_hash / state_root / validators) |
+| `GET /rpc/info` | 创世摘要 + 当前高度 + head |
+| `GET /rpc/version` | 协议版本 |
+| `GET /rpc/routes` | 本节点支持的路由清单 |
+| `GET /rpc/params` | 链参数(增发基准、衰减半衰期、罚没比例等) |
+| `GET /rpc/supply` | 供应与守恒检查(`conserved`) |
+| `GET /rpc/status` | 节点存活 |
+| `GET /rpc/node` | 本节点身份与角色 |
+| `GET /rpc/config` | 本节点配置(非敏感项) |
+
+## 3. 知识(核心)
+
+### 3.1 单元目录
+
+```
+GET /rpc/units?limit=50&cursor=<id>&domain=2&layer=foundation&author=7&min_effective_bps=2000
+```
+
+| 参数 | 说明 |
+|---|---|
+| `limit` | 每页条数(默认 100) |
+| `cursor` | 上一页最后一个单元 id |
+| `domain` | 按领域筛选(1 = 大模型应用开发,2 = 运动健身) |
+| `layer` | 按层级筛选(`foundation` / `explanation` / `scenario` / `application`) |
+| `author` | 按作者账户筛选 |
+| `min_effective_bps` | 只看有效可信度不低于此值的单元(万分比,10000 = 1.0) |
+
+每项字段:`id`、`layer`、`domain`、`author`、`created_height`、`versions`、`credibility`
+(`passes` / `needs` / `self_bps` / `effective_bps` / `bottleneck` / `stale_cites`)、
+`body_hashes`(当前版本正文哈希)、`cites`(当前版本的引用:`unit` / `version` / `kind`)。
+
+> **可信度语义**:`effective_bps` = min(自身可信度, 所依据的每个单元的有效可信度)。
+> 每一位"需修改"抵消一位"通过"。`bottleneck` 指出卡住它的那条依据;`stale_cites` 指出已过时的依据。
+
+### 3.2 单元详情
+
+```
+GET /rpc/unit/{id}
+```
+
+返回该单元的全部版本:每版含 `n`、`publisher`、`published_height`、`source`
+(`human` / `model:<id>` / `model-verified:<id>`)、`bodies`(语言与哈希)、`cites`、
+`verifications`(核验人、结论、高度)、以及该版可信度。
+
+### 3.3 成员
+
+```
+GET /rpc/members?limit=100
+```
+
+每项:`id`、`joined_height`、`inviter`(0 = 创世成员)、`last_invite_height`、`established`
+(是否已过见习期)。**已过见习期**的成员其核验才计入可信度。
+
+### 3.4 全文检索(浏览器服务)
+
+```
+GET /search?q=<关键词>&domain=2&layer=foundation&limit=50
+```
+
+跨**标题与正文**检索(正文在正文仓库,链上只有哈希)。中文按单字与双字组合匹配,英文按词匹配。
+返回:`items[]`(`id`、`title`、`excerpt` 摘要、`body_url`、`credibility`、`score` 命中分,标题命中加权)。
+
+### 3.5 导出(浏览器服务)
+
+```
+GET /export/units
+```
+
+JSONL:第一行是元数据(许可、来源、单元数),其后每行一个单元,含**正文全文**与链上信息
+(`id`、`layer`、`domain`、`author`、`cites`、`credibility`、`license`、`bodies[]`)。
+正文缺失时 `text` 为 `null`(链上哈希仍在,可据此去正文仓库取)。
+
+> 用途:喂给大模型训练、做检索索引、做离线分析。许可为 CC BY 4.0,署名即可。
+
+### 3.6 正文仓库
+
+```
+GET  /bodies/<sha256>          公开;内容寻址,永不变化
+PUT  /bodies/<sha256>          需写入令牌;服务端校验 sha256(body) == <sha256>,不符则 422
+```
+
+浏览器取回正文后会**重新计算哈希**并与链上比对,一致才显示。
+
+## 4. 链上其他只读目录
+
+| 端点 | 内容 |
+|---|---|
+| `GET /rpc/validators` | 验证人集(id、权力、公钥) |
+| `GET /rpc/accounts` | 账户目录(余额、质押、收益、提交数) |
+| `GET /rpc/account/{id}` | 单个账户 |
+| `GET /rpc/reviewers` | 审阅人目录(声誉) |
+| `GET /rpc/cnfts` | cNFT 贡献证书 |
+| `GET /rpc/proposals` | 治理提案 |
+| `GET /rpc/bonds` | 质押绑定 |
+| `GET /rpc/unbonding` | 解绑队列 |
+| `GET /rpc/stake-ops` | 待处理质押操作 |
+| `GET /rpc/evidence` | 待处理的双签证据 |
+| `GET /rpc/peers` | 已连接对端 |
+| `GET /rpc/mempool` | 内存池 |
+| `GET /rpc/graph` | 旧版认知图谱(嵌入向量图;测试网已关闭 ΔK 提交,通常为空) |
+| `GET /rpc/bridge/locks` | 跨链锁 |
+
+## 5. 区块与证明
+
+| 端点 | 说明 |
+|---|---|
+| `GET /rpc/block/{height}` | 区块摘要 |
+| `GET /rpc/block/{height}/txs` | 区块内交易 |
+| `GET /rpc/tx/{hash}` | 交易是否已上链 |
+| `GET /rpc/tx/{hash}/detail` | 交易详情 |
+| `GET /rpc/header/{height}` | 认证区块头(certified header) |
+| `GET /rpc/headers?limit=&from=` | 批量取头(轻客户端同步) |
+| `GET /rpc/account/{id}/proof` | 账户的 Merkle 包含证明 |
+| `GET /rpc/leaf/account/{id}` | 证明叶 |
+| `GET /rpc/graph/{id}/proof`、`/rpc/cnft/{id}/proof`、`/rpc/reviewer/{id}/proof`、`/rpc/bridge/lock/{id}/proof` | 各实体的包含证明 |
+
+轻客户端可用 `header + cert + proof` 离线验证:头由 2/3 投票权证书背书,证明可对着头里的
+`accounts_root` / `next_validators_root` 复核,无需重放整条链。
+
+## 6. 写入(需要令牌)
+
+```
+POST /rpc/knowledge        知识操作(create / publish / verify / invite)
+```
+
+请求体是 op 的规范编码(二进制),不是 JSON;`Authorization: Bearer <写入令牌>`。
+**每个操作必须用你自己的密钥签名**,令牌只防刷写入,不能代替签名。
+
+各操作的可执行工具(在仓库里):
+- 浏览器:https://blockchain.yeying.pub 的「我的身份」与单元页(核验、邀请、写作、修订);
+- 命令行:`node encode-knowledge-op` + `node rpc --path /knowledge --post`。
+
+## 7. 限流
+
+nginx 按读写分开限流:**写入 5 次/秒/IP**(突发 20),**读取 50 次/秒/IP**(突发 300)。
+超限返回 `429`。打开一个知识页会同时发出几十个读请求,读额度为此留足。
+
+## 8. 稳定性
+
+接口形状在测试网期间**可能变**(这是测试网)。破坏性变更会写进本文件与
+`docs/design/`。依赖读取接口的应用请用 `?format=json` 并对未知字段保持宽容。

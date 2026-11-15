@@ -26,7 +26,7 @@ fuzz_target!(|data: &[u8]| {
     };
     // Keep this list in sync with `node/fuzz/README.md` and the stable fuzz-lite test.
     // The `% N` dispatch means new decoders only need an arm appended (N auto-grows).
-    match sel % 29 {
+    match sel % 30 {
         0 => {
             let _ = codec::decode_header(b);
         }
@@ -115,6 +115,9 @@ fuzz_target!(|data: &[u8]| {
         28 => {
             let _ = codec::decode_block(b);
         }
-        _ => unreachable!("sel % 29 is always 0..=28"),
+        29 => {
+            let _ = codec::decode_knowledge_op(b);
+        }
+        _ => unreachable!("sel % 30 is always 0..=29"),
     }
 });

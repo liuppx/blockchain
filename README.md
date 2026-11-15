@@ -393,6 +393,7 @@ python3 sim/run.py --compare  # baseline 场景 Python vs Rust 后端对比
 ./cmd bond      # 账户1(=验证人+评议人)绑定质押,使其治理投票有权重
 ./cmd unbond    # 解绑质押 → 进入解绑队列(冷却后释放,见浏览器 Staking 页)
 ./cmd propose 1 base_emission=12000000  # 发起治理提案 · ./cmd vote 1 <id> true 投票 · ./cmd gov 查看
+./cmd knowledge # 导入运动健身试运行知识单元 · ./cmd kverify 2 <unit> 核验 · ./cmd units 看链上可信度
 ./cmd status    # 看高度 / 供应
 ./cmd down      # 停止   ·   ./cmd reset 清空 .localnet 重来
 ```
@@ -436,7 +437,7 @@ cargo test --release                                 # 647 项单元测试（见
 
 ## 里程碑变更日志（M6–M171）
 
-截至 M239，node 有 **768** 项单元测试（707 lib + 61 bin，另 2 个 `#[ignore]`），engine 另有 **11** 项。生产就绪自评见 [`docs/PRODUCTION-READINESS-2026-11.md`](docs/PRODUCTION-READINESS-2026-11.md)（结论:受控/许可制测试网可行,高价值主网前仍需独立审计 + 经济校准 + 规模化测试）。早期里程碑（M6–M23）主题：确定性/守恒/回滚/持久化/Merkle/BFT/认证链/最终性复验/动态验证人集/P2P gossip/质押绑定/等价双签罚没/块级 ops 走 gossip/轻客户端跟随验证人集/验证人集 Merkle 承诺入头/头部轻同步传输/钱包 SPV 账户证明。此后逐里程碑：
+截至 K7，node 有 **793** 项单元测试（731 lib + 62 bin，另 2 个 `#[ignore]`），engine 另有 **11** 项。生产就绪自评见 [`docs/PRODUCTION-READINESS-2026-11.md`](docs/PRODUCTION-READINESS-2026-11.md)（结论:受控/许可制测试网可行,高价值主网前仍需独立审计 + 经济校准 + 规模化测试）。早期里程碑（M6–M23）主题：确定性/守恒/回滚/持久化/Merkle/BFT/认证链/最终性复验/动态验证人集/P2P gossip/质押绑定/等价双签罚没/块级 ops 走 gossip/轻客户端跟随验证人集/验证人集 Merkle 承诺入头/头部轻同步传输/钱包 SPV 账户证明。此后逐里程碑：
 
 - **M24** 泛化批量化证明请求总线：Account/Reviewer/Validator 同一 GetProof 对、单一 verify_proof_against_header 验证器、reviewer_proof 闭合审阅人路径、MAX_PROOF_BATCH=32 上限
 - **M25** 图节点 cert-signed 包含证明

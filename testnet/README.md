@@ -54,6 +54,37 @@ testnet/soak.sh [DURATION_S=180] [INTERVAL_S=10] [LAG=2] [LEAK_PCT=50] [load]
 默认 **4 验证人**(id 21–24,容 1 拜占庭)+ **3 个有余额账户**(id 1–3,tx 作者)+
 3 个评议人(id 10–12)。`gen.sh -n 7 -a 5` 改规模;`--force` 重新生成(**销毁**旧密钥)。
 
+### 知识单元(测试网阶段 1,K7)
+
+`gen.sh` 生成的创世带 `[knowledge]` 段:登记领域 1(大模型应用开发)与 2(运动健身),**关闭旧的 ΔK 提交路径**
+(`legacy_submissions = false`,自报嵌入向量可被操纵,VISION Q7)。时长默认取正式值:**见习期 7 天**(604,800 块)、
+**邀请冷却 1 天**(86,400 块),按每秒一块折算;`gen.sh --drill` 改为 60 / 30 块,便于快速演练邀请。
+
+#### 用第一批成员的公钥开链
+
+成员按 [`MEMBERS.md`](MEMBERS.md) 自己生成密钥,只把公钥发给组织者。组织者把名单填进
+`testnet/members.toml`(格式见 [`members.example.toml`](members.example.toml);该文件含称呼,已加入 .gitignore),然后:
+
+```sh
+testnet/gen.sh --members testnet/members.toml --force    # 账户 1..N = 名单顺序,不生成任何成员密钥
+```
+
+生成时会校验每个公钥(64 位十六进制、不重复)与方向(fitness / llm);称呼只写入链下名单
+`testnet/out/members.md`,不上链。第一批成员即创世成员,不需要见习期;之后加入的人由他们邀请,须经见习期。
+实测:两名成员各用自己的密钥文件,一人创建单元、另一人核验,可信度 0.1 → 0.4;组织者全程不接触任何成员私钥。
+
+```sh
+# 把运动健身试运行单元导入测试网(作者为账户 1,经令牌保护的 /knowledge 提交,从加密 keystore 签名)
+ZHIXING_KEYSTORE_PASSWORD=$(cat testnet/out/password) python3 tools/kimport.py \
+  --dir docs/pilot/fitness --domain 2 --config testnet/out/n21/node.toml \
+  --rpc http://127.0.0.1:9221 --key "1=testnet/out/keys/acct1.json"
+curl -s http://127.0.0.1:9221/units      # 任一节点:单元列表与链上可信度
+```
+
+实测(2026-11-08):6 个单元导入后,4 个节点的 `/units` 逐字节一致;`soak.sh load` 的写负载改为知识 op
+(每采样创建一个单元),5/5 入块,状态根与供应跨节点一致;`chaos.sh` 崩溃容错、失去法定数停摆、只重启被杀节点
+自动恢复全部通过,恢复后 4 个节点的知识状态仍逐字节一致;旧 ΔK 提交被拒(`422 this chain does not accept legacy ΔK submissions`)。
+
 ### 远程签名器(M219)
 
 `gen.sh --signer 24`(可多个:`--signer 23,24`)让这些验证人经**进程外 `node signer`**

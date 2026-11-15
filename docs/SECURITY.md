@@ -55,7 +55,7 @@ RUSTFLAGS="-D warnings" cargo test --release --no-run     # 零编译告警
 # 其中位锚点测(见 §6)验证共识浮点逐位一致。
 ```
 
-- 测试总数:**node 768(707 lib + 61 bin)+ engine 11**,全绿。2 个 `#[ignore]`(config 的
+- 测试总数:**node 796(734 lib + 62 bin)+ engine 11**,全绿。2 个 `#[ignore]`(config 的
   环境依赖测;M213 的 `seed_fuzz_corpus` 语料生成器,均非安全相关)。
 - `unsafe`:**全仓非测试代码 0 处**(`grep -rn unsafe engine/src node/src`)。
 - 无 `cargo-audit` 门禁(当前 advisory,依赖树未确认无 RUSTSEC —— 见 §10)。
@@ -192,13 +192,13 @@ RUSTFLAGS="-D warnings" cargo test --release --no-run     # 零编译告警
 ## 9. wire 代际 & 快照版本
 
 - **区块/头 wire**:B2 → B3(M171 桥 unbond)→ B4(M179 密钥轮换)→ B5(M185 `contributions_root`
-  前缀根)→ B6(M194 治理 op 尾承诺)→ **B7(SEC-05 `unbonding_root` 前缀根)**。per-body 承诺尾
-  追加(前缀稳定);B5/B7 加前缀根(硬断)。`decode_certified_header` 固定前缀 **284B** + 10×32B
+  前缀根)→ B6(M194 治理 op 尾承诺)→ B7(SEC-05 `unbonding_root` 前缀根)→ **B8(测试网阶段 1 知识单元 op 尾承诺)**。per-body 承诺尾
+  追加(前缀稳定);B5/B7 加前缀根(硬断)。`decode_certified_header` 固定前缀 **284B** + 11×32B
   承诺尾。M192 起握手协商 `PROTOCOL_VERSION`,不匹配**显式拒连**(不再静默 mis-parse);
-  **M221 起协商为版本区间** `[MIN_WIRE_VERSION, PROTOCOL_VERSION]`(当前均为 3),取双方最高公共
+  **M221 起协商为版本区间** `[MIN_WIRE_VERSION, PROTOCOL_VERSION]`(B8 起均为 4),取双方最高公共
   版本、无交集则拒连——为滚动升级铺路(见 [`docs/design/rolling-upgrade.md`](design/rolling-upgrade.md);
   握手由 4 字节单值改 8 字节区间是一次性引导破坏)。
-- **快照版本**:`SNAPSHOT_VERSION` 当前 **5**(v3 加 cNFT、v4 加 time_decay、v5 加治理提案)。
+- **快照版本**:`SNAPSHOT_VERSION` 当前 **7**(v3 加 cNFT、v4 加 time_decay、v5 加治理提案、v6 加验证人权力占比上限、v7 加知识模块状态)。
   旧版严格拒绝。
 - **升级**:当前只支持"同版本运行 / 异版本干净拒连",**不支持多版本并存滚动升级**(需多 wire
   解码器)。wire 破坏需协调停机 + 重新 snap。
@@ -218,7 +218,7 @@ RUSTFLAGS="-D warnings" cargo test --release --no-run     # 零编译告警
    fail-closed;见 [`docs/design/remote-signer.md`](design/remote-signer.md) 与 DEPLOYMENT §2b。
    仍无 HSM/云 KMS 后端(远程签名器为本地 socket 参考实现)。
 4. **治理刚上线**(M193–198),未经对抗/洪流/临界票数压测。
-5. **无长跑/网络分区/混沌测**;fuzz 有两层:always-on 的 "fuzz-lite"(确定性 PRNG 轰全部 29 个
+5. **无长跑/网络分区/混沌测**;fuzz 有两层:always-on 的 "fuzz-lite"(确定性 PRNG 轰全部 30 个
    `decode_*` 入口,stable CI 门禁)+ **M213 cargo-fuzz**(`node/fuzz/` libFuzzer `decode_all`
    多路目标 + 提交的种子语料,nightly CI advisory 跑;见 `node/fuzz/README.md`)。**M231 起**补
    `testnet/chaos.sh`:对 4 验证人测试网注入**崩溃容错**(杀少数、存活 >2/3 继续出块且不分叉)、
@@ -276,6 +276,12 @@ RUSTFLAGS="-D warnings" cargo test --release --no-run     # 零编译告警
     quorum。**残余**:① 豁免的既有验证人若**后续**增绑超 1/3 再下线仍可影响活性(范围窄,与 §10.2 活性问责
     重叠);② `0` 默认为向后兼容,运营方须**显式**在创世启用;③ 治理动态调参(`GovParam`)为后续项。属
     **已缓解的已知边界**。
+
+12. **既有 op 的签名字节没有域分隔**(2026-11-08 实现知识 op 时发现,纵深防御缺口,未发现可利用路径)。
+    质押、治理、密钥轮换、桥等 op 的签名字节只是各自字段的拼接,不带类型前缀。理论上,若两种 op 的签名字节
+    在长度与布局上恰好一致,一种 op 的签名可被当作另一种 op 的签名重放。目前各 op 的字段长度与布局基本不同,
+    未构造出实际碰撞。**新增的知识 op 已带域前缀** `zhixing-knowledge-op-v1`;既有 op 补域前缀属线上格式变更,
+    建议随测试网的协议版本 4 一并完成。
 
 ## 11. 负责任披露
 

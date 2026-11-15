@@ -11,17 +11,15 @@
 #   - NO LEAK         each node's RSS grows < LEAK_PCT% over the whole run
 #   - CLEAN LOGS      no error/panic lines appear in any node log during the run
 #
-# Load-free: relies on the create_empty_blocks heartbeat (testnet default) so thousands of
-# blocks flow with no tx authoring. A tx-LOAD soak additionally needs raw-seed accounts
-# (testnet ships encrypted keystores, which `encode-tx --key-file` can't consume) — tracked
-# as a follow-up. Real pre-mainnet soak = hours/days; this is a repeatable minutes-scale gate.
+# Default is load-free: the create_empty_blocks heartbeat keeps blocks flowing with no writes.
+# Real pre-mainnet soak = hours/days; this is a repeatable minutes-scale gate.
 #
-# M234: pass `load` as the 5th arg to drive REAL write load — each sample authors a knowledge
-# submission tx from a genesis account's encrypted keystore (M233) and POSTs it to the first
-# node's bearer-gated write face via `submit-tx` (the CLI now sends the configured RPC token,
-# M234). A tx is pure PoK load: it mints/credits but NEVER mutates the validator set, so the
-# chain can't be wedged by the load itself (bonding WOULD — a bond instantly becomes validator
-# power, see SECURITY.md §10.11; that is why load uses txs, not stake-ops).
+# Pass `load` as the 5th arg to drive REAL write load. Since K7 the load is knowledge ops — the
+# testnet's actual workload (its genesis turns the legacy ΔK path off): each sample a genesis
+# account creates a knowledge unit with a unique body hash, signed from its encrypted keystore
+# (M233) and POSTed to the bearer-gated /knowledge endpoint (the CLI sends the configured RPC
+# token, M234); the nonce is read from the chain. Knowledge ops never mint, move money, or touch
+# the validator set, so the load itself cannot wedge the chain (a bond could — SECURITY §10.11).
 #
 #   testnet/soak.sh [DURATION_S=180] [INTERVAL_S=10] [LAG=2] [LEAK_PCT=50] [load]
 set -euo pipefail
@@ -36,7 +34,6 @@ LAG="${3:-2}"          # trailing height offset for agreement checks (avoid tip 
 LEAK_PCT="${4:-50}"    # max tolerated RSS growth over the run, percent
 LOAD="${5:-}"          # "load" ⇒ submit a knowledge tx each sample (needs keystore password)
 LOAD_ACCT=2            # genesis account (funded, non-validator) whose keystore authors the tx
-LOAD_REVIEWER=10       # a genesis reviewer id (reputation weight)
 loadok=0; loadtry=0    # loadok doubles as the next tx nonce (== account 2's accepted count)
 
 if [ "$LOAD" = load ]; then
@@ -107,16 +104,17 @@ while [ $SECONDS -lt $deadline ]; do
   loadnote=""
   if [ "$LOAD" = load ]; then
     loadtry=$((loadtry + 1))
-    nonce=$loadok                       # account 2's next nonce == its accepted-tx count
-    dim=$(( nonce % 8 ))                 # rotate a unit-vector embedding to stay novel (ΔK>0)
-    emb=""; for k in 0 1 2 3 4 5 6 7; do [ "$k" = "$dim" ] && emb="$emb${emb:+,}1" || emb="$emb${emb:+,}0"; done
-    # author from the encrypted keystore (M233); submit-tx sends the config bearer token (M234).
-    # A knowledge tx mints/credits but never touches the validator set — safe sustained load.
-    if "$BIN" encode-tx --key-file "$OUT/keys/acct$LOAD_ACCT.json" --out "$OUT/.soak-load.bin" \
-         --author "$LOAD_ACCT" --domain 1 --embedding "$emb" --review "$LOAD_REVIEWER:0.9" \
-         --repl-success 3 --repl-total 3 --timestamp-days 1.0 --stake 2000000 --fee 0 \
-         --nonce "$nonce" >/dev/null 2>&1 \
-       && "$BIN" submit-tx --config "$OUT/n${ids[0]}/node.toml" --tx "$OUT/.soak-load.bin" >/dev/null 2>&1; then
+    # K7: the testnet's real write load is knowledge ops (the legacy ΔK path is off). Each sample
+    # account LOAD_ACCT creates a knowledge unit with a unique body hash, signed from its encrypted
+    # keystore (M233) and POSTed to the bearer-gated /knowledge endpoint (token from config, M234).
+    # The nonce is read from the chain (`/account/{id}` exposes it since K6).
+    nonce=$(curl -s -H "Accept: application/json" "http://127.0.0.1:92${ids[0]}/account/$LOAD_ACCT" \
+      | sed -E 's/.*"nonce":"([0-9]+)".*/\1/')
+    body=$(printf 'soak-%s-%s' "$samples" "$RANDOM" | shasum -a 256 | awk '{print $1}')
+    if "$BIN" encode-knowledge-op --key-file "$OUT/keys/acct$LOAD_ACCT.json" --out "$OUT/.soak-load.bin" \
+         --actor "$LOAD_ACCT" --nonce "$nonce" --action create --layer foundation --domain 2 \
+         --body "zh:$body" --source human >/dev/null 2>&1 \
+       && "$BIN" rpc --config "$OUT/n${ids[0]}/node.toml" --path /knowledge --post "$OUT/.soak-load.bin" >/dev/null 2>&1; then
       loadok=$((loadok + 1)); loadnote=" | load $loadok/$loadtry ok"
     else
       loadnote=" | load submit FAILED ($loadok/$loadtry ok)"
@@ -141,7 +139,7 @@ done
 rm -f "$OUT/.soak-load.bin"
 if [ "$LOAD" = load ]; then
   [ "$loadok" -gt 0 ] || { echo "SOAK FAILED: load mode on but 0/$loadtry writes landed" >&2; exit 1; }
-  echo "OK: soak passed under write load ($loadok/$loadtry knowledge txs accepted) — liveness, no fork/drift, supply conserved+identical, no leak, clean logs"
+  echo "OK: soak passed under write load ($loadok/$loadtry knowledge ops accepted) — liveness, no fork/drift, supply conserved+identical, no leak, clean logs"
 else
   echo "OK: soak passed — liveness, no fork/drift, supply conserved+identical, no leak, clean logs"
 fi

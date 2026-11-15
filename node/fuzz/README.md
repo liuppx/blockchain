@@ -34,8 +34,8 @@ growth that meaningfully improves coverage; prune with `cargo +nightly fuzz cmin
 
 ## Target shape
 
-`decode_all` is **multiplexed**: input byte 0 selects a decoder (`sel % 29`), the rest is the
-frame. One corpus hammers all 29 parsers and mutations cross-pollinate between them. Adding a
+`decode_all` is **multiplexed**: input byte 0 selects a decoder (`sel % 30`), the rest is the
+frame. One corpus hammers all 30 parsers and mutations cross-pollinate between them. Adding a
 new `decode_*` is a one-line arm in [`fuzz_targets/decode_all.rs`](fuzz_targets/decode_all.rs)
 (the modulus auto-grows).
 

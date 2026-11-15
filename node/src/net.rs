@@ -92,6 +92,9 @@ pub enum GossipMsg {
     /// M195: gossip one signed governance vote — same flood/dedup pattern. Admitted
     /// into a block where `apply_gov_vote` checks sig + nonce + the open window.
     GovVote(Box<GovVote>),
+    /// K4(测试网阶段 1):一条已签名的知识 op(创建单元 / 发布版本 / 核验 / 邀请),
+    /// 与治理 op 相同的泛洪 / 去重 / 待处理池模式。
+    KnowledgeOp(Box<crate::knowledge::KnowledgeOp>),
     /// "Send me cert-signed BLOCK HEADERS (no bodies) from this height onward."
     /// The light-sync analogue of `GetBlocks` (M22). A light client announces
     /// its height with `Status`; on seeing a peer ahead, it sends `GetHeaders`
@@ -229,6 +232,11 @@ pub const MAX_PENDING_GOV: usize = 4096;
 /// fill the pool with future-nonce ops nor crowd out other accounts' current-nonce
 /// ops — reaching `MAX_PENDING_GOV` takes `MAX_PENDING_GOV / 16` distinct accounts.
 pub const MAX_PENDING_GOV_PER_ACCOUNT: usize = 16;
+
+/// K4:知识 op 待处理池的全局上限(与治理池同一取值与理由)。
+pub const MAX_PENDING_KNOWLEDGE: usize = 4096;
+/// K4:每个账户在知识 op 待处理池中的配额。结合序号窗口,单个账户无法占满全局池。
+pub const MAX_PENDING_KNOWLEDGE_PER_ACCOUNT: usize = 16;
 /// SEC-01 (re-verify): hard default bound (FIFO) for the governance / key-rotation dedup
 /// caches, applied at construction so they are never unbounded even when `[mempool]
 /// seen_cache` is left at its `0` (unbounded) default. Governance is low-volume, so a
@@ -283,6 +291,8 @@ pub const TAG_KEYROTATION: u8 = 20;
 pub const TAG_GOVPROPOSAL: u8 = 21;
 /// M195: governance vote op gossip.
 pub const TAG_GOVVOTE: u8 = 22;
+/// K4:知识 op 的 gossip 标签。
+pub const TAG_KNOWLEDGE_OP: u8 = 23;
 
 /// M29: maximum items in a single heterogeneous batched
 /// request/response. Mirrors `MAX_PROOF_BATCH = 32` so the bus caps
@@ -462,6 +472,7 @@ pub struct GossipNode {
     /// M195: content hashes of governance proposals / votes already seen — dedup.
     seen_gov_proposal: SeenSet,
     seen_gov_vote: SeenSet,
+    seen_knowledge: SeenSet,
     /// Evidence staged to be carried by the next block this node proposes
     /// (drained by the driver via [`Self::take_pending_evidence`]).
     pending_evidence: Vec<SlashEvidence>,
@@ -472,6 +483,7 @@ pub struct GossipNode {
     /// M195: governance proposals / votes staged for the next block this node proposes.
     pending_gov_proposals: Vec<GovProposal>,
     pending_gov_votes: Vec<GovVote>,
+    pending_knowledge_ops: Vec<crate::knowledge::KnowledgeOp>,
     /// Known peer ids (iterated in sorted order for deterministic output).
     peers: BTreeSet<u64>,
     /// M212: local liveness-observability window (NOT consensus state; see
@@ -503,11 +515,13 @@ impl GossipNode {
             seen_key_rotation: SeenSet::bounded(DEFAULT_OP_SEEN_CAP),
             seen_gov_proposal: SeenSet::bounded(DEFAULT_OP_SEEN_CAP),
             seen_gov_vote: SeenSet::bounded(DEFAULT_OP_SEEN_CAP),
+            seen_knowledge: SeenSet::bounded(DEFAULT_OP_SEEN_CAP),
             pending_evidence: Vec::new(),
             pending_stake_ops: Vec::new(),
             pending_key_rotations: Vec::new(),
             pending_gov_proposals: Vec::new(),
             pending_gov_votes: Vec::new(),
+            pending_knowledge_ops: Vec::new(),
             peers: peers.into_iter().filter(|&p| p != id).collect(),
             liveness: LivenessTracker::default(),
         }
@@ -548,11 +562,13 @@ impl GossipNode {
             seen_key_rotation: SeenSet::bounded(DEFAULT_OP_SEEN_CAP),
             seen_gov_proposal: SeenSet::bounded(DEFAULT_OP_SEEN_CAP),
             seen_gov_vote: SeenSet::bounded(DEFAULT_OP_SEEN_CAP),
+            seen_knowledge: SeenSet::bounded(DEFAULT_OP_SEEN_CAP),
             pending_evidence: Vec::new(),
             pending_stake_ops: Vec::new(),
             pending_key_rotations: Vec::new(),
             pending_gov_proposals: Vec::new(),
             pending_gov_votes: Vec::new(),
+            pending_knowledge_ops: Vec::new(),
             peers: peers.into_iter().filter(|&p| p != id).collect(),
             liveness: LivenessTracker::default(),
         }
@@ -648,6 +664,9 @@ impl GossipNode {
     pub fn pending_gov_votes(&self) -> &[GovVote] {
         &self.pending_gov_votes
     }
+    pub fn pending_knowledge_ops(&self) -> &[crate::knowledge::KnowledgeOp] {
+        &self.pending_knowledge_ops
+    }
 
     /// M212: local liveness-observability snapshot — `(window_samples, [(validator_id,
     /// missed_commits)])` for every **current** validator, sorted by id. `window_samples`
@@ -682,6 +701,7 @@ impl GossipNode {
             || !self.pending_key_rotations.is_empty()
             || !self.pending_gov_proposals.is_empty()
             || !self.pending_gov_votes.is_empty()
+            || !self.pending_knowledge_ops.is_empty()
     }
 
     /// Drain staged evidence, transferring it to a block builder (e.g. a
@@ -708,6 +728,9 @@ impl GossipNode {
     }
     pub fn take_pending_gov_votes(&mut self) -> Vec<GovVote> {
         std::mem::take(&mut self.pending_gov_votes)
+    }
+    pub fn take_pending_knowledge_ops(&mut self) -> Vec<crate::knowledge::KnowledgeOp> {
+        std::mem::take(&mut self.pending_knowledge_ops)
     }
 
     /// Preload an already-certified chain (e.g. a seed node handing out history).
@@ -1395,6 +1418,13 @@ impl GossipNode {
             self.pending_gov_votes
                 .retain(|op| !committed.contains(&op.hash()));
         }
+        // K4:同理,丢弃已入块的知识 op。
+        if !block.knowledge_ops.is_empty() {
+            let committed: std::collections::HashSet<[u8; 32]> =
+                block.knowledge_ops.iter().map(|op| op.hash()).collect();
+            self.pending_knowledge_ops
+                .retain(|op| !committed.contains(&op.hash()));
+        }
         // SEC-01 (round 3): the block just applied may have advanced account nonces
         // (via any op type) or matured proposals, so staged gov ops that can now never
         // apply are dropped here instead of holding pool slots until eviction. Cheap:
@@ -1405,6 +1435,9 @@ impl GossipNode {
                 .retain(|op| state.gov_proposal_not_stale(op));
             self.pending_gov_votes
                 .retain(|op| state.gov_vote_not_stale(op));
+            // K4:序号已落在窗口之外的知识 op 永远无法执行,丢弃。
+            self.pending_knowledge_ops
+                .retain(|op| state.knowledge_op_not_stale(op));
             // SEC-01 (round 5): a key rotation in this block replaced the account's
             // pubkey, so its queued ops signed by the OLD key are still inside the nonce
             // window (rotation bumps the nonce by one) yet can never verify at apply.
@@ -1418,6 +1451,10 @@ impl GossipNode {
                 });
                 self.pending_gov_votes.retain(|op| {
                     !rotated.contains(&op.voter) || state.gov_vote_admissible(op).is_ok()
+                });
+                // K4:被轮换密钥的账户,其旧密钥签名的知识 op 无法再验签,重跑完整准入。
+                self.pending_knowledge_ops.retain(|op| {
+                    !rotated.contains(&op.actor) || state.knowledge_op_admissible(op).is_ok()
                 });
             }
         }
@@ -1470,6 +1507,7 @@ impl GossipNode {
                 key_rotations: Vec::new(),
                 gov_proposals: Vec::new(),
                 gov_votes: Vec::new(),
+                knowledge_ops: Vec::new(),
             });
         // M235: include only stake-ops that apply cleanly AND don't trip the §10.11 share cap,
         // so a stale/over-cap bond can't make the whole candidate unsealable and stall
@@ -1487,6 +1525,13 @@ impl GossipNode {
             self.chain.state.height + 1,
             &self.pending_gov_proposals,
             &self.pending_gov_votes,
+        );
+        // K4:知识 op 在治理 op 之后执行、共用账户序号,所以在已选入的治理 op 之上过滤。
+        candidate.knowledge_ops = self.chain.state.filter_applicable_knowledge(
+            self.chain.state.height + 1,
+            &gp,
+            &gv,
+            &self.pending_knowledge_ops,
         );
         candidate.gov_proposals = gp;
         candidate.gov_votes = gv;
@@ -1561,6 +1606,7 @@ impl GossipNode {
         self.seen_key_rotation.set_capacity(capacity);
         self.seen_gov_proposal.set_capacity(capacity);
         self.seen_gov_vote.set_capacity(capacity);
+        self.seen_knowledge.set_capacity(capacity);
     }
 
     /// M55: current number of entries in the tx dedup set (the one under flood
@@ -1648,6 +1694,78 @@ impl GossipNode {
     ) -> Result<Vec<(u64, GossipMsg)>, ChainError> {
         self.admit_gov_vote(&op)?;
         Ok(self.broadcast(GossipMsg::GovVote(Box::new(op)), None))
+    }
+
+    /// K4:暂存一条本地创建的知识 op 并泛洪。与 gossip 入口走同一个准入函数
+    /// ([`Self::admit_knowledge_op`]),结构化的 `Err` 告诉调用方(RPC)为什么没有入池。
+    pub fn submit_local_knowledge_op(
+        &mut self,
+        op: crate::knowledge::KnowledgeOp,
+    ) -> Result<Vec<(u64, GossipMsg)>, ChainError> {
+        self.admit_knowledge_op(&op)?;
+        Ok(self.broadcast(GossipMsg::KnowledgeOp(Box::new(op)), None))
+    }
+
+    /// K4:知识 op 待处理池的唯一准入路径(gossip 与本地 / RPC 共用),完全沿用治理池经五轮
+    /// 审计加固后的顺序:有效性(结构 / 签名 / 成员 / 序号窗口)→ 按账户配额 → 全局上限 →
+    /// 去重 → 入池。容量在去重插入之前检查,满池时不占用 `seen` 槽位。当前序号(可立即执行)
+    /// 的 op 在配额满或池满时,可以淘汰停放最远的超前序号 op,不会被它们饿死。
+    fn admit_knowledge_op(&mut self, op: &crate::knowledge::KnowledgeOp) -> Result<(), ChainError> {
+        self.chain.state.knowledge_op_admissible(op)?;
+        let current = self
+            .chain
+            .state
+            .accounts
+            .get(&op.actor)
+            .is_some_and(|a| a.nonce == op.nonce);
+        let mine = self
+            .pending_knowledge_ops
+            .iter()
+            .filter(|p| p.actor == op.actor)
+            .count();
+        if mine >= MAX_PENDING_KNOWLEDGE_PER_ACCOUNT
+            && !(current && self.evict_furthest_future_knowledge(Some(op.actor)))
+        {
+            return Err(ChainError::KnowledgeAccountQuotaExceeded {
+                account: op.actor,
+                limit: MAX_PENDING_KNOWLEDGE_PER_ACCOUNT,
+            });
+        }
+        if self.pending_knowledge_ops.len() >= MAX_PENDING_KNOWLEDGE
+            && !(current && self.evict_furthest_future_knowledge(None))
+        {
+            return Err(ChainError::KnowledgePoolFull);
+        }
+        if !self.seen_knowledge.insert(op.hash()) {
+            return Err(ChainError::KnowledgeAlreadySeen);
+        }
+        self.pending_knowledge_ops.push(op.clone());
+        Ok(())
+    }
+
+    /// K4:淘汰(可限定某账户的)序号最超前的知识 op,平局取最早入池者;其哈希从去重缓存移除,
+    /// 主人有空位时可重新提交。若所有候选都在当前序号(没有"停放"的),返回 false。
+    fn evict_furthest_future_knowledge(&mut self, account: Option<u64>) -> bool {
+        let state = &self.chain.state;
+        let victim = self
+            .pending_knowledge_ops
+            .iter()
+            .enumerate()
+            .filter(|(_, p)| account.is_none_or(|a| p.actor == a))
+            .filter_map(|(i, p)| {
+                let cur = state.accounts.get(&p.actor)?.nonce;
+                (p.nonce > cur).then_some((p.nonce - cur, i))
+            })
+            .max_by_key(|&(d, i)| (d, std::cmp::Reverse(i)))
+            .map(|(_, i)| i);
+        match victim {
+            Some(i) => {
+                let gone = self.pending_knowledge_ops.remove(i);
+                self.seen_knowledge.remove(&gone.hash());
+                true
+            }
+            None => false,
+        }
     }
 
     /// SEC-01 (round 3): the single admission path into the governance proposal pool,
@@ -1798,6 +1916,12 @@ impl GossipNode {
         self.seen_gov_proposal.len()
     }
 
+    /// Test-only: size of the knowledge-op dedup cache.
+    #[cfg(test)]
+    pub(crate) fn seen_knowledge_len(&self) -> usize {
+        self.seen_knowledge.len()
+    }
+
     /// The gossip a node emits to announce its current height (anti-entropy tick).
     pub fn announce(&self) -> Vec<(u64, GossipMsg)> {
         self.broadcast(
@@ -1843,6 +1967,7 @@ impl GossipNode {
             GossipMsg::KeyRotation(op) => self.on_key_rotation(from, op),
             GossipMsg::GovProposal(op) => self.on_gov_proposal(from, *op),
             GossipMsg::GovVote(op) => self.on_gov_vote(from, *op),
+            GossipMsg::KnowledgeOp(op) => self.on_knowledge_op(from, *op),
             // M22: a full node answers `GetHeaders` with its retained
             // cert-signed headers. If we receive `Headers(...)` directly
             // (e.g. from a peer that pushes), drop them — full nodes don't
@@ -2043,6 +2168,18 @@ impl GossipNode {
         self.broadcast(GossipMsg::GovVote(Box::new(op)), Some(from))
     }
 
+    /// K4:去重 + 入池 + 转发一条 gossip 来的知识 op。被拒或重复的 op 静默丢弃,不入池也不转发。
+    fn on_knowledge_op(
+        &mut self,
+        from: u64,
+        op: crate::knowledge::KnowledgeOp,
+    ) -> Vec<(u64, GossipMsg)> {
+        if self.admit_knowledge_op(&op).is_err() {
+            return Vec::new();
+        }
+        self.broadcast(GossipMsg::KnowledgeOp(Box::new(op)), Some(from))
+    }
+
     /// Address `msg` to every peer, optionally excluding one (the sender), in
     /// sorted order for deterministic output.
     fn broadcast(&self, msg: GossipMsg, except: Option<u64>) -> Vec<(u64, GossipMsg)> {
@@ -2128,6 +2265,15 @@ impl Network {
     /// M195: submit a governance proposal / vote at `id` and flood it. Panics if the
     /// op is not admitted (test-bus helper; tests that exercise rejection call
     /// `submit_local_gov_*` on the node directly).
+    pub fn submit_knowledge_op(&mut self, id: u64, op: crate::knowledge::KnowledgeOp) {
+        let out = self
+            .nodes
+            .get_mut(&id)
+            .unwrap()
+            .submit_local_knowledge_op(op)
+            .expect("knowledge op admitted");
+        self.enqueue(id, out);
+    }
     pub fn submit_gov_proposal(&mut self, id: u64, op: GovProposal) {
         let out = self
             .nodes
@@ -2515,6 +2661,8 @@ impl LightGossipNode {
             // M195: governance ops are a full-node block concern; light clients ignore.
             | GossipMsg::GovProposal(_)
             | GossipMsg::GovVote(_)
+            // K4:知识 op 是全节点的区块事务;轻客户端忽略。
+            | GossipMsg::KnowledgeOp(_)
             // M33: consensus is an Actor concern; light clients never vote.
             | GossipMsg::Consensus(_)
             // M39: peer discovery is an Actor concern; the pure core does no I/O.
@@ -2764,6 +2912,10 @@ pub fn encode_gossip(m: &GossipMsg) -> Vec<u8> {
             out.push(TAG_GOVVOTE);
             put_bytes(&mut out, &crate::codec::encode_gov_vote(op));
         }
+        GossipMsg::KnowledgeOp(op) => {
+            out.push(TAG_KNOWLEDGE_OP);
+            put_bytes(&mut out, &crate::codec::encode_knowledge_op(op));
+        }
         GossipMsg::GetHeaders { from } => {
             out.push(TAG_GETHEADERS);
             out.extend_from_slice(&from.to_be_bytes());
@@ -2921,6 +3073,9 @@ pub fn decode_gossip(buf: &[u8]) -> Result<GossipMsg, CodecError> {
         TAG_GOVVOTE => GossipMsg::GovVote(Box::new(crate::codec::decode_gov_vote(take_bytes(
             &mut rest,
         )?)?)),
+        TAG_KNOWLEDGE_OP => GossipMsg::KnowledgeOp(Box::new(crate::codec::decode_knowledge_op(
+            take_bytes(&mut rest)?,
+        )?)),
         TAG_GETHEADERS => GossipMsg::GetHeaders {
             from: take_u64(&mut rest)?,
         },
@@ -3646,6 +3801,7 @@ mod tests {
             decay_half_life_blocks: 0,
             slash_bps: 10_000,
             max_validator_power_bps: 0,
+            knowledge: crate::knowledge::KnowledgeGenesis::default(),
             timestamp_days: 0.0,
             validators: [21u64, 22, 23, 24]
                 .iter()
@@ -3879,6 +4035,7 @@ mod tests {
             decay_half_life_blocks: 0,
             slash_bps: 10_000,
             max_validator_power_bps: 0,
+            knowledge: crate::knowledge::KnowledgeGenesis::default(),
             timestamp_days: 0.0,
             validators: vec![(21, kp(21).public(), 1)],
             bridge_sources: vec![],
@@ -3930,6 +4087,7 @@ mod tests {
             decay_half_life_blocks: 0,
             slash_bps: 10_000,
             max_validator_power_bps: 0,
+            knowledge: crate::knowledge::KnowledgeGenesis::default(),
             timestamp_days: 0.0,
             validators: vec![(21, kp(21).public(), 1)],
             bridge_sources: vec![],
@@ -4748,6 +4906,345 @@ mod tests {
             node.pending_gov_proposals().len(),
             MAX_PENDING_GOV_PER_ACCOUNT + 1
         );
+    }
+
+    // --- K4:知识 op 的 gossip 与待处理池 ---------------------------------------
+
+    fn kgen() -> Genesis {
+        let mut g = genesis();
+        g.knowledge.domains = vec![2];
+        g
+    }
+
+    fn kpayload(tag: u8, cites: Vec<crate::knowledge::Cite>) -> crate::knowledge::VersionPayload {
+        use crate::knowledge::*;
+        VersionPayload {
+            bodies: vec![Body {
+                lang: "zh".into(),
+                hash: [tag; 32],
+            }],
+            source: Source::Human,
+            cites,
+        }
+    }
+
+    /// 由 `actor` 用 kp(actor) 签名的知识 op;`tag` 区分正文,使同序号的 op 也有不同哈希。
+    fn kop_create(actor: u64, nonce: u64, tag: u8) -> crate::knowledge::KnowledgeOp {
+        use crate::knowledge::*;
+        KnowledgeOp {
+            actor,
+            action: KnowledgeAction::CreateUnit {
+                layer: Layer::Foundation,
+                domain: 2,
+                version: kpayload(tag, vec![]),
+            },
+            nonce,
+            signature: [0u8; 64],
+        }
+        .signed(&kp(actor))
+    }
+
+    #[test]
+    fn knowledge_op_gossip_wire_round_trips() {
+        let op = kop_create(1, 0, 9);
+        let bytes = encode_gossip(&GossipMsg::KnowledgeOp(Box::new(op.clone())));
+        assert_eq!(bytes[0], TAG_KNOWLEDGE_OP);
+        match decode_gossip(&bytes) {
+            Ok(GossipMsg::KnowledgeOp(back)) => assert_eq!(*back, op),
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    #[test]
+    fn knowledge_op_gossip_reaches_every_node_and_dedups() {
+        let ids = [1u64, 2, 3];
+        let nodes: Vec<GossipNode> = ids
+            .iter()
+            .map(|&id| GossipNode::new(id, kgen(), 16, ids.iter().copied()))
+            .collect();
+        let mut net = Network::new(nodes);
+        let a = kop_create(1, 0, 1);
+        let b = kop_create(2, 0, 2);
+        net.submit_knowledge_op(1, a.clone());
+        net.submit_knowledge_op(2, b.clone());
+        net.run();
+        for id in ids {
+            let hs: std::collections::HashSet<_> = net
+                .node(id)
+                .pending_knowledge_ops()
+                .iter()
+                .map(|o| o.hash())
+                .collect();
+            assert_eq!(hs.len(), 2, "node {id} has both ops");
+            assert!(hs.contains(&a.hash()) && hs.contains(&b.hash()));
+        }
+        let out = net
+            .node_mut(2)
+            .on_message(1, GossipMsg::KnowledgeOp(Box::new(a)));
+        assert!(out.is_empty(), "a seen op is not re-flooded");
+        assert_eq!(net.node(2).pending_knowledge_ops().len(), 2);
+    }
+
+    #[test]
+    fn knowledge_gossip_rejects_inadmissible_ops() {
+        // 无效的知识 op 既不入池也不转发:签名错误、非成员、序号过旧 / 过于超前、结构不合法。
+        let mut node = GossipNode::new(1, kgen(), 16, [1, 2]);
+        let forged = crate::knowledge::KnowledgeOp {
+            actor: 1,
+            ..kop_create(1, 0, 1)
+        }
+        .signed(&kp(2));
+        let too_far = kop_create(1, crate::GOV_NONCE_LOOKAHEAD + 1, 2);
+        let mut malformed = kop_create(1, 0, 3);
+        if let crate::knowledge::KnowledgeAction::CreateUnit { version, .. } = &mut malformed.action
+        {
+            version.bodies.clear();
+        }
+        let malformed = malformed.signed(&kp(1));
+        node.chain.state.knowledge.members.remove(&2);
+        let non_member = kop_create(2, 0, 4);
+        for op in [forged, too_far, malformed, non_member] {
+            assert!(node
+                .on_message(2, GossipMsg::KnowledgeOp(Box::new(op)))
+                .is_empty());
+        }
+        assert!(node.pending_knowledge_ops().is_empty());
+        assert_eq!(
+            node.seen_knowledge_len(),
+            0,
+            "rejected ops never consume a dedup slot"
+        );
+        let r = node.submit_local_knowledge_op(kop_create(2, 0, 5));
+        assert!(
+            matches!(r, Err(ChainError::NotAMember(2))),
+            "local submit gets the structured reason: {r:?}"
+        );
+    }
+
+    #[test]
+    fn knowledge_admission_rejects_permanently_invalid_ops_up_front() {
+        // 测试网实测发现:成员核验自己的版本时,RPC 先回报成功、出块时才悄悄丢弃。现在准入时即给出原因,
+        // 且不入池、不占去重槽位。可能在同一块内变得有效的 op(引用尚未创建的单元)仍然放行。
+        use crate::knowledge::*;
+        let ids = [1u64, 2, 3, 21, 22, 23, 24];
+        let seeds: BTreeMap<u64, [u8; 32]> = ids.iter().map(|&id| (id, seed(id))).collect();
+        let mut driver = ChainDriver::new(kgen(), seeds, 4);
+        let mut node = GossipNode::new(1, kgen(), 16, [1]);
+        driver.stage_knowledge_op(kop_create(1, 0, 1));
+        driver.produce(1.0, &BTreeSet::new()).unwrap();
+        let (b, c) = (driver.blocks()[0].clone(), driver.certificates()[0].clone());
+        assert!(node.apply_certified(b, c));
+
+        let mk = |actor: u64, nonce: u64, action| {
+            KnowledgeOp {
+                actor,
+                action,
+                nonce,
+                signature: [0u8; 64],
+            }
+            .signed(&kp(actor))
+        };
+        let self_verify = mk(
+            1,
+            1,
+            KnowledgeAction::Verify {
+                unit: 1,
+                version: 1,
+                verdict: Verdict::Pass,
+                note_hash: [0u8; 32],
+            },
+        );
+        let r = node.submit_local_knowledge_op(self_verify);
+        assert!(
+            matches!(
+                r,
+                Err(ChainError::SelfVerify {
+                    unit: 1,
+                    version: 1
+                })
+            ),
+            "{r:?}"
+        );
+        let bad_domain = mk(
+            2,
+            0,
+            KnowledgeAction::CreateUnit {
+                layer: Layer::Foundation,
+                domain: 9,
+                version: kpayload(4, vec![]),
+            },
+        );
+        assert!(matches!(
+            node.submit_local_knowledge_op(bad_domain),
+            Err(ChainError::UnknownDomain(9))
+        ));
+        let reuse_key = mk(
+            2,
+            0,
+            KnowledgeAction::Invite {
+                pubkey: kp(3).public(),
+            },
+        );
+        assert!(matches!(
+            node.submit_local_knowledge_op(reuse_key),
+            Err(ChainError::PubkeyInUse)
+        ));
+        assert!(node.pending_knowledge_ops().is_empty());
+        assert_eq!(node.seen_knowledge_len(), 0);
+        // 他人核验:放行;引用尚未存在的单元:放行(可能被同一块内更早的 op 创建)
+        let other = mk(
+            2,
+            0,
+            KnowledgeAction::Verify {
+                unit: 1,
+                version: 1,
+                verdict: Verdict::Pass,
+                note_hash: [0u8; 32],
+            },
+        );
+        node.submit_local_knowledge_op(other)
+            .expect("another member may verify");
+        let forward = mk(
+            3,
+            0,
+            KnowledgeAction::CreateUnit {
+                layer: Layer::Application,
+                domain: 2,
+                version: kpayload(
+                    5,
+                    vec![Cite {
+                        unit: 7,
+                        version: 1,
+                        kind: CiteKind::Basis,
+                    }],
+                ),
+            },
+        );
+        node.submit_local_knowledge_op(forward)
+            .expect("a forward cite may resolve within a block");
+    }
+
+    #[test]
+    fn knowledge_pool_caps_quota_and_current_nonce_priority() {
+        // 镜像治理池 SEC-01 第 3 / 5 轮:按账户配额、全局上限(本地提交同样受限,满池不占去重槽位)、
+        // 当前序号的 op 可淘汰停放最远的超前序号 op。
+        let fillers = (MAX_PENDING_KNOWLEDGE / MAX_PENDING_KNOWLEDGE_PER_ACCOUNT) as u64;
+        let mut node = GossipNode::new(1, genesis_with_accounts(fillers + 2), 16, [1]);
+        node.chain.state.knowledge.domains.insert(2);
+        for acct in 1..=fillers {
+            for i in 0..MAX_PENDING_KNOWLEDGE_PER_ACCOUNT as u64 {
+                let op = kop_create(acct, 1 + i % crate::GOV_NONCE_LOOKAHEAD, i as u8);
+                node.submit_local_knowledge_op(op).expect("within caps");
+            }
+        }
+        assert_eq!(node.pending_knowledge_ops().len(), MAX_PENDING_KNOWLEDGE);
+        // 配额:账户 1 已满,再交一个超前序号的 op 被拒
+        let r = node.submit_local_knowledge_op(kop_create(1, 3, 200));
+        assert!(
+            matches!(
+                r,
+                Err(ChainError::KnowledgeAccountQuotaExceeded { account: 1, .. })
+            ),
+            "{r:?}"
+        );
+        // 全局上限:新账户的超前序号 op 被明确拒绝,池与去重缓存都不增长
+        let seen = node.seen_knowledge_len();
+        let r = node.submit_local_knowledge_op(kop_create(fillers + 1, 2, 1));
+        assert!(matches!(r, Err(ChainError::KnowledgePoolFull)), "{r:?}");
+        assert_eq!(node.pending_knowledge_ops().len(), MAX_PENDING_KNOWLEDGE);
+        assert_eq!(
+            node.seen_knowledge_len(),
+            seen,
+            "a full pool does not grow the dedup cache"
+        );
+        // 当前序号优先:淘汰一个最超前(序号 8)的停放 op,池仍在上限
+        let far = |n: &GossipNode| {
+            n.pending_knowledge_ops()
+                .iter()
+                .filter(|o| o.nonce == crate::GOV_NONCE_LOOKAHEAD)
+                .count()
+        };
+        let before = far(&node);
+        let cur = kop_create(fillers + 2, 0, 1);
+        node.submit_local_knowledge_op(cur.clone())
+            .expect("current nonce takes priority");
+        assert_eq!(node.pending_knowledge_ops().len(), MAX_PENDING_KNOWLEDGE);
+        assert!(node
+            .pending_knowledge_ops()
+            .iter()
+            .any(|o| o.hash() == cur.hash()));
+        assert_eq!(
+            far(&node),
+            before - 1,
+            "the victim was a furthest-future op"
+        );
+    }
+
+    #[test]
+    fn knowledge_candidate_orders_by_nonce_and_skips_inapplicable_ops() {
+        // 同一账户先交序号 1(依赖序号 0 创建的单元)、后交序号 0;另一账户交一条引用不存在单元的 op。
+        // 候选块应按(账户, 序号)排好两条、丢掉不可执行的那条,且能正常封装(不停摆)。
+        use crate::knowledge::*;
+        let mut node = GossipNode::new(1, kgen(), 16, [1]);
+        let create = kop_create(1, 0, 1);
+        let publish = KnowledgeOp {
+            actor: 1,
+            action: KnowledgeAction::PublishVersion {
+                unit: 1,
+                version: kpayload(2, vec![]),
+            },
+            nonce: 1,
+            signature: [0u8; 64],
+        }
+        .signed(&kp(1));
+        let dangling = KnowledgeOp {
+            actor: 2,
+            action: KnowledgeAction::CreateUnit {
+                layer: Layer::Application,
+                domain: 2,
+                version: kpayload(
+                    3,
+                    vec![Cite {
+                        unit: 99,
+                        version: 1,
+                        kind: CiteKind::Basis,
+                    }],
+                ),
+            },
+            nonce: 0,
+            signature: [0u8; 64],
+        }
+        .signed(&kp(2));
+        node.submit_local_knowledge_op(publish.clone()).unwrap();
+        node.submit_local_knowledge_op(dangling).unwrap();
+        node.submit_local_knowledge_op(create.clone()).unwrap();
+        let cand = node
+            .build_candidate(1.0)
+            .expect("candidate seals despite an inapplicable op");
+        assert_eq!(cand.knowledge_ops, vec![create, publish]);
+    }
+
+    #[test]
+    fn knowledge_ops_are_pruned_on_commit() {
+        // 已入块的知识 op 从池中移除;序号被其他 op 消耗掉的 op 成为陈旧 op,也被移除。
+        let ids = [1u64, 2, 3, 21, 22, 23, 24];
+        let seeds: BTreeMap<u64, [u8; 32]> = ids.iter().map(|&id| (id, seed(id))).collect();
+        let mut driver = ChainDriver::new(kgen(), seeds, 4);
+        let mut node = GossipNode::new(1, kgen(), 16, [1]);
+        let committed = kop_create(1, 0, 1);
+        node.submit_local_knowledge_op(committed.clone()).unwrap();
+        node.submit_local_knowledge_op(kop_create(2, 0, 2)).unwrap(); // 将被另一条序号 0 的 op 顶掉
+        driver.stage_knowledge_op(committed);
+        driver.stage_knowledge_op(kop_create(2, 0, 3));
+        driver.produce(1.0, &BTreeSet::new()).unwrap();
+        let (b, c) = (driver.blocks()[0].clone(), driver.certificates()[0].clone());
+        assert_eq!(b.knowledge_ops.len(), 2);
+        assert!(node.apply_certified(b, c));
+        assert!(
+            node.pending_knowledge_ops().is_empty(),
+            "committed and stale knowledge ops pruned"
+        );
+        assert_eq!(node.chain.state.knowledge.units.len(), 2);
     }
 
     #[test]

@@ -23,6 +23,8 @@ pub enum CodecError {
     TrailingBytes,
     TooManyItems(u64),
     BadEnum(u32),
+    /// 字符串不是合法的 UTF-8(共识数据,严格拒绝,不做有损解码)。
+    BadString,
 }
 
 impl std::fmt::Display for CodecError {
@@ -32,6 +34,7 @@ impl std::fmt::Display for CodecError {
             CodecError::TrailingBytes => write!(f, "trailing bytes after block"),
             CodecError::TooManyItems(n) => write!(f, "implausible item count {n}"),
             CodecError::BadEnum(v) => write!(f, "invalid enum discriminant {v}"),
+            CodecError::BadString => write!(f, "invalid UTF-8 string"),
         }
     }
 }
@@ -154,6 +157,11 @@ pub fn encode_block(b: &Block) -> Vec<u8> {
     for op in &b.gov_votes {
         enc_gov_vote(&mut e, op, true);
     }
+    // 测试网阶段 1(B8 wire):知识单元 op 列表,追加在尾部。
+    e.u64(b.knowledge_ops.len() as u64);
+    for op in &b.knowledge_ops {
+        enc_knowledge_op(&mut e, op, true);
+    }
     e.0
 }
 
@@ -231,6 +239,8 @@ pub fn encode_header(h: &BlockHeader) -> Vec<u8> {
     // votes), appended at the tail — same prefix-stability discipline.
     e.raw(&h.gov_proposals_commitment);
     e.raw(&h.gov_votes_commitment);
+    // 测试网阶段 1(B8 wire):第十一个 per-body 承诺(知识单元 op 列表),追加在尾部。
+    e.raw(&h.knowledge_ops_commitment);
     e.0
 }
 
@@ -301,6 +311,8 @@ pub fn decode_header(buf: &[u8]) -> Result<BlockHeader, CodecError> {
     gov_proposals_commitment.copy_from_slice(d.take(32)?);
     let mut gov_votes_commitment = [0u8; 32];
     gov_votes_commitment.copy_from_slice(d.take(32)?);
+    let mut knowledge_ops_commitment = [0u8; 32];
+    knowledge_ops_commitment.copy_from_slice(d.take(32)?);
     if d.pos != d.buf.len() {
         return Err(CodecError::TrailingBytes);
     }
@@ -327,6 +339,7 @@ pub fn decode_header(buf: &[u8]) -> Result<BlockHeader, CodecError> {
         key_rotations_commitment,
         gov_proposals_commitment,
         gov_votes_commitment,
+        knowledge_ops_commitment,
     })
 }
 
@@ -368,7 +381,7 @@ pub fn decode_certified_header(buf: &[u8]) -> Result<CertifiedHeader, CodecError
     // (no allocation: `header_len` is bounded by `buf.len()`).
     let header_len = match (n_updates as usize)
         .checked_mul(48)
-        .and_then(|u| u.checked_add(284 + 320))
+        .and_then(|u| u.checked_add(284 + 352))
     {
         Some(len) if len <= buf.len() => len, // 604 base + 48 per update
         _ => return Err(CodecError::UnexpectedEof),
@@ -521,6 +534,8 @@ pub struct BlockHeader {
     /// M194 (B6 wire): SHA-256 over the canonical encoding of the governance vote
     /// op list (`Block::gov_votes`). Tenth and last per-body commitment.
     pub gov_votes_commitment: crate::Hash,
+    /// 测试网阶段 1(B8 wire):知识单元 op 列表(`Block::knowledge_ops`)的 SHA-256。第十一个、也是最后一个 per-body 承诺。
+    pub knowledge_ops_commitment: crate::Hash,
 }
 
 impl BlockHeader {
@@ -605,6 +620,12 @@ impl BlockHeader {
             gov_votes_commitment: list_commitment(
                 &b.gov_votes.iter().map(encode_gov_vote).collect::<Vec<_>>(),
             ),
+            knowledge_ops_commitment: list_commitment(
+                &b.knowledge_ops
+                    .iter()
+                    .map(encode_knowledge_op)
+                    .collect::<Vec<_>>(),
+            ),
         }
     }
 
@@ -638,6 +659,7 @@ impl BlockHeader {
         key_rotations: Vec<KeyRotation>,
         gov_proposals: Vec<GovProposal>,
         gov_votes: Vec<GovVote>,
+        knowledge_ops: Vec<crate::knowledge::KnowledgeOp>,
     ) -> Block {
         Block {
             height: self.height,
@@ -662,6 +684,7 @@ impl BlockHeader {
             key_rotations,
             gov_proposals,
             gov_votes,
+            knowledge_ops,
         }
     }
 }
@@ -1033,6 +1056,339 @@ fn dec_gov_vote(d: &mut Dec) -> Result<GovVote, CodecError> {
         approve,
         nonce,
         signature,
+    })
+}
+
+// --- 知识单元 op(测试网阶段 1,设计稿 docs/design/knowledge-units-onchain.md)---
+
+/// 知识 op 的签名字节:`SIGN_DOMAIN` 前缀 + 除签名外的全部字段。
+/// 域前缀保证知识 op 的签名不能被挪用为任何其他 op 的签名。
+pub fn knowledge_op_signing_bytes(op: &crate::knowledge::KnowledgeOp) -> Vec<u8> {
+    let mut e = Enc(Vec::new());
+    e.raw(crate::knowledge::SIGN_DOMAIN);
+    enc_knowledge_op(&mut e, op, false);
+    e.0
+}
+
+/// 知识 op 的完整(含签名)规范编码,也是内容哈希的原像。
+pub fn encode_knowledge_op(op: &crate::knowledge::KnowledgeOp) -> Vec<u8> {
+    let mut e = Enc(Vec::new());
+    enc_knowledge_op(&mut e, op, true);
+    e.0
+}
+
+pub fn decode_knowledge_op(buf: &[u8]) -> Result<crate::knowledge::KnowledgeOp, CodecError> {
+    let mut d = Dec { buf, pos: 0 };
+    let op = dec_knowledge_op(&mut d)?;
+    if d.pos != d.buf.len() {
+        return Err(CodecError::TrailingBytes);
+    }
+    Ok(op)
+}
+
+fn enc_version_payload(e: &mut Enc, v: &crate::knowledge::VersionPayload) {
+    use crate::knowledge::Source;
+    e.u64(v.bodies.len() as u64);
+    for b in &v.bodies {
+        e.string(&b.lang);
+        e.raw(&b.hash);
+    }
+    match &v.source {
+        Source::Human => e.u8(0),
+        Source::Model(m) => {
+            e.u8(1);
+            e.string(m);
+        }
+        Source::ModelVerified(m) => {
+            e.u8(2);
+            e.string(m);
+        }
+    }
+    e.u64(v.cites.len() as u64);
+    for c in &v.cites {
+        e.u64(c.unit);
+        e.u32(c.version);
+        e.u8(c.kind as u8);
+    }
+}
+
+fn dec_version_payload(d: &mut Dec) -> Result<crate::knowledge::VersionPayload, CodecError> {
+    use crate::knowledge::{
+        Body, Cite, CiteKind, Source, VersionPayload, MAX_BODIES, MAX_CITES, MAX_LANG_LEN,
+        MAX_MODEL_ID_LEN,
+    };
+    let nb = d.bounded(MAX_BODIES)?;
+    let mut bodies = Vec::with_capacity(nb);
+    for _ in 0..nb {
+        let lang = d.string(MAX_LANG_LEN)?;
+        let mut hash = [0u8; 32];
+        hash.copy_from_slice(d.take(32)?);
+        bodies.push(Body { lang, hash });
+    }
+    let source = match d.u8()? {
+        0 => Source::Human,
+        1 => Source::Model(d.string(MAX_MODEL_ID_LEN)?),
+        2 => Source::ModelVerified(d.string(MAX_MODEL_ID_LEN)?),
+        other => return Err(CodecError::BadEnum(other as u32)),
+    };
+    let nc = d.bounded(MAX_CITES)?;
+    let mut cites = Vec::with_capacity(nc);
+    for _ in 0..nc {
+        let unit = d.u64()?;
+        let version = d.u32()?;
+        let kind = match d.u8()? {
+            0 => CiteKind::Basis,
+            1 => CiteKind::SeeAlso,
+            other => return Err(CodecError::BadEnum(other as u32)),
+        };
+        cites.push(Cite {
+            unit,
+            version,
+            kind,
+        });
+    }
+    Ok(VersionPayload {
+        bodies,
+        source,
+        cites,
+    })
+}
+
+fn enc_knowledge_op(e: &mut Enc, op: &crate::knowledge::KnowledgeOp, include_sig: bool) {
+    use crate::knowledge::KnowledgeAction;
+    e.u64(op.actor);
+    match &op.action {
+        KnowledgeAction::CreateUnit {
+            layer,
+            domain,
+            version,
+        } => {
+            e.u8(0);
+            e.u8(*layer as u8);
+            e.u32(*domain);
+            enc_version_payload(e, version);
+        }
+        KnowledgeAction::PublishVersion { unit, version } => {
+            e.u8(1);
+            e.u64(*unit);
+            enc_version_payload(e, version);
+        }
+        KnowledgeAction::Verify {
+            unit,
+            version,
+            verdict,
+            note_hash,
+        } => {
+            e.u8(2);
+            e.u64(*unit);
+            e.u32(*version);
+            e.u8(*verdict as u8);
+            e.raw(note_hash);
+        }
+        KnowledgeAction::Invite { pubkey } => {
+            e.u8(3);
+            e.raw(pubkey);
+        }
+    }
+    e.u64(op.nonce);
+    if include_sig {
+        e.raw(&op.signature);
+    }
+}
+
+fn dec_knowledge_op(d: &mut Dec) -> Result<crate::knowledge::KnowledgeOp, CodecError> {
+    use crate::knowledge::{KnowledgeAction, KnowledgeOp, Layer, Verdict};
+    let actor = d.u64()?;
+    let action = match d.u8()? {
+        0 => {
+            let lt = d.u8()?;
+            let layer = Layer::from_u8(lt).ok_or(CodecError::BadEnum(lt as u32))?;
+            let domain = d.u32()?;
+            let version = dec_version_payload(d)?;
+            KnowledgeAction::CreateUnit {
+                layer,
+                domain,
+                version,
+            }
+        }
+        1 => {
+            let unit = d.u64()?;
+            let version = dec_version_payload(d)?;
+            KnowledgeAction::PublishVersion { unit, version }
+        }
+        2 => {
+            let unit = d.u64()?;
+            let version = d.u32()?;
+            let verdict = match d.u8()? {
+                0 => Verdict::Pass,
+                1 => Verdict::NeedsRevision,
+                other => return Err(CodecError::BadEnum(other as u32)),
+            };
+            let mut note_hash = [0u8; 32];
+            note_hash.copy_from_slice(d.take(32)?);
+            KnowledgeAction::Verify {
+                unit,
+                version,
+                verdict,
+                note_hash,
+            }
+        }
+        3 => {
+            let mut pubkey = [0u8; 32];
+            pubkey.copy_from_slice(d.take(32)?);
+            KnowledgeAction::Invite { pubkey }
+        }
+        other => return Err(CodecError::BadEnum(other as u32)),
+    };
+    let nonce = d.u64()?;
+    let mut signature = [0u8; 64];
+    signature.copy_from_slice(d.take(64)?);
+    Ok(KnowledgeOp {
+        actor,
+        action,
+        nonce,
+        signature,
+    })
+}
+
+/// 知识模块状态的规范编码:`state_root` 与快照共用(BTreeMap / BTreeSet 有序迭代 ⇒ 字节规范)。
+pub(crate) fn enc_knowledge_state(e: &mut Enc, k: &crate::knowledge::KnowledgeState) {
+    e.u64(k.units.len() as u64);
+    for (id, u) in &k.units {
+        e.u64(*id);
+        e.u64(u.author);
+        e.u8(u.layer as u8);
+        e.u32(u.domain);
+        e.u64(u.created_height);
+        e.u64(u.versions.len() as u64);
+        for v in &u.versions {
+            e.u32(v.n);
+            e.u64(v.publisher);
+            e.u64(v.published_height);
+            enc_version_payload(e, &v.payload);
+        }
+    }
+    e.u64(k.verifications.len() as u64);
+    for ((unit, version, verifier), v) in &k.verifications {
+        e.u64(*unit);
+        e.u32(*version);
+        e.u64(*verifier);
+        e.u8(v.verdict as u8);
+        e.raw(&v.note_hash);
+        e.u64(v.height);
+    }
+    e.u64(k.members.len() as u64);
+    for (id, m) in &k.members {
+        e.u64(*id);
+        e.u64(m.joined_height);
+        e.u64(m.inviter);
+        e.u64(m.last_invite_height);
+    }
+    e.u64(k.domains.len() as u64);
+    for d in &k.domains {
+        e.u32(*d);
+    }
+    e.u64(k.next_unit_id);
+    e.u64(k.next_account_id);
+    e.u8(k.legacy_submissions as u8);
+    e.u64(k.probation_blocks);
+    e.u64(k.invite_cooldown_blocks);
+}
+
+fn dec_knowledge_state(d: &mut Dec) -> Result<crate::knowledge::KnowledgeState, CodecError> {
+    use crate::knowledge::{
+        KnowledgeState, KnowledgeUnit, Layer, Member, UnitVersion, Verdict, Verification,
+    };
+    use std::collections::{BTreeMap, BTreeSet};
+    let nu = d.count()?;
+    let mut units = BTreeMap::new();
+    for _ in 0..nu {
+        let id = d.u64()?;
+        let author = d.u64()?;
+        let lt = d.u8()?;
+        let layer = Layer::from_u8(lt).ok_or(CodecError::BadEnum(lt as u32))?;
+        let domain = d.u32()?;
+        let created_height = d.u64()?;
+        let nv = d.count()?;
+        let mut versions = Vec::with_capacity(prealloc(nv));
+        for _ in 0..nv {
+            let n = d.u32()?;
+            let publisher = d.u64()?;
+            let published_height = d.u64()?;
+            let payload = dec_version_payload(d)?;
+            versions.push(UnitVersion {
+                n,
+                publisher,
+                payload,
+                published_height,
+            });
+        }
+        units.insert(
+            id,
+            KnowledgeUnit {
+                id,
+                author,
+                layer,
+                domain,
+                created_height,
+                versions,
+            },
+        );
+    }
+    let nver = d.count()?;
+    let mut verifications = BTreeMap::new();
+    for _ in 0..nver {
+        let unit = d.u64()?;
+        let version = d.u32()?;
+        let verifier = d.u64()?;
+        let verdict = match d.u8()? {
+            0 => Verdict::Pass,
+            1 => Verdict::NeedsRevision,
+            other => return Err(CodecError::BadEnum(other as u32)),
+        };
+        let mut note_hash = [0u8; 32];
+        note_hash.copy_from_slice(d.take(32)?);
+        let height = d.u64()?;
+        verifications.insert(
+            (unit, version, verifier),
+            Verification {
+                unit,
+                version,
+                verifier,
+                verdict,
+                note_hash,
+                height,
+            },
+        );
+    }
+    let nm = d.count()?;
+    let mut members = BTreeMap::new();
+    for _ in 0..nm {
+        let id = d.u64()?;
+        members.insert(
+            id,
+            Member {
+                joined_height: d.u64()?,
+                inviter: d.u64()?,
+                last_invite_height: d.u64()?,
+            },
+        );
+    }
+    let nd = d.count()?;
+    let mut domains = BTreeSet::new();
+    for _ in 0..nd {
+        domains.insert(d.u32()?);
+    }
+    Ok(KnowledgeState {
+        units,
+        verifications,
+        members,
+        domains,
+        next_unit_id: d.u64()?,
+        next_account_id: d.u64()?,
+        legacy_submissions: d.u8()? != 0,
+        probation_blocks: d.u64()?,
+        invite_cooldown_blocks: d.u64()?,
     })
 }
 
@@ -1612,7 +1968,9 @@ pub fn decode_account(buf: &[u8]) -> Result<Account, CodecError> {
 ///
 /// v6 (M235): adds `max_validator_power_bps` (§10.11 validator power share cap, folded into
 /// `state_root`). A v5 snapshot lacks it, so v5 is now rejected — regenerate.
-pub const SNAPSHOT_VERSION: u32 = 6;
+///
+/// v7(测试网阶段 1):追加知识模块状态(单元、版本、核验、成员、领域与参数)。v6 快照缺少该段,被拒——重新生成。
+pub const SNAPSHOT_VERSION: u32 = 7;
 
 /// Write the account's state fields into the shared stream (same layout as
 /// [`encode_account`], inlined so the snapshot controls framing).
@@ -1786,6 +2144,8 @@ pub fn encode_snapshot(s: &ChainState) -> Vec<u8> {
             e.u64(*index);
         }
     }
+    // v7:知识模块状态(与 state_root 共用同一份规范编码)。
+    enc_knowledge_state(&mut e, &s.knowledge);
     e.0
 }
 
@@ -1964,10 +2324,12 @@ pub fn decode_snapshot(buf: &[u8]) -> Result<ChainState, CodecError> {
             },
         );
     }
+    let knowledge = dec_knowledge_state(&mut d)?;
     if d.pos != d.buf.len() {
         return Err(CodecError::TrailingBytes);
     }
     Ok(ChainState {
+        knowledge,
         accounts,
         reviewers,
         graph,
@@ -2373,6 +2735,11 @@ impl Enc {
             self.f32(*x);
         }
     }
+    /// 长度前缀(u32)+ UTF-8 字节。
+    pub fn string(&mut self, v: &str) {
+        self.u32(v.len() as u32);
+        self.raw(v.as_bytes());
+    }
 }
 
 // --- decode ------------------------------------------------------------------
@@ -2483,6 +2850,12 @@ pub fn decode_block(buf: &[u8]) -> Result<Block, CodecError> {
     for _ in 0..n_votes {
         gov_votes.push(dec_gov_vote(&mut d)?);
     }
+    // 测试网阶段 1(B8 wire):知识单元 op 列表。
+    let n_kops = d.count()?;
+    let mut knowledge_ops = Vec::with_capacity(prealloc(n_kops));
+    for _ in 0..n_kops {
+        knowledge_ops.push(dec_knowledge_op(&mut d)?);
+    }
     if d.pos != d.buf.len() {
         return Err(CodecError::TrailingBytes);
     }
@@ -2509,6 +2882,7 @@ pub fn decode_block(buf: &[u8]) -> Result<Block, CodecError> {
         key_rotations,
         gov_proposals,
         gov_votes,
+        knowledge_ops,
     })
 }
 
@@ -2608,6 +2982,25 @@ impl<'a> Dec<'a> {
             return Err(CodecError::TooManyItems(n));
         }
         Ok(n)
+    }
+    /// 长度前缀字符串,长度超过 `max` 即拒绝(先查长度再取字节,不做无界分配),且必须是合法 UTF-8。
+    fn string(&mut self, max: usize) -> Result<String, CodecError> {
+        let n = self.u32()? as usize;
+        if n > max {
+            return Err(CodecError::TooManyItems(n as u64));
+        }
+        let b = self.take(n)?;
+        std::str::from_utf8(b)
+            .map(|v| v.to_string())
+            .map_err(|_| CodecError::BadString)
+    }
+    /// 有上限的数量:超过 `max` 即拒绝(用于知识 op 中的正文与引用)。
+    fn bounded(&mut self, max: usize) -> Result<usize, CodecError> {
+        let n = self.u64()?;
+        if n > max as u64 {
+            return Err(CodecError::TooManyItems(n));
+        }
+        Ok(n as usize)
     }
 }
 
@@ -2723,6 +3116,7 @@ mod tests {
             key_rotations: Vec::new(),
             gov_proposals: Vec::new(),
             gov_votes: Vec::new(),
+            knowledge_ops: Vec::new(),
             proposer: 0,
         }
     }
@@ -3641,6 +4035,7 @@ mod tests {
                 key_rotations_commitment: [0u8; 32],
                 gov_proposals_commitment: [0u8; 32],
                 gov_votes_commitment: [0u8; 32],
+                knowledge_ops_commitment: [0u8; 32],
                 proposer: 0,
             },
             cert_prev: crate::consensus::Commit {
@@ -3671,6 +4066,7 @@ mod tests {
                 key_rotations_commitment: [0u8; 32],
                 gov_proposals_commitment: [0u8; 32],
                 gov_votes_commitment: [0u8; 32],
+                knowledge_ops_commitment: [0u8; 32],
                 proposer: 0,
             },
             cert_new: crate::consensus::Commit {
@@ -3801,6 +4197,7 @@ mod tests {
                         key_rotations_commitment: [0u8; 32],
                         gov_proposals_commitment: [0u8; 32],
                         gov_votes_commitment: [0u8; 32],
+                        knowledge_ops_commitment: [0u8; 32],
                         proposer: 0,
                     },
                     cert_prev: crate::consensus::Commit {
@@ -3831,6 +4228,7 @@ mod tests {
                         key_rotations_commitment: [0u8; 32],
                         gov_proposals_commitment: [0u8; 32],
                         gov_votes_commitment: [0u8; 32],
+                        knowledge_ops_commitment: [0u8; 32],
                         proposer: 0,
                     },
                     cert_new: crate::consensus::Commit {
@@ -4112,6 +4510,7 @@ mod tests {
             decay_half_life_blocks: 0,
             slash_bps: 10_000,
             max_validator_power_bps: 3_333, // M235 (§10.11): snapshot round-trip covers v6 field
+            knowledge: crate::knowledge::KnowledgeGenesis::default(),
             timestamp_days: 1.5,
             validators: vec![(21, pk(21), 3), (22, pk(22), 1)],
             bridge_sources: vec![],
@@ -4502,6 +4901,9 @@ mod tests {
             |b| {
                 let _ = decode_block(b);
             },
+            |b| {
+                let _ = decode_knowledge_op(b);
+            },
             // Also fuzz the top-level gossip-message decoder (net.rs), the other
             // attacker-reachable entry point (it dispatches into these codec decoders).
             |b| {
@@ -4541,7 +4943,7 @@ mod tests {
     /// (node/fuzz). `#[ignore]` so normal CI skips it; run once with
     /// `cargo test --release -- --ignored seed_fuzz_corpus` to (re)write deterministic,
     /// structurally-valid seeds — each is `[selector_byte] ++ <valid encoding>`, where the
-    /// selector matches `decode_all`'s `sel % 29` dispatch. Valid seeds warm the fuzzer so
+    /// selector matches `decode_all`'s `sel % 30` dispatch. Valid seeds warm the fuzzer so
     /// it reaches deep parse paths fast; mutation + cross-pollination covers the rest.
     #[test]
     #[ignore = "corpus generator; run explicitly with --ignored"]
@@ -4573,6 +4975,11 @@ mod tests {
         write(24, "validator", encode_validator(&vs.validators()[0]));
         write(25, "reviewer", encode_reviewer(10, 1.0));
         write(28, "block", encode_block(&b));
+        write(
+            29,
+            "knowledge_op",
+            encode_knowledge_op(&tests_sample_knowledge_op()),
+        );
 
         // Every seed must decode cleanly under the target's own dispatch (selector byte
         // stripped), proving the corpus is valid, not garbage.
@@ -4589,5 +4996,262 @@ mod tests {
             let data = std::fs::read(&p).expect("read seed");
             assert!(data.len() > 1, "seed {p:?} carries a body");
         }
+    }
+
+    // --- 知识单元 op(K1)------------------------------------------------------
+
+    fn tests_sample_knowledge_op() -> crate::knowledge::KnowledgeOp {
+        use crate::knowledge::*;
+        KnowledgeOp {
+            actor: 7,
+            action: KnowledgeAction::CreateUnit {
+                layer: Layer::Application,
+                domain: 2,
+                version: VersionPayload {
+                    bodies: vec![
+                        Body {
+                            lang: "zh".into(),
+                            hash: [1u8; 32],
+                        },
+                        Body {
+                            lang: "en".into(),
+                            hash: [2u8; 32],
+                        },
+                    ],
+                    source: Source::Model("claude-opus-5-5".into()),
+                    cites: vec![
+                        Cite {
+                            unit: 1,
+                            version: 1,
+                            kind: CiteKind::Basis,
+                        },
+                        Cite {
+                            unit: 2,
+                            version: 3,
+                            kind: CiteKind::SeeAlso,
+                        },
+                    ],
+                },
+            },
+            nonce: 4,
+            signature: [0u8; 64],
+        }
+        .signed(&crate::Keypair::from_seed([7u8; 32]))
+    }
+
+    fn all_knowledge_actions() -> Vec<crate::knowledge::KnowledgeOp> {
+        use crate::knowledge::*;
+        let kp = crate::Keypair::from_seed([9u8; 32]);
+        let mk = |action| {
+            KnowledgeOp {
+                actor: 9,
+                action,
+                nonce: 1,
+                signature: [0u8; 64],
+            }
+            .signed(&kp)
+        };
+        vec![
+            tests_sample_knowledge_op(),
+            mk(KnowledgeAction::PublishVersion {
+                unit: 3,
+                version: VersionPayload {
+                    bodies: vec![Body {
+                        lang: "zh-Hant".into(),
+                        hash: [5u8; 32],
+                    }],
+                    source: Source::Human,
+                    cites: vec![],
+                },
+            }),
+            mk(KnowledgeAction::PublishVersion {
+                unit: 3,
+                version: VersionPayload {
+                    bodies: vec![Body {
+                        lang: "zh".into(),
+                        hash: [6u8; 32],
+                    }],
+                    source: Source::ModelVerified("m".into()),
+                    cites: vec![Cite {
+                        unit: 1,
+                        version: 2,
+                        kind: CiteKind::Basis,
+                    }],
+                },
+            }),
+            mk(KnowledgeAction::Verify {
+                unit: 3,
+                version: 2,
+                verdict: Verdict::NeedsRevision,
+                note_hash: [8u8; 32],
+            }),
+            mk(KnowledgeAction::Invite { pubkey: [3u8; 32] }),
+        ]
+    }
+
+    #[test]
+    fn knowledge_op_round_trips_every_action() {
+        for op in all_knowledge_actions() {
+            let bytes = encode_knowledge_op(&op);
+            let back = decode_knowledge_op(&bytes).expect("decode");
+            assert_eq!(back, op);
+            assert_eq!(
+                encode_knowledge_op(&back),
+                bytes,
+                "re-encoding is byte-stable"
+            );
+            let mut extra = bytes.clone();
+            extra.push(0);
+            assert!(matches!(
+                decode_knowledge_op(&extra),
+                Err(CodecError::TrailingBytes)
+            ));
+            assert!(op.is_well_formed().is_ok(), "{op:?}");
+        }
+    }
+
+    #[test]
+    fn knowledge_op_signing_is_domain_separated() {
+        // 签名字节 = 域前缀 + 不含签名的字段;签名可验证;改任何字段签名即失效。
+        let op = tests_sample_knowledge_op();
+        let sb = knowledge_op_signing_bytes(&op);
+        assert!(sb.starts_with(crate::knowledge::SIGN_DOMAIN));
+        let full = encode_knowledge_op(&op);
+        assert_eq!(
+            &sb[crate::knowledge::SIGN_DOMAIN.len()..],
+            &full[..full.len() - 64]
+        );
+        let pk = crate::Keypair::from_seed([7u8; 32]).public();
+        assert!(crate::crypto::verify(&pk, &sb, &op.signature));
+        let mut tampered = op.clone();
+        tampered.nonce += 1;
+        assert!(!crate::crypto::verify(
+            &pk,
+            &knowledge_op_signing_bytes(&tampered),
+            &op.signature
+        ));
+        // 不带域前缀的同样字段,签名不成立:知识 op 的签名不能被当作"无前缀"op 的签名使用。
+        assert!(!crate::crypto::verify(
+            &pk,
+            &full[..full.len() - 64],
+            &op.signature
+        ));
+    }
+
+    #[test]
+    fn knowledge_op_decoder_rejects_malformed_input() {
+        let good = encode_knowledge_op(&tests_sample_knowledge_op());
+        // 未知动作标签(第 8 字节,紧跟 actor)
+        let mut b = good.clone();
+        b[8] = 9;
+        assert!(matches!(
+            decode_knowledge_op(&b),
+            Err(CodecError::BadEnum(9))
+        ));
+        // 未知层级(紧跟动作标签)
+        let mut b = good.clone();
+        b[9] = 7;
+        assert!(matches!(
+            decode_knowledge_op(&b),
+            Err(CodecError::BadEnum(7))
+        ));
+        // 正文数量超过上限:layer(1) + domain(4) 之后是 8 字节正文计数
+        let mut b = good.clone();
+        b[14..22].copy_from_slice(&(crate::knowledge::MAX_BODIES as u64 + 1).to_be_bytes());
+        assert!(matches!(
+            decode_knowledge_op(&b),
+            Err(CodecError::TooManyItems(_))
+        ));
+        // 语言标签长度超过上限
+        let mut b = good.clone();
+        b[22..26].copy_from_slice(&(crate::knowledge::MAX_LANG_LEN as u32 + 1).to_be_bytes());
+        assert!(matches!(
+            decode_knowledge_op(&b),
+            Err(CodecError::TooManyItems(_))
+        ));
+        // 语言标签不是合法 UTF-8
+        let mut b = good.clone();
+        b[26] = 0xff;
+        assert!(matches!(
+            decode_knowledge_op(&b),
+            Err(CodecError::BadString)
+        ));
+        // 截断
+        assert!(matches!(
+            decode_knowledge_op(&good[..good.len() - 1]),
+            Err(CodecError::UnexpectedEof)
+        ));
+    }
+
+    #[test]
+    fn block_with_knowledge_ops_round_trips_and_commits() {
+        // 测试网阶段 1(B8 wire):区块携带知识 op,编解码往返;头部承诺覆盖它们,
+        // 且 header.hash() == block.hash() 的 SPV 契约仍成立;改动任何一条 op 都改变区块哈希。
+        let mut b = sample_block();
+        b.knowledge_ops = all_knowledge_actions();
+        let bytes = encode_block(&b);
+        let back = decode_block(&bytes).expect("decode");
+        assert_eq!(encode_block(&back), bytes);
+        assert_eq!(back.knowledge_ops, b.knowledge_ops);
+        let h = BlockHeader::from_block(&b);
+        assert_ne!(h.knowledge_ops_commitment, [0u8; 32]);
+        assert_eq!(h.hash(), b.hash());
+        let hb = encode_header(&h);
+        assert_eq!(encode_header(&decode_header(&hb).unwrap()), hb);
+        let mut b2 = b.clone();
+        b2.knowledge_ops[0].nonce += 1;
+        assert_ne!(
+            b2.hash(),
+            b.hash(),
+            "knowledge ops are bound by the header commitment"
+        );
+    }
+
+    #[test]
+    fn knowledge_op_well_formedness() {
+        use crate::knowledge::*;
+        let base = || match tests_sample_knowledge_op().action {
+            KnowledgeAction::CreateUnit { version, .. } => version,
+            _ => unreachable!(),
+        };
+        let wrap = |v: VersionPayload| KnowledgeOp {
+            actor: 1,
+            action: KnowledgeAction::PublishVersion {
+                unit: 1,
+                version: v,
+            },
+            nonce: 0,
+            signature: [0u8; 64],
+        };
+        let mut v = base();
+        v.bodies.clear();
+        assert!(wrap(v).is_well_formed().is_err(), "needs a body");
+        let mut v = base();
+        v.bodies[1].lang = "zh".into();
+        assert!(wrap(v).is_well_formed().is_err(), "duplicate language");
+        let mut v = base();
+        v.bodies[0].lang = "zh cn".into();
+        assert!(wrap(v).is_well_formed().is_err(), "bad language chars");
+        let mut v = base();
+        v.cites[0].version = 0;
+        assert!(wrap(v).is_well_formed().is_err(), "versions start at 1");
+        let mut v = base();
+        v.cites[1] = v.cites[0].clone();
+        assert!(wrap(v).is_well_formed().is_err(), "duplicate cite");
+        let mut v = base();
+        v.source = Source::Model(String::new());
+        assert!(wrap(v).is_well_formed().is_err(), "empty model id");
+        let verify0 = KnowledgeOp {
+            actor: 1,
+            action: KnowledgeAction::Verify {
+                unit: 1,
+                version: 0,
+                verdict: Verdict::Pass,
+                note_hash: [0u8; 32],
+            },
+            nonce: 0,
+            signature: [0u8; 64],
+        };
+        assert!(verify0.is_well_formed().is_err(), "verify version 0");
     }
 }

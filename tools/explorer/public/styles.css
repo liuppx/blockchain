@@ -21,3 +21,33 @@ a.link { color:var(--acc); cursor:pointer; text-decoration:none; } a.link:hover 
 .tabs button.on { border-color:var(--acc); color:var(--acc); }
 .err { color:var(--bad); } .hash { color:var(--mut); }
 kv { display:block; } kv b { color:var(--mut); font-weight:normal; display:inline-block; min-width:140px; }
+/* knowledge bodies */
+.bodyslot { margin:8px 0 14px; padding:10px 14px; border:1px solid var(--line); border-radius:6px; background:var(--panel); }
+.ok { color:var(--ok); font-size:12px; margin-bottom:6px; }
+.mdbody { line-height:1.75; max-width:900px; font-family:-apple-system,"PingFang SC","Noto Sans CJK SC","Microsoft YaHei",sans-serif; font-size:15px; }
+.mdbody h3.md, .mdbody h4.md, .mdbody h5.md { margin:16px 0 6px; border:0; padding:0; }
+.mdbody table.md { margin:8px 0; }
+.mdbody pre { background:#0d1117; padding:8px; overflow-x:auto; }
+.mdbody blockquote.md { border-left:3px solid var(--line); margin:8px 0; padding-left:10px; color:var(--mut); }
+.mdbody code { background:#1f242d; padding:0 3px; border-radius:3px; }
+/* member: identity & review */
+ol.mnemonic { display:grid; grid-template-columns:repeat(4, minmax(140px,1fr)); gap:6px 18px; background:var(--panel);
+  border:1px solid var(--line); border-radius:6px; padding:12px 12px 12px 40px; font-size:16px; }
+ol.checklist li { margin:6px 0; line-height:1.6; }
+#idBtn { margin-left:auto; }
+textarea { background:#0d1117; color:var(--fg); border:1px solid var(--line); border-radius:6px; padding:6px 10px; font:inherit; }
+button:disabled { opacity:.45; cursor:not-allowed; }
+ol.queue li { margin:6px 0; }
+#reviewQueue { margin-bottom:12px; }
+/* author */
+.auSplit { display:grid; grid-template-columns:1fr 1fr; gap:14px; }
+.auSplit textarea { width:100%; min-height:520px; font:13px/1.6 ui-monospace,Menlo,monospace; }
+.auPreview { max-height:560px; overflow:auto; border:1px solid var(--line); border-radius:6px; padding:8px 12px; background:var(--panel); }
+#authorSlot { margin-bottom:10px; }
+#reviseSlot { margin:10px 0; }
+@media (max-width: 900px) { .auSplit { grid-template-columns:1fr; } }
+select { background:#0d1117; color:var(--fg); border:1px solid var(--line); border-radius:6px; padding:5px 8px; font:inherit; }
+.banner { border-radius:6px; padding:10px 14px; margin-bottom:12px; line-height:1.6; }
+.banner.warn { background:#3a2e0b; border:1px solid #9e6a03; }
+.banner.bad { background:#3d1214; border:1px solid var(--bad); }
+.searchbar { display:flex; gap:8px; align-items:center; flex-wrap:wrap; margin-bottom:10px; }
