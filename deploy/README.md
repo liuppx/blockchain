@@ -82,6 +82,28 @@ curl -s 127.0.0.1:19221/height              # 经通道读新机高度
 
 更新浏览器:把仓库 `tools/explorer/` 同步到旧机 `/opt/zhixing/tools/explorer/` 后 `systemctl restart zhixing-explorer`。
 
+## 监控与告警
+
+`deploy/monitor-testnet.sh`(已装到两台机器的 `/opt/zhixing/deploy/`,并接入社区的飞书通知):
+
+| 机器 | 定时任务 | 检查 |
+|---|---|---|
+| 新机 | `/etc/cron.d/zhixing-testnet-monitor`(每 5 分钟) | 4 个节点 RPC 可答、链在出块、4 个节点 head 一致、`/data` 余量 |
+| 旧机 | `/etc/cron.d/zhixing-tunnel-monitor`(每 5 分钟) | 旧机 → 新机的通道可答、`/data` 余量 |
+
+脚本自己写日志(`/opt/logs/zhixing-testnet-monitor.log`,超过 1 MB 截断),发现异常时通过社区的
+`send_feishu_message` 发出通知并以非零码退出(定时任务能看到失败)。通知链路已实测送达。
+
+手动执行:
+
+```sh
+/opt/zhixing/deploy/monitor-testnet.sh                        # 新机
+ZHIXING_SKIP_NODES=1 ZHIXING_CHECK_TUNNEL=1 /opt/zhixing/deploy/monitor-testnet.sh   # 旧机
+```
+
+链自身的 Prometheus 指标与告警规则见 [`docs/ops/`](../docs/ops/)(`zhixing_height`、`zhixing_peers_connected`、
+`zhixing_slashing_events_total` 等);本机未部署 Prometheus,故用上面的定时脚本覆盖同样的关键指标。
+
 ## 已停用
 
 | 文件 | 原因 |
