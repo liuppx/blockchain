@@ -28,6 +28,8 @@ const BODY_TOKEN = process.env.BODY_TOKEN || "";
 const MAX_BODY = 64 * 1024; // matches the node's RPC body cap
 const { KnowledgeIndex, LICENSE } = require("./knowledge-index.js");
 const { ReviewAssigner } = require("./review-assign.js");
+const { TerrainBuilder } = require("./terrain.js");
+const TERRAIN = new TerrainBuilder(NODE_RPC);
 const INDEX = new KnowledgeIndex(BODY_DIR, NODE_RPC);
 const ASSIGNER = new ReviewAssigner(NODE_RPC);
 
@@ -163,6 +165,18 @@ async function assign(req, res) {
   }
 }
 
+// GET /terrain   认知地形图:把引用关系投影成地形(峰/高原/山脊/山谷/断层)
+async function terrain(req, res) {
+  try {
+    const t = await TERRAIN.build();
+    res.writeHead(200, { "Content-Type": "application/json; charset=utf-8", "Cache-Control": "no-store" })
+      .end(JSON.stringify(t));
+  } catch (e) {
+    res.writeHead(500, { "Content-Type": "application/json" })
+      .end(JSON.stringify({ error: "terrain failed: " + e.message }));
+  }
+}
+
 // GET /export/units   全部单元的 JSONL 导出(CC BY 4.0)
 async function exportUnits(req, res) {
   try {
@@ -201,6 +215,7 @@ http.createServer((req, res) => {
   if (req.url.startsWith("/status/")) return status(req, res);
   if (req.url === "/search" || req.url.startsWith("/search?")) return search(req, res);
   if (req.url.startsWith("/assign")) return assign(req, res);
+  if (req.url === "/terrain" || req.url.startsWith("/terrain?")) return terrain(req, res);
   if (req.url === "/export/units" || req.url.startsWith("/export/units?")) return exportUnits(req, res);
   if (req.url === "/rpc" || req.url.startsWith("/rpc/") || req.url.startsWith("/rpc?")) return proxy(req, res);
   return serveStatic(req, res);
