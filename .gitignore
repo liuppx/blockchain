@@ -39,3 +39,4 @@ __pycache__/
 testnet/members.toml
 node/target-linux/
 output/
+tools/explorer/node_modules/

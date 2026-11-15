@@ -3,9 +3,18 @@
   "version": "0.1.0",
   "private": true,
   "description": "Lightweight (L1) block explorer for a zhixing node — static UI + zero-dependency RPC proxy.",
-  "bin": { "zhixing-explorer": "server.js" },
-  "scripts": {
-    "start": "node server.js"
+  "bin": {
+    "zhixing-explorer": "server.js"
   },
-  "engines": { "node": ">=18" }
+  "scripts": {
+    "start": "node server.js",
+    "test": "node --test test/signer.test.mjs",
+    "test:browser": "node --test test/browser.e2e.mjs"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "devDependencies": {
+    "puppeteer-core": "^23.0.0"
+  }
 }
