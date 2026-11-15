@@ -341,10 +341,47 @@
     setToken(t) { t ? root.localStorage.setItem(TOKEN_KEY, t.trim()) : root.localStorage.removeItem(TOKEN_KEY); },
   };
 
+  // ---- 钱包登录:从钱包签名派生成员密钥 ------------------------------------------
+  // 夜莺钱包目前不向网页开放"对任意字节做 ed25519 签名"(personal_sign 是以太坊 secp256k1;
+  // wallet_ucan_sign 用的是按站点生成、会过期的会话密钥,不能作为稳定的成员身份)。
+  // 因此:让钱包对一段固定的、写明用途的消息做 personal_sign,再用 HKDF 把签名变成 ed25519 种子。
+  // 以太坊签名是确定性的(RFC 6979),同一账户每次得到同一把成员密钥——密钥无需保存,随时可由钱包重新派生。
+  // 门限(MPC)账户的签名不确定,派生结果每次不同,调用方必须检查并拒绝。
+  const WALLET_DERIVE_VERSION = 1;
+  function walletDeriveMessage(address) {
+    return [
+      "知行图成员密钥派生 / ZhixingGraph member key derivation",
+      "",
+      "签署这条消息会生成你在知行图上的成员密钥。",
+      "只在 blockchain.yeying.pub 上签署它;任何拿到这个签名的人都能以你的身份核验和发布知识。",
+      "这不是交易,不会花费任何资产。",
+      "",
+      `Address: ${String(address).toLowerCase()}`,
+      `Version: ${WALLET_DERIVE_VERSION}`,
+    ].join("\n");
+  }
+  async function seedFromWalletSignature(sigHex, address) {
+    const sig = hexToBytes(String(sigHex).replace(/^0x/, ""));
+    if (sig.length !== 65) throw new Error("钱包返回的签名长度不对(应为 65 字节)");
+    const ikm = await subtle.importKey("raw", sig, "HKDF", false, ["deriveBits"]);
+    const bits = await subtle.deriveBits({
+      name: "HKDF", hash: "SHA-256",
+      salt: new TextEncoder().encode(`zhixing-wallet-seed-v${WALLET_DERIVE_VERSION}`),
+      info: new TextEncoder().encode(String(address).toLowerCase()),
+    }, ikm, 256);
+    return new Uint8Array(bits);
+  }
+  function utf8ToHex(s) { return "0x" + bytesToHex(new TextEncoder().encode(s)); }
+
+  const WALLET_LINK_KEY = "zhixing.walletLink.v1";
+  store.walletLink = function () { try { return JSON.parse(root.localStorage.getItem(WALLET_LINK_KEY) || "null"); } catch (_) { return null; } };
+  store.setWalletLink = function (v) { v ? root.localStorage.setItem(WALLET_LINK_KEY, JSON.stringify(v)) : root.localStorage.removeItem(WALLET_LINK_KEY); };
+
   const api = {
     generateMnemonic, entropyToMnemonic, validateMnemonic, mnemonicToSeed, keyFromSeed,
     encodeOp, signOp, sealSeed, openSeed, store, bytesToHex, hexToBytes,
     keccak256, scrypt, decryptKeystore,
+    walletDeriveMessage, seedFromWalletSignature, utf8ToHex,
   };
   root.ZXSigner = api;
   if (typeof module !== "undefined") module.exports = api;
