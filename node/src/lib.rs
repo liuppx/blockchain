@@ -1291,6 +1291,13 @@ pub enum ChainError {
     },
     /// 版本引用了自身所在的单元。
     SelfCite(u64),
+    /// 取代关系会成环(A 取代 B,B 又取代 A)。
+    SupersedeCycle(u64),
+    /// U2:该正文已经属于另一个单元(重复提交,常见于把别人的翻译当新单元提交)。
+    DuplicateBody {
+        unit: u64,
+        hash: Hash,
+    },
     /// 核验人就是该版本的发布者。
     SelfVerify {
         unit: u64,
@@ -1537,6 +1544,14 @@ impl std::fmt::Display for ChainError {
                 write!(f, "knowledge unit {unit} has no version {version}")
             }
             ChainError::SelfCite(u) => write!(f, "a version of unit {u} cannot cite its own unit"),
+            ChainError::SupersedeCycle(u) => {
+                write!(f, "unit {u} cannot supersede a unit in a supersede cycle")
+            }
+            ChainError::DuplicateBody { unit, hash } => write!(
+                f,
+                "body {} already belongs to unit {unit}; publish it as another version of that unit instead",
+                crate::hash::hex(hash)
+            ),
             ChainError::SelfVerify { unit, version } => {
                 write!(f, "the publisher of unit {unit} v{version} cannot verify it")
             }
@@ -2368,6 +2383,17 @@ impl ChainState {
                     return Err(ChainError::UnknownDomain(*domain));
                 }
                 self.check_knowledge_cites(None, &version.cites)?;
+                // U2(跨语言查重):同一份正文不能被当作新单元再提交一次。
+                // 翻译算"同一条"(同一单元的另一种语言表达),所以正文哈希相同的单元不允许重复创建——
+                // 否则翻译者可以抢走原作者的署名。改用新版本追加另一种语言,是允许的。
+                for b in &version.bodies {
+                    if let Some(owner) = self.knowledge.unit_with_body_hash(&b.hash) {
+                        return Err(ChainError::DuplicateBody {
+                            unit: owner,
+                            hash: b.hash,
+                        });
+                    }
+                }
                 let id = self.knowledge.next_unit_id;
                 self.knowledge.units.insert(
                     id,
@@ -2602,6 +2628,7 @@ impl ChainState {
         own: Option<u64>,
         cites: &[crate::knowledge::Cite],
     ) -> Result<(), ChainError> {
+        use crate::knowledge::CiteKind;
         for c in cites {
             if Some(c.unit) == own {
                 return Err(ChainError::SelfCite(c.unit));
@@ -2616,6 +2643,18 @@ impl ChainState {
                     unit: c.unit,
                     version: c.version,
                 });
+            }
+            // 取代:被取代的单元不能反过来取代本单元(取代关系不可成环),
+            // 也不能取代一个已经取代了本单元的单元(即不能取代自己的"取代者"的被取代者)。
+            if c.kind == CiteKind::Supersedes {
+                if let Some(prev) = self.knowledge.superseded_by(c.unit) {
+                    if Some(prev) == own {
+                        return Err(ChainError::SupersedeCycle(c.unit));
+                    }
+                }
+                if self.knowledge.unit_supersedes(own.unwrap_or(0)) == Some(c.unit) {
+                    return Err(ChainError::SupersedeCycle(c.unit));
+                }
             }
         }
         Ok(())
@@ -5499,12 +5538,17 @@ mod tests {
         g
     }
 
+    /// 每个版本一个**不同**的正文哈希:U2 规定同一份正文不能被当作新单元重复提交,
+    /// 所以测试里不同单元必须用不同哈希(否则会被 DuplicateBody 拒绝)。
     fn payload(cites: Vec<crate::knowledge::Cite>) -> crate::knowledge::VersionPayload {
         use crate::knowledge::*;
+        use std::sync::atomic::{AtomicU8, Ordering};
+        static SEQ: AtomicU8 = AtomicU8::new(0);
+        let n = SEQ.fetch_add(1, Ordering::Relaxed);
         VersionPayload {
             bodies: vec![Body {
                 lang: "zh".into(),
-                hash: [7u8; 32],
+                hash: [n.wrapping_add(1); 32],
             }],
             source: Source::Model("claude-opus-5-5".into()),
             cites,

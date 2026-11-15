@@ -1139,6 +1139,7 @@ fn dec_version_payload(d: &mut Dec) -> Result<crate::knowledge::VersionPayload, 
         let kind = match d.u8()? {
             0 => CiteKind::Basis,
             1 => CiteKind::SeeAlso,
+            2 => CiteKind::Supersedes,
             other => return Err(CodecError::BadEnum(other as u32)),
         };
         cites.push(Cite {

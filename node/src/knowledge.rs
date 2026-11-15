@@ -69,6 +69,13 @@ pub enum CiteKind {
     Basis = 0,
     /// 参见:相关但互不依赖;不传递可信度。
     SeeAlso = 1,
+    /// 取代:本单元**取代**了被引用的单元——被取代的单元作废(生命周期进入"已取代"),
+    /// 它的贡献者与核验记录保留,历史可追溯。
+    ///
+    /// 与"依据"相反:取代**不**传递可信度(新单元不继承旧单元的可信度),
+    /// 也不要求双方有依赖关系——它们是两个独立的单元,只是前者废弃了后者。
+    /// 取代关系不可成环(A 取代 B,B 不能再取代 A)。
+    Supersedes = 2,
 }
 
 /// 一条引用,锁定被引用单元的具体版本(U1)。
@@ -368,7 +375,97 @@ pub struct Credibility {
     pub stale_cites: Vec<(u64, u32, u32)>,
 }
 
+/// 知识单元的生命周期状态(§4a)。**由链上已有的关系派生**,不是新增的状态字段,
+/// 所以推导它不会改变 `state_root`,已有链不需要重开。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LifecycleState {
+    /// 活跃:正常参与可信度计算与奖励分配。
+    Active,
+    /// 休眠:长期无人引用、无人核验;仍在链上,仍可被引用与修订。
+    Dormant,
+    /// 已被另一个单元取代(见 `CiteKind::Supersedes`);保留历史,不再参与奖励分配。
+    Superseded,
+    /// 竞争单元:与被引用的单元**并存**(§4b"挑战共识不用举报,而用提交竞争单元")。
+    /// 链上记录为一处"断层",由证据、引用与使用随时间分出高下;**不强行裁决**。
+    Contested,
+}
+
 impl KnowledgeState {
+    /// 某个正文哈希已经属于哪个单元(U2 跨语言查重:同一份正文只能属于一个单元)。
+    pub fn unit_with_body_hash(&self, hash: &[u8; 32]) -> Option<u64> {
+        self.units
+            .values()
+            .find(|u| {
+                u.versions
+                    .iter()
+                    .any(|v| v.payload.bodies.iter().any(|b| &b.hash == hash))
+            })
+            .map(|u| u.id)
+    }
+
+    /// 某单元**取代了谁**(当前版本里的 `Supersedes` 引用指向被取代的单元)。
+    pub fn unit_supersedes(&self, unit: u64) -> Option<u64> {
+        let unit_state = self.units.get(&unit)?;
+        let v = unit_state.versions.last()?;
+        v.payload
+            .cites
+            .iter()
+            .find(|c| c.kind == CiteKind::Supersedes)
+            .map(|c| c.unit)
+    }
+
+    /// 某单元**被谁取代**:找出所有当前版本以 `Supersedes` 引用它的单元。
+    pub fn superseded_by(&self, unit: u64) -> Option<u64> {
+        self.units
+            .values()
+            .filter(|other| other.id != unit)
+            .find(|other| {
+                other.versions.last().is_some_and(|v| {
+                    v.payload
+                        .cites
+                        .iter()
+                        .any(|c| c.unit == unit && c.kind == CiteKind::Supersedes)
+                })
+            })
+            .map(|other| other.id)
+    }
+
+    /// 某单元的生命周期状态。
+    ///
+    /// - 被取代 ⇒ `Superseded`(优先于其他判定:取代是显式声明);
+    /// - 本身是竞争单元(它取代了别人)⇒ `Contested`:新旧并存,等证据与使用分高下;
+    /// - 否则:若已确立(有核验通过)或仍被别的单元依据 ⇒ `Active`;
+    /// - 否则(既无人核验、也无人依据)⇒ `Dormant`。
+    pub fn lifecycle(&self, unit: u64) -> Option<LifecycleState> {
+        self.units.get(&unit)?;
+        if self.superseded_by(unit).is_some() {
+            return Some(LifecycleState::Superseded);
+        }
+        if self.unit_supersedes(unit).is_some() {
+            // 竞争单元:它主张取代了旧单元,但旧单元同时也是"被取代"——两个方向都存在时,
+            // 说明这是"竞争"而非"平稳取代"(§4b:不强行裁决,靠证据与使用分高下)。
+            return Some(LifecycleState::Contested);
+        }
+        let cred = self.current_credibility(unit)?;
+        if cred.passes > 0 {
+            return Some(LifecycleState::Active);
+        }
+        // 被别人的当前版本依据 ⇒ 仍在使用
+        let cited = self.units.values().any(|other| {
+            other.id != unit
+                && other.versions.last().is_some_and(|v| {
+                    v.payload
+                        .cites
+                        .iter()
+                        .any(|c| c.unit == unit && c.kind == CiteKind::Basis)
+                })
+        });
+        if cited {
+            return Some(LifecycleState::Active);
+        }
+        Some(LifecycleState::Dormant)
+    }
+
     fn version(&self, unit: u64, version: u32) -> Option<&UnitVersion> {
         self.units
             .get(&unit)?
@@ -448,6 +545,13 @@ impl KnowledgeState {
         let mut bottleneck = None;
         let mut stale_cites = Vec::new();
         for c in v.payload.cites.iter().filter(|c| c.kind == CiteKind::Basis) {
+            // 被取代的地基不再传递可信度:依据一个已作废的单元,上层同样不可信。
+            // (取代关系是显式声明,不是"看起来没人用",所以不靠启发式判断。)
+            if self.superseded_by(c.unit).is_some() {
+                effective_bps = 0;
+                bottleneck = Some((c.unit, c.version));
+                break;
+            }
             // 引用目标在应用时已校验存在;状态被手工破坏时按 0 处理(不可信)。
             let dep = self
                 .credibility_memo(c.unit, c.version, memo)
@@ -631,6 +735,135 @@ mod tests {
         assert_eq!(k.self_credibility(1, 1), Some((CRED_HUMAN, 0)));
         assert_eq!(k.self_credibility(9, 1), None);
         assert_eq!(k.self_credibility(1, 2), None);
+    }
+
+    #[test]
+    #[test]
+    fn supersedes_marks_the_old_unit_and_blocks_cycles() {
+        let mut k = state(&[1, 2, 3], 0);
+        add_unit(&mut k, 1, 1, model(), vec![]); // 被取代的旧单元
+        add_unit(&mut k, 2, 2, model(), vec![]); // 取代它的新单元
+                                                 // 新单元引用旧单元,类型为"取代"
+        k.units.get_mut(&2).unwrap().versions[0].payload.cites = vec![Cite {
+            unit: 1,
+            version: 1,
+            kind: CiteKind::Supersedes,
+        }];
+        assert_eq!(k.superseded_by(1), Some(2), "旧单元应被标记为已取代");
+        assert_eq!(k.unit_supersedes(2), Some(1));
+        assert_eq!(k.lifecycle(1), Some(LifecycleState::Superseded));
+        // 新单元是**竞争单元**:新旧并存,由证据与使用分高下(§4b,不强行裁决)
+        assert_eq!(k.lifecycle(2), Some(LifecycleState::Contested));
+        // 取代**不**传递可信度:新单元不继承旧单元的可信度
+        verify(&mut k, 1, 1, 2, Verdict::Pass, 3);
+        let c2 = k.credibility(2, 1).unwrap();
+        assert_eq!(c2.passes, 0, "取代关系本身不应带来通过计数");
+    }
+
+    #[test]
+    #[test]
+    fn competing_units_coexist_rather_than_being_retired() {
+        // §4b:竞争单元与原单元**并存**,链上显示为一处"断层";旧单元不因被挑战就作废。
+        let mut k = state(&[1, 2, 3], 0);
+        add_unit(&mut k, 1, 1, model(), vec![]);
+        add_unit(
+            &mut k,
+            2,
+            2,
+            model(),
+            vec![Cite {
+                unit: 1,
+                version: 1,
+                kind: CiteKind::Supersedes,
+            }],
+        );
+        assert_eq!(k.lifecycle(2), Some(LifecycleState::Contested));
+        // 旧单元仍可被引用与修订(不因被挑战而消失)
+        assert!(k.units.contains_key(&1));
+        assert_eq!(k.lifecycle(1), Some(LifecycleState::Superseded));
+        // 旧单元的历史(核验记录)保留
+        verify(&mut k, 1, 1, 3, Verdict::Pass, 3);
+        assert_eq!(k.verdict_counts(1, 1), Some((1, 0)));
+    }
+
+    #[test]
+    fn a_superseded_foundation_stops_passing_credibility() {
+        let mut k = state(&[1, 2, 3], 0);
+        add_unit(&mut k, 1, 1, model(), vec![]); // 地基
+        add_unit(
+            &mut k,
+            2,
+            2,
+            model(),
+            vec![Cite {
+                unit: 1,
+                version: 1,
+                kind: CiteKind::Basis,
+            }],
+        ); // 依据它
+        verify(&mut k, 1, 1, 3, Verdict::Pass, 3);
+        verify(&mut k, 2, 1, 3, Verdict::Pass, 3);
+        assert_eq!(
+            k.credibility(2, 1).unwrap().effective_bps,
+            CRED_HUMAN + CRED_STEP
+        );
+        // 单元 3 取代地基 1
+        add_unit(
+            &mut k,
+            3,
+            3,
+            model(),
+            vec![Cite {
+                unit: 1,
+                version: 1,
+                kind: CiteKind::Supersedes,
+            }],
+        );
+        let c2 = k.credibility(2, 1).unwrap();
+        assert_eq!(c2.effective_bps, 0, "依据已作废地基的上层单元不再有可信度");
+        assert_eq!(c2.bottleneck, Some((1, 1)), "应指出是哪个地基作废了它");
+    }
+
+    #[test]
+    #[test]
+    fn dormant_when_nobody_verified_or_cites_it() {
+        let mut k = state(&[1, 2, 3], 0);
+        add_unit(&mut k, 1, 1, model(), vec![]);
+        add_unit(&mut k, 2, 2, model(), vec![]);
+        assert_eq!(
+            k.lifecycle(1),
+            Some(LifecycleState::Dormant),
+            "无人核验也无人依据 ⇒ 休眠"
+        );
+        verify(&mut k, 1, 1, 2, Verdict::Pass, 3);
+        assert_eq!(
+            k.lifecycle(1),
+            Some(LifecycleState::Active),
+            "有核验通过 ⇒ 活跃"
+        );
+    }
+
+    #[test]
+    #[test]
+    fn cited_units_stay_active() {
+        let mut k = state(&[1, 2, 3], 0);
+        add_unit(&mut k, 1, 1, model(), vec![]);
+        add_unit(
+            &mut k,
+            2,
+            2,
+            model(),
+            vec![Cite {
+                unit: 1,
+                version: 1,
+                kind: CiteKind::Basis,
+            }],
+        );
+        assert_eq!(
+            k.lifecycle(1),
+            Some(LifecycleState::Active),
+            "被依据 ⇒ 活跃"
+        );
     }
 
     #[test]

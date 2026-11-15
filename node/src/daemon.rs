@@ -1879,6 +1879,10 @@ async fn run_actor(mut actor: Actor, mut rx: mpsc::UnboundedReceiver<Cmd>) {
                                 .iter()
                                 .map(|c| (c.unit, c.version, cite_kind_name(c.kind)))
                                 .collect(),
+                            lifecycle: lifecycle_name(
+                                k.lifecycle(u.id)
+                                    .unwrap_or(crate::knowledge::LifecycleState::Active),
+                            ),
                         })
                     })
                     .collect();
@@ -3414,6 +3418,8 @@ struct UnitSummary {
     body_hashes: Vec<String>,
     /// P1:当前版本的引用(单元号, 版本号, 类型)。
     cites: Vec<(u64, u32, &'static str)>,
+    /// 生命周期状态(活跃 / 休眠 / 已取代),由链上关系派生。
+    lifecycle: &'static str,
 }
 
 /// K5:单个知识单元的完整信息;`versions[i]` 对应 `unit.versions[i]` 的(可信度, 核验记录)。
@@ -3444,10 +3450,21 @@ fn source_name(s: &crate::knowledge::Source) -> String {
     }
 }
 
+/// P1:生命周期状态的对外名字。
+fn lifecycle_name(s: crate::knowledge::LifecycleState) -> &'static str {
+    match s {
+        crate::knowledge::LifecycleState::Active => "active",
+        crate::knowledge::LifecycleState::Dormant => "dormant",
+        crate::knowledge::LifecycleState::Superseded => "superseded",
+        crate::knowledge::LifecycleState::Contested => "contested",
+    }
+}
+
 fn cite_kind_name(k: crate::knowledge::CiteKind) -> &'static str {
     match k {
         crate::knowledge::CiteKind::Basis => "basis",
         crate::knowledge::CiteKind::SeeAlso => "see-also",
+        crate::knowledge::CiteKind::Supersedes => "supersedes",
     }
 }
 
@@ -3547,7 +3564,7 @@ fn json_unit_listing(units: &[UnitSummary]) -> String {
                 .collect::<Vec<_>>()
                 .join(",");
             format!(
-                "{{\"id\":{},\"layer\":{},\"domain\":{},\"author\":{},\"created_height\":{},\"versions\":{},\"credibility\":{},\"body_hashes\":[{}],\"cites\":[{}]}}",
+                "{{\"id\":{},\"layer\":{},\"domain\":{},\"author\":{},\"created_height\":{},\"versions\":{},\"credibility\":{},\"body_hashes\":[{}],\"cites\":[{}],\"lifecycle\":{}}}",
                 json_u64(u.id),
                 json_str(layer_name(u.layer)),
                 json_u64(u.domain as u64),
@@ -3556,7 +3573,8 @@ fn json_unit_listing(units: &[UnitSummary]) -> String {
                 json_u64(u.versions as u64),
                 json_credibility(&u.cred),
                 bodies,
-                cites
+                cites,
+                json_str(u.lifecycle)
             )
         })
         .collect::<Vec<_>>()
@@ -15500,6 +15518,7 @@ mod tests {
             },
             body_hashes: vec!["aa".repeat(32)],
             cites: vec![(1, 1, "basis")],
+            lifecycle: "active",
         };
         assert!(unit_matches_filters(&u, ""), "no params ⇒ no filter");
         assert!(unit_matches_filters(&u, "domain=2"));
