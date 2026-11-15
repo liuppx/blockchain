@@ -80,7 +80,16 @@ systemctl status zhixing-tunnel             # 通道断开时浏览器读不到�
 curl -s 127.0.0.1:19221/height              # 经通道读新机高度
 ```
 
-更新浏览器:把仓库 `tools/explorer/` 同步到旧机 `/opt/zhixing/tools/explorer/` 后 `systemctl restart zhixing-explorer`。
+更新浏览器:用脚本同步并重启,带自检(校验和一致 + 首页返回 200):
+
+```sh
+deploy/deploy-explorer.sh            # 同步 tools/explorer/ → 重启 zhixing-explorer → 自检
+deploy/deploy-explorer.sh --check    # 只看远端状态,不改动
+```
+
+脚本只碰浏览器(旧机的 `/opt/zhixing/tools/explorer`),不碰节点、链数据与密钥——节点在新机上,
+由 `/opt/deploy/zhixing-testnet/scripts/starter.sh` 管理。环境变量 `HOST`(默认 `root@122.9.144.27`)、
+`DEST`(默认 `/opt/zhixing/tools/explorer`)可覆盖。
 
 ## 监控与告警
 
