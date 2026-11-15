@@ -53,7 +53,18 @@ GET /rpc/units?limit=50&cursor=<id>&domain=2&layer=foundation&author=7&min_effec
 
 每项字段:`id`、`layer`、`domain`、`author`、`created_height`、`versions`、`credibility`
 (`passes` / `needs` / `self_bps` / `effective_bps` / `bottleneck` / `stale_cites`)、
-`body_hashes`(当前版本正文哈希)、`cites`(当前版本的引用:`unit` / `version` / `kind`)。
+`body_hashes`(当前版本正文哈希)、`cites`(当前版本的引用:`unit` / `version` / `kind`)、
+`lifecycle`(生命周期状态,见下)。
+
+> **生命周期状态**(由链上关系派生,不是新增的状态字段):
+> | 值 | 含义 |
+> |---|---|
+> | `active` | 活跃:有核验通过,或仍被别的单元依据 |
+> | `dormant` | 休眠:既无人核验、也无人依据(通常是图谱最上层、待核验的单元) |
+> | `contested` | 竞争:它以"取代"引用挑战了另一个单元,新旧**并存**,链上不强行裁决 |
+> | `superseded` | 已取代:被另一个单元取代;历史与署名保留,**不再向依据它的单元传递可信度** |
+>
+> **引用类型 `kind`**:`basis`(依据,传递可信度)、`see-also`(参见)、`supersedes`(取代)。
 
 > **可信度语义**:`effective_bps` = min(自身可信度, 所依据的每个单元的有效可信度)。
 > 每一位"需修改"抵消一位"通过"。`bottleneck` 指出卡住它的那条依据;`stale_cites` 指出已过时的依据。
