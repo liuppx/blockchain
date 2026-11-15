@@ -27,7 +27,9 @@ const STATUS_DIR = process.env.STATUS_DIR || ""; // 运维状态(如 deploy/disk
 const BODY_TOKEN = process.env.BODY_TOKEN || "";
 const MAX_BODY = 64 * 1024; // matches the node's RPC body cap
 const { KnowledgeIndex, LICENSE } = require("./knowledge-index.js");
+const { ReviewAssigner } = require("./review-assign.js");
 const INDEX = new KnowledgeIndex(BODY_DIR, NODE_RPC);
+const ASSIGNER = new ReviewAssigner(NODE_RPC);
 
 const MIME = { ".html": "text/html; charset=utf-8", ".js": "text/javascript; charset=utf-8",
   ".css": "text/css; charset=utf-8", ".json": "application/json", ".ico": "image/x-icon" };
@@ -117,7 +119,8 @@ async function search(req, res) {
   const layer = u.searchParams.get("layer") || undefined;
   const limit = u.searchParams.get("limit");
   try {
-    await INDEX.ensureFresh(30000);
+    // 索引最多 15 秒刷新一次;新单元通常在一个刷新周期内即可被搜到
+    await INDEX.ensureFresh(15000);
     const hits = INDEX.search(q, { domain, layer, limit });
     const body = JSON.stringify({
       query: q, total: hits.length,
@@ -133,6 +136,30 @@ async function search(req, res) {
   } catch (e) {
     res.writeHead(500, { "Content-Type": "application/json" })
       .end(JSON.stringify({ error: "search failed: " + e.message }));
+  }
+}
+
+// GET /assign?unit=N[&version=M]   该版本的核验人指派(确定性,可验证)
+// GET /assign/pending?member=N      指派给该成员、尚未核验的版本
+async function assign(req, res) {
+  const u = new URL(req.url, "http://x");
+  const json = (obj, code = 200) => {
+    res.writeHead(code, { "Content-Type": "application/json; charset=utf-8", "Cache-Control": "no-store" })
+      .end(JSON.stringify(obj));
+  };
+  try {
+    const member = u.searchParams.get("member");
+    if (member) {
+      const list = await ASSIGNER.pendingFor(member);
+      return json({ member, count: list.length, items: list, enforced: false });
+    }
+    const unit = u.searchParams.get("unit");
+    if (!unit) return json({ error: "missing unit" }, 400);
+    const version = u.searchParams.get("version") || undefined;
+    const a = await ASSIGNER.forVersion(unit, version);
+    return json(a);
+  } catch (e) {
+    return json({ error: "assign failed: " + e.message }, 500);
   }
 }
 
@@ -173,6 +200,7 @@ http.createServer((req, res) => {
   if (req.url.startsWith("/bodies/")) return bodies(req, res);
   if (req.url.startsWith("/status/")) return status(req, res);
   if (req.url === "/search" || req.url.startsWith("/search?")) return search(req, res);
+  if (req.url.startsWith("/assign")) return assign(req, res);
   if (req.url === "/export/units" || req.url.startsWith("/export/units?")) return exportUnits(req, res);
   if (req.url === "/rpc" || req.url.startsWith("/rpc/") || req.url.startsWith("/rpc?")) return proxy(req, res);
   return serveStatic(req, res);

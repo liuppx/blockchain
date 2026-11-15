@@ -165,7 +165,10 @@ test("浏览器:导入身份 → 写作 → 修订 → 核验 → 邀请 → 检
     }
 
     // ---- 写作:创建单元 ------------------------------------------------------
-    const BODY = `# 端到端测试单元
+    // 正文每次运行都不同:U2 规定同一份正文不能被当作新单元重复提交(否则会被 DuplicateBody 拒绝),
+    // 而本地链会在多次运行之间保留,所以用运行编号让正文唯一。
+    const RUN = Date.now().toString(36);
+    const BODY = `# 端到端测试单元 ${RUN}
 
 | 字段 | 内容 |
 |---|---|
@@ -174,7 +177,7 @@ test("浏览器:导入身份 → 写作 → 修订 → 核验 → 邀请 → 检
 
 ## 核心陈述
 
-浏览器端到端测试创建的知识单元。
+浏览器端到端测试创建的知识单元(运行 ${RUN})。
 
 ## 核验要点(给人类审查者)
 
@@ -212,7 +215,7 @@ test("浏览器:导入身份 → 写作 → 修订 → 核验 → 邀请 → 检
     const prefilled = await p.$eval("#auText", (e) => e.value);
     assert.match(prefilled, /端到端测试单元/, "修订应预填当前正文");
     await p.$eval("#auText", (e) => {
-      e.value = e.value.replace("浏览器端到端测试创建的知识单元。", "浏览器端到端测试创建的知识单元(第二版)。");
+      e.value = e.value.replace("浏览器端到端测试创建的知识单元(", "浏览器端到端测试创建的知识单元(第二版,");
       e.dispatchEvent(new Event("input"));
     });
     await p.click("#auGo");
@@ -223,10 +226,15 @@ test("浏览器:导入身份 → 写作 → 修订 → 核验 → 邀请 → 检
     assert.equal(Number(after.versions[1].publisher) !== 0, true, "修订者应记录在链上");
 
     // ---- 检索 ---------------------------------------------------------------
-    const sr = await fetch(WEB + "/search?q=" + encodeURIComponent("端到端测试"));
-    assert.equal(sr.status, 200);
-    const hits = await sr.json();
-    assert.ok(hits.items.some((h) => String(h.id) === String(created)), "检索应命中新建单元");
+    // 检索索引按需刷新(最多 30 秒一次),刚建的单元可能还没进索引:等它出现,而不是只查一次
+    let hits = null;
+    const found = await waitFor(async () => {
+      const sr = await fetch(WEB + "/search?q=" + encodeURIComponent(RUN));
+      if (sr.status !== 200) return null;
+      hits = await sr.json();
+      return hits.items.some((h) => String(h.id) === String(created)) ? hits : null;
+    }, 45000, 1500);
+    assert.ok(found, "检索应命中新建单元(按本次运行编号查找)");
     assert.ok(hits.items.find((h) => String(h.id) === String(created)).title.includes("端到端测试"), "标题应含关键词");
 
     // ---- 导出 ---------------------------------------------------------------

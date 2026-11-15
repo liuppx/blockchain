@@ -252,6 +252,22 @@
       return;
     }
     const mine = v.verifications.find((r) => String(r.verifier) === String(me.id));
+    // 核验人指派(服务侧确定性计算;现阶段只是提示,链仍接受所有成员的核验)
+    let assignNote = "";
+    try {
+      const a = await (await fetch("/assign?unit=" + encodeURIComponent(u.id) + "&version=" + vn)).json();
+      if (a && a.assigned && a.assigned.length) {
+        const isMine = a.assigned.includes(String(me.id));
+        assignNote = `<p class='mut'>本版指派给 ${a.assigned.map((x) => "#" + x).join("、")}` +
+          `${isMine ? "<b>(包括你)</b>" : ""}。指派由区块哈希确定性算出,任何人都能复核;` +
+          `现阶段只是提示,链仍接受所有成员的核验。</p>`;
+        const others = a.verifications.filter((x) => x.assigned);
+        if (others.length) {
+          assignNote += `<p class='mut'>已有指派者的结论:${others.map((x) =>
+            `#${x.verifier} ${x.verdict === "pass" ? "通过" : "需修改"}`).join("、")}</p>`;
+        }
+      }
+    } catch (_) { /* 指派不可用不影响核验 */ }
     let items = [];
     const b = v.bodies[0] ? await fetchBody(v.bodies[0].hash) : null;
     if (b && b.ok) items = checklistFrom(b.text);
@@ -259,7 +275,7 @@
       ? `<p>请逐条确认单元末尾的"核验要点"(勾选全部后才能给"通过"):</p><ol class='checklist'>${items.map((t, i) =>
           `<li><label><input type='checkbox' class='rvChk' id='rvc${i}'> ${mdInline(t)}</label></li>`).join("")}</ol>`
       : "<p class='mut'>这个单元没有列出核验要点;请按领域的审查清单逐项检查。</p>";
-    slot.innerHTML = head + (mine ? `<p>你之前的结论:<b>${mine.verdict === "pass" ? "通过" : "需修改"}</b>(高度 ${esc(mine.height)})。再次提交会以最新的结论为准。</p>` : "")
+    slot.innerHTML = head + assignNote + (mine ? `<p>你之前的结论:<b>${mine.verdict === "pass" ? "通过" : "需修改"}</b>(高度 ${esc(mine.height)})。再次提交会以最新的结论为准。</p>` : "")
       + (me.established ? "" : "<p class='err'>你还在见习期:核验照常记录,但暂不计入可信度。</p>")
       + checks
       + `<p class='mut'>你只对<b>核验当时能知道的事</b>负责;后来出现的新证据推翻它,是"诚实的错",不会受罚。
