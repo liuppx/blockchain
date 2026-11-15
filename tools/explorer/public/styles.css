@@ -50,3 +50,4 @@ select { background:#0d1117; color:var(--fg); border:1px solid var(--line); bord
 .banner { border-radius:6px; padding:10px 14px; margin-bottom:12px; line-height:1.6; }
 .banner.warn { background:#3a2e0b; border:1px solid #9e6a03; }
 .banner.bad { background:#3d1214; border:1px solid var(--bad); }
+.searchbar { display:flex; gap:8px; align-items:center; flex-wrap:wrap; margin-bottom:10px; }

@@ -333,12 +333,21 @@ async function tabKnowledge() {
         <td>${esc(c.passes)}${Number(c.needs) ? ` <span class='err'>−${esc(c.needs)}</span>` : ""}</td><td>${credBar(c.self_bps)}</td><td>${credBar(c.effective_bps)}</td><td>${neck}</td></tr>`;
     }).join("") : "<tr><td class='mut' colspan=9>(no knowledge units yet — ./cmd knowledge)</td></tr>";
     setView(`<h2 style='border:0;padding:0 0 8px'>Knowledge units</h2>
+      <div class='searchbar'>
+        <input id='kSearch' placeholder='搜索标题与正文(中英文均可)' size='40' autocomplete='off'>
+        <select id='kDomain'><option value=''>全部领域</option><option value='1'>大模型应用开发</option><option value='2'>运动健身</option></select>
+        <select id='kLayer'><option value=''>全部层级</option><option value='foundation'>基础</option><option value='explanation'>解释</option><option value='scenario'>场景</option><option value='application'>应用</option></select>
+        <button id='kSearchGo'>搜索</button>
+        <a id='kExport' class='link' href='/export/units' download>导出全部(JSONL)</a>
+      </div>
+      <div id='kSearchOut'></div>
       <div id='authorSlot'></div>
       <div id='reviewQueue'></div>
       <p class='mut'>有效可信度 = 自身可信度与所依据单元有效可信度的最小值。"被谁卡住"指出它最薄弱的地基。</p>
       <table><tr><th>unit</th><th>标题</th><th>层级</th><th>领域</th><th>版本数</th><th>核验通过 / 需修改</th><th>自身</th><th>有效</th><th>被谁卡住</th></tr>${rows}</table>`);
     el("view").querySelectorAll("a[data-unit]").forEach(a => a.addEventListener("click", () => showUnit(a.dataset.unit)));
     if (window.ZXAuthor) ZXAuthor.attachKnowledge();
+    wireSearch();
     // 详情只取一次:标题与"先核验哪个"都要用
     const details = await Promise.all(items.map(u => j("/unit/" + u.id).catch(() => null)));
     const titles = {};
@@ -399,6 +408,43 @@ function renderQueue(details, titles) {
     : (me ? "<p class='mut'>暂时没有需要你核验的单元。</p>" : "");
   box.querySelectorAll("a[data-unit]").forEach(a => a.addEventListener("click", () => showUnit(a.dataset.unit)));
 }
+// 全文检索:走浏览器服务的 /search(正文在正文仓库,链上只有哈希)
+function wireSearch() {
+  const go = () => runSearch();
+  el("kSearchGo").addEventListener("click", go);
+  el("kSearch").addEventListener("keydown", (e) => { if (e.key === "Enter") go(); });
+  el("kDomain").addEventListener("change", go);
+  el("kLayer").addEventListener("change", go);
+}
+
+async function runSearch() {
+  const q = el("kSearch").value.trim();
+  const domain = el("kDomain").value, layer = el("kLayer").value;
+  const out = el("kSearchOut");
+  if (!q && !domain && !layer) { out.innerHTML = ""; return; }
+  out.innerHTML = "<span class='mut'>搜索中…</span>";
+  const p = new URLSearchParams();
+  if (q) p.set("q", q);
+  if (domain) p.set("domain", domain);
+  if (layer) p.set("layer", layer);
+  try {
+    const r = await fetch("/search?" + p.toString());
+    if (!r.ok) throw new Error("HTTP " + r.status);
+    const d = await r.json();
+    if (!d.items.length) { out.innerHTML = "<p class='mut'>没有匹配的单元。</p>"; return; }
+    out.innerHTML = `<p class='mut'>${d.total} 条结果</p><table><tr><th>单元</th><th>标题</th><th>层级</th><th>领域</th><th>命中</th><th>有效可信度</th></tr>` +
+      d.items.map((i) => `<tr>
+        <td><a class='link' data-unit='${esc(i.id)}'>#${esc(i.id)}</a></td>
+        <td><a class='link' data-unit='${esc(i.id)}'>${esc(i.title || "(正文未上传)")}</a></td>
+        <td>${esc(LAYER_ZH[i.layer] || i.layer)}</td><td>${esc(domainName(i.domain))}</td>
+        <td class='mut'>${esc(i.excerpt.slice(0, 160))}</td>
+        <td>${credBar(i.credibility ? i.credibility.effective_bps : 0)}</td></tr>`).join("") + "</table>";
+    out.querySelectorAll("a[data-unit]").forEach((a) => a.addEventListener("click", () => showUnit(a.dataset.unit)));
+  } catch (e) {
+    out.innerHTML = `<span class='err'>搜索失败:${esc(e.message)}</span>`;
+  }
+}
+
 async function showUnit(id) {
   history.replaceState(null, "", "#unit/" + id);
   setView("<span class='mut'>loading…</span>");

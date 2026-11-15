@@ -1858,6 +1858,7 @@ async fn run_actor(mut actor: Actor, mut rx: mpsc::UnboundedReceiver<Cmd>) {
                     .units
                     .values()
                     .filter_map(|u| {
+                        let last = u.versions.last()?;
                         Some(UnitSummary {
                             id: u.id,
                             author: u.author,
@@ -1866,6 +1867,18 @@ async fn run_actor(mut actor: Actor, mut rx: mpsc::UnboundedReceiver<Cmd>) {
                             created_height: u.created_height,
                             versions: u.versions.len() as u32,
                             cred: k.current_credibility(u.id)?,
+                            body_hashes: last
+                                .payload
+                                .bodies
+                                .iter()
+                                .map(|b| crate::hash::hex(&b.hash))
+                                .collect(),
+                            cites: last
+                                .payload
+                                .cites
+                                .iter()
+                                .map(|c| (c.unit, c.version, cite_kind_name(c.kind)))
+                                .collect(),
                         })
                     })
                     .collect();
@@ -3397,6 +3410,10 @@ struct UnitSummary {
     created_height: u64,
     versions: u32,
     cred: crate::knowledge::Credibility,
+    /// P1:当前版本正文的哈希(内容寻址,正文在正文仓库)。检索与导出用。
+    body_hashes: Vec<String>,
+    /// P1:当前版本的引用(单元号, 版本号, 类型)。
+    cites: Vec<(u64, u32, &'static str)>,
 }
 
 /// K5:单个知识单元的完整信息;`versions[i]` 对应 `unit.versions[i]` 的(可信度, 核验记录)。
@@ -3509,15 +3526,37 @@ fn json_unit_listing(units: &[UnitSummary]) -> String {
     let items = units
         .iter()
         .map(|u| {
+            // P1:body_hashes(正文哈希,正文在正文仓库)与 cites(当前版本的引用)
+            let bodies = u
+                .body_hashes
+                .iter()
+                .map(|h| json_str(h))
+                .collect::<Vec<_>>()
+                .join(",");
+            let cites = u
+                .cites
+                .iter()
+                .map(|(unit, ver, kind)| {
+                    format!(
+                        "{{\"unit\":{},\"version\":{},\"kind\":{}}}",
+                        json_u64(*unit),
+                        json_u64(*ver as u64),
+                        json_str(kind)
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(",");
             format!(
-                "{{\"id\":{},\"layer\":{},\"domain\":{},\"author\":{},\"created_height\":{},\"versions\":{},\"credibility\":{}}}",
+                "{{\"id\":{},\"layer\":{},\"domain\":{},\"author\":{},\"created_height\":{},\"versions\":{},\"credibility\":{},\"body_hashes\":[{}],\"cites\":[{}]}}",
                 json_u64(u.id),
                 json_str(layer_name(u.layer)),
                 json_u64(u.domain as u64),
                 json_u64(u.author),
                 json_u64(u.created_height),
                 json_u64(u.versions as u64),
-                json_credibility(&u.cred)
+                json_credibility(&u.cred),
+                bodies,
+                cites
             )
         })
         .collect::<Vec<_>>()
@@ -4090,6 +4129,74 @@ fn response_format(query: &str) -> Option<RespFormat> {
 /// M72: parse an optional `usize` query parameter (`<key>=<n>`) from a raw query
 /// string. The first pair whose key matches wins (mirrors `response_format`); a
 /// missing key or an unparseable value ⇒ `None`. Pure, so it is unit-tested directly.
+/// P1:`/units` 的链上筛选参数。领域 / 层级 / 作者 / 最低有效可信度。
+/// 正文全文检索不在此处:链上只存正文哈希(正文在正文仓库),由浏览器服务负责。
+fn str_param(query: &str, key: &str) -> Option<String> {
+    query
+        .split('&')
+        .filter_map(|pair| pair.split_once('='))
+        .find(|(k, _)| *k == key)
+        .map(|(_, v)| percent_decode(v))
+}
+
+/// URL 百分号解码(仅 `%XX` 与 `+`;非 ASCII 原样保留)。
+fn percent_decode(s: &str) -> String {
+    let b = s.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        match b[i] {
+            b'%' if i + 2 < b.len() => {
+                let hex = std::str::from_utf8(&b[i + 1..i + 3]).unwrap_or("");
+                match u8::from_str_radix(hex, 16) {
+                    Ok(v) => {
+                        out.push(v);
+                        i += 3;
+                    }
+                    Err(_) => {
+                        out.push(b[i]);
+                        i += 1;
+                    }
+                }
+            }
+            b'+' => {
+                out.push(b' ');
+                i += 1;
+            }
+            c => {
+                out.push(c);
+                i += 1;
+            }
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// P1:链上筛选。参数缺失即不过滤;`layer` 接受英文层级名。
+fn unit_matches_filters(u: &UnitSummary, query: &str) -> bool {
+    if let Some(d) = str_param(query, "domain").and_then(|v| v.parse::<u32>().ok()) {
+        if u.domain != d {
+            return false;
+        }
+    }
+    if let Some(l) = str_param(query, "layer") {
+        if !layer_name(u.layer).eq_ignore_ascii_case(&l) {
+            return false;
+        }
+    }
+    if let Some(a) = str_param(query, "author").and_then(|v| v.parse::<u64>().ok()) {
+        if u.author != a {
+            return false;
+        }
+    }
+    if let Some(m) = usize_param(query, "min_effective_bps") {
+        if (u.cred.effective_bps as usize) < m {
+            return false;
+        }
+    }
+    true
+}
+
 fn usize_param(query: &str, key: &str) -> Option<usize> {
     query
         .split('&')
@@ -7194,12 +7301,18 @@ async fn serve_rpc_conn(
             }
             GetRoute::Units => {
                 // K5:知识单元目录,按 id 分页(游标为单元 id),每项附当前版本的可信度。
+                // P1:支持按领域 / 层级 / 作者 / 最低有效可信度筛选(均为链上字段);
+                //     正文全文检索在正文仓库侧(浏览器服务),链上不存正文。
                 let (reply, rx) = oneshot::channel();
                 if cmd.send(Cmd::QueryUnits { reply }).is_err() {
                     http_response("503 Service Unavailable", "node stopped")
                 } else {
                     match rx.await {
                         Ok(listing) => {
+                            let listing: Vec<UnitSummary> = listing
+                                .into_iter()
+                                .filter(|u| unit_matches_filters(u, query))
+                                .collect();
                             let keys: Vec<u64> = listing.iter().map(|u| u.id).collect();
                             let cursor = usize_param(query, "cursor").map(|c| c as u64);
                             let start = if cursor.is_some() {
@@ -15365,6 +15478,59 @@ mod tests {
             response_format("format=text&format=json"),
             Some(RespFormat::Text)
         );
+    }
+
+    #[test]
+    fn units_filters_by_chain_fields() {
+        // P1:/units 的链上筛选:领域 / 层级 / 作者 / 最低有效可信度;正文全文不在链上。
+        let mut u = UnitSummary {
+            id: 1,
+            author: 7,
+            layer: crate::knowledge::Layer::Foundation,
+            domain: 2,
+            created_height: 10,
+            versions: 1,
+            cred: crate::knowledge::Credibility {
+                passes: 1,
+                needs: 0,
+                self_bps: 4000,
+                effective_bps: 4000,
+                bottleneck: None,
+                stale_cites: Vec::new(),
+            },
+            body_hashes: vec!["aa".repeat(32)],
+            cites: vec![(1, 1, "basis")],
+        };
+        assert!(unit_matches_filters(&u, ""), "no params ⇒ no filter");
+        assert!(unit_matches_filters(&u, "domain=2"));
+        assert!(!unit_matches_filters(&u, "domain=1"));
+        assert!(unit_matches_filters(&u, "layer=foundation"));
+        assert!(!unit_matches_filters(&u, "layer=application"));
+        assert!(unit_matches_filters(&u, "author=7"));
+        assert!(!unit_matches_filters(&u, "author=8"));
+        assert!(unit_matches_filters(&u, "min_effective_bps=4000"));
+        assert!(!unit_matches_filters(&u, "min_effective_bps=4001"));
+        assert!(unit_matches_filters(
+            &u,
+            "domain=2&layer=foundation&author=7&min_effective_bps=1"
+        ));
+        assert!(!unit_matches_filters(
+            &u,
+            "domain=2&layer=foundation&author=7&min_effective_bps=9000"
+        ));
+        // 未知参数被忽略,不误杀结果
+        assert!(unit_matches_filters(&u, "foo=bar"));
+        u.domain = 1;
+        assert!(!unit_matches_filters(&u, "domain=2"));
+    }
+
+    #[test]
+    fn percent_decode_handles_utf8_and_plus() {
+        assert_eq!(percent_decode("a%20b"), "a b");
+        assert_eq!(percent_decode("a+b"), "a b");
+        assert_eq!(percent_decode("%E7%9F%A5%E8%A1%8C"), "知行");
+        assert_eq!(percent_decode("100%"), "100%"); // 不合法的转义原样保留
+        assert_eq!(percent_decode(""), "");
     }
 
     #[test]

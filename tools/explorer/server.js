@@ -26,6 +26,8 @@ const BODY_DIR = process.env.BODY_DIR || "";
 const STATUS_DIR = process.env.STATUS_DIR || ""; // 运维状态(如 deploy/diskwatch.sh 写的 disk.json),只读公开
 const BODY_TOKEN = process.env.BODY_TOKEN || "";
 const MAX_BODY = 64 * 1024; // matches the node's RPC body cap
+const { KnowledgeIndex, LICENSE } = require("./knowledge-index.js");
+const INDEX = new KnowledgeIndex(BODY_DIR, NODE_RPC);
 
 const MIME = { ".html": "text/html; charset=utf-8", ".js": "text/javascript; charset=utf-8",
   ".css": "text/css; charset=utf-8", ".json": "application/json", ".ico": "image/x-icon" };
@@ -107,6 +109,57 @@ function bodies(req, res) {
   });
 }
 
+// GET /search?q=…&domain=…&layer=…   跨标题与正文的检索
+async function search(req, res) {
+  const u = new URL(req.url, "http://x");
+  const q = u.searchParams.get("q") || "";
+  const domain = u.searchParams.get("domain");
+  const layer = u.searchParams.get("layer") || undefined;
+  const limit = u.searchParams.get("limit");
+  try {
+    await INDEX.ensureFresh(30000);
+    const hits = INDEX.search(q, { domain, layer, limit });
+    const body = JSON.stringify({
+      query: q, total: hits.length,
+      // 命中的单元 id 与摘要;正文本身用 /bodies/<sha256> 取
+      items: hits.map((h) => ({
+        id: h.id, title: h.title, layer: h.layer, domain: h.domain, author: h.author,
+        versions: h.versions, excerpt: h.excerpt, body_url: h.body_url,
+        credibility: h.credibility, score: h.score,
+      })),
+    });
+    res.writeHead(200, { "Content-Type": "application/json; charset=utf-8",
+      "Cache-Control": "no-store" }).end(body);
+  } catch (e) {
+    res.writeHead(500, { "Content-Type": "application/json" })
+      .end(JSON.stringify({ error: "search failed: " + e.message }));
+  }
+}
+
+// GET /export/units   全部单元的 JSONL 导出(CC BY 4.0)
+async function exportUnits(req, res) {
+  try {
+    const units = await INDEX.exportUnits();
+    res.writeHead(200, {
+      "Content-Type": "application/x-ndjson; charset=utf-8",
+      "Content-Disposition": 'attachment; filename="zhixing-units.jsonl"',
+      "Cache-Control": "no-store",
+    });
+    // 先写一行元数据(许可与来源),再逐行写单元
+    res.write(JSON.stringify({
+      kind: "metadata", license: LICENSE,
+      source: "知行图测试网 blockchain.yeying.pub",
+      note: "内容以 CC BY 4.0 许可开放:任何人可使用(含商用),只需署名。链上只存正文哈希,正文在此文件中。",
+      units: units.length,
+    }) + "\n");
+    for (const u of units) res.write(JSON.stringify(u) + "\n");
+    res.end();
+  } catch (e) {
+    res.writeHead(500, { "Content-Type": "application/json" })
+      .end(JSON.stringify({ error: "export failed: " + e.message }));
+  }
+}
+
 function status(req, res) {
   const m = /^\/status\/([a-z]+\.json)$/.exec(new URL(req.url, "http://x").pathname);
   if (!STATUS_DIR || !m || req.method !== "GET") return res.writeHead(404).end();
@@ -119,6 +172,8 @@ function status(req, res) {
 http.createServer((req, res) => {
   if (req.url.startsWith("/bodies/")) return bodies(req, res);
   if (req.url.startsWith("/status/")) return status(req, res);
+  if (req.url === "/search" || req.url.startsWith("/search?")) return search(req, res);
+  if (req.url === "/export/units" || req.url.startsWith("/export/units?")) return exportUnits(req, res);
   if (req.url === "/rpc" || req.url.startsWith("/rpc/") || req.url.startsWith("/rpc?")) return proxy(req, res);
   return serveStatic(req, res);
 }).listen(PORT, HOST, () => {
