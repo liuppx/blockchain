@@ -439,7 +439,7 @@ fn usage() {
     eprintln!("  node encode-tx --key-file F --out F --author N --domain N --stake N --embedding f,..(DIM) --review R:S.. --repl-success N --repl-total N --timestamp-days F [--fee MICRO] [--nonce N] [--config F]  author+sign a tx offline into a submit-tx file; print its hash; M122: --fee paid to the proposer (default 0), --nonce must equal the author's account nonce (default 0); M233: --key-file is a raw 64-hex seed OR an encrypted keystore (ZHIXING_KEYSTORE_PASSWORD) — same for encode-stakeop/encode-gov-*");
     eprintln!("  node encode-gov-proposal --key-file F --out F --proposer N --param name=value --voting-period N [--nonce N]  M228: author+sign a GovProposal (param: base_emission|slash_bps|decay_half_life) into a raw op file for `node rpc --path /gov/proposal --post F`");
     eprintln!("  node encode-gov-vote --key-file F --out F --proposal-id N --voter N --approve true|false [--nonce N]  M228: author+sign a GovVote into a raw op file for `node rpc --path /gov/vote --post F`");
-    eprintln!("  node encode-knowledge-op --key-file F --out F --actor N [--nonce N] --action create|publish|verify|invite ...  K5: author+sign a knowledge op for `node rpc --path /knowledge --post F`. create: --layer foundation|explanation|scenario|application --domain N --body LANG:SHA256HEX.. --source human|model:ID|model-verified:ID [--cite UNIT:VER:basis|see-also ..]; publish: --unit N + body/source/cite; verify: --unit N --version N --verdict pass|needs-revision [--note-hash HEX]; invite: --pubkey HEX");
+    eprintln!("  node encode-knowledge-op --key-file F --out F --actor N [--nonce N] --action create|publish|verify|invite ...  K5: author+sign a knowledge op for `node rpc --path /knowledge --post F`. create: --layer foundation|explanation|scenario|application --domain N --body LANG:SHA256HEX.. --source human|model:ID|model-verified:ID [--cite UNIT:VER:basis|see-also|supersedes ..]; publish: --unit N + body/source/cite; verify: --unit N --version N --verdict pass|needs-revision [--note-hash HEX]; invite: --pubkey HEX");
     eprintln!("  node hash-content --file F [--store DIR]  K5: print the SHA-256 of a knowledge body file (the hash a version records on chain); --store copies it to DIR/<hash> (content-addressed body store)");
     eprintln!("  node encode-stakeop --key-file F --out F --account N --kind bond|unbond --amount N  M229: author+sign a bond/unbond StakeOp into a raw op file for `node rpc --path /stake --post F`");
     eprintln!("  node inspect-tx --tx F [--pubkey HEX]  decode a codec-encoded tx file and print its fields + content hash; with --pubkey, also verify the signature (the read-side companion to encode-tx)");
@@ -4750,7 +4750,7 @@ fn parse_body(s: &str) -> Result<zhixing_node::knowledge::Body, String> {
     })
 }
 
-/// K5:解析引用:`UNIT:VERSION:basis|see-also`。
+/// K5:解析引用:`UNIT:VERSION:basis|see-also|supersedes`。
 fn parse_cite(s: &str) -> Result<zhixing_node::knowledge::Cite, String> {
     use zhixing_node::knowledge::{Cite, CiteKind};
     let parts: Vec<&str> = s.split(':').collect();
@@ -4760,7 +4760,12 @@ fn parse_cite(s: &str) -> Result<zhixing_node::knowledge::Cite, String> {
     let kind = match *k {
         "basis" => CiteKind::Basis,
         "see-also" => CiteKind::SeeAlso,
-        _ => return Err(format!("cite kind must be basis|see-also, got {k:?}")),
+        "supersedes" => CiteKind::Supersedes,
+        _ => {
+            return Err(format!(
+                "cite kind must be basis|see-also|supersedes, got {k:?}"
+            ))
+        }
     };
     Ok(Cite {
         unit: u.parse().map_err(|_| format!("bad cite unit {u:?}"))?,
@@ -6251,6 +6256,10 @@ mod tests {
             })
         );
         assert_eq!(parse_cite("3:1:see-also").unwrap().kind, CiteKind::SeeAlso);
+        assert_eq!(
+            parse_cite("3:1:supersedes").unwrap().kind,
+            CiteKind::Supersedes
+        );
         assert!(parse_cite("3:basis").is_err());
         assert!(parse_cite("3:1:depends").is_err());
         assert!(parse_hash32("zz").is_err());

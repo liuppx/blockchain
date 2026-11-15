@@ -88,13 +88,16 @@
     box.innerHTML = (state.cites.length ? `<table><tr><th>单元</th><th>类型</th><th>版本</th><th></th></tr>` + state.cites.map((c, i) =>
       `<tr><td>#${esc(c.unit)} ${esc(c.title)}</td>
          <td><select data-i='${i}' class='auKind'><option value='basis'${c.kind === "basis" ? " selected" : ""}>依据</option>
-           <option value='see-also'${c.kind === "see-also" ? " selected" : ""}>参见</option></select></td>
+           <option value='see-also'${c.kind === "see-also" ? " selected" : ""}>参见</option>
+           <option value='supersedes'${c.kind === "supersedes" ? " selected" : ""}>取代</option></select></td>
          <td>v${esc(c.version)}${c.stale ? ` <span class='mut'>(原为 v${esc(c.stale)},已更新到当前版本)</span>` : ""}</td>
          <td><button data-i='${i}' class='auDel'>移除</button></td></tr>`).join("") + "</table>" : "<p class='mut'>还没有引用。</p>")
-      + `<p><input id='auCiteId' size='6' placeholder='单元编号'> <select id='auCiteKind'><option value='basis'>依据</option><option value='see-also'>参见</option></select>
+      + `<p><input id='auCiteId' size='6' placeholder='单元编号'> <select id='auCiteKind'><option value='basis'>依据</option><option value='see-also'>参见</option><option value='supersedes'>取代</option></select>
          <button id='auCiteAdd'>添加引用</button></p>
          <p class='mut'><b>依据</b>:本单元建立在它之上,它若被证伪,本单元也站不住;依据会传递可信度,不能成环。
-         <b>参见</b>:相关、可互相补充,任何一方出错不影响另一方;不传递可信度。</p>`;
+         <b>参见</b>:相关、可互相补充,任何一方出错不影响另一方;不传递可信度。
+         <b>取代</b>:本单元取代它(它是旧版本)。这是"挑战"的表达方式:新旧单元**并存**,链上不强行裁决,
+         靠证据、引用与使用随时间分高下;被取代的单元不再传递可信度,历史与署名全部保留。</p>`;
     box.querySelectorAll(".auKind").forEach((s) => s.addEventListener("change", () => { state.cites[s.dataset.i].kind = s.value; }));
     box.querySelectorAll(".auDel").forEach((b) => b.addEventListener("click", () => { state.cites.splice(b.dataset.i, 1); renderCites(state); }));
     el("auCiteAdd").addEventListener("click", async () => {
