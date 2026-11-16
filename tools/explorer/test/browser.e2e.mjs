@@ -150,7 +150,9 @@ test("浏览器:导入身份 → 写作 → 修订 → 核验 → 邀请 → 检
       const invited = await ensureMember();
       assert.ok(invited, "测试公钥不是链上成员,且无法自动邀请(需要本地链与账户 1 的种子)");
       await p.reload({ waitUntil: "networkidle0" });
-      await p.click("#idBtn"); await p.waitForSelector("#imp"); await p.click("#imp");
+      // The import control is #idImp (the same selector used for the first import).
+      // Keep the selector consistent after reloading once the invitation is mined.
+      await p.click("#idBtn"); await p.waitForSelector("#idImp"); await p.click("#idImp");
       await p.type("#impWords", ZERO24); await p.type("#impPw", "e2e-test-password-123");
       await p.click("#impSave"); await p.waitForSelector("#idTok", { timeout: 30000 });
       const st2 = await p.$eval("#idState", (e) => e.textContent);
@@ -277,7 +279,12 @@ test("浏览器:核验面板 —— 勾选全部核验要点后才能通过;不�
 
     // 找一个不是本账户发布的单元
     const me = await p.$eval("#idState", (e) => e.textContent);
-    const units = (await rpc("/units?limit=50")).items;
+    // The first browser flow may have just created the fixture unit. Wait for it
+    // instead of racing the block commit when the suite runs against a fresh chain.
+    const units = (await waitFor(async () => {
+      const items = (await rpc("/units?limit=50")).items;
+      return items.length ? items : null;
+    }, 30000, 500)) || [];
     const target = units.find((u) => !me.includes("账户 " + u.author + " "));
     assert.ok(target, "应存在其他作者发布的单元");
     await p.goto(WEB + "/#unit/" + target.id, { waitUntil: "networkidle0" });
