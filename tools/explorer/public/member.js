@@ -19,6 +19,7 @@
   }
 
   function status() {
+    refreshWalletUi();
     const v = S.store.loadVault();
     const w = S.store.walletLink();
     const s = el("idStatus");
@@ -36,7 +37,11 @@
   let walletProvider = null;
   window.addEventListener("eip6963:announceProvider", (e) => {
     const d = e.detail || {};
-    if (d.info && d.info.rdns === "io.github.yeying" && d.provider) walletProvider = d.provider;
+    if (d.info && d.info.rdns === "io.github.yeying" && d.provider) {
+      const first = !walletProvider;
+      walletProvider = d.provider;
+      if (first) refreshWalletUi(); // 钱包插件可能比本脚本晚注入:检测到时补上顶栏按钮
+    }
   });
   window.dispatchEvent(new Event("eip6963:requestProvider"));
 
@@ -51,9 +56,12 @@
   }
 
   async function walletSign(provider, address) {
+    // 传明文而不是十六进制:夜莺钱包的弹窗会把 0x 开头的消息解码成文字显示,但签名时
+    // ethers 把字符串当 UTF-8 原文签——即签的是 "0x…" 这串字面量。显示与签名不一致,
+    // 一旦钱包将来改成先解码再签,所有钱包用户的成员密钥都会变。明文两边一致,不受影响。
     const sig = await provider.request({
       method: "personal_sign",
-      params: [S.utf8ToHex(S.walletDeriveMessage(address)), address],
+      params: [S.walletDeriveMessage(address), address],
     });
     return S.seedFromWalletSignature(sig, address);
   }
@@ -106,8 +114,17 @@
 
   function walletButton(id) {
     return findWallet()
-      ? `<p><button id='${id}'>用夜莺钱包登录</button> <span class='mut'>密钥由钱包签名派生,本机不保存任何密钥</span></p>`
-      : `<p class='mut'>使用夜莺钱包?安装<a class='link' href='https://wallet.yeying.pub/' target='_blank' rel='noopener'>钱包插件</a>后刷新页面,即可直接用钱包登录。</p>`;
+      ? `<p><button id='${id}'>用夜莺钱包登录</button> <span class='ok'>✓ 已检测到夜莺钱包</span>
+         <span class='mut'>密钥由钱包签名派生,本机不保存任何密钥</span></p>`
+      : `<p class='mut'>✗ 没有检测到夜莺钱包。安装<a class='link' href='https://wallet.yeying.pub/' target='_blank' rel='noopener'>钱包插件</a>
+         并确认它在本站已启用,然后刷新页面,这里会出现「用夜莺钱包登录」。</p>`;
+  }
+
+  // 顶栏的「钱包登录」:检测到钱包、且还没登录时显示
+  function refreshWalletUi() {
+    const b = el("idWalletTop");
+    if (!b) return;
+    b.style.display = findWallet() && !session ? "" : "none";
   }
 
   async function unlock(password) {
@@ -218,9 +235,13 @@
     }
     const acct = session && session.account;
     const pub = session ? session.pubkey : v.pubkey;
+    // 本机已有口令加密的身份、尚未解锁:既可以输口令解锁它,也可以改用钱包登录(那是另一把密钥)
     const unlockUi = session
       ? `<p><button id='idLock'>${session.wallet ? "退出" : "锁定"}</button></p>`
-      : `<p><input id='idPw' type='password' placeholder='口令' autocomplete='current-password'> <button id='idUnlock'>解锁</button> <span id='idMsg'></span></p>`;
+      : `<p><input id='idPw' type='password' placeholder='口令' autocomplete='current-password'> <button id='idUnlock'>解锁</button> <span id='idMsg'></span></p>
+         <h3 class='md'>或者用钱包登录</h3>
+         <p class='mut'>钱包登录得到的是<b>另一把</b>成员密钥(由钱包账户派生),与上面这个本机身份不是同一个链上账户。</p>
+         ${walletButton("idWallet")}<p><span id='idWMsg'></span></p>`;
     setView(`<h2 style='border:0;padding:0 0 8px'>我的身份</h2>
       <kv><b>公钥</b><span class='mono'>${esc(pub)}</span></kv>
       ${session && session.wallet ? `<kv><b>钱包</b><span class='mono'>${esc(session.wallet)}</span> <span class='mut'>(成员密钥由这个账户的签名派生,本机不保存)</span></kv>` : ""}
@@ -235,6 +256,7 @@
       ${v ? `<h3 class='md'>移除本机身份</h3>
       <p class='mut'>从这个浏览器删除加密的密钥。之后只能用助记词恢复——没有助记词,这个身份就永久丢失。</p>
       <p><button id='idForget'>从本机移除</button></p>` : ""}`);
+    useWallet("idWallet", "idWMsg");
     if (session) el("idLock").addEventListener("click", () => { lock(); showIdentity(); });
     else el("idUnlock").addEventListener("click", async () => {
       msg("idMsg", "解锁中…(需要几秒)");
@@ -419,10 +441,26 @@
     st.className = "mut";
     const h = document.querySelector("header");
     h.appendChild(btn);
+    // 顶栏直接放「钱包登录」:不用先找到「我的身份」页
+    const wb = document.createElement("button");
+    wb.id = "idWalletTop";
+    wb.textContent = "用夜莺钱包登录";
+    wb.style.display = "none";
+    wb.addEventListener("click", async () => {
+      const s = el("idStatus");
+      try {
+        await loginWithWallet((t) => { if (s) s.textContent = t; });
+        showIdentity();
+      } catch (e) {
+        if (s) s.textContent = (e && e.code === 4001) ? "你在钱包里取消了" : e.message;
+      }
+    });
+    h.appendChild(wb);
     h.appendChild(st);
     btn.addEventListener("click", showIdentity);
     if (!crypto.subtle) st.textContent = "此浏览器不支持签名(需要 HTTPS 与较新的浏览器)";
     else status();
+    refreshWalletUi();
   }
 
   window.ZXMember = {

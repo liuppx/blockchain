@@ -15,6 +15,7 @@
     "node": ">=18"
   },
   "devDependencies": {
+    "ethers": "^6.17.0",
     "puppeteer-core": "^23.0.0"
   }
 }

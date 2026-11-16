@@ -23,10 +23,11 @@ const S = require(join(here, "../public/signer.js"));
 const PK_A = "0x" + "11".repeat(32);
 const PK_B = "0x" + "22".repeat(32);
 
-// ethers 只用于在测试里模拟钱包签名;浏览器代码本身不依赖它
-const ETHERS = process.env.ETHERS_PATH
-  || join(here, "../../../../wallet/lib/ethers-6.16.esm.min.js");
-const haveEthers = existsSync(ETHERS);
+// ethers 只用于在测试里模拟钱包签名(devDependency);浏览器代码本身不依赖它。
+// 夜莺钱包的 keyring 就是 ethers.Wallet,所以用它模拟最贴近真实。ETHERS_PATH 可覆盖。
+const ETHERS = process.env.ETHERS_PATH || "ethers";
+let haveEthers = true;
+try { require.resolve(ETHERS); } catch (_) { haveEthers = existsSync(ETHERS); }
 
 test("派生消息写明用途、地址与版本,地址统一小写", () => {
   const m = S.walletDeriveMessage("0xAbCdEf0000000000000000000000000000000001");
@@ -78,4 +79,26 @@ test("派生出的密钥能签 op", { skip: !haveEthers && "找不到 ethers" },
   const k = await S.keyFromSeed(await S.seedFromWalletSignature(sig, w.address));
   const op = await S.signOp(k.signKey, 7, { type: "verify", unit: 1, version: 1, verdict: "pass" }, 0);
   assert.ok(op instanceof Uint8Array && op.length > 64);
+});
+
+// 成员密钥依赖"钱包签的到底是哪串字节",这条一旦变,所有钱包用户都会变成另一个人。
+// 夜莺钱包:personal_sign 的消息原样交给 ethers.Wallet.signMessage(字符串) → 按 UTF-8 原文签;
+// 弹窗却会把 0x 开头的消息解码成文字显示。所以页面必须传**明文**:显示的就是签的。
+// 传十六进制的话,签的是 "0x…" 这串字面量——与显示不一致,也与离线派生对不上。
+test("页面传给钱包的是明文消息,不是十六进制", async () => {
+  const { readFileSync } = await import("node:fs");
+  const src = readFileSync(join(here, "../public/member.js"), "utf8");
+  const call = /method:\s*"personal_sign",\s*params:\s*\[([^\]]+)\]/.exec(src);
+  assert.ok(call, "member.js 里应有 personal_sign 调用");
+  assert.match(call[1], /S\.walletDeriveMessage\(address\)/);
+  assert.doesNotMatch(call[1], /utf8ToHex/, "不能把消息转成十六进制再交给钱包");
+});
+
+test("明文与十六进制签出不同的签名(说明格式确实决定成员密钥)", { skip: !haveEthers && "找不到 ethers" }, async () => {
+  const { Wallet } = await import(ETHERS);
+  const w = new Wallet(PK_A);
+  const m = S.walletDeriveMessage(w.address);
+  const plain = await w.signMessage(m);
+  const asHexString = await w.signMessage(S.utf8ToHex(m)); // 钱包对十六进制字符串的实际行为
+  assert.notEqual(plain, asHexString);
 });

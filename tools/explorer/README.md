@@ -66,11 +66,12 @@ PORT=8080 NODE_RPC=http://127.0.0.1:9221 npm start      # 或: node server.js
 ## 用夜莺钱包登录
 
 装了[夜莺钱包](https://wallet.yeying.pub/)插件的成员,不需要抄助记词,也不需要在本机保存密钥:
-「我的身份」页点 **「用夜莺钱包登录」**,在钱包里确认连接并签名即可。
+检测到钱包时,顶栏直接出现 **「用夜莺钱包登录」**;「我的身份」页也有(本机已有锁定身份时在口令框下方)。
+页面会明确显示"✓ 已检测到夜莺钱包"或"✗ 没有检测到",方便排查。
 
 **怎么做到**:钱包不向网页开放"对任意字节做签名"的接口(`personal_sign` 是以太坊 secp256k1;
 `wallet_ucan_sign` 用的是按站点生成、会过期的会话密钥,不能当稳定身份)。所以浏览器请钱包对一条
-**写明用途的固定消息**做 `personal_sign`,再用这个签名派生成员密钥:
+**写明用途的固定消息**做 `personal_sign`(传**明文**,不是十六进制),再用这个签名派生成员密钥:
 
 ```
 seed = HKDF-SHA256(ikm = 签名, salt = "zhixing-wallet-seed-v1", info = 小写钱包地址)   // 32 字节
@@ -86,7 +87,11 @@ member_key = ed25519(seed)
   ⇒ 直接拒绝并提示换普通账户;
 - 钱包里切换或断开账户 ⇒ 前端自动退出,避免继续以旧账户身份签名;
 - 拿到签名的人就能以你的身份核验和发布,所以只在 `blockchain.yeying.pub` 上签这条消息;
+- **消息必须传明文**:夜莺钱包的弹窗会把 `0x` 开头的消息解码成文字显示,但签名时 `ethers.Wallet.signMessage`
+  把字符串当 UTF-8 原文签——传十六进制就等于签了 `"0x…"` 这串字面量,显示与签名不一致。
+  `wallet.test.mjs` 锁定了这一点(改了它,所有钱包用户的成员密钥都会变);
 - 派生规则是公开的;成员密钥与钱包 DID 的正式绑定属于白皮书 §11 阶段 2。
 
-检验:`node --test tools/explorer/test/wallet.test.mjs`(派生规则)与
-`node --test tools/explorer/test/wallet.e2e.mjs`(浏览器里登录 → 邀请 → 核验入块,需要本地链)。
+检验:`node --test tools/explorer/test/wallet.test.mjs`(派生规则、明文消息)与
+`node --test tools/explorer/test/wallet.e2e.mjs`(注入模拟钱包:登录、本机有锁定身份时入口仍在、
+没装钱包时的提示、登录 → 邀请 → 核验入块;需要本地链)。两者都用 devDependency 里的 `ethers` 模拟钱包签名。

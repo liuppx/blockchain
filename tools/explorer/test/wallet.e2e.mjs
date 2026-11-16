@@ -17,7 +17,8 @@ const here = dirname(fileURLToPath(import.meta.url));
 const require = createRequire(import.meta.url);
 const CHROME = process.env.CHROME_PATH || "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome";
 const WEB = process.env.TEST_WEB || "http://127.0.0.1:8080";
-const ETHERS = process.env.ETHERS_PATH || join(here, "../../../../wallet/lib/ethers-6.16.esm.min.js");
+// ethers(devDependency)模拟夜莺钱包的签名:钱包的 keyring 就是 ethers.Wallet。ETHERS_PATH 可覆盖。
+const ETHERS = process.env.ETHERS_PATH || "ethers";
 
 let puppeteer = null;
 try { puppeteer = require("puppeteer-core"); } catch (_) { puppeteer = null; }
@@ -59,13 +60,11 @@ async function injectFakeWallet(page, privKey) {
     window.addEventListener("eip6963:requestProvider", announce);
     announce();
   }, w.address);
-  // personal_sign 用 ethers 真签名(页面里没有 ethers);参数是 UTF-8 的十六进制
-  await page.exposeFunction("__realPersonalSign", async (hex) => {
-    const hexs = hex.replace(/^0x/, "");
-    const bytes = new Uint8Array(hexs.length / 2);
-    for (let i = 0; i < bytes.length; i++) bytes[i] = parseInt(hexs.slice(i * 2, i * 2 + 2), 16);
-    return w.signMessage(new TextDecoder().decode(bytes));
-  });
+  // personal_sign 用 ethers 真签名(页面里没有 ethers)
+  // 与夜莺钱包一致:keyring 是 ethers.Wallet,signMessage(字符串) 把字符串按 UTF-8 原文签,
+  // 不会把 0x 开头的十六进制解码。页面若传十六进制,签的就是那串字面量——所以这里不做解码,
+  // 页面必须传明文(否则派生出的公钥与离线派生对不上,下面的断言会失败)。
+  await page.exposeFunction("__realPersonalSign", async (message) => w.signMessage(message));
   return w;
 }
 
@@ -100,6 +99,53 @@ test("用钱包登录:派生出的成员公钥与离线派生一致,并找到成
   const expect = k.pubkey;
   assert.match(shown, new RegExp(expect.slice(0, 16)), "页面显示的公钥应与离线派生的一致");
 
+  await ctx.close();
+});
+
+// 回归:本机已经保存了口令加密的身份(顶栏显示「已锁定」)时,钱包登录入口不能消失。
+// 曾经的 bug:这种状态下身份页只显示口令解锁,顶栏也没有钱包按钮,用户找不到钱包登录。
+test("本机已有锁定的身份时,顶栏与身份页仍能用钱包登录", { skip: skip() }, async () => {
+  const ctx = await browser.createBrowserContext();
+  const page = await ctx.newPage();
+  page.on("dialog", (d) => d.accept());
+  await injectFakeWallet(page, "0x" + "33".repeat(32));
+  // 先放一个(假的)已加密身份,模拟以前在这个浏览器里生成过身份
+  await page.evaluateOnNewDocument(() => {
+    localStorage.setItem("zhixing.vault.v1", JSON.stringify({
+      v: 1, kdf: "pbkdf2-sha256", iters: 600000, salt: "AAAA", iv: "AAAA", ct: "AAAA",
+      pubkey: "aa".repeat(32),
+    }));
+  });
+  await page.goto(WEB + "/", { waitUntil: "networkidle0" });
+  assert.match(await page.$eval("#idStatus", (e) => e.textContent), /已锁定/);
+
+  // 顶栏按钮可见
+  await page.waitForFunction(() => {
+    const b = document.getElementById("idWalletTop");
+    return b && b.style.display !== "none";
+  }, { timeout: 10000 });
+
+  // 身份页(锁定视图)里也有钱包按钮,且标明检测到了钱包
+  await page.click("#idBtn");
+  await page.waitForSelector("#idWallet", { timeout: 10000 });
+  assert.match(await page.$eval("#view", (e) => e.innerText), /已检测到夜莺钱包/);
+
+  // 从顶栏登录成功后,顶栏按钮隐藏。
+  // 注意:锁定视图里本来就有 #idState 和"钱包"字样,要等只在登录后才出现的那一行
+  await page.click("#idWalletTop");
+  await page.waitForFunction(() => /成员密钥由这个账户的签名派生/.test(document.getElementById("view").innerText), { timeout: 30000 });
+  assert.equal(await page.$eval("#idWalletTop", (e) => e.style.display), "none");
+  await ctx.close();
+});
+
+// 没装钱包时:不显示顶栏按钮,身份页明确说"没有检测到",告诉用户怎么办
+test("没装钱包时,身份页说明没有检测到并给出安装指引", { skip: skip() }, async () => {
+  const ctx = await browser.createBrowserContext();
+  const page = await ctx.newPage();
+  await page.goto(WEB + "/", { waitUntil: "networkidle0" });
+  assert.equal(await page.$eval("#idWalletTop", (e) => e.style.display), "none");
+  await page.click("#idBtn");
+  await page.waitForFunction(() => /没有检测到夜莺钱包/.test(document.getElementById("view").innerText), { timeout: 10000 });
   await ctx.close();
 });
 
