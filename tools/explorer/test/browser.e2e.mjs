@@ -129,7 +129,7 @@ async function waitFor(fn, ms = 20000, step = 500) {
   return null;
 }
 
-test("浏览器:导入身份 → 写作 → 修订 → 核验 → 邀请 → 检索 → 导出", async (t) => {
+test("浏览器:导入身份 → 写作 → 修订 → 核验 → 邀请 → 检索 → 导出", { concurrency: false }, async (t) => {
   const why = skipIfNoBrowser();
   if (why) { t.skip(why); return; }
   const p = await newPage();
@@ -149,12 +149,14 @@ test("浏览器:导入身份 → 写作 → 修订 → 核验 → 邀请 → 检
     if (/不是测试网成员/.test(state)) {
       const invited = await ensureMember();
       assert.ok(invited, "测试公钥不是链上成员,且无法自动邀请(需要本地链与账户 1 的种子)");
-      await p.reload({ waitUntil: "networkidle0" });
-      // The import control is #idImp (the same selector used for the first import).
-      // Keep the selector consistent after reloading once the invitation is mined.
-      await p.click("#idBtn"); await p.waitForSelector("#idImp"); await p.click("#idImp");
-      await p.type("#impWords", ZERO24); await p.type("#impPw", "e2e-test-password-123");
-      await p.click("#impSave"); await p.waitForSelector("#idTok", { timeout: 30000 });
+      // The first import already saved the vault. After the invite is mined,
+      // unlock that vault instead of trying to import it a second time (the
+      // locked identity view intentionally offers only the unlock form).
+      const joined = await waitFor(isTestKeyMember, 30000, 500);
+      assert.ok(joined, "邀请已提交但测试公钥尚未成为成员");
+      await p.$eval("#idPw", (e, v) => { e.value = v; }, "e2e-test-password-123");
+      await p.click("#idUnlock");
+      await p.waitForFunction(() => /账户 \d+/.test(document.querySelector("#idState")?.textContent || ""), { timeout: 30000 });
       const st2 = await p.$eval("#idState", (e) => e.textContent);
       assert.match(st2, /账户 \d+/, "邀请后应显示账户编号:" + st2);
     }
@@ -261,7 +263,7 @@ test("浏览器:导入身份 → 写作 → 修订 → 核验 → 邀请 → 检
   }
 });
 
-test("浏览器:核验面板 —— 勾选全部核验要点后才能通过;不能核验自己发布的版本", async (t) => {
+test("浏览器:核验面板 —— 勾选全部核验要点后才能通过;不能核验自己发布的版本", { concurrency: false }, async (t) => {
   const why = skipIfNoBrowser();
   if (why) { t.skip(why); return; }
   const p = await newPage();
