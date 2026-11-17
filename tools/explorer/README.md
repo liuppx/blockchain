@@ -65,33 +65,29 @@ PORT=8080 NODE_RPC=http://127.0.0.1:9221 npm start      # 或: node server.js
 
 ## 用夜莺钱包登录
 
-装了[夜莺钱包](https://wallet.yeying.pub/)插件的成员,不需要抄助记词,也不需要在本机保存密钥:
-检测到钱包时,顶栏直接出现 **「用夜莺钱包登录」**;「我的身份」页也有(本机已有锁定身份时在口令框下方)。
-页面会明确显示"✓ 已检测到夜莺钱包"或"✗ 没有检测到",方便排查。
+[夜莺钱包](https://wallet.yeying.pub/)原生支持知行图:钱包保管知行图密钥(「设置 → 📚 知行图」里生成,或用助记词导入——
+派生与 `node keygen` 相同,导入后就是成员原来那个链上账户),网页只拿公钥、只递"意图",钱包自己编码、
+在弹窗里给用户看可读摘要、确认后签名。
 
-**怎么做到**:钱包不向网页开放"对任意字节做签名"的接口(`personal_sign` 是以太坊 secp256k1;
-`wallet_ucan_sign` 用的是按站点生成、会过期的会话密钥,不能当稳定身份)。所以浏览器请钱包对一条
-**写明用途的固定消息**做 `personal_sign`(传**明文**,不是十六进制),再用这个签名派生成员密钥:
+检测到钱包时,顶栏出现 **「用夜莺钱包登录」**;「我的身份」页也有(本机已有锁定身份时在口令框下方),
+并明确显示"✓ 已检测到夜莺钱包"或"✗ 没有检测到"。
 
-```
-seed = HKDF-SHA256(ikm = 签名, salt = "zhixing-wallet-seed-v1", info = 小写钱包地址)   // 32 字节
-member_key = ed25519(seed)
-```
+**接口**(EIP-1193 `provider.request`,钱包侧实现见 wallet 仓库 `js/background/request-router.js`):
 
-以太坊签名用 RFC 6979 确定性 k,**同一个钱包账户每次都得到同一把成员密钥**——换电脑、换浏览器
-不需要迁移,重新签一次名即可,本机不落盘任何密钥。
+| 方法 | 参数 | 返回 | 说明 |
+|---|---|---|---|
+| `zhixing_accounts` | — | `[公钥]` 或 `[]` | 本站已授权时返回公钥;不弹窗 |
+| `zhixing_requestAccounts` | — | `[公钥]` | 首次弹窗请用户确认连接;按网站单独授权 |
+| `zhixing_signKnowledgeOp` | `[{ actor, nonce, action }]` | `{ signed, address }` | `action` 与 `signer.js` 的 `encodeAction` 同形;`signed` 是 op ‖ 签名的十六进制,直接 POST `/rpc/knowledge` |
 
-**边界**:
+错误码:`4001` 用户拒绝;`4100` 本站未连接;`4900` 钱包里还没有知行图密钥;旧版钱包不认识这些方法(页面提示升级)。
 
-- 首次登录要求签**两次**,用来确认签名是稳定的。两次派生出不同密钥(门限 MPC 账户的签名每次都不一样)
-  ⇒ 直接拒绝并提示换普通账户;
-- 钱包里切换或断开账户 ⇒ 前端自动退出,避免继续以旧账户身份签名;
-- 拿到签名的人就能以你的身份核验和发布,所以只在 `blockchain.yeying.pub` 上签这条消息;
-- **消息必须传明文**:夜莺钱包的弹窗会把 `0x` 开头的消息解码成文字显示,但签名时 `ethers.Wallet.signMessage`
-  把字符串当 UTF-8 原文签——传十六进制就等于签了 `"0x…"` 这串字面量,显示与签名不一致。
-  `wallet.test.mjs` 锁定了这一点(改了它,所有钱包用户的成员密钥都会变);
-- 派生规则是公开的;成员密钥与钱包 DID 的正式绑定属于白皮书 §11 阶段 2。
+**为什么只递意图**:如果网页把待签字节交给钱包,弹窗里显示的内容就不一定是实际签的内容。钱包自己从意图编码,
+显示与签名必然一致。钱包的编码由 wallet 仓库 `tests/zhixing-op.test.mjs` 对照本仓库 `signer.js` 的输出逐字节检验,
+`signer.js` 又由 `test/signer.test.mjs` 对照 Rust 节点检验——三方一致。
 
-检验:`node --test tools/explorer/test/wallet.test.mjs`(派生规则、明文消息)与
-`node --test tools/explorer/test/wallet.e2e.mjs`(注入模拟钱包:登录、本机有锁定身份时入口仍在、
-没装钱包时的提示、登录 → 邀请 → 核验入块;需要本地链)。两者都用 devDependency 里的 `ethers` 模拟钱包签名。
+(早先曾用以太坊 `personal_sign` 的签名派生成员密钥;钱包原生支持后已移除,避免同一个钱包产生两把不同的成员密钥。)
+
+检验:`node --test tools/explorer/test/wallet.test.mjs`(接口约定,CI 门禁)与
+`node --test tools/explorer/test/wallet.e2e.mjs`(注入实现同样接口的模拟钱包:登录、本机有锁定身份时入口仍在、
+没装钱包 / 钱包里无密钥 / 旧版钱包的提示、登录 → 邀请 → 核验入块;需要本地链)。

@@ -91,7 +91,7 @@ jobs:
           ./cmd up
           sleep 5
           node --test tools/explorer/test/browser.e2e.mjs
-          # 钱包登录(注入模拟钱包):派生一致、锁定身份时入口不消失、登录→邀请→核验入块。
+          # 夜莺钱包(注入实现 zhixing_* 接口的模拟钱包):登录、锁定身份时入口不消失、无密钥/旧版提示、登录→邀请→核验入块。
           # 与上一个文件分开跑:两者共用一条链,并行会让邀请冷却互相干扰。
           node --test tools/explorer/test/wallet.e2e.mjs
           ./cmd down
