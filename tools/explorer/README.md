@@ -63,11 +63,11 @@ PORT=8080 NODE_RPC=http://127.0.0.1:9221 npm start      # 或: node server.js
 
 ## 用夜莺钱包登录
 
-[夜莺钱包](https://wallet.yeying.pub/)原生支持知行图:钱包保管知行图密钥(「设置 → 📚 知行图」里生成,或用助记词 / `node keygen` 的密钥文件导入——
+[夜莺钱包](https://wallet.yeying.pub/)原生支持知行图:知行图账户就是钱包里的普通账户(「账户管理 → 导入钱包」里网络选「知行图」,用助记词 / `node keygen` 的密钥文件导入——
 派生与 `node keygen` 相同,导入后就是成员原来那个链上账户),网页只拿公钥、只递"意图",钱包自己编码、
 在弹窗里给用户看可读摘要、确认后签名。
 
-检测到钱包时,顶栏出现 **「用夜莺钱包登录」**;「我的身份」页也有(本机已有锁定身份时在口令框下方),
+检测到钱包时,顶栏出现 **「用夜莺钱包登录」**;「我的身份」页也有,
 并明确显示"✓ 已检测到夜莺钱包"或"✗ 没有检测到"。
 
 **接口**(EIP-1193 `provider.request`,钱包侧实现见 wallet 仓库 `js/background/request-router.js`):
@@ -87,5 +87,5 @@ PORT=8080 NODE_RPC=http://127.0.0.1:9221 npm start      # 或: node server.js
 (早先曾用以太坊 `personal_sign` 的签名派生成员密钥;钱包原生支持后已移除,避免同一个钱包产生两把不同的成员密钥。)
 
 检验:`node --test tools/explorer/test/wallet.test.mjs`(接口约定,CI 门禁)与
-`node --test tools/explorer/test/wallet.e2e.mjs`(注入实现同样接口的模拟钱包:登录、本机有锁定身份时入口仍在、
+`node --test tools/explorer/test/wallet.e2e.mjs`(注入实现同样接口的模拟钱包:登录、本机留有旧版密钥时提示移进钱包、
 没装钱包 / 钱包里无密钥 / 旧版钱包的提示、登录 → 邀请 → 核验入块;需要本地链)。

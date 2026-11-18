@@ -112,7 +112,7 @@ test("没装钱包时,身份页说明没有检测到并给出安装指引", { sk
 });
 
 test("钱包里还没有知行图密钥 / 旧版钱包:给出能照着做的提示", { skip: skip() }, async () => {
-  for (const [mode, expect] of [["nokey", /设置 → 知行图/], ["old", /升级到最新版本/]]) {
+  for (const [mode, expect] of [["nokey", /账户管理 → 导入钱包/], ["old", /升级到最新版本/]]) {
     const ctx = await browser.createBrowserContext();
     const page = await ctx.newPage();
     await injectFakeWallet(page, TEST_KEY, { mode });

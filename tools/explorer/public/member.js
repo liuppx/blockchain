@@ -6,8 +6,8 @@
 // yeying-community/wallet 的 docs/protocols/知行图协议.md。
 //
 // 浏览器本地存密钥的那种做法已经下线。此前在浏览器里生成过身份的成员,
-// 页面会提示把密钥移进钱包(钱包「设置 → 知行图」里用助记词或密钥文件导入,
-// 导入后就是同一个链上账户)。
+// 页面会提示把密钥移进钱包(钱包「账户管理 → 导入钱包」里网络选「知行图」,用助记词或
+// 密钥文件导入,导入后就是同一个链上账户)。
 (function () {
   const S = window.ZXSigner;
   let session = null; // { pubkey, account, wallet }
@@ -59,8 +59,8 @@
     const code = e && e.code;
     const m = String((e && e.message) || e || "");
     if (code === 4001 || /rejected/i.test(m)) return new Error("你在钱包里取消了");
-    if (code === 4900 || /知行图密钥/.test(m)) {
-      return new Error("钱包里还没有知行图密钥:打开夜莺钱包「设置 → 知行图」,用助记词或密钥文件导入(已是成员),或生成新密钥,再回来登录");
+    if (code === 4900 || /知行图(密钥|账户)/.test(m)) {
+      return new Error("钱包里还没有知行图账户:打开夜莺钱包「账户管理 → 导入钱包」,网络选「知行图」,用助记词或密钥文件导入,再回来登录");
     }
     if (code === 4100) return new Error("这个网站还没有连接你的知行图密钥,请重新用钱包登录");
     if (/ZHIXING_/.test(m)) return new Error("钱包拒绝了这条操作:" + m.replace(/^.*ZHIXING_[A-Z_]+:?\\s*/, ""));
@@ -175,7 +175,7 @@
     return `<div class="banner warn" style="padding:10px 14px;margin:12px 0;border-radius:6px">
       <p><b>这个浏览器里还留着旧版网页自己保存的密钥。</b>那条路已经下线:现在密钥由夜莺钱包保管,
       网页不持有私钥,每次签名都在钱包里确认。</p>
-      <p class='mut'>你的链上账户没有变——在钱包「设置 → 📚 知行图」里用<b>同一组助记词</b>或密钥文件导入,
+      <p class='mut'>你的链上账户没有变——在钱包「账户管理 → 导入钱包」里网络选「知行图」,用<b>同一组助记词</b>或密钥文件导入,
       导入后就是同一个账户。导入完成后可以清掉本机这份旧密钥(下面的「清除本机旧密钥」)。</p>
       <p><button id='idForgetLegacy'>清除本机旧密钥</button> <span id='idForgetMsg'></span></p>
     </div>`;
@@ -219,7 +219,7 @@
       <p class='mut'>提交核验需要一个写入令牌,由组织者私下提供。它只用于防止刷写入,不代表你的身份。</p>
       <p><input id='idTok' type='password' size='40' placeholder='${S.store.token() ? "已保存(输入新值可替换)" : "粘贴写入令牌"}'> <button id='idTokSave'>保存</button> <span id='idTokMsg'></span></p>
       ${acct && acct.established ? `<h3 class='md'>邀请新成员</h3>
-        <p class='mut'>新成员在钱包「设置 → 知行图」里导入或生成密钥后,把公钥发给你。新成员有见习期;每位成员每天最多邀请一人。</p>
+        <p class='mut'>新成员用 <code>node keygen</code> 生成密钥、在钱包「账户管理 → 导入钱包 → 知行图」里导入后,把公钥(钱包里的账户地址)发给你。新成员有见习期;每位成员每天最多邀请一人。</p>
         <p><input id='invPk' size='70' placeholder='新成员的公钥(64 位十六进制)'> <button id='invGo'>邀请</button> <span id='invMsg'></span></p>` : ""}`);
     el("idLock").addEventListener("click", () => { session = null; status(); showIdentity(); });
     el("idTokSave").addEventListener("click", () => { S.store.setToken(el("idTok").value); el("idTok").value = ""; msg("idTokMsg", "已保存", "ok"); });
