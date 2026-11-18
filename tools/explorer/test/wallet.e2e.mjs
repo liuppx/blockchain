@@ -20,11 +20,14 @@ import { tmpdir } from "node:os";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import { createRequire } from "node:module";
+import { injectFakeWallet, memberKeyFromMnemonic } from "./fake-wallet.mjs";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const require = createRequire(import.meta.url);
 require(join(here, "../public/bip39-en.js"));
 const S = require(join(here, "../public/signer.js"));
+const ZERO24 = Array(23).fill("abandon").join(" ") + " art";
+const TEST_KEY = await memberKeyFromMnemonic(ZERO24);
 const CHROME = process.env.CHROME_PATH || "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome";
 const WEB = process.env.TEST_WEB || "http://127.0.0.1:8080";
 const RPC = process.env.TEST_RPC || "http://127.0.0.1:9221";
@@ -50,81 +53,50 @@ const skip = () => (!puppeteer || !hasChrome ? "no browser" : false);
  *   "old"    — 旧版钱包:不认识 zhixing_*
  * 返回 { pubkey, requests }:requests 记录网页发给钱包的每个请求(用来检查网页只递意图)。
  */
-async function injectFakeWallet(page, mode = "native") {
-  const key = await S.keyFromSeed(await S.mnemonicToSeed(await S.generateMnemonic()));
-  const requests = [];
-  await page.exposeFunction("__zxWallet", async (method, params) => {
-    requests.push({ method, params });
-    if (mode === "old") return { error: { code: -32601, message: "Method not found" } };
-    if (mode === "nokey") return { error: { code: 4900, message: "钱包里还没有知行图密钥" } };
-    if (method === "zhixing_requestAccounts" || method === "zhixing_accounts") return { result: [key.pubkey] };
-    if (method === "zhixing_signKnowledgeOp") {
-      const { actor, nonce, action } = params[0];
-      const signed = await S.signOp(key.signKey, Number(actor), action, Number(nonce));
-      return { result: { signed: S.bytesToHex(signed), address: key.pubkey } };
-    }
-    return { error: { code: -32601, message: "Method not found: " + method } };
-  });
-  await page.evaluateOnNewDocument(() => {
-    const info = Object.freeze({ uuid: "11111111-2222-4333-8444-555555555555", name: "YeYing Wallet", icon: "data:image/svg+xml;base64,", rdns: "io.github.yeying" });
-    const provider = {
-      isYeYing: true,
-      async request({ method, params }) {
-        const r = await window.__zxWallet(method, params === undefined ? null : params);
-        if (r.error) { const e = new Error(r.error.message); e.code = r.error.code; throw e; }
-        return r.result;
-      },
-      on() {},
-    };
-    // 与真钱包一样:注入时宣告一次,之后回应每次 requestProvider
-    const announce = () => window.dispatchEvent(new CustomEvent("eip6963:announceProvider", { detail: { info, provider } }));
-    window.addEventListener("eip6963:requestProvider", announce);
-    announce();
-  });
-  return { pubkey: key.pubkey, requests };
-}
-
 async function login(page) {
   await page.click("#idBtn");
   await page.waitForSelector("#idWallet", { timeout: 10000 });
   await page.click("#idWallet");
-  // 只在登录成功后出现的一行
-  await page.waitForFunction(() => /由夜莺钱包保管/.test(document.getElementById("view").innerText), { timeout: 30000 });
+  // #idState 只在登录成功后的身份页出现(未登录页也提到"由夜莺钱包保管",不能用它判断)
+  await page.waitForSelector("#idState", { timeout: 30000 });
 }
 
 test("用钱包登录:页面显示的就是钱包里那把密钥的公钥", { skip: skip() }, async () => {
   const ctx = await browser.createBrowserContext();
   const page = await ctx.newPage();
-  const w = await injectFakeWallet(page);
+  const requests = await injectFakeWallet(page, TEST_KEY);
   await page.goto(WEB + "/", { waitUntil: "networkidle0" });
   await login(page);
-  assert.match(await page.$eval("#view", (e) => e.innerText), new RegExp(w.pubkey));
-  assert.deepEqual(w.requests.map((r) => r.method), ["zhixing_requestAccounts"]);
+  assert.match(await page.$eval("#view", (e) => e.innerText), new RegExp(TEST_KEY.pubkey));
+  assert.deepEqual(requests.map((r) => r.method), ["zhixing_requestAccounts"]);
   await ctx.close();
 });
 
-// 回归:本机已经保存了口令加密的身份(顶栏显示「已锁定」)时,钱包登录入口不能消失。
-test("本机已有锁定的身份时,顶栏与身份页仍能用钱包登录", { skip: skip() }, async () => {
+// 旧版网页在浏览器里存过密钥的成员:不再给口令解锁,而是提示把密钥移进钱包;钱包登录照常可用。
+test("浏览器里留着旧版密钥时:提示移进钱包,钱包登录照常可用", { skip: skip() }, async () => {
   const ctx = await browser.createBrowserContext();
   const page = await ctx.newPage();
-  await injectFakeWallet(page);
+  await injectFakeWallet(page, TEST_KEY);
   await page.evaluateOnNewDocument(() => {
     localStorage.setItem("zhixing.vault.v1", JSON.stringify({
       v: 1, kdf: "pbkdf2-sha256", iters: 600000, salt: "AAAA", iv: "AAAA", ct: "AAAA", pubkey: "aa".repeat(32),
     }));
   });
   await page.goto(WEB + "/", { waitUntil: "networkidle0" });
-  assert.match(await page.$eval("#idStatus", (e) => e.textContent), /已锁定/);
+  assert.match(await page.$eval("#idStatus", (e) => e.textContent), /未连接钱包/);
   await page.waitForFunction(() => {
     const b = document.getElementById("idWalletTop");
     return b && b.style.display !== "none";
   }, { timeout: 10000 });
   await page.click("#idBtn");
   await page.waitForSelector("#idWallet", { timeout: 10000 });
-  assert.match(await page.$eval("#view", (e) => e.innerText), /已检测到夜莺钱包/);
+  const view = await page.$eval("#view", (e) => e.innerText);
+  assert.match(view, /已检测到夜莺钱包/);
+  assert.match(view, /旧版网页自己保存的密钥/, "应提示把旧密钥移进钱包");
+  assert.equal(await page.$("#idPw"), null, "不应再有口令解锁框");
 
   await page.click("#idWalletTop");
-  await page.waitForFunction(() => /由夜莺钱包保管/.test(document.getElementById("view").innerText), { timeout: 30000 });
+  await page.waitForSelector("#idState", { timeout: 30000 });
   assert.equal(await page.$eval("#idWalletTop", (e) => e.style.display), "none");
   await ctx.close();
 });
@@ -143,7 +115,7 @@ test("钱包里还没有知行图密钥 / 旧版钱包:给出能照着做的提�
   for (const [mode, expect] of [["nokey", /设置 → 知行图/], ["old", /升级到最新版本/]]) {
     const ctx = await browser.createBrowserContext();
     const page = await ctx.newPage();
-    await injectFakeWallet(page, mode);
+    await injectFakeWallet(page, TEST_KEY, { mode });
     await page.goto(WEB + "/", { waitUntil: "networkidle0" });
     await page.click("#idBtn");
     await page.waitForSelector("#idWallet", { timeout: 10000 });
@@ -174,7 +146,10 @@ test("钱包登录后核验:网页只递意图,钱包签出的操作被节点接
   const ctx = await browser.createBrowserContext();
   const page = await ctx.newPage();
   page.on("dialog", (d) => d.accept());
-  const w = await injectFakeWallet(page);
+  // 每次运行用新密钥:它一开始不是成员,才能走完"邀请 → 成员 → 核验"
+  const fresh = await memberKeyFromMnemonic(await S.generateMnemonic());
+  const requests = await injectFakeWallet(page, fresh);
+  const w = { pubkey: fresh.pubkey, requests };
 
   // 1. 登录(此时还不是成员)
   await page.goto(WEB + "/", { waitUntil: "networkidle0" });

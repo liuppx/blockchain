@@ -1,7 +1,7 @@
 "use strict";
 // 在浏览器里写知识:创建单元、为已有单元发布新版本。
 // 流程:编辑正文(Markdown)→ 预览 → 计算 SHA-256 → 上传到正文仓库(/bodies/<哈希>,仓库只接受哈希一致的内容)
-// → 签名 create / publish 操作 → 提交 → 等入块。签名在本机完成,依赖 signer.js 与 member.js。
+// → 在夜莺钱包里签名 create / publish 操作 → 提交 → 等入块。依赖 signer.js(只用来校验格式)与 member.js。
 (function () {
   const S = window.ZXSigner;
   const M = () => window.ZXMember;
@@ -168,7 +168,7 @@
   async function submitEditor(state, isNew) {
     const btn = el("auGo");
     try {
-      if (!M().unlocked()) throw new Error("请先在「我的身份」里解锁");
+      if (!M().unlocked()) throw new Error("请先在「我的身份」里用夜莺钱包登录");
       const me = M().account();
       if (!me) throw new Error("你的公钥还不是测试网成员");
       const text = el("auText").value;

@@ -40,3 +40,12 @@ test("不再用以太坊签名派生成员密钥", () => {
 test("钱包返回的公钥与登录时不同 ⇒ 拒绝提交(钱包里换过密钥)", () => {
   assert.match(member, /out\.address !== session\.pubkey/);
 });
+
+test("浏览器本地存密钥的旧登录方式已下线:网页不生成、不导入、不解锁私钥", () => {
+  for (const gone of ["generateMnemonic", "mnemonicToSeed", "sealSeed", "openSeed", "decryptKeystore", "keyFromSeed", "signOp"]) {
+    assert.doesNotMatch(member, new RegExp("S\\." + gone + "\\("), `member.js 不应再调用 S.${gone}`);
+  }
+  for (const id of ["idGen", "idImp", "idFile", "idUnlock", "rvUnlock", "impWords"]) {
+    assert.doesNotMatch(member, new RegExp(`id='${id}'`), `不应再有 #${id}`);
+  }
+});

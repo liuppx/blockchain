@@ -2,8 +2,9 @@
 //
 //   node --test tools/explorer/test/browser.e2e.mjs
 //
-// 覆盖:生成/导入身份 → 解锁 → 写作(上传正文 + create)→ 修订(publish v2)→
-//       核验(需勾选全部核验要点)→ 邀请 → 检索 → 导出。
+// 覆盖:用夜莺钱包登录(注入实现 zhixing_* 接口的假钱包,见 fake-wallet.mjs)→ 写作(上传正文 + create)
+//       → 修订(publish v2)→ 核验(需勾选全部核验要点)→ 邀请 → 检索 → 导出。
+// 浏览器本地存密钥的旧登录方式已下线,网页不再持有私钥。
 //
 // 前置:需要已运行的本地链(`./cmd up`,RPC 127.0.0.1:9221)与浏览器服务(127.0.0.1:8080)。
 // 浏览器:用 CHROME_PATH 指定,默认 macOS 的 Chrome 路径;未找到则整个套件跳过(不算失败)。
@@ -24,6 +25,8 @@ const CHROME = process.env.CHROME_PATH ||
 const RPC = process.env.TEST_RPC || "http://127.0.0.1:9221";
 const WEB = process.env.TEST_WEB || "http://127.0.0.1:8080";
 const ZERO24 = Array(23).fill("abandon").join(" ") + " art"; // 公开测试助记词
+import { injectFakeWallet, memberKeyFromMnemonic } from "./fake-wallet.mjs";
+const TEST_KEY = await memberKeyFromMnemonic(ZERO24);
 
 let puppeteer = null;
 try {
@@ -52,9 +55,10 @@ function skipIfNoBrowser() {
 }
 
 async function newPage() {
-  // 独立的浏览器上下文:每个用例的 localStorage 互不影响(否则上一个用例保存的身份会挡住"导入"入口)
+  // 独立的浏览器上下文:每个用例的 localStorage 互不影响
   const ctx = await browser.createBrowserContext();
   const p = await ctx.newPage();
+  await injectFakeWallet(p, TEST_KEY);
   p.context = ctx;
   await p.setViewport({ width: 1300, height: 1400 });
   p.on("dialog", (d) => d.accept());
@@ -67,6 +71,15 @@ async function newPage() {
   p.notFound = notFound;
   p.errors = errors;
   return p;
+}
+
+// 在「我的身份」页用钱包登录,等到登录完成(只在登录后出现"由夜莺钱包保管")
+async function loginWithWallet(p) {
+  await p.click("#idBtn");
+  await p.waitForSelector("#idWallet", { timeout: 10000 });
+  await p.click("#idWallet");
+  await p.waitForFunction(() => /由夜莺钱包保管/.test(document.getElementById("view")?.innerText || "")
+    && !!document.getElementById("idState"), { timeout: 30000 });
 }
 
 // 测试公钥(公开测试助记词 "abandon … art" 的公钥)。
@@ -134,32 +147,18 @@ test("浏览器:导入身份 → 写作 → 修订 → 核验 → 邀请 → 检
   if (why) { t.skip(why); return; }
   const p = await newPage();
   try {
-    // ---- 导入身份(公开测试助记词) -------------------------------------------
-    await p.goto(WEB + "/", { waitUntil: "networkidle0" });
-    await p.click("#idBtn");
-    await p.waitForSelector("#idImp");
-    await p.click("#idImp");
-    await p.type("#impWords", ZERO24);
-    await p.type("#impPw", "e2e-test-password-123");
-    await p.click("#impSave");
-    await p.waitForSelector("#idTok", { timeout: 30000 });
-    const state = await p.$eval("#idState", (e) => e.textContent);
-    assert.match(state, /账户|不是测试网成员/, "身份状态应显示:" + state);
-    // 该公钥必须是链上成员才能写;不是就先用账户 1 邀请它
-    if (/不是测试网成员/.test(state)) {
+    // ---- 用夜莺钱包登录(公开测试助记词对应的密钥) ----------------------------
+    // 该公钥必须是链上成员才能写;不是就先用账户 1 邀请它,再登录
+    if (!(await isTestKeyMember())) {
       const invited = await ensureMember();
       assert.ok(invited, "测试公钥不是链上成员,且无法自动邀请(需要本地链与账户 1 的种子)");
-      // The first import already saved the vault. After the invite is mined,
-      // unlock that vault instead of trying to import it a second time (the
-      // locked identity view intentionally offers only the unlock form).
       const joined = await waitFor(isTestKeyMember, 30000, 500);
       assert.ok(joined, "邀请已提交但测试公钥尚未成为成员");
-      await p.$eval("#idPw", (e, v) => { e.value = v; }, "e2e-test-password-123");
-      await p.click("#idUnlock");
-      await p.waitForFunction(() => /账户 \d+/.test(document.querySelector("#idState")?.textContent || ""), { timeout: 30000 });
-      const st2 = await p.$eval("#idState", (e) => e.textContent);
-      assert.match(st2, /账户 \d+/, "邀请后应显示账户编号:" + st2);
     }
+    await p.goto(WEB + "/", { waitUntil: "networkidle0" });
+    await loginWithWallet(p);
+    const state = await p.$eval("#idState", (e) => e.textContent);
+    assert.match(state, /账户 \d+/, "登录后应显示账户编号:" + state);
 
     // 该密钥要在链上是成员才能写;不是的话先由链上邀请(见下面的邀请用例)
     const token = process.env.TEST_WRITE_TOKEN || "local-dev-token";
@@ -269,13 +268,7 @@ test("浏览器:核验面板 —— 勾选全部核验要点后才能通过;不�
   const p = await newPage();
   try {
     await p.goto(WEB + "/", { waitUntil: "networkidle0" });
-    await p.click("#idBtn");
-    await p.waitForSelector("#idImp");
-    await p.click("#idImp");
-    await p.type("#impWords", ZERO24);
-    await p.type("#impPw", "e2e-test-password-123");
-    await p.click("#impSave");
-    await p.waitForSelector("#idTok", { timeout: 30000 });
+    await loginWithWallet(p);
     const token = process.env.TEST_WRITE_TOKEN || "local-dev-token";
     if (token) { await p.type("#idTok", token); await p.click("#idTokSave"); }
 
@@ -298,11 +291,11 @@ test("浏览器:核验面板 —— 勾选全部核验要点后才能通过;不�
       assert.match(text, /不能由你自己核验/);
       return;
     }
-    // 否则应有核验要点与按钮
-    if (/口令/.test(text)) {
-      await p.type("#rvPw", "e2e-test-password-123");
-      await p.click("#rvUnlock");
-      await p.waitForSelector("#rvPass, #rvNeeds", { timeout: 30000 });
+    // 否则应有核验要点与按钮(登录状态只在内存里,换页后在单元页用钱包重新登录)
+    if (/用夜莺钱包登录后核验/.test(text)) {
+      await p.click("#rvWallet");
+      await p.waitForSelector("#rvPass, #rvNeeds, #reviewSlot .mut", { timeout: 30000 });
+      if (/不能由你自己核验/.test(await p.$eval("#reviewSlot", (e) => e.innerText))) return;
     }
     const checks = await p.$$eval(".rvChk", (cs) => cs.length);
     if (checks > 0) {

@@ -47,25 +47,23 @@ PORT=8080 NODE_RPC=http://127.0.0.1:9221 npm start      # 或: node server.js
 - 字段名对齐节点 `daemon.rs` 的 `json_*` 渲染器;列表走 `{total,cursor,items}` 分页信封;
   u64 为无损引号串原样显示。
 
-## 成员功能:在浏览器里核验与邀请
+## 成员功能:用夜莺钱包核验、邀请、写作
 
-`public/signer.js` + `public/member.js` 让成员不装任何程序,在浏览器里持有密钥、核验知识单元、邀请新成员。
+`public/member.js` 让成员用[夜莺钱包](https://wallet.yeying.pub/)登录后核验知识单元、邀请新成员;
+`public/author.js` 负责写新单元与修订(Markdown 编辑与预览 → 计算 SHA-256 → 上传到正文仓库 → 请钱包签名 create / publish)。
 
-- **私钥只在本机**:助记词(BIP-39)→ 种子 → ed25519 密钥,全部用浏览器内置的 WebCrypto 完成;
-  种子用成员口令加密(PBKDF2-SHA256 60 万次 → AES-256-GCM)后存在 `localStorage`,解锁后的签名密钥只在内存里。
-- **与节点逐字节一致**:`node --test tools/explorer/test/signer.test.mjs` 用同一助记词对照 Rust 程序
-  (`node keygen` / `node encode-knowledge-op`)的公钥与签名后的 op,CI 中为必过项。
-- **导入**:助记词,或 `node keygen --encrypt` 写的密钥文件(Web3 Secret Storage v3:scrypt + AES-128-CTR + Keccak-256 MAC;
-  scrypt 与 Keccak 为纯 JS 实现,对照 RFC 7914 / 官方向量与 Rust 程序生成的文件检验)。
-- **支持**:核验(通过 / 需修改,"通过"须先勾选单元的全部核验要点)、邀请、**写新单元与修订**(`public/author.js`:
-  Markdown 编辑与预览 → 计算 SHA-256 → 上传到正文仓库 → 签名 create / publish)。批量导入目录仍用 `tools/kimport.py`。
-- 本地开发链(`./cmd up`)的写入令牌是 `local-dev-token`。
-- 提交需要写入令牌(组织者私下提供),保存在本机 `localStorage`。
-- 需要较新的浏览器(WebCrypto Ed25519:Chrome / Edge 137+、Firefox 129+、Safari 17+)与 HTTPS(或 localhost)。
+- **网页不持有私钥**:密钥在钱包里;网页只递"意图",钱包编码、显示摘要、确认后签名(接口见下一节)。
+- **旧的浏览器本地身份已下线**:以前网页可以自己生成/导入助记词、把种子用口令加密存在 `localStorage`。
+  这条路已移除——同一个身份不应同时存在于浏览器和钱包两处。浏览器里留有旧密钥的成员,页面会提示把它移进钱包
+  (在钱包里导入同一组助记词或同一个密钥文件,就是同一个链上账户),并提供「清除本机旧密钥」。
+- **`signer.js` 仍保留**:它是 op 编码与签名的参考实现,`test/signer.test.mjs` 用它对照 Rust 程序逐字节检验,
+  钱包仓库的 `tests/zhixing-op.test.mjs` 又用它的输出检验钱包自己的编码;页面里只用它做提交前的格式检查与十六进制转换。
+- **支持**:核验(通过 / 需修改,"通过"须先勾选单元的全部核验要点)、邀请、写新单元与修订。批量导入目录仍用 `tools/kimport.py`。
+- 提交需要写入令牌(组织者私下提供),保存在本机 `localStorage`。本地开发链(`./cmd up`)的写入令牌是 `local-dev-token`。
 
 ## 用夜莺钱包登录
 
-[夜莺钱包](https://wallet.yeying.pub/)原生支持知行图:钱包保管知行图密钥(「设置 → 📚 知行图」里生成,或用助记词导入——
+[夜莺钱包](https://wallet.yeying.pub/)原生支持知行图:钱包保管知行图密钥(「设置 → 📚 知行图」里生成,或用助记词 / `node keygen` 的密钥文件导入——
 派生与 `node keygen` 相同,导入后就是成员原来那个链上账户),网页只拿公钥、只递"意图",钱包自己编码、
 在弹窗里给用户看可读摘要、确认后签名。
 
