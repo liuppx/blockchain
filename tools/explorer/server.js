@@ -27,7 +27,11 @@ const STATUS_DIR = process.env.STATUS_DIR || ""; // 运维状态(如 deploy/disk
 const BODY_TOKEN = process.env.BODY_TOKEN || "";
 const MAX_BODY = 64 * 1024; // matches the node's RPC body cap
 const { KnowledgeIndex, LICENSE } = require("./knowledge-index.js");
+const { ReviewAssigner } = require("./review-assign.js");
+const { TerrainBuilder } = require("./terrain.js");
+const TERRAIN = new TerrainBuilder(NODE_RPC);
 const INDEX = new KnowledgeIndex(BODY_DIR, NODE_RPC);
+const ASSIGNER = new ReviewAssigner(NODE_RPC);
 
 const MIME = { ".html": "text/html; charset=utf-8", ".js": "text/javascript; charset=utf-8",
   ".css": "text/css; charset=utf-8", ".json": "application/json", ".ico": "image/x-icon" };
@@ -117,7 +121,8 @@ async function search(req, res) {
   const layer = u.searchParams.get("layer") || undefined;
   const limit = u.searchParams.get("limit");
   try {
-    await INDEX.ensureFresh(30000);
+    // 索引最多 15 秒刷新一次;新单元通常在一个刷新周期内即可被搜到
+    await INDEX.ensureFresh(15000);
     const hits = INDEX.search(q, { domain, layer, limit });
     const body = JSON.stringify({
       query: q, total: hits.length,
@@ -133,6 +138,71 @@ async function search(req, res) {
   } catch (e) {
     res.writeHead(500, { "Content-Type": "application/json" })
       .end(JSON.stringify({ error: "search failed: " + e.message }));
+  }
+}
+
+// GET /assign?unit=N[&version=M]   该版本的核验人指派(确定性,可验证)
+// GET /assign/pending?member=N      指派给该成员、尚未核验的版本
+async function assign(req, res) {
+  const u = new URL(req.url, "http://x");
+  const json = (obj, code = 200) => {
+    res.writeHead(code, { "Content-Type": "application/json; charset=utf-8", "Cache-Control": "no-store" })
+      .end(JSON.stringify(obj));
+  };
+  try {
+    const member = u.searchParams.get("member");
+    if (member) {
+      const list = await ASSIGNER.pendingFor(member);
+      return json({ member, count: list.length, items: list, enforced: false });
+    }
+    const unit = u.searchParams.get("unit");
+    if (!unit) return json({ error: "missing unit" }, 400);
+    const version = u.searchParams.get("version") || undefined;
+    const a = await ASSIGNER.forVersion(unit, version);
+    return json(a);
+  } catch (e) {
+    return json({ error: "assign failed: " + e.message }, 500);
+  }
+}
+
+// GET /explore?unit=N      该单元的上游(谁建立在它之上)与地基(它站在谁之上)
+// GET /gaps[?domain=N]     缺口:无人依据、也无人核验的单元(可以填的"山谷")
+// GET /coverage            按领域的覆盖情况
+async function explore(req, res) {
+  const u = new URL(req.url, "http://x");
+  const json = (obj, code = 200) => res.writeHead(code, {
+    "Content-Type": "application/json; charset=utf-8", "Cache-Control": "no-store",
+  }).end(JSON.stringify(obj));
+  try {
+    await INDEX.ensureFresh(15000);
+    if (req.url.startsWith("/gaps")) {
+      const domain = u.searchParams.get("domain");
+      return json({ gaps: INDEX.gaps(domain ? { domain } : {}) });
+    }
+    if (req.url.startsWith("/coverage")) {
+      return json({ coverage: INDEX.coverage() });
+    }
+    const unit = u.searchParams.get("unit");
+    if (!unit) return json({ error: "missing unit" }, 400);
+    return json({
+      unit: String(unit),
+      upstream: INDEX.upstream(unit),
+      downstream: INDEX.downstream(unit),
+    });
+  } catch (e) {
+    return json({ error: "explore failed: " + e.message }, 500);
+  }
+}
+
+// GET /terrain   认知地形图:把引用关系投影成地形(峰/高原/山脊/山谷/断层)
+async function terrain(req, res) {
+  try {
+    const t = await TERRAIN.build();
+    res.writeHead(200, { "Content-Type": "application/json; charset=utf-8", "Cache-Control": "no-store" })
+      .end(JSON.stringify(t));
+  } catch (e) {
+    res.writeHead(500, { "Content-Type": "application/json" })
+      .end(JSON.stringify({ error: "terrain failed: " + e.message }));
   }
 }
 
@@ -169,10 +239,19 @@ function status(req, res) {
   });
 }
 
+function apiPathOf(req) { return new URL(req.url, "http://x").pathname; }
+
 http.createServer((req, res) => {
   if (req.url.startsWith("/bodies/")) return bodies(req, res);
   if (req.url.startsWith("/status/")) return status(req, res);
   if (req.url === "/search" || req.url.startsWith("/search?")) return search(req, res);
+  if (apiPathOf(req) === "/assign" || apiPathOf(req) === "/assign/pending") return assign(req, res);
+  if (req.url === "/terrain" || req.url.startsWith("/terrain?")) return terrain(req, res);
+  // 精确匹配 API 路径:不能用 startsWith("/explore"),否则会吞掉静态文件 /explore.js
+  const apiPath = new URL(req.url, "http://x").pathname;
+  if (apiPath === "/explore" || apiPath === "/gaps" || apiPath === "/coverage") {
+    return explore(req, res);
+  }
   if (req.url === "/export/units" || req.url.startsWith("/export/units?")) return exportUnits(req, res);
   if (req.url === "/rpc" || req.url.startsWith("/rpc/") || req.url.startsWith("/rpc?")) return proxy(req, res);
   return serveStatic(req, res);

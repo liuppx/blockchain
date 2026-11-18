@@ -78,6 +78,8 @@ jobs:
           (cd node && cargo build --release)
           node --version
           node --test tools/explorer/test/signer.test.mjs
+          node --test tools/explorer/test/assign.test.mjs
+          node --test tools/explorer/test/wallet.test.mjs
 
       - name: browser end-to-end (member flows in a real browser)
         # 起一条本地链,导入知识单元,然后用 Chrome 走一遍成员流程:身份 → 写作 → 修订 →
@@ -89,6 +91,9 @@ jobs:
           ./cmd up
           sleep 5
           node --test tools/explorer/test/browser.e2e.mjs
+          # 夜莺钱包(注入实现 zhixing_* 接口的模拟钱包):登录、锁定身份时入口不消失、无密钥/旧版提示、登录→邀请→核验入块。
+          # 与上一个文件分开跑:两者共用一条链,并行会让邀请冷却互相干扰。
+          node --test tools/explorer/test/wallet.e2e.mjs
           ./cmd down
 
   audit:

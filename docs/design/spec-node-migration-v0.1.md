@@ -50,15 +50,15 @@
 
 | 规范要求 | 本项目实现 |
 |---|---|
-| `scripts/package.sh` + `scripts/package-api.json`(v1) | 在隔离 worktree 中按 `--ref` 构建 `node` 发布二进制,产出 `zhixing-testnet-v<ver>-<commit7>.tar.gz` 与 `release-manifest.json`(`type: service`) |
+| `scripts/package.sh` + `scripts/package-api.json`(v1) | 在隔离 worktree 中按 `--ref` 构建 `node` 发布二进制,产出 `zhixing-testnet-service-v<ver>-<commit7>.tar.gz` 与 `release-manifest.json`(`type: service`) |
 | 包内 `scripts/starter.sh [start\|stop\|restart]` | 管理 4 个验证节点进程;stop:SIGTERM → 等 `STOP_TIMEOUT_SECONDS`(30)→ SIGKILL → 再确认退出;只清除已确认退出进程的 PID 文件 |
 | `scripts/health-check.sh --level liveness\|readiness\|dependency\|all` | liveness:4 个进程在、RPC 端口在听;readiness:4 个节点高度推进且 head 一致;dependency:磁盘余量;支持 `--format json`、退出码 0–4 |
 | `scripts/test.sh --suite smoke` | 只读冒烟:读高度/版本/知识单元/成员,检查供应守恒;不写链 |
 | `scripts/upgrade.sh prepare\|copy-config\|post-copy\|finalize` | `copy-config` 迁移 `config/`(节点配置、创世、密钥库、密码文件) |
-| 部署目录 | `/opt/deploy/zhixing-testnet-v<ver>-<commit7>/`,软链接 `/opt/deploy/zhixing-testnet` |
+| 部署目录 | `/opt/deploy/zhixing-testnet-service-v<ver>-<commit7>/`,软链接 `/opt/deploy/zhixing-testnet` |
 | 持久数据 | `/data/zhixing-testnet/n2{1..4}/`(区块日志、证书日志) |
 | 操作日志 | `/opt/logs/zhixing-testnet-*.log`(单文件 ≤ 1 MB 截断) |
-| 安装包 | `/opt/package/zhixing-testnet-v<ver>-<commit7>.tar.gz` + `.sha256sum` |
+| 安装包 | `/opt/package/zhixing-testnet-service-v<ver>-<commit7>.tar.gz` + `.sha256sum` |
 
 **配置与密钥不进安装包**:节点配置、创世、验证人密钥库、密钥库密码放在部署目录的 `config/`(权限 700/600),
 首次安装时从旧机迁入,升级时由 `copy-config` 带到新版本目录。密码不出现在命令行或日志里。
@@ -137,7 +137,7 @@ DNS 不切换、浏览器留在旧机、通道采用 SSH 转发、旧机节点�
 | 16:22 | 新机按已提交源码构建 `node` | 与旧二进制的差别:包含 `02c592b`(`--key-file` 接受带注释种子文件) |
 | 16:25–16:38 | 传输 | 旧机出口仅约 0.17 MB/s,经本机中转;传完 n21 全部数据与配置后改为**只取 n22 最后 5 个区块**(块记录固定 376 字节、证书 416 字节,共 3960 字节) |
 | 16:40 | 拼装并校验 | n21 日志 + n22 尾部 → 全量重放:高度 419195、head、state_root 与旧机完全一致,快照字节哈希相同(`cd50544f…`);所有配置、密钥库、密码逐文件 SHA-256 与源一致 |
-| 16:43 | 安装 | `/opt/deploy/zhixing-testnet-v0.1.0-967d1b2/`、软链接 `/opt/deploy/zhixing-testnet`、数据 `/data/zhixing-testnet/n2{1..4}`;节点配置改写为新路径,端口不变、只监听 127.0.0.1 |
+| 16:43 | 安装 | `/opt/deploy/zhixing-testnet-service-v0.1.0-967d1b2/`、软链接 `/opt/deploy/zhixing-testnet`、数据 `/data/zhixing-testnet/n2{1..4}`;节点配置改写为新路径,端口不变、只监听 127.0.0.1 |
 | 16:44 | 再次确认旧机无节点进程后启动 | 约 100 秒重放后 4 个节点在 419210 一致,继续出块 |
 | 16:47 | 通道 | 旧机 `zhixing-tunnel.service`:`127.0.0.1:19221 → 新机 127.0.0.1:9221`;新机 `zhixing-tunnel` 账户 `restrict,port-forwarding,permitopen="127.0.0.1:9221"`。验证:该密钥执行命令被拒、转发到 9222 被拒(administratively prohibited) |
 | 16:48 | 旧机 nginx `/rpc/` 与浏览器 `NODE_RPC` 改指 19221 | 原配置备份在 `/opt/backup/*.pre-tunnel.*` |
@@ -185,14 +185,17 @@ DNS 不切换、浏览器留在旧机、通道采用 SSH 转发、旧机节点�
 
 ### 现状(2026-11-14 17:25)
 
-- 新机:`/opt/deploy/zhixing-testnet` → `zhixing-testnet-v0.1.2-979dda7`;上一版本 `v0.1.0-967d1b2` 保留用于回退;
-  安装包 `/opt/package/zhixing-testnet-v0.1.2-979dda7.tar.gz`(SHA-256 `7eeb9bb0…`)
+- 新机:`/opt/deploy/zhixing-testnet` → `zhixing-testnet-service-v0.1.2-979dda7`;上一版本 `v0.1.0-967d1b2` 保留用于回退;
+  安装包 `/opt/package/zhixing-testnet-service-v0.1.2-979dda7.tar.gz`(SHA-256 `7eeb9bb0…`)
 - 冒烟:本机与公网(经通道)均 6/6 通过
 - 运维文档:`deploy/README.md` 已按新拓扑重写
 
 ### 待办
 
 - [ ] `v0.1.2` 包内的 `health-check.sh` 是手动替换的修复版;下次打包(v0.1.3)时随包发布,保持"部署目录 = 安装包内容"
-- [ ] 节点程序自身锁定数据目录(目前由 starter 的 flock 保证;节点程序加锁能覆盖所有启动方式)
+- [x] 节点程序自身锁定数据目录(2026-11-15,`4878a2e`):`DataDirLock` 在打开日志前对 `<data_dir>/.node.lock`
+      取独占锁,同一数据目录的第二个节点直接失败,覆盖手工启动。实测:手工在同一数据目录再启一个节点被拒绝,线上链不受影响。
+      **升级中暴露的问题**:脚本层原有的 flock 锁的是**同一个文件**,两把锁互相冲突,4 个节点全部拒绝启动,链暂停约 2 分钟。
+      修复(`b8864e1`):去掉脚本层的锁(节点自己的锁已覆盖全部启动方式),链恢复,升级前后同一高度区块哈希相同。
 - [ ] 旧机备份 `/opt/backup/zhixing-testnet-out-20261114161812.tar.gz` 含验证人密钥库,确认不再需要回退后删除
 - [ ] 接入社区 WebDAV 发布与 `operator/upgrade/upgrade.sh`(本次为本地打包、手动执行升级流程)

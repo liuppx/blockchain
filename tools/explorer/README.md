@@ -62,3 +62,32 @@ PORT=8080 NODE_RPC=http://127.0.0.1:9221 npm start      # 或: node server.js
 - 本地开发链(`./cmd up`)的写入令牌是 `local-dev-token`。
 - 提交需要写入令牌(组织者私下提供),保存在本机 `localStorage`。
 - 需要较新的浏览器(WebCrypto Ed25519:Chrome / Edge 137+、Firefox 129+、Safari 17+)与 HTTPS(或 localhost)。
+
+## 用夜莺钱包登录
+
+[夜莺钱包](https://wallet.yeying.pub/)原生支持知行图:钱包保管知行图密钥(「设置 → 📚 知行图」里生成,或用助记词导入——
+派生与 `node keygen` 相同,导入后就是成员原来那个链上账户),网页只拿公钥、只递"意图",钱包自己编码、
+在弹窗里给用户看可读摘要、确认后签名。
+
+检测到钱包时,顶栏出现 **「用夜莺钱包登录」**;「我的身份」页也有(本机已有锁定身份时在口令框下方),
+并明确显示"✓ 已检测到夜莺钱包"或"✗ 没有检测到"。
+
+**接口**(EIP-1193 `provider.request`,钱包侧实现见 wallet 仓库 `js/background/request-router.js`):
+
+| 方法 | 参数 | 返回 | 说明 |
+|---|---|---|---|
+| `zhixing_accounts` | — | `[公钥]` 或 `[]` | 本站已授权时返回公钥;不弹窗 |
+| `zhixing_requestAccounts` | — | `[公钥]` | 首次弹窗请用户确认连接;按网站单独授权 |
+| `zhixing_signKnowledgeOp` | `[{ actor, nonce, action }]` | `{ signed, address }` | `action` 与 `signer.js` 的 `encodeAction` 同形;`signed` 是 op ‖ 签名的十六进制,直接 POST `/rpc/knowledge` |
+
+错误码:`4001` 用户拒绝;`4100` 本站未连接;`4900` 钱包里还没有知行图密钥;旧版钱包不认识这些方法(页面提示升级)。
+
+**为什么只递意图**:如果网页把待签字节交给钱包,弹窗里显示的内容就不一定是实际签的内容。钱包自己从意图编码,
+显示与签名必然一致。钱包的编码由 wallet 仓库 `tests/zhixing-op.test.mjs` 对照本仓库 `signer.js` 的输出逐字节检验,
+`signer.js` 又由 `test/signer.test.mjs` 对照 Rust 节点检验——三方一致。
+
+(早先曾用以太坊 `personal_sign` 的签名派生成员密钥;钱包原生支持后已移除,避免同一个钱包产生两把不同的成员密钥。)
+
+检验:`node --test tools/explorer/test/wallet.test.mjs`(接口约定,CI 门禁)与
+`node --test tools/explorer/test/wallet.e2e.mjs`(注入实现同样接口的模拟钱包:登录、本机有锁定身份时入口仍在、
+没装钱包 / 钱包里无密钥 / 旧版钱包的提示、登录 → 邀请 → 核验入块;需要本地链)。

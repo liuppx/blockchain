@@ -66,7 +66,8 @@ async function refreshOverview() {
 }
 
 const TABS = [
-  ["knowledge", "Knowledge"], ["blocks", "Blocks"], ["tx", "Tx lookup"], ["account", "Account"], ["graph", "Graph"],
+  ["knowledge", "Knowledge"], ["terrain", "地形图"], ["gaps", "缺口"], ["blocks", "Blocks"], ["tx", "Tx lookup"],
+  ["account", "Account"], ["graph", "Graph"],
   ["cnfts", "cNFTs"], ["validators", "Validators"], ["staking", "Staking"],
   ["proposals", "Governance"], ["supply", "Supply"],
 ];
@@ -76,7 +77,9 @@ function renderTabs() {
 }
 function showTab(k) {
   TABS.forEach(([t]) => { const b = el("tab-"+t); if (b) b.className = (t===k ? "on" : ""); });
-  ({ knowledge:tabKnowledge, blocks:tabBlocks, tx:tabTx, account:tabAccount, graph:tabGraph, validators:tabValidators,
+  ({ knowledge:tabKnowledge, terrain:() => window.ZXTerrain ? ZXTerrain.show() : setView("<span class='mut'>地形图未加载</span>"),
+     gaps:() => window.ZXExplore ? ZXExplore.showGaps() : setView("<span class='mut'>缺口视图未加载</span>"),
+     blocks:tabBlocks, tx:tabTx, account:tabAccount, graph:tabGraph, validators:tabValidators,
      staking:tabStaking, proposals:tabProposals, cnfts:tabCnfts, supply:tabSupply })[k]();
 }
 
@@ -237,6 +240,12 @@ async function tabSupply() {
 // effective credibility = min(own, every "basis" citation's effective credibility), so the
 // bottleneck column names the weakest foundation a unit stands on.
 const LAYER_ZH = { foundation: "基础", explanation: "解释", scenario: "场景", application: "应用" };
+const LIFECYCLE_ZH = { active: "活跃", dormant: "休眠", superseded: "已取代", contested: "竞争" };
+const CITE_KIND_ZH = { basis: "依据", "see-also": "参见", supersedes: "取代" };
+function lifecycleLabel(s) {
+  if (!s || s === "active") return "";
+  return `<span class='lc ${esc(s)}'>${esc(LIFECYCLE_ZH[s] || s)}</span>`;
+}
 const DOMAIN_ZH = { 1: "大模型应用开发", 2: "运动健身" }; // testnet genesis [knowledge] domains
 const domainName = d => DOMAIN_ZH[d] ? `${DOMAIN_ZH[d]} (${d})` : String(d);
 function credBar(bps) {
@@ -329,7 +338,7 @@ async function tabKnowledge() {
       const neck = b ? `<a class='link' data-unit='${esc(b.unit)}'>#${esc(b.unit)} v${esc(b.version)}</a>` : "<span class='mut'>—</span>";
       return `<tr><td><a class='link' data-unit='${esc(u.id)}'>#${esc(u.id)}</a></td>
         <td><a class='link' data-unit='${esc(u.id)}' data-title='${esc(u.id)}'><span class='mut'>…</span></a></td>
-        <td>${esc(LAYER_ZH[u.layer] || u.layer)}</td><td>${esc(domainName(u.domain))}</td><td>${esc(u.versions)}</td>
+        <td>${esc(LAYER_ZH[u.layer] || u.layer)}</td><td>${esc(domainName(u.domain))}</td><td>${lifecycleLabel(u.lifecycle)}</td><td>${esc(u.versions)}</td>
         <td>${esc(c.passes)}${Number(c.needs) ? ` <span class='err'>−${esc(c.needs)}</span>` : ""}</td><td>${credBar(c.self_bps)}</td><td>${credBar(c.effective_bps)}</td><td>${neck}</td></tr>`;
     }).join("") : "<tr><td class='mut' colspan=9>(no knowledge units yet — ./cmd knowledge)</td></tr>";
     setView(`<h2 style='border:0;padding:0 0 8px'>Knowledge units</h2>
@@ -344,7 +353,7 @@ async function tabKnowledge() {
       <div id='authorSlot'></div>
       <div id='reviewQueue'></div>
       <p class='mut'>有效可信度 = 自身可信度与所依据单元有效可信度的最小值。"被谁卡住"指出它最薄弱的地基。</p>
-      <table><tr><th>unit</th><th>标题</th><th>层级</th><th>领域</th><th>版本数</th><th>核验通过 / 需修改</th><th>自身</th><th>有效</th><th>被谁卡住</th></tr>${rows}</table>`);
+      <table><tr><th>unit</th><th>标题</th><th>层级</th><th>领域</th><th>状态</th><th>版本数</th><th>核验通过 / 需修改</th><th>自身</th><th>有效</th><th>被谁卡住</th></tr>${rows}</table>`);
     el("view").querySelectorAll("a[data-unit]").forEach(a => a.addEventListener("click", () => showUnit(a.dataset.unit)));
     if (window.ZXAuthor) ZXAuthor.attachKnowledge();
     wireSearch();
@@ -453,7 +462,7 @@ async function showUnit(id) {
     const vers = u.versions.slice().reverse().map((v, vi) => {
       const c = v.credibility;
       const cites = v.cites.length ? v.cites.map(x =>
-        `<a class='link' data-unit='${esc(x.unit)}'>#${esc(x.unit)} v${esc(x.version)}</a> <span class='mut'>(${x.kind === "basis" ? "依据" : "参见"})</span>`).join("<br>") : "<span class='mut'>—</span>";
+        `<a class='link' data-unit='${esc(x.unit)}'>#${esc(x.unit)} v${esc(x.version)}</a> <span class='mut'>(${esc(CITE_KIND_ZH[x.kind] || x.kind)})</span>`).join("<br>") : "<span class='mut'>—</span>";
       const stale = c.stale_cites.map(s => `<div class='err'>引用已过时:#${esc(s.unit)} 引用 v${esc(s.cited)},当前 v${esc(s.current)}</div>`).join("");
       const ver = v.verifications.length ? v.verifications.map(r =>
         `account ${esc(r.verifier)} · ${r.verdict === "pass" ? "通过" : "需修改"} · height ${esc(r.height)}`).join("<br>") : "<span class='mut'>尚无核验</span>";
@@ -470,12 +479,15 @@ async function showUnit(id) {
     setView(`<p><a class='link' id='kback'>← knowledge</a></p>
       <h2 style='border:0;padding:0 0 8px'>Unit #${esc(u.id)} · ${esc(LAYER_ZH[u.layer] || u.layer)}</h2>
       <kv><b>author / created</b>account ${esc(u.author)} · height ${esc(u.created_height)}</kv>
-      <kv><b>domain</b>${esc(domainName(u.domain))}</kv><kv><b>license</b>${esc(u.license)}</kv>${vers}`);
+      <kv><b>domain</b>${esc(domainName(u.domain))}</kv><kv><b>license</b>${esc(u.license)}</kv>
+      <kv><b>状态</b>${lifecycleLabel(u.lifecycle) || "活跃"}</kv>${vers}
+      <div id='exploreSlot'></div>`);
     el("kback").addEventListener("click", () => { history.replaceState(null, "", location.pathname); showTab("knowledge"); });
     // latest version expanded; older versions' bodies load too (they are usually the same text)
     el("view").querySelectorAll(".bodyslot").forEach(sl => fillBody(sl, sl.dataset.hash));
     if (window.ZXMember) ZXMember.attachReview(u);
     if (window.ZXAuthor) ZXAuthor.attachUnit(u);
+    if (window.ZXExplore) ZXExplore.attachExplore(u);
     el("view").querySelectorAll("a[data-unit]").forEach(a => a.addEventListener("click", () => showUnit(a.dataset.unit)));
   } catch (e) { setView(`<span class='err'>${esc(e.message)}</span>`); }
 }

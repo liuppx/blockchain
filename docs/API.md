@@ -53,7 +53,18 @@ GET /rpc/units?limit=50&cursor=<id>&domain=2&layer=foundation&author=7&min_effec
 
 每项字段:`id`、`layer`、`domain`、`author`、`created_height`、`versions`、`credibility`
 (`passes` / `needs` / `self_bps` / `effective_bps` / `bottleneck` / `stale_cites`)、
-`body_hashes`(当前版本正文哈希)、`cites`(当前版本的引用:`unit` / `version` / `kind`)。
+`body_hashes`(当前版本正文哈希)、`cites`(当前版本的引用:`unit` / `version` / `kind`)、
+`lifecycle`(生命周期状态,见下)。
+
+> **生命周期状态**(由链上关系派生,不是新增的状态字段):
+> | 值 | 含义 |
+> |---|---|
+> | `active` | 活跃:有核验通过,或仍被别的单元依据 |
+> | `dormant` | 休眠:既无人核验、也无人依据(通常是图谱最上层、待核验的单元) |
+> | `contested` | 竞争:它以"取代"引用挑战了另一个单元,新旧**并存**,链上不强行裁决 |
+> | `superseded` | 已取代:被另一个单元取代;历史与署名保留,**不再向依据它的单元传递可信度** |
+>
+> **引用类型 `kind`**:`basis`(依据,传递可信度)、`see-also`(参见)、`supersedes`(取代)。
 
 > **可信度语义**:`effective_bps` = min(自身可信度, 所依据的每个单元的有效可信度)。
 > 每一位"需修改"抵消一位"通过"。`bottleneck` 指出卡住它的那条依据;`stale_cites` 指出已过时的依据。
@@ -86,7 +97,29 @@ GET /search?q=<关键词>&domain=2&layer=foundation&limit=50
 跨**标题与正文**检索(正文在正文仓库,链上只有哈希)。中文按单字与双字组合匹配,英文按词匹配。
 返回:`items[]`(`id`、`title`、`excerpt` 摘要、`body_url`、`credibility`、`score` 命中分,标题命中加权)。
 
-### 3.5 导出(浏览器服务)
+### 3.5 认知地形图(浏览器服务)
+
+```
+GET /terrain
+```
+
+把链上的引用关系与可信度投影成地形数据:每个单元给出层级、领域、核验通过数、有效可信度、被引/引用的次数、
+重要性、**地形类型**(峰 / 高原 / 山脊 / 山谷 / 断层 / 坡 / 平地)与高度;另有全部引用边(依据 / 参见 / 取代)。
+数据全部来自链上已有的记录,**不新增任何链上状态**。
+
+### 3.6 探索与缺口(浏览器服务)
+
+```
+GET /explore?unit=N      该单元的上下游:谁建立在它之上(继承)、它站在谁之上(地基),按距离分层
+GET /gaps[?domain=N]     缺口:没有任何单元依据它、也还没人核验它的单元(图里的"山谷")
+GET /coverage            按领域的覆盖:单元数、已确立数、缺口数、层级分布
+```
+
+`/explore` 沿着链上的引用关系双向遍历,返回 `{unit, upstream[], downstream[]}`,
+每项含 `{unit, depth, via, kind}`:`depth` 是距离(1 = 直接),`via` 是中间那一条,`kind` 是引用类型。
+这是"持续探索"的支撑:从任意一条知识,能立刻知道**它支撑了谁、又被谁支撑**。
+
+### 3.7 导出(浏览器服务)
 
 ```
 GET /export/units
@@ -98,7 +131,7 @@ JSONL:第一行是元数据(许可、来源、单元数),其后每行一个单�
 
 > 用途:喂给大模型训练、做检索索引、做离线分析。许可为 CC BY 4.0,署名即可。
 
-### 3.6 正文仓库
+### 3.8 正文仓库
 
 ```
 GET  /bodies/<sha256>          公开;内容寻址,永不变化
@@ -154,6 +187,8 @@ POST /rpc/knowledge        知识操作(create / publish / verify / invite)
 
 各操作的可执行工具(在仓库里):
 - 浏览器:https://blockchain.yeying.pub 的「我的身份」与单元页(核验、邀请、写作、修订);
+  装了[夜莺钱包](https://wallet.yeying.pub/)的成员可由钱包保管密钥并签名(钱包接口 `zhixing_requestAccounts` /
+  `zhixing_signKnowledgeOp`,见 [`tools/explorer/README.md`](../tools/explorer/README.md));
 - 命令行:`node encode-knowledge-op` + `node rpc --path /knowledge --post`。
 
 ## 7. 限流

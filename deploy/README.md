@@ -15,8 +15,8 @@
 
 | 项 | 位置 |
 |---|---|
-| 安装包 | `/opt/package/zhixing-testnet-v<版本>-<commit>.tar.gz` + `.sha256sum` + `release-manifest.json` |
-| 当前版本 | `/opt/deploy/zhixing-testnet` → `zhixing-testnet-v<版本>-<commit>/`(保留上一版本目录用于回退) |
+| 安装包 | `/opt/package/zhixing-testnet-service-v<版本>-<commit>.tar.gz` + `.sha256sum` + `release-manifest.json` |
+| 当前版本 | `/opt/deploy/zhixing-testnet` → `zhixing-testnet-service-v<版本>-<commit>/`(保留上一版本目录用于回退) |
 | 配置与密钥 | `<版本目录>/config/`(700):创世、`node2{1..4}.toml`、`keys/`(验证人密钥库,600)、`password`、`tokens.env` |
 | 链数据 | `/data/zhixing-testnet/n2{1..4}/`(不随版本移动) |
 | 操作日志 | `/opt/logs/zhixing-testnet-{starter,health}.log`(各 ≤ 1 MB) |
@@ -48,7 +48,7 @@ scripts/package.sh --ref <commit> --source-commit <commit> --version <x.y.z> --o
 ### 升级(手动执行升级器的流程)
 
 ```sh
-CUR=/opt/deploy/zhixing-testnet-v<旧>; TGT=/opt/deploy/zhixing-testnet-v<新>
+CUR=/opt/deploy/zhixing-testnet-service-v<旧>; TGT=/opt/deploy/zhixing-testnet-service-v<新>
 cd /opt/package && sha256sum -c <包>.sha256sum && tar -xzf <包> -C /opt/deploy/
 bash $TGT/scripts/upgrade.sh prepare $CUR $TGT
 bash $CUR/scripts/starter.sh stop                         # 必须返回 0(确认已退出)
@@ -80,7 +80,16 @@ systemctl status zhixing-tunnel             # 通道断开时浏览器读不到�
 curl -s 127.0.0.1:19221/height              # 经通道读新机高度
 ```
 
-更新浏览器:把仓库 `tools/explorer/` 同步到旧机 `/opt/zhixing/tools/explorer/` 后 `systemctl restart zhixing-explorer`。
+更新浏览器:用脚本同步并重启,带自检(校验和一致 + 首页返回 200):
+
+```sh
+deploy/deploy-explorer.sh            # 同步 tools/explorer/ → 重启 zhixing-explorer → 自检
+deploy/deploy-explorer.sh --check    # 只看远端状态,不改动
+```
+
+脚本只碰浏览器(旧机的 `/opt/zhixing/tools/explorer`),不碰节点、链数据与密钥——节点在新机上,
+由 `/opt/deploy/zhixing-testnet/scripts/starter.sh` 管理。环境变量 `HOST`(默认 `root@122.9.144.27`)、
+`DEST`(默认 `/opt/zhixing/tools/explorer`)可覆盖。
 
 ## 监控与告警
 

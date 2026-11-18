@@ -181,6 +181,106 @@ class KnowledgeIndex {
     });
   }
 
+  // 引用图的上下游:从某单元出发,沿"依据"向上(谁建立在它之上)与向下(它建立在谁之上)
+  // ——这是"持续探索"需要的方向感:一条想法被谁继承,又站在谁的肩上。
+  graph() {
+    const byId = new Map(this.units.map((u) => [String(u.id), u]));
+    const up = new Map(), down = new Map();
+    for (const u of this.units) {
+      const id = String(u.id);
+      const cites = u.cites || [];
+      for (const c of cites) {
+        if (!down.has(id)) down.set(id, []);
+        down.get(id).push(c);
+        if (!up.has(String(c.unit))) up.set(String(c.unit), []);
+        up.get(String(c.unit)).push({ from: id, kind: c.kind, version: c.version });
+      }
+    }
+    return { byId, up, down };
+  }
+
+  /** 某单元的上游(谁建立在它之上),按距离分层。 */
+  upstream(id, maxDepth = 3) {
+    const { up } = this.graph();
+    const out = [];
+    let frontier = [String(id)];
+    const seen = new Set(frontier);
+    for (let depth = 1; depth <= maxDepth && frontier.length; depth++) {
+      const next = [];
+      for (const f of frontier) {
+        for (const e of up.get(f) || []) {
+          if (seen.has(e.from)) continue;
+          seen.add(e.from);
+          next.push(e.from);
+          out.push({ unit: e.from, depth, via: f, kind: e.kind });
+        }
+      }
+      frontier = next;
+    }
+    return out;
+  }
+
+  /** 某单元的地基(它建立在谁之上),按距离分层。 */
+  downstream(id, maxDepth = 3) {
+    const { down } = this.graph();
+    const out = [];
+    let frontier = [String(id)];
+    const seen = new Set(frontier);
+    for (let depth = 1; depth <= maxDepth && frontier.length; depth++) {
+      const next = [];
+      for (const f of frontier) {
+        for (const c of down.get(f) || []) {
+          if (seen.has(String(c.unit))) continue;
+          seen.add(String(c.unit));
+          next.push(String(c.unit));
+          out.push({ unit: String(c.unit), depth, via: f, kind: c.kind });
+        }
+      }
+      frontier = next;
+    }
+    return out;
+  }
+
+  /** 缺口:没有任何单元依据它、也没人核验它——可以填的"山谷"。 */
+  gaps(opts = {}) {
+    const { byId } = this.graph();
+    const out = [];
+    for (const u of this.units) {
+      const id = String(u.id);
+      const citedBy = (u.cited_by || []).filter((e) => e.kind === "basis").length;
+      const passes = Number((u.credibility || {}).passes || 0);
+      if (citedBy === 0 && passes === 0) {
+        out.push({
+          id, domain: String(u.domain), layer: u.layer,
+          lifecycle: u.lifecycle || "active",
+          versions: u.versions,
+          // 已确立(有人核验过)但无人依据:地基扎实,还没有上层——最值得被引用的
+          established: passes > 0,
+        });
+      }
+    }
+    if (opts.domain) out = out.filter((g) => g.domain === String(opts.domain));
+    return out;
+  }
+
+  /** 按领域的覆盖情况:每个领域有多少单元、多少已确立、多少无人依据。 */
+  coverage() {
+    const { byId } = this.graph();
+    const domains = new Map();
+    for (const u of this.units) {
+      const d = String(u.domain);
+      if (!domains.has(d)) domains.set(d, { domain: d, total: 0, established: 0, unreferenced: 0, layers: {} });
+      const e = domains.get(d);
+      e.total += 1;
+      e.layers[u.layer] = (e.layers[u.layer] || 0) + 1;
+      const passes = Number((u.credibility || {}).passes || 0);
+      const citedBy = (u.cited_by || []).filter((x) => x.kind === "basis").length;
+      if (passes > 0) e.established += 1;
+      if (citedBy === 0 && passes === 0) e.unreferenced += 1;
+    }
+    return [...domains.values()].sort((a, b) => a.domain.localeCompare(b.domain));
+  }
+
   // 导出:全部单元(JSONL),含正文
   async exportUnits() {
     await this.ensureFresh(0);

@@ -101,7 +101,7 @@
   // ---- 知识 op 编码(codec.rs enc_knowledge_op)----------------------------------
   const VERDICT = { pass: 0, "needs-revision": 1 };
   const LAYER = { foundation: 0, explanation: 1, scenario: 2, application: 3 };
-  const CITE_KIND = { basis: 0, "see-also": 1 };
+  const CITE_KIND = { basis: 0, "see-also": 1, supersedes: 2 };
   const MAX_CITES = 32, MAX_BODIES = 16, MAX_LANG_LEN = 16, MAX_MODEL_ID_LEN = 64;
 
   function encodeVersionPayload(p) {

@@ -854,6 +854,10 @@ pub struct Metrics {
 #[derive(Clone)]
 pub struct Node {
     cmd: mpsc::UnboundedSender<Cmd>,
+    /// 数据目录的独占锁,随节点存活。同一数据目录上不允许第二个节点进程(防双签);
+    /// 进程退出(含被 kill)时由内核自动释放。
+    /// `Arc`:`Node` 可以克隆(多个句柄),锁只有一份,最后一个句柄释放时才解锁。
+    _data_dir_lock: Option<std::sync::Arc<crate::store::DataDirLock>>,
 }
 
 /// M140/M141: decode + verify a snapshot-boot config into `(state, tip_head_hash)`. The
@@ -1879,6 +1883,10 @@ async fn run_actor(mut actor: Actor, mut rx: mpsc::UnboundedReceiver<Cmd>) {
                                 .iter()
                                 .map(|c| (c.unit, c.version, cite_kind_name(c.kind)))
                                 .collect(),
+                            lifecycle: lifecycle_name(
+                                k.lifecycle(u.id)
+                                    .unwrap_or(crate::knowledge::LifecycleState::Active),
+                            ),
                         })
                     })
                     .collect();
@@ -3414,6 +3422,8 @@ struct UnitSummary {
     body_hashes: Vec<String>,
     /// P1:当前版本的引用(单元号, 版本号, 类型)。
     cites: Vec<(u64, u32, &'static str)>,
+    /// 生命周期状态(活跃 / 休眠 / 已取代),由链上关系派生。
+    lifecycle: &'static str,
 }
 
 /// K5:单个知识单元的完整信息;`versions[i]` 对应 `unit.versions[i]` 的(可信度, 核验记录)。
@@ -3444,10 +3454,21 @@ fn source_name(s: &crate::knowledge::Source) -> String {
     }
 }
 
+/// P1:生命周期状态的对外名字。
+fn lifecycle_name(s: crate::knowledge::LifecycleState) -> &'static str {
+    match s {
+        crate::knowledge::LifecycleState::Active => "active",
+        crate::knowledge::LifecycleState::Dormant => "dormant",
+        crate::knowledge::LifecycleState::Superseded => "superseded",
+        crate::knowledge::LifecycleState::Contested => "contested",
+    }
+}
+
 fn cite_kind_name(k: crate::knowledge::CiteKind) -> &'static str {
     match k {
         crate::knowledge::CiteKind::Basis => "basis",
         crate::knowledge::CiteKind::SeeAlso => "see-also",
+        crate::knowledge::CiteKind::Supersedes => "supersedes",
     }
 }
 
@@ -3547,7 +3568,7 @@ fn json_unit_listing(units: &[UnitSummary]) -> String {
                 .collect::<Vec<_>>()
                 .join(",");
             format!(
-                "{{\"id\":{},\"layer\":{},\"domain\":{},\"author\":{},\"created_height\":{},\"versions\":{},\"credibility\":{},\"body_hashes\":[{}],\"cites\":[{}]}}",
+                "{{\"id\":{},\"layer\":{},\"domain\":{},\"author\":{},\"created_height\":{},\"versions\":{},\"credibility\":{},\"body_hashes\":[{}],\"cites\":[{}],\"lifecycle\":{}}}",
                 json_u64(u.id),
                 json_str(layer_name(u.layer)),
                 json_u64(u.domain as u64),
@@ -3556,7 +3577,8 @@ fn json_unit_listing(units: &[UnitSummary]) -> String {
                 json_u64(u.versions as u64),
                 json_credibility(&u.cred),
                 bodies,
-                cites
+                cites,
+                json_str(u.lifecycle)
             )
         })
         .collect::<Vec<_>>()
@@ -8530,6 +8552,10 @@ impl Node {
             ));
         }
 
+        // 先锁数据目录,再打开日志:第二个节点在这里就失败,不会读写同一份链数据。
+        // 无论从哪个路径、经不经过 starter 脚本启动,同一数据目录只能有一个节点(防双签)。
+        let data_dir_lock = crate::store::DataDirLock::acquire(&cfg.node.data_dir)?;
+
         // logs + boot recovery
         let bpath = format!("{}/blocks.log", cfg.node.data_dir);
         let cpath = format!("{}/certs.log", cfg.node.data_dir);
@@ -8893,7 +8919,10 @@ impl Node {
             });
         }
 
-        Ok(Node { cmd: cmd_tx })
+        Ok(Node {
+            cmd: cmd_tx,
+            _data_dir_lock: Some(std::sync::Arc::new(data_dir_lock)),
+        })
     }
 }
 
@@ -15500,6 +15529,7 @@ mod tests {
             },
             body_hashes: vec!["aa".repeat(32)],
             cites: vec![(1, 1, "basis")],
+            lifecycle: "active",
         };
         assert!(unit_matches_filters(&u, ""), "no params ⇒ no filter");
         assert!(unit_matches_filters(&u, "domain=2"));

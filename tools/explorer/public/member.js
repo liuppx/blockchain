@@ -1,9 +1,10 @@
 "use strict";
 // 成员功能:在浏览器里持有密钥、核验知识单元、邀请新成员。依赖 signer.js(签名)与 app.js(j / el / esc / setView)。
-// 私钥只在本机:种子用你的口令加密后存在这个浏览器里;解锁后的签名密钥只留在内存,刷新页面即清除。
+// 两种持有密钥的方式:①浏览器本机(种子用口令加密存在 localStorage,解锁后的密钥只在内存);
+// ②夜莺钱包(密钥在钱包里,网页只递意图,钱包编码、确认、签名)。
 (function () {
   const S = window.ZXSigner;
-  let session = null; // { signKey, pubkey, account }
+  let session = null; // { pubkey, account, signKey | wallet }
   let pending = null; // 生成流程中尚未保存的助记词
 
   // ---- 身份 -----------------------------------------------------------------
@@ -19,12 +20,102 @@
   }
 
   function status() {
+    refreshWalletUi();
     const v = S.store.loadVault();
     const s = el("idStatus");
     if (!s) return;
-    if (!v) s.textContent = "未设置身份";
-    else if (session) s.textContent = session.account ? `账户 ${session.account.id} · 已解锁` : "已解锁 · 尚未成为成员";
+    if (session) {
+      const via = session.wallet ? "钱包 · " : "";
+      s.textContent = session.account ? `${via}账户 ${session.account.id} · 已解锁` : `${via}已解锁 · 尚未成为成员`;
+    } else if (!v) s.textContent = "未设置身份";
     else s.textContent = "已锁定";
+  }
+
+  // ---- 夜莺钱包 -----------------------------------------------------------------
+  // 知行图密钥由夜莺钱包保管(钱包「设置 → 知行图」里生成或用助记词导入,派生与 node keygen 相同)。
+  // 网页只拿公钥、只递"意图"(actor / nonce / action);钱包自己编码、给用户看可读摘要、签名。
+  // 接口:zhixing_requestAccounts → [公钥];zhixing_signKnowledgeOp({actor,nonce,action}) → { signed }
+  let walletProvider = null;
+  window.addEventListener("eip6963:announceProvider", (e) => {
+    const d = e.detail || {};
+    if (d.info && d.info.rdns === "io.github.yeying" && d.provider) {
+      const first = !walletProvider;
+      walletProvider = d.provider;
+      if (first) refreshWalletUi(); // 钱包插件可能比本脚本晚注入:检测到时补上顶栏按钮
+    }
+  });
+  window.dispatchEvent(new Event("eip6963:requestProvider"));
+
+  function findWallet() {
+    // 钱包插件可能比页面脚本晚注入:每次需要时再请求一次(EIP-6963 的回应是同步派发的)
+    if (!walletProvider) window.dispatchEvent(new Event("eip6963:requestProvider"));
+    if (walletProvider) return walletProvider;
+    const eth = window.ethereum;
+    if (eth && eth.isYeYing) return eth;
+    if (eth && Array.isArray(eth.providers)) return eth.providers.find((p) => p.isYeYing) || null;
+    return null;
+  }
+
+  // 钱包报错 → 给成员看的说明。旧版钱包不认识 zhixing_* 方法,会把它当成 EVM 请求转发出去而失败。
+  function walletError(e) {
+    const code = e && e.code;
+    const m = String((e && e.message) || e || "");
+    if (code === 4001 || /rejected/i.test(m)) return new Error("你在钱包里取消了");
+    if (code === 4900 || /知行图密钥/.test(m)) {
+      return new Error("钱包里还没有知行图密钥:打开夜莺钱包「设置 → 知行图」,用助记词导入(已是成员)或生成新密钥,再回来登录");
+    }
+    if (code === 4100) return new Error("这个网站还没有连接你的知行图密钥,请重新用钱包登录");
+    if (/ZHIXING_/.test(m)) return new Error("钱包拒绝了这条操作:" + m.replace(/^.*ZHIXING_[A-Z_]+:?\s*/, ""));
+    return new Error("你的夜莺钱包还不支持知行图(或出错了:" + m.slice(0, 80) + ")。请把钱包升级到最新版本");
+  }
+
+  async function loginWithWallet(onProgress = () => {}) {
+    const provider = findWallet();
+    if (!provider) throw new Error("没有检测到夜莺钱包。请先安装钱包插件并刷新页面");
+    onProgress("请在钱包里确认连接知行图…");
+    let accounts;
+    try {
+      accounts = await provider.request({ method: "zhixing_requestAccounts" });
+    } catch (e) {
+      throw walletError(e);
+    }
+    const pubkey = String((accounts || [])[0] || "").toLowerCase();
+    if (!/^[0-9a-f]{64}$/.test(pubkey)) throw walletError(new Error("钱包返回的不是知行图公钥"));
+    onProgress("查找成员账户…");
+    session = { wallet: provider, pubkey, account: await findAccount(pubkey) };
+    status();
+    return session;
+  }
+
+  /** 用当前身份签一条操作,返回可提交给节点的字节。 */
+  async function signAction(actor, action, nonce) {
+    if (!session.wallet) return S.signOp(session.signKey, actor, action, nonce);
+    let out;
+    try {
+      out = await session.wallet.request({
+        method: "zhixing_signKnowledgeOp",
+        params: [{ actor: String(actor), nonce: String(nonce), action }],
+      });
+    } catch (e) {
+      throw walletError(e);
+    }
+    if (!out || out.address !== session.pubkey) throw new Error("钱包里的知行图密钥已更换,请重新用钱包登录");
+    return S.hexToBytes(out.signed);
+  }
+
+  function walletButton(id) {
+    return findWallet()
+      ? `<p><button id='${id}'>用夜莺钱包登录</button> <span class='ok'>✓ 已检测到夜莺钱包</span>
+         <span class='mut'>知行图密钥由钱包保管,每次签名都在钱包里确认</span></p>`
+      : `<p class='mut'>✗ 没有检测到夜莺钱包。安装<a class='link' href='https://wallet.yeying.pub/' target='_blank' rel='noopener'>钱包插件</a>
+         并确认它在本站已启用,然后刷新页面,这里会出现「用夜莺钱包登录」。</p>`;
+  }
+
+  // 顶栏的「钱包登录」:检测到钱包、且还没登录时显示
+  function refreshWalletUi() {
+    const b = el("idWalletTop");
+    if (!b) return;
+    b.style.display = findWallet() && !session ? "" : "none";
   }
 
   async function unlock(password) {
@@ -80,7 +171,7 @@
     const token = S.store.token();
     if (!token) throw new Error("还没有填写写入令牌(在「我的身份」里设置,由组织者私下提供)");
     const nonce = (await j("/account/" + session.account.id)).nonce;
-    const op = await S.signOp(session.signKey, Number(session.account.id), action, Number(nonce));
+    const op = await signAction(Number(session.account.id), action, Number(nonce));
     const r = await fetch(RPC + "/knowledge", {
       method: "POST",
       headers: { "Authorization": "Bearer " + token, "Content-Type": "application/octet-stream", "Accept": "application/json" },
@@ -107,38 +198,59 @@
   async function showIdentity() {
     const v = S.store.loadVault();
     if (pending) return showGenerate();
-    if (!v) {
+    const useWallet = (id, msgId) => {
+      if (!el(id)) return;
+      el(id).addEventListener("click", async () => {
+        try { await loginWithWallet((t) => msg(msgId, t)); showIdentity(); }
+        catch (e) { msg(msgId, (e && e.code === 4001) ? "你在钱包里取消了" : e.message, "err"); }
+      });
+    };
+    if (!v && !session) {
       setView(`<h2 style='border:0;padding:0 0 8px'>我的身份</h2>
-        <p>你的身份是一把密钥。它<b>只保存在这个浏览器里</b>,用你设置的口令加密;组织者和其他任何人都拿不到。</p>
+        <p>你的身份是一把密钥。组织者和其他任何人都拿不到它。</p>
+        ${walletButton("idWallet")}<p><span id='idWMsg'></span></p>
+        <h3 class='md'>不用钱包</h3>
+        <p class='mut'>密钥<b>只保存在这个浏览器里</b>,用你设置的口令加密。</p>
         <p><button id='idGen'>生成新身份</button> <span class='mut'>第一次加入测试网选这个</span></p>
         <p><button id='idImp'>用助记词导入</button> <span class='mut'>手上有 12 或 24 个词的助记词</span></p>
         <p><button id='idFile'>导入密钥文件</button> <span class='mut'>用 <code>node keygen --encrypt</code> 生成的 .json 文件,例如 <code>alice.json</code></span></p>`);
+      useWallet("idWallet", "idWMsg");
       el("idGen").addEventListener("click", async () => { pending = await S.generateMnemonic(); showGenerate(); });
       el("idImp").addEventListener("click", showImport);
       el("idFile").addEventListener("click", showImportFile);
       return;
     }
     const acct = session && session.account;
+    const pub = session ? session.pubkey : v.pubkey;
+    // 本机已有口令加密的身份、尚未解锁:既可以输口令解锁它,也可以改用钱包登录(那是另一把密钥)
+    const unlockUi = session
+      ? `<p><button id='idLock'>${session.wallet ? "退出" : "锁定"}</button></p>`
+      : `<p><input id='idPw' type='password' placeholder='口令' autocomplete='current-password'> <button id='idUnlock'>解锁</button> <span id='idMsg'></span></p>
+         <h3 class='md'>或者用钱包登录</h3>
+         <p class='mut'>如果钱包里导入的是同一组助记词,就是同一个链上账户;否则是另一个账户。</p>
+         ${walletButton("idWallet")}<p><span id='idWMsg'></span></p>`;
     setView(`<h2 style='border:0;padding:0 0 8px'>我的身份</h2>
-      <kv><b>公钥</b><span class='mono'>${esc(v.pubkey)}</span></kv>
+      <kv><b>公钥</b><span class='mono'>${esc(pub)}</span></kv>
+      ${session && session.wallet ? `<kv><b>密钥</b><span>由夜莺钱包保管 <span class='mut'>(每次签名都在钱包里确认;本机不保存任何密钥)</span></span></kv>` : ""}
       <kv><b>状态</b><span id='idState'>${session ? (acct ? `账户 ${esc(acct.id)} · ${acct.established ? "已过见习期" : "见习期中(核验照常记录,但暂不计入可信度)"}` : "这个公钥还不是测试网成员:把它发给邀请你的成员") : "已锁定"}</span></kv>
-      ${session ? "<p><button id='idLock'>锁定</button></p>" : `<p><input id='idPw' type='password' placeholder='口令' autocomplete='current-password'> <button id='idUnlock'>解锁</button> <span id='idMsg'></span></p>`}
+      ${unlockUi}
       <h3 class='md'>写入令牌</h3>
       <p class='mut'>提交核验需要一个写入令牌,由组织者私下提供。它只用于防止刷写入,不代表你的身份(身份由你的密钥签名证明)。</p>
       <p><input id='idTok' type='password' size='40' placeholder='${S.store.token() ? "已保存(输入新值可替换)" : "粘贴写入令牌"}'> <button id='idTokSave'>保存</button> <span id='idTokMsg'></span></p>
       ${acct && acct.established ? `<h3 class='md'>邀请新成员</h3>
         <p class='mut'>新成员在自己的浏览器里「生成新身份」后,把公钥发给你。新成员有见习期;每位成员每天最多邀请一人。</p>
         <p><input id='invPk' size='70' placeholder='新成员的公钥(64 位十六进制)'> <button id='invGo'>邀请</button> <span id='invMsg'></span></p>` : ""}
-      <h3 class='md'>移除本机身份</h3>
+      ${v ? `<h3 class='md'>移除本机身份</h3>
       <p class='mut'>从这个浏览器删除加密的密钥。之后只能用助记词恢复——没有助记词,这个身份就永久丢失。</p>
-      <p><button id='idForget'>从本机移除</button></p>`);
+      <p><button id='idForget'>从本机移除</button></p>` : ""}`);
+    useWallet("idWallet", "idWMsg");
     if (session) el("idLock").addEventListener("click", () => { lock(); showIdentity(); });
     else el("idUnlock").addEventListener("click", async () => {
       msg("idMsg", "解锁中…(需要几秒)");
       try { await unlock(el("idPw").value); showIdentity(); } catch (e) { msg("idMsg", e.message, "err"); }
     });
     el("idTokSave").addEventListener("click", () => { S.store.setToken(el("idTok").value); el("idTok").value = ""; msg("idTokMsg", "已保存", "ok"); });
-    el("idForget").addEventListener("click", () => {
+    if (el("idForget")) el("idForget").addEventListener("click", () => {
       if (!confirm("确定从本机移除身份?没有助记词将无法恢复。")) return;
       S.store.forget(); lock(); showIdentity();
     });
@@ -232,9 +344,15 @@
     const v = u.versions[u.versions.length - 1];
     const vn = Number(v.n);
     const head = `<h2 style='border:0;padding:12px 0 6px'>核验 v${esc(vn)}</h2>`;
-    if (!S.store.loadVault()) {
-      slot.innerHTML = head + "<p class='mut'>要核验这个单元,先在<a class='link' id='goId'>「我的身份」</a>里设置你的密钥。</p>";
-      el("goId").addEventListener("click", showIdentity);
+    if (!S.store.loadVault() && !session) {
+      slot.innerHTML = head + (findWallet()
+        ? `<p><button id='rvWallet'>用夜莺钱包登录后核验</button> <span id='rvMsg'></span></p>`
+        : "<p class='mut'>要核验这个单元,先在<a class='link' id='goId'>「我的身份」</a>里设置你的密钥或用钱包登录。</p>");
+      if (el("goId")) el("goId").addEventListener("click", showIdentity);
+      if (el("rvWallet")) el("rvWallet").addEventListener("click", async () => {
+        try { await loginWithWallet((t) => msg("rvMsg", t)); attachReview(u); }
+        catch (e) { msg("rvMsg", (e && e.code === 4001) ? "你在钱包里取消了" : e.message, "err"); }
+      });
       return;
     }
     if (!session) {
@@ -252,6 +370,22 @@
       return;
     }
     const mine = v.verifications.find((r) => String(r.verifier) === String(me.id));
+    // 核验人指派(服务侧确定性计算;现阶段只是提示,链仍接受所有成员的核验)
+    let assignNote = "";
+    try {
+      const a = await (await fetch("/assign?unit=" + encodeURIComponent(u.id) + "&version=" + vn)).json();
+      if (a && a.assigned && a.assigned.length) {
+        const isMine = a.assigned.includes(String(me.id));
+        assignNote = `<p class='mut'>本版指派给 ${a.assigned.map((x) => "#" + x).join("、")}` +
+          `${isMine ? "<b>(包括你)</b>" : ""}。指派由区块哈希确定性算出,任何人都能复核;` +
+          `现阶段只是提示,链仍接受所有成员的核验。</p>`;
+        const others = a.verifications.filter((x) => x.assigned);
+        if (others.length) {
+          assignNote += `<p class='mut'>已有指派者的结论:${others.map((x) =>
+            `#${x.verifier} ${x.verdict === "pass" ? "通过" : "需修改"}`).join("、")}</p>`;
+        }
+      }
+    } catch (_) { /* 指派不可用不影响核验 */ }
     let items = [];
     const b = v.bodies[0] ? await fetchBody(v.bodies[0].hash) : null;
     if (b && b.ok) items = checklistFrom(b.text);
@@ -259,7 +393,7 @@
       ? `<p>请逐条确认单元末尾的"核验要点"(勾选全部后才能给"通过"):</p><ol class='checklist'>${items.map((t, i) =>
           `<li><label><input type='checkbox' class='rvChk' id='rvc${i}'> ${mdInline(t)}</label></li>`).join("")}</ol>`
       : "<p class='mut'>这个单元没有列出核验要点;请按领域的审查清单逐项检查。</p>";
-    slot.innerHTML = head + (mine ? `<p>你之前的结论:<b>${mine.verdict === "pass" ? "通过" : "需修改"}</b>(高度 ${esc(mine.height)})。再次提交会以最新的结论为准。</p>` : "")
+    slot.innerHTML = head + assignNote + (mine ? `<p>你之前的结论:<b>${mine.verdict === "pass" ? "通过" : "需修改"}</b>(高度 ${esc(mine.height)})。再次提交会以最新的结论为准。</p>` : "")
       + (me.established ? "" : "<p class='err'>你还在见习期:核验照常记录,但暂不计入可信度。</p>")
       + checks
       + `<p class='mut'>你只对<b>核验当时能知道的事</b>负责;后来出现的新证据推翻它,是"诚实的错",不会受罚。
@@ -293,18 +427,34 @@
     st.className = "mut";
     const h = document.querySelector("header");
     h.appendChild(btn);
+    // 顶栏直接放「钱包登录」:不用先找到「我的身份」页
+    const wb = document.createElement("button");
+    wb.id = "idWalletTop";
+    wb.textContent = "用夜莺钱包登录";
+    wb.style.display = "none";
+    wb.addEventListener("click", async () => {
+      const s = el("idStatus");
+      try {
+        await loginWithWallet((t) => { if (s) s.textContent = t; });
+        showIdentity();
+      } catch (e) {
+        if (s) s.textContent = (e && e.code === 4001) ? "你在钱包里取消了" : e.message;
+      }
+    });
+    h.appendChild(wb);
     h.appendChild(st);
     btn.addEventListener("click", showIdentity);
     if (!crypto.subtle) st.textContent = "此浏览器不支持签名(需要 HTTPS 与较新的浏览器)";
     else status();
+    refreshWalletUi();
   }
 
   window.ZXMember = {
     attachReview, showIdentity, submit, waitNonce,
     account: () => (session && session.account ? session.account.id : null),
     unlocked: () => !!session,
-    hasVault: () => !!S.store.loadVault(),
-    unlock,
+    hasVault: () => !!S.store.loadVault() || !!session,
+    unlock, loginWithWallet,
   };
   init();
 })();

@@ -129,7 +129,7 @@ async function waitFor(fn, ms = 20000, step = 500) {
   return null;
 }
 
-test("浏览器:导入身份 → 写作 → 修订 → 核验 → 邀请 → 检索 → 导出", async (t) => {
+test("浏览器:导入身份 → 写作 → 修订 → 核验 → 邀请 → 检索 → 导出", { concurrency: false }, async (t) => {
   const why = skipIfNoBrowser();
   if (why) { t.skip(why); return; }
   const p = await newPage();
@@ -149,10 +149,14 @@ test("浏览器:导入身份 → 写作 → 修订 → 核验 → 邀请 → 检
     if (/不是测试网成员/.test(state)) {
       const invited = await ensureMember();
       assert.ok(invited, "测试公钥不是链上成员,且无法自动邀请(需要本地链与账户 1 的种子)");
-      await p.reload({ waitUntil: "networkidle0" });
-      await p.click("#idBtn"); await p.waitForSelector("#imp"); await p.click("#imp");
-      await p.type("#impWords", ZERO24); await p.type("#impPw", "e2e-test-password-123");
-      await p.click("#impSave"); await p.waitForSelector("#idTok", { timeout: 30000 });
+      // The first import already saved the vault. After the invite is mined,
+      // unlock that vault instead of trying to import it a second time (the
+      // locked identity view intentionally offers only the unlock form).
+      const joined = await waitFor(isTestKeyMember, 30000, 500);
+      assert.ok(joined, "邀请已提交但测试公钥尚未成为成员");
+      await p.$eval("#idPw", (e, v) => { e.value = v; }, "e2e-test-password-123");
+      await p.click("#idUnlock");
+      await p.waitForFunction(() => /账户 \d+/.test(document.querySelector("#idState")?.textContent || ""), { timeout: 30000 });
       const st2 = await p.$eval("#idState", (e) => e.textContent);
       assert.match(st2, /账户 \d+/, "邀请后应显示账户编号:" + st2);
     }
@@ -165,7 +169,10 @@ test("浏览器:导入身份 → 写作 → 修订 → 核验 → 邀请 → 检
     }
 
     // ---- 写作:创建单元 ------------------------------------------------------
-    const BODY = `# 端到端测试单元
+    // 正文每次运行都不同:U2 规定同一份正文不能被当作新单元重复提交(否则会被 DuplicateBody 拒绝),
+    // 而本地链会在多次运行之间保留,所以用运行编号让正文唯一。
+    const RUN = Date.now().toString(36);
+    const BODY = `# 端到端测试单元 ${RUN}
 
 | 字段 | 内容 |
 |---|---|
@@ -174,7 +181,7 @@ test("浏览器:导入身份 → 写作 → 修订 → 核验 → 邀请 → 检
 
 ## 核心陈述
 
-浏览器端到端测试创建的知识单元。
+浏览器端到端测试创建的知识单元(运行 ${RUN})。
 
 ## 核验要点(给人类审查者)
 
@@ -212,7 +219,7 @@ test("浏览器:导入身份 → 写作 → 修订 → 核验 → 邀请 → 检
     const prefilled = await p.$eval("#auText", (e) => e.value);
     assert.match(prefilled, /端到端测试单元/, "修订应预填当前正文");
     await p.$eval("#auText", (e) => {
-      e.value = e.value.replace("浏览器端到端测试创建的知识单元。", "浏览器端到端测试创建的知识单元(第二版)。");
+      e.value = e.value.replace("浏览器端到端测试创建的知识单元(", "浏览器端到端测试创建的知识单元(第二版,");
       e.dispatchEvent(new Event("input"));
     });
     await p.click("#auGo");
@@ -223,10 +230,15 @@ test("浏览器:导入身份 → 写作 → 修订 → 核验 → 邀请 → 检
     assert.equal(Number(after.versions[1].publisher) !== 0, true, "修订者应记录在链上");
 
     // ---- 检索 ---------------------------------------------------------------
-    const sr = await fetch(WEB + "/search?q=" + encodeURIComponent("端到端测试"));
-    assert.equal(sr.status, 200);
-    const hits = await sr.json();
-    assert.ok(hits.items.some((h) => String(h.id) === String(created)), "检索应命中新建单元");
+    // 检索索引按需刷新(最多 30 秒一次),刚建的单元可能还没进索引:等它出现,而不是只查一次
+    let hits = null;
+    const found = await waitFor(async () => {
+      const sr = await fetch(WEB + "/search?q=" + encodeURIComponent(RUN));
+      if (sr.status !== 200) return null;
+      hits = await sr.json();
+      return hits.items.some((h) => String(h.id) === String(created)) ? hits : null;
+    }, 45000, 1500);
+    assert.ok(found, "检索应命中新建单元(按本次运行编号查找)");
     assert.ok(hits.items.find((h) => String(h.id) === String(created)).title.includes("端到端测试"), "标题应含关键词");
 
     // ---- 导出 ---------------------------------------------------------------
@@ -251,7 +263,7 @@ test("浏览器:导入身份 → 写作 → 修订 → 核验 → 邀请 → 检
   }
 });
 
-test("浏览器:核验面板 —— 勾选全部核验要点后才能通过;不能核验自己发布的版本", async (t) => {
+test("浏览器:核验面板 —— 勾选全部核验要点后才能通过;不能核验自己发布的版本", { concurrency: false }, async (t) => {
   const why = skipIfNoBrowser();
   if (why) { t.skip(why); return; }
   const p = await newPage();
@@ -269,7 +281,12 @@ test("浏览器:核验面板 —— 勾选全部核验要点后才能通过;不�
 
     // 找一个不是本账户发布的单元
     const me = await p.$eval("#idState", (e) => e.textContent);
-    const units = (await rpc("/units?limit=50")).items;
+    // The first browser flow may have just created the fixture unit. Wait for it
+    // instead of racing the block commit when the suite runs against a fresh chain.
+    const units = (await waitFor(async () => {
+      const items = (await rpc("/units?limit=50")).items;
+      return items.length ? items : null;
+    }, 30000, 500)) || [];
     const target = units.find((u) => !me.includes("账户 " + u.author + " "));
     assert.ok(target, "应存在其他作者发布的单元");
     await p.goto(WEB + "/#unit/" + target.id, { waitUntil: "networkidle0" });
