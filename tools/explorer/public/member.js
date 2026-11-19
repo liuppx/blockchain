@@ -9,7 +9,7 @@
 // 页面会提示把密钥移进钱包(钱包「账户管理 → 导入钱包」里网络选「知行图」,用助记词或
 // 密钥文件导入,导入后就是同一个链上账户)。
 (function () {
-  const S = window.ZXSigner;
+  const U = window.ZXUtil; // 十六进制、写入令牌、旧密钥清理;网页里没有私钥代码
   let session = null; // { pubkey, account, wallet }
 
   // ---- 身份 -----------------------------------------------------------------
@@ -97,7 +97,7 @@
       throw walletError(e);
     }
     if (!out || out.address !== session.pubkey) throw new Error("钱包里的知行图密钥已更换,请重新用钱包登录");
-    return S.hexToBytes(out.signed);
+    return U.hexToBytes(out.signed);
   }
 
   function walletButton(id) {
@@ -142,7 +142,7 @@
 
   async function submit(action) {
     if (!session || !session.account) throw new Error("请先用夜莺钱包登录;且该身份必须已是测试网成员");
-    const token = S.store.token();
+    const token = U.token();
     if (!token) throw new Error("还没有填写写入令牌(在「我的身份」里设置,由组织者私下提供)");
     const nonce = (await j("/account/" + session.account.id)).nonce;
     const op = await signAction(Number(session.account.id), action, Number(nonce));
@@ -171,7 +171,7 @@
 
   /** 旧版本在浏览器本地存过密钥 ⇒ 提示把它移进钱包。 */
   function legacyNotice() {
-    if (!S.store.loadVault()) return "";
+    if (!U.hasLegacyKey()) return "";
     return `<div class="banner warn" style="padding:10px 14px;margin:12px 0;border-radius:6px">
       <p><b>这个浏览器里还留着旧版网页自己保存的密钥。</b>那条路已经下线:现在密钥由夜莺钱包保管,
       网页不持有私钥,每次签名都在钱包里确认。</p>
@@ -197,12 +197,12 @@
         ${legacyNotice()}
         <h3 class='md'>写入令牌</h3>
         <p class='mut'>提交核验需要一个写入令牌,由组织者私下提供。它只用于防止刷写入,不代表你的身份(身份由钱包的签名证明)。</p>
-        <p><input id='idTok' type='password' size='40' placeholder='${S.store.token() ? "已保存(输入新值可替换)" : "粘贴写入令牌"}'> <button id='idTokSave'>保存</button> <span id='idTokMsg'></span></p>`);
+        <p><input id='idTok' type='password' size='40' placeholder='${U.token() ? "已保存(输入新值可替换)" : "粘贴写入令牌"}'> <button id='idTokSave'>保存</button> <span id='idTokMsg'></span></p>`);
       useWallet("idWallet", "idWMsg");
-      el("idTokSave").addEventListener("click", () => { S.store.setToken(el("idTok").value); el("idTok").value = ""; msg("idTokMsg", "已保存", "ok"); });
+      el("idTokSave").addEventListener("click", () => { U.setToken(el("idTok").value); el("idTok").value = ""; msg("idTokMsg", "已保存", "ok"); });
       if (el("idForgetLegacy")) el("idForgetLegacy").addEventListener("click", () => {
         if (!confirm("清除这个浏览器里旧版保存的密钥?\n确认已经把同一组助记词导入钱包后再做这一步。")) return;
-        S.store.forget();
+        U.removeLegacyKey();
         msg("idForgetMsg", "已清除", "ok");
         showIdentity();
       });
@@ -217,12 +217,12 @@
       <p><button id='idLock'>退出</button></p>
       <h3 class='md'>写入令牌</h3>
       <p class='mut'>提交核验需要一个写入令牌,由组织者私下提供。它只用于防止刷写入,不代表你的身份。</p>
-      <p><input id='idTok' type='password' size='40' placeholder='${S.store.token() ? "已保存(输入新值可替换)" : "粘贴写入令牌"}'> <button id='idTokSave'>保存</button> <span id='idTokMsg'></span></p>
+      <p><input id='idTok' type='password' size='40' placeholder='${U.token() ? "已保存(输入新值可替换)" : "粘贴写入令牌"}'> <button id='idTokSave'>保存</button> <span id='idTokMsg'></span></p>
       ${acct && acct.established ? `<h3 class='md'>邀请新成员</h3>
         <p class='mut'>新成员用 <code>node keygen</code> 生成密钥、在钱包「账户管理 → 导入钱包 → 知行图」里导入后,把公钥(钱包里的账户地址)发给你。新成员有见习期;每位成员每天最多邀请一人。</p>
         <p><input id='invPk' size='70' placeholder='新成员的公钥(64 位十六进制)'> <button id='invGo'>邀请</button> <span id='invMsg'></span></p>` : ""}`);
     el("idLock").addEventListener("click", () => { session = null; status(); showIdentity(); });
-    el("idTokSave").addEventListener("click", () => { S.store.setToken(el("idTok").value); el("idTok").value = ""; msg("idTokMsg", "已保存", "ok"); });
+    el("idTokSave").addEventListener("click", () => { U.setToken(el("idTok").value); el("idTok").value = ""; msg("idTokMsg", "已保存", "ok"); });
     if (el("invGo")) el("invGo").addEventListener("click", async () => {
       const pk = el("invPk").value.trim().toLowerCase();
       if (!/^[0-9a-f]{64}$/.test(pk)) return msg("invMsg", "公钥应为 64 位十六进制", "err");

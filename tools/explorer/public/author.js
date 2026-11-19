@@ -1,9 +1,9 @@
 "use strict";
 // 在浏览器里写知识:创建单元、为已有单元发布新版本。
 // 流程:编辑正文(Markdown)→ 预览 → 计算 SHA-256 → 上传到正文仓库(/bodies/<哈希>,仓库只接受哈希一致的内容)
-// → 在夜莺钱包里签名 create / publish 操作 → 提交 → 等入块。依赖 signer.js(只用来校验格式)与 member.js。
+// → 在夜莺钱包里签名 create / publish 操作 → 提交 → 等入块。依赖 util.js(格式检查、写入令牌)与 member.js;网页里没有私钥代码。
 (function () {
-  const S = window.ZXSigner;
+  const U = window.ZXUtil;
   const M = () => window.ZXMember;
   const MAX_BODY = 64 * 1024;
   const LAYER_FROM_ZH = { 基础: "foundation", 解释: "explanation", 场景: "scenario", 应用: "application" };
@@ -58,7 +58,7 @@
   }
 
   async function uploadBody(bytes, hash) {
-    const token = S.store.token();
+    const token = U.token();
     if (!token) throw new Error("还没有填写写入令牌(在「我的身份」里设置)");
     const r = await fetch("/bodies/" + hash, {
       method: "PUT", body: bytes,
@@ -185,7 +185,7 @@
       const action = isNew
         ? { type: "create", layer: el("auLayer").value, domain: Number(el("auDomain").value), ...common }
         : { type: "publish", unit: Number(state.unit), ...common };
-      S.encodeOp(1, action, 0); // 先在本地检查格式(长度、数量等),有问题就不上传
+      U.checkAction(action); // 先在本地检查格式(长度、数量等),有问题就不上传
       const label = isNew ? `在「${DOMAIN_ZH[action.domain]}」创建一个${LAYER_ZH[action.layer]}单元` : `为单元 #${state.unit} 发布 v${state.nextVersion}`;
       if (!confirm(`以账户 ${me} 的身份${label}?\n内容将以 CC BY 4.0 许可公开,并永久记录在链上。`)) return;
       btn.disabled = true;

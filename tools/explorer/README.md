@@ -13,6 +13,13 @@ tools/explorer/
     index.html        # 页面骨架
     styles.css        # 样式
     app.js            # 逻辑(vanilla JS fetch,无框架、无构建)
+    util.js           # 十六进制、写入令牌、格式检查、旧密钥清理(无任何私钥代码)
+    member.js         # 成员功能:用夜莺钱包登录、邀请、核验
+    author.js         # 写作与修订
+  reference/
+    signer.js         # op 编码与签名的参考实现(只给测试用;不被服务、不部署)
+    bip39-en.js       # BIP-39 词表(同上)
+  test/               # 契约测试与浏览器端到端测试
 ```
 
 ## 运行
@@ -56,8 +63,12 @@ PORT=8080 NODE_RPC=http://127.0.0.1:9221 npm start      # 或: node server.js
 - **旧的浏览器本地身份已下线**:以前网页可以自己生成/导入助记词、把种子用口令加密存在 `localStorage`。
   这条路已移除——同一个身份不应同时存在于浏览器和钱包两处。浏览器里留有旧密钥的成员,页面会提示把它移进钱包
   (在钱包里导入同一组助记词或同一个密钥文件,就是同一个链上账户),并提供「清除本机旧密钥」。
-- **`signer.js` 仍保留**:它是 op 编码与签名的参考实现,`test/signer.test.mjs` 用它对照 Rust 程序逐字节检验,
-  钱包仓库的 `tests/zhixing-op.test.mjs` 又用它的输出检验钱包自己的编码;页面里只用它做提交前的格式检查与十六进制转换。
+- **网页里没有任何私钥代码**:`public/` 里不生成助记词、不派生密钥、不签名、不加解密;页面只加载 `public/util.js`
+  (十六进制转换、写入令牌、提交前的格式检查、旧版本机密钥的检测与删除)。`test/wallet.test.mjs` 会扫描 `public/`,
+  一旦出现这类代码 CI 就失败。
+- **参考签名器在 `reference/`**:`reference/signer.js`(连同 `bip39-en.js`)是 op 编码与签名的 JavaScript 参考实现,
+  **不被服务、不部署**(`deploy/deploy-explorer.sh` 排除它,并检查线上 `/signer.js` 返回 404)。`test/signer.test.mjs`
+  用它对照 Rust 程序逐字节检验,`test/fake-wallet.mjs` 用它扮演钱包。
 - **支持**:核验(通过 / 需修改,"通过"须先勾选单元的全部核验要点)、邀请、写新单元与修订。批量导入目录仍用 `tools/kimport.py`。
 - 提交需要写入令牌(组织者私下提供),保存在本机 `localStorage`。本地开发链(`./cmd up`)的写入令牌是 `local-dev-token`。
 
@@ -76,13 +87,13 @@ PORT=8080 NODE_RPC=http://127.0.0.1:9221 npm start      # 或: node server.js
 |---|---|---|---|
 | `zhixing_accounts` | — | `[公钥]` 或 `[]` | 本站已授权时返回公钥;不弹窗 |
 | `zhixing_requestAccounts` | — | `[公钥]` | 首次弹窗请用户确认连接;按网站单独授权 |
-| `zhixing_signKnowledgeOp` | `[{ actor, nonce, action }]` | `{ signed, address }` | `action` 与 `signer.js` 的 `encodeAction` 同形;`signed` 是 op ‖ 签名的十六进制,直接 POST `/rpc/knowledge` |
+| `zhixing_signKnowledgeOp` | `[{ actor, nonce, action }]` | `{ signed, address }` | `action` 的字段见 `reference/signer.js` 的 `encodeOp`(网页用 `util.js` 的 `checkAction` 预检同样的格式);`signed` 是 op ‖ 签名的十六进制,直接 POST `/rpc/knowledge` |
 
 错误码:`4001` 用户拒绝;`4100` 本站未连接;`4900` 钱包里还没有知行图密钥;旧版钱包不认识这些方法(页面提示升级)。
 
 **为什么只递意图**:如果网页把待签字节交给钱包,弹窗里显示的内容就不一定是实际签的内容。钱包自己从意图编码,
-显示与签名必然一致。钱包的编码由 wallet 仓库 `tests/zhixing-op.test.mjs` 对照本仓库 `signer.js` 的输出逐字节检验,
-`signer.js` 又由 `test/signer.test.mjs` 对照 Rust 节点检验——三方一致。
+显示与签名必然一致。钱包的编码由 wallet 仓库 `tests/zhixing-op.test.mjs` 对照本仓库 `reference/signer.js` 的输出逐字节检验,
+`reference/signer.js` 又由 `test/signer.test.mjs` 对照 Rust 节点检验——三方一致。
 
 (早先曾用以太坊 `personal_sign` 的签名派生成员密钥;钱包原生支持后已移除,避免同一个钱包产生两把不同的成员密钥。)
 

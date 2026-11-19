@@ -5,7 +5,7 @@
 // 模拟钱包实现与真钱包相同的接口(夜莺钱包 js/background/request-router.js):
 //   zhixing_requestAccounts           → [知行图公钥]
 //   zhixing_signKnowledgeOp(意图)     → { signed: op‖签名 的十六进制, address }
-// 签名用本仓库的 signer.js(已由 signer.test.mjs 对照 Rust 节点逐字节检验);钱包仓库那一侧的
+// 签名用本仓库的参考签名器 reference/signer.js(已由 signer.test.mjs 对照 Rust 节点逐字节检验);钱包仓库那一侧的
 // tests/zhixing-op.test.mjs 再用这份 signer.js 的输出检验钱包自己的编码——两边合起来闭环。
 //
 // 覆盖:登录 → 公钥与钱包里的密钥一致;本机有锁定身份时入口不消失;没装钱包时的提示;
@@ -24,8 +24,8 @@ import { injectFakeWallet, memberKeyFromMnemonic } from "./fake-wallet.mjs";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const require = createRequire(import.meta.url);
-require(join(here, "../public/bip39-en.js"));
-const S = require(join(here, "../public/signer.js"));
+require(join(here, "../reference/bip39-en.js"));
+const S = require(join(here, "../reference/signer.js"));
 const ZERO24 = Array(23).fill("abandon").join(" ") + " art";
 const TEST_KEY = await memberKeyFromMnemonic(ZERO24);
 const CHROME = process.env.CHROME_PATH || "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome";
@@ -94,6 +94,12 @@ test("浏览器里留着旧版密钥时:提示移进钱包,钱包登录照常可
   assert.match(view, /已检测到夜莺钱包/);
   assert.match(view, /旧版网页自己保存的密钥/, "应提示把旧密钥移进钱包");
   assert.equal(await page.$("#idPw"), null, "不应再有口令解锁框");
+
+  // 「清除本机旧密钥」:确认后删掉旧密钥,提示随之消失
+  page.once("dialog", (d) => d.accept());
+  await page.click("#idForgetLegacy");
+  await page.waitForFunction(() => !document.getElementById("idForgetLegacy"), { timeout: 10000 });
+  assert.equal(await page.evaluate(() => localStorage.getItem("zhixing.vault.v1")), null, "旧密钥应已删除");
 
   await page.click("#idWalletTop");
   await page.waitForSelector("#idState", { timeout: 30000 });

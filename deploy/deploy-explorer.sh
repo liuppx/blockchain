@@ -30,14 +30,16 @@ fi
 
 # 先看远端现在是什么样(便于事后核对)
 echo "== 远端当前版本"
-ssh "$HOST" "systemctl is-active $SERVICE; md5sum $DEST/public/member.js $DEST/public/signer.js 2>/dev/null || true"
+ssh "$HOST" "systemctl is-active $SERVICE; md5sum $DEST/public/member.js $DEST/public/util.js 2>/dev/null || true"
 
 echo "== 同步 → $HOST:$DEST"
 # --delete 让远端不留旧文件;排除本机依赖、测试与日志。
+# reference/ 是 op 编码与签名的参考实现(只给测试用),不部署:服务器上不放任何私钥代码。
 # 注意:node_modules 不在远端安装(浏览器服务零依赖),排除它以免传垃圾。
 rsync -az --delete \
   --exclude 'node_modules' \
   --exclude 'test' \
+  --exclude 'reference' \
   --exclude '*.log' \
   --exclude 'package-lock.json' \
   "$SRC/" "$HOST:$DEST/"
@@ -57,4 +59,12 @@ if [ "$HTTP" != "200" ]; then
   echo "自检失败:浏览器首页返回 $HTTP" >&2
   exit 1
 fi
-echo "== 完成:浏览器已更新(member.js $LOCAL_MEMBER,首页 200)"
+# 网页里不能有私钥代码:旧的签名器与词表必须已从服务器上消失
+for gone in signer.js bip39-en.js; do
+  CODE="$(ssh "$HOST" "curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8080/$gone || true")"
+  if [ "$CODE" != "404" ]; then
+    echo "自检失败:/$gone 仍能下载(HTTP $CODE),网页里不应有私钥代码" >&2
+    exit 1
+  fi
+done
+echo "== 完成:浏览器已更新(member.js $LOCAL_MEMBER,首页 200,私钥代码已不在网页里)"

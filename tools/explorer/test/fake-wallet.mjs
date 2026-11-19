@@ -11,8 +11,8 @@ import { createRequire } from "node:module";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const require = createRequire(import.meta.url);
-require(join(here, "../public/bip39-en.js"));
-const S = require(join(here, "../public/signer.js"));
+require(join(here, "../reference/bip39-en.js"));
+const S = require(join(here, "../reference/signer.js"));
 
 /** 用助记词生成一把"成员密钥",返回 { pubkey, signKey }。 */
 export async function memberKeyFromMnemonic(mnemonic) {
