@@ -6,9 +6,9 @@
   const esc = (s) => String(s).replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
 
   const LAYER = { foundation: "基础", explanation: "解释", scenario: "场景", application: "应用" };
-  const DOMAIN = { "1": "大模型应用开发", "2": "运动健身" };
   const layerZh = (l) => LAYER[l] || l;
-  const domainZh = (d) => DOMAIN[String(d)] ? `${DOMAIN[String(d)]} (${d})` : String(d);
+  // 领域名称来自 app.js 载入的 /ns/v1/domains.jsonld(唯一的定义处)
+  const domainZh = (d) => (typeof DOMAIN_ZH !== "undefined" && DOMAIN_ZH[String(d)]) ? `${DOMAIN_ZH[String(d)]} (${d})` : String(d);
 
   function unitLink(id, label) {
     return `<a class='link' data-unit='${esc(id)}'>#${esc(id)}${label ? " " + esc(label) : ""}</a>`;

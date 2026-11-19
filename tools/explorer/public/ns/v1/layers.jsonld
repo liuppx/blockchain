@@ -1,0 +1,32 @@
+{
+  "@context": "https://blockchain.yeying.pub/ns/v1/context.jsonld",
+  "id": "kdg:layers",
+  "type": "ConceptScheme",
+  "prefLabel": { "zh": "知识层级", "en": "Knowledge layers" },
+  "definition": {
+    "zh": "知识单元的四个层级。上层依据下层;基础层准入最严。",
+    "en": "The four layers of a knowledge unit. Upper layers are based on lower ones; the foundation layer has the strictest entry."
+  },
+  "concepts": [
+    {
+      "id": "kdg:Foundation", "type": "Concept", "notation": "foundation", "inScheme": "kdg:layers",
+      "prefLabel": { "zh": "基础", "en": "Foundation" },
+      "definition": { "zh": "一条通用原理,只讲一件事;以外部出处为证据。", "en": "One general principle, stated on its own, with external sources as evidence." }
+    },
+    {
+      "id": "kdg:Explanation", "type": "Concept", "notation": "explanation", "inScheme": "kdg:layers",
+      "prefLabel": { "zh": "解释", "en": "Explanation" },
+      "definition": { "zh": "把一条基础原理讲给普通人听懂;至少依据一个基础单元。", "en": "Makes a foundation principle understandable; based on at least one foundation unit." }
+    },
+    {
+      "id": "kdg:Scenario", "type": "Concept", "notation": "scenario", "inScheme": "kdg:layers",
+      "prefLabel": { "zh": "场景", "en": "Scenario" },
+      "definition": { "zh": "在具体处境下如何运用;依据基础或解释单元。", "en": "How to apply knowledge in a concrete situation; based on foundation or explanation units." }
+    },
+    {
+      "id": "kdg:Application", "type": "Concept", "notation": "application", "inScheme": "kdg:layers",
+      "prefLabel": { "zh": "应用", "en": "Application" },
+      "definition": { "zh": "某项具体做法;依据它所用到的基础单元。", "en": "A specific practice; based on the foundation units it relies on." }
+    }
+  ]
+}

@@ -9,8 +9,10 @@
 // 页面会提示把密钥移进钱包(钱包「账户管理 → 导入钱包」里网络选「知行图」,用助记词或
 // 密钥文件导入,导入后就是同一个链上账户)。
 (function () {
-  const U = window.ZXUtil; // 十六进制、写入令牌、旧密钥清理;网页里没有私钥代码
+  const U = window.ZXUtil;   // 十六进制、写入令牌、旧密钥清理;网页里没有私钥代码
   let session = null; // { pubkey, account, wallet }
+  let lastUnit = null;   // 当前打开的单元:恢复登录后用它重画核验面板
+  let restoring = null;  // 正在进行的恢复登录(避免初始化与钱包宣告两处同时请求)
 
   // ---- 身份 -----------------------------------------------------------------
   async function findAccount(pubkey) {
@@ -39,7 +41,11 @@
     if (d.info && d.info.rdns === "io.github.yeying" && d.provider) {
       const first = !walletProvider;
       walletProvider = d.provider;
-      if (first) refreshWalletUi(); // 钱包插件可能比本脚本晚注入:检测到时补上顶栏按钮
+      if (first) {
+        // 钱包插件通常比本脚本晚注入(实测晚约 20ms):检测到时补上顶栏按钮,并尝试恢复登录
+        refreshWalletUi();
+        if (!session) restoreSession().catch(() => {});
+      }
     }
   });
   window.dispatchEvent(new Event("eip6963:requestProvider"));
@@ -85,9 +91,35 @@
     return session;
   }
 
+  /**
+   * 恢复登录:页面重新加载后,钱包里这个站点还授权着(而且知行图账户还在),就不该要求重新登录。
+   * 用 zhixing_accounts:它不弹窗、不需要解锁,已授权就返回公钥,没授权就返回空数组。
+   */
+  function restoreSession() {
+    if (session) return Promise.resolve(true);
+    if (!restoring) restoring = doRestoreSession().finally(() => { restoring = null; });
+    return restoring;
+  }
+  async function doRestoreSession() {
+    const provider = findWallet();
+    if (!provider) return false;
+    let accounts;
+    try {
+      accounts = await provider.request({ method: "zhixing_accounts" });
+    } catch (_) {
+      return false; // 旧版钱包不认识这个方法:让人点登录按钮即可
+    }
+    const pubkey = String((accounts || [])[0] || "").toLowerCase();
+    if (!/^[0-9a-f]{64}$/.test(pubkey)) return false;
+    session = { wallet: provider, pubkey, account: await findAccount(pubkey) };
+    status();
+    // 正开着单元页时,把核验面板重画成"已登录"的样子(不抢走用户正在看的页面)
+    if (lastUnit) { try { await attachReview(lastUnit); } catch (_) { /* 面板重画失败不影响登录 */ } }
+    return true;
+  }
+
   /** 用当前身份签一条操作,返回可提交给节点的字节。 */
-  async function signAction(actor, action, nonce) {
-    let out;
+  async function signAction(actor, action, nonce) {    let out;
     try {
       out = await session.wallet.request({
         method: "zhixing_signKnowledgeOp",
@@ -244,6 +276,7 @@
   async function attachReview(u) {
     const slot = el("reviewSlot");
     if (!slot) return;
+    lastUnit = u;
     const v = u.versions[u.versions.length - 1];
     const vn = Number(v.n);
     const head = `<h2 style='border:0;padding:12px 0 6px'>核验 v${esc(vn)}</h2>`;
@@ -342,6 +375,8 @@
     if (!crypto.subtle) st.textContent = "此浏览器不支持签名(需要 HTTPS 与较新的浏览器)";
     else status();
     refreshWalletUi();
+    // 页面重新加载后自动恢复登录(站点已授权且钱包里还有知行图账户时)
+    restoreSession().then((ok) => { if (!ok) refreshWalletUi(); }).catch(() => {});
   }
 
   window.ZXMember = {

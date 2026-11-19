@@ -1,4 +1,4 @@
-//! Reference PoK consensus node for ZhixingGraph (deterministic state machine).
+//! Reference PoK consensus node for KnowDoGraph (deterministic state machine).
 //!
 //! This is the on-chain counterpart to the economic simulation (`sim/`) and the
 //! ΔK engine (`engine/`): a *deterministic* state transition function that turns

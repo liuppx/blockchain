@@ -1,6 +1,6 @@
 # 生产部署手册 / Production Deployment Runbook
 
-> 面向**运营方**:从零把一个 ZhixingGraph 验证人网络搭到生产的可重复流程。命令与配置字段
+> 面向**运营方**:从零把一个 KnowDoGraph 验证人网络搭到生产的可重复流程。命令与配置字段
 > 均对 `node` CLI 与 `src/config.rs` 核验。配套阅读:[`docs/SECURITY.md`](SECURITY.md)
 > (信任模型/已知边界)、[`sim/CALIBRATION.md`](../sim/CALIBRATION.md)(genesis 参数理由)。
 >

@@ -34,7 +34,8 @@ const INDEX = new KnowledgeIndex(BODY_DIR, NODE_RPC);
 const ASSIGNER = new ReviewAssigner(NODE_RPC);
 
 const MIME = { ".html": "text/html; charset=utf-8", ".js": "text/javascript; charset=utf-8",
-  ".css": "text/css; charset=utf-8", ".json": "application/json", ".ico": "image/x-icon" };
+  ".css": "text/css; charset=utf-8", ".json": "application/json", ".ico": "image/x-icon",
+  ".jsonld": "application/ld+json; charset=utf-8" };
 
 function serveStatic(req, res) {
   // Map "/" → index.html; prevent path traversal by resolving under PUBLIC.
@@ -239,6 +240,116 @@ function status(req, res) {
   });
 }
 
+// ---- 知识互操作词表 v1(JSON-LD,规范见 docs/design/ontology-v0.1.md)-------------------------
+// GET /export/units?format=jsonld    全部单元的 JSON-LD(一个 @graph,含全部版本、来源、引用、核验与正文)
+// GET /unit/{id}.jsonld              单个单元的 JSON-LD(不含正文全文)
+// GET /id/unit/{id}[/v/{n}]          全局标识:要 JSON-LD 就返回 JSON-LD,浏览器访问则跳到单元页
+// GET /id/member/{id}                成员(账户号、公钥)
+// GET /id/domain[/{n}]               领域概念方案
+// GET /lookup?body=<sha256>          正文属于哪个单元的哪个版本
+// GET /lookup?pubkey=<hex>           公钥对应的成员
+const { CONTEXT_URL } = require("./ontology.js");
+const NS_DIR = path.join(PUBLIC, "ns", "v1");
+
+function sendJsonLd(res, obj, code = 200) {
+  res.writeHead(code, { "Content-Type": "application/ld+json; charset=utf-8", "Cache-Control": "no-store",
+    "Access-Control-Allow-Origin": "*" }).end(JSON.stringify(obj));
+}
+function sendJson(res, obj, code = 200) {
+  res.writeHead(code, { "Content-Type": "application/json; charset=utf-8", "Cache-Control": "no-store",
+    "Access-Control-Allow-Origin": "*" }).end(JSON.stringify(obj));
+}
+function wantsJsonLd(req) {
+  const a = String(req.headers.accept || "");
+  return /application\/(ld\+json|json)/.test(a) && !/text\/html/.test(a);
+}
+
+async function exportJsonLd(req, res) {
+  try {
+    const graph = (await INDEX.exportJsonLd()).map((d) => { const { ["@context"]: _c, ...rest } = d; return rest; });
+    res.writeHead(200, {
+      "Content-Type": "application/ld+json; charset=utf-8",
+      "Content-Disposition": 'attachment; filename="zhixing-units.jsonld"',
+      "Cache-Control": "no-store",
+    });
+    // 数据集说明放进 @graph 里的一个节点:顶层若带 id,@graph 会变成"命名图",
+    // 只读默认图的工具(如 rdflib 的 Graph)就看不到任何单元
+    const dataset = {
+      id: "https://blockchain.yeying.pub/id/export",
+      type: "schema:Dataset",
+      name: "知行图测试网知识单元",
+      license: "https://creativecommons.org/licenses/by/4.0/",
+    };
+    res.end(JSON.stringify({ "@context": CONTEXT_URL, "@graph": [dataset, ...graph] }));
+  } catch (e) {
+    sendJson(res, { error: "export failed: " + e.message }, 500);
+  }
+}
+
+async function identity(req, res, apiPath) {
+  try {
+    let m;
+    if ((m = /^\/unit\/(\d+)\.jsonld$/.exec(apiPath))) {
+      await INDEX.ensureFresh(15000);
+      const doc = INDEX.unitJsonLd(m[1]);
+      return doc ? sendJsonLd(res, doc) : sendJson(res, { error: "no such unit" }, 404);
+    }
+    if ((m = /^\/id\/unit\/(\d+)(?:\/v\/(\d+))?$/.exec(apiPath))) {
+      if (!wantsJsonLd(req)) {
+        return res.writeHead(303, { Location: "/#unit/" + m[1] }).end();
+      }
+      await INDEX.ensureFresh(15000);
+      const doc = INDEX.unitJsonLd(m[1]);
+      if (!doc) return sendJson(res, { error: "no such unit" }, 404);
+      if (m[2]) {
+        const v = doc.versions.find((x) => x.versionNumber === Number(m[2]));
+        return v ? sendJsonLd(res, { "@context": CONTEXT_URL, ...v }) : sendJson(res, { error: "no such version" }, 404);
+      }
+      return sendJsonLd(res, doc);
+    }
+    if ((m = /^\/id\/member\/(\d+)$/.exec(apiPath))) {
+      await INDEX.ensureFresh(15000);
+      const doc = INDEX.memberJsonLd(m[1]);
+      return doc ? sendJsonLd(res, doc) : sendJson(res, { error: "no such member" }, 404);
+    }
+    if (/^\/id\/domain(?:\/\d+)?$/.test(apiPath)) {
+      const scheme = JSON.parse(await fs.promises.readFile(path.join(NS_DIR, "domains.jsonld"), "utf8"));
+      const n = /^\/id\/domain\/(\d+)$/.exec(apiPath);
+      if (!n) return sendJsonLd(res, scheme);
+      const c = (scheme.concepts || []).find((x) => x.notation === n[1]);
+      return c ? sendJsonLd(res, { "@context": CONTEXT_URL, ...c }) : sendJson(res, { error: "no such domain" }, 404);
+    }
+    return sendJson(res, { error: "not found" }, 404);
+  } catch (e) {
+    return sendJson(res, { error: "identity failed: " + e.message }, 500);
+  }
+}
+
+async function lookup(req, res) {
+  const u = new URL(req.url, "http://x");
+  try {
+    const body = u.searchParams.get("body");
+    const pubkey = u.searchParams.get("pubkey");
+    if (body) {
+      if (!/^[0-9a-fA-F]{64}$/.test(body)) return sendJson(res, { error: "body must be a sha256 hex" }, 400);
+      await INDEX.ensureFresh(5000);
+      const hit = INDEX.lookupBody(body);
+      return hit ? sendJson(res, { found: true, ...hit }) : sendJson(res, { found: false });
+    }
+    if (pubkey) {
+      if (!/^[0-9a-fA-F]{64}$/.test(pubkey)) return sendJson(res, { error: "pubkey must be 64 hex" }, 400);
+      await INDEX.ensureFresh(15000);
+      await INDEX.refreshMembers(0).catch(() => {});
+      const m = INDEX.lookupPubkey(pubkey);
+      return m ? sendJson(res, { found: true, account: m.id, established: m.established })
+        : sendJson(res, { found: false });
+    }
+    return sendJson(res, { error: "need body= or pubkey=" }, 400);
+  } catch (e) {
+    return sendJson(res, { error: "lookup failed: " + e.message }, 500);
+  }
+}
+
 function apiPathOf(req) { return new URL(req.url, "http://x").pathname; }
 
 http.createServer((req, res) => {
@@ -252,7 +363,13 @@ http.createServer((req, res) => {
   if (apiPath === "/explore" || apiPath === "/gaps" || apiPath === "/coverage") {
     return explore(req, res);
   }
-  if (req.url === "/export/units" || req.url.startsWith("/export/units?")) return exportUnits(req, res);
+  if (apiPath === "/export/units") {
+    return new URL(req.url, "http://x").searchParams.get("format") === "jsonld" ? exportJsonLd(req, res) : exportUnits(req, res);
+  }
+  if (apiPath === "/lookup") return lookup(req, res);
+  if (apiPath.startsWith("/id/") || apiPath === "/id/domain" || /^\/unit\/\d+\.jsonld$/.test(apiPath)) {
+    return identity(req, res, apiPath);
+  }
   if (req.url === "/rpc" || req.url.startsWith("/rpc/") || req.url.startsWith("/rpc?")) return proxy(req, res);
   return serveStatic(req, res);
 }).listen(PORT, HOST, () => {

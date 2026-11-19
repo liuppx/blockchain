@@ -55,6 +55,9 @@ const skip = () => (!puppeteer || !hasChrome ? "no browser" : false);
  */
 async function login(page) {
   await page.click("#idBtn");
+  // 已授权的站点会自动恢复登录:这时直接就是身份页,没有登录按钮
+  const already = await page.$("#idState");
+  if (already) return;
   await page.waitForSelector("#idWallet", { timeout: 10000 });
   await page.click("#idWallet");
   // #idState 只在登录成功后的身份页出现(未登录页也提到"由夜莺钱包保管",不能用它判断)
@@ -68,7 +71,8 @@ test("用钱包登录:页面显示的就是钱包里那把密钥的公钥", { sk
   await page.goto(WEB + "/", { waitUntil: "networkidle0" });
   await login(page);
   assert.match(await page.$eval("#view", (e) => e.innerText), new RegExp(TEST_KEY.pubkey));
-  assert.deepEqual(requests.map((r) => r.method), ["zhixing_requestAccounts"]);
+  // 页面加载时先问一次 zhixing_accounts(未授权就是空数组,不弹窗),再请求授权
+  assert.deepEqual(requests.map((r) => r.method), ["zhixing_accounts", "zhixing_requestAccounts"]);
   await ctx.close();
 });
 
@@ -181,8 +185,7 @@ test("钱包登录后核验:网页只递意图,钱包签出的操作被节点接
   assert.ok(target, "本地链上应至少有一个单元");
   const before = (await rpc("/account/" + m.id)).nonce;
   await page.goto(WEB + "/?r=1#unit/" + target.id, { waitUntil: "networkidle0" });
-  await page.waitForSelector("#rvWallet", { timeout: 20000 });
-  await page.click("#rvWallet");
+  // 站点已授权:页面自动恢复登录,单元页上直接就是核验面板
   await page.waitForSelector("#rvNeeds", { timeout: 30000 });
   await page.click("#rvNeeds"); // "需修改"不需要勾选核验要点
   const after = await waitFor(async () => { const n = (await rpc("/account/" + m.id)).nonce; return Number(n) > Number(before) ? n : null; }, 30000);
@@ -199,5 +202,49 @@ test("钱包登录后核验:网页只递意图,钱包签出的操作被节点接
   const detail = await rpc("/unit/" + target.id);
   const last = detail.versions[detail.versions.length - 1];
   assert.ok(last.verifications.some((r) => String(r.verifier) === String(m.id)), "链上应能查到这位成员的核验记录");
+  await ctx.close();
+});
+
+// 页面重新加载后,登录状态应当自动恢复(不用重新点"用夜莺钱包登录")。
+test("刷新页面后登录状态自动恢复", { skip: skip() }, async () => {
+  const ctx = await browser.createBrowserContext();
+  const page = await ctx.newPage();
+  const requests = await injectFakeWallet(page, TEST_KEY);
+  await page.goto(WEB + "/", { waitUntil: "networkidle0" });
+  await login(page);
+  assert.match(await page.$eval("#idStatus", (e) => e.textContent), /已连接钱包/);
+
+  // 刷新:钱包里这个站点仍然授权着 ⇒ 页面应自动恢复登录
+  await page.reload({ waitUntil: "networkidle0" });
+  await page.waitForFunction(() => /已连接钱包/.test(document.getElementById("idStatus")?.textContent || ""), { timeout: 20000 });
+  assert.match(await page.$eval("#idStatus", (e) => e.textContent), /已连接钱包/);
+  assert.equal(await page.$eval("#idWalletTop", (e) => e.style.display), "none", "已登录时顶栏不再显示登录按钮");
+  // 恢复登录用的是 zhixing_accounts(不弹窗);已经授权过就不该再请求一次授权
+  assert.ok(requests.some((r) => r.method === "zhixing_accounts"), "应调用 zhixing_accounts 恢复登录");
+  assert.equal(requests.filter((r) => r.method === "zhixing_requestAccounts").length, 1,
+    "只在首次登录时请求授权,刷新后不该再弹一次");
+  await ctx.close();
+});
+
+// 真钱包比页面脚本晚注入:页面初始化时还找不到钱包,要在钱包宣告时再恢复登录。
+test("钱包晚于页面注入时,已授权的站点也能自动恢复登录", { skip: skip() }, async () => {
+  const ctx = await browser.createBrowserContext();
+  const page = await ctx.newPage();
+  const requests = await injectFakeWallet(page, TEST_KEY, { authorized: true, lateMs: 300 });
+  await page.goto(WEB + "/", { waitUntil: "networkidle0" });
+  await page.waitForFunction(() => /已连接钱包/.test(document.getElementById("idStatus")?.textContent || ""), { timeout: 20000 });
+  assert.equal(requests.filter((r) => r.method === "zhixing_requestAccounts").length, 0, "不应弹授权");
+  await ctx.close();
+});
+
+test("站点没有授权时,刷新后保持未登录(不自动弹授权)", { skip: skip() }, async () => {
+  const ctx = await browser.createBrowserContext();
+  const page = await ctx.newPage();
+  const requests = await injectFakeWallet(page, TEST_KEY, { lateMs: 300 });
+  await page.goto(WEB + "/", { waitUntil: "networkidle0" });
+  await new Promise((r) => setTimeout(r, 1500));
+  assert.match(await page.$eval("#idStatus", (e) => e.textContent), /未连接钱包/);
+  assert.notEqual(await page.$eval("#idWalletTop", (e) => e.style.display), "none", "应显示登录按钮");
+  assert.equal(requests.filter((r) => r.method === "zhixing_requestAccounts").length, 0, "不能自动弹授权");
   await ctx.close();
 });

@@ -26,17 +26,24 @@ export async function memberKeyFromMnemonic(mnemonic) {
  * 在页面里注入假钱包。
  * @param {import('puppeteer-core').Page} page
  * @param {{ pubkey: string, signKey: CryptoKey }} key
- * @param {{ mode?: 'native'|'nokey'|'old' }} [opts] nokey: 钱包里没有知行图密钥;old: 不认识 zhixing_*
+ * @param {{ mode?: 'native'|'nokey'|'old', authorized?: boolean, lateMs?: number }} [opts]
+ *   nokey: 钱包里没有知行图密钥;old: 不认识 zhixing_*;
+ *   authorized: 本站一开始就已授权(模拟之前登录过);
+ *   lateMs: 晚于页面脚本多少毫秒才宣告钱包(真钱包实测晚约 20ms)
  * @returns {Promise<Array<{ method: string, params: any }>>} 记录网页发给钱包的请求
  */
 export async function injectFakeWallet(page, key, opts = {}) {
   const mode = opts.mode || "native";
   const requests = [];
+  // 真钱包的语义:zhixing_accounts 只在本站已授权时返回公钥,否则返回空数组;
+  // zhixing_requestAccounts 会记下授权(此后 accounts 才返回公钥)。
+  let authorized = !!opts.authorized;
   await page.exposeFunction("__zxWallet", async (method, params) => {
     requests.push({ method, params });
     if (mode === "old") return { error: { code: -32601, message: "Method not found" } };
     if (mode === "nokey") return { error: { code: 4900, message: "钱包里还没有知行图密钥" } };
-    if (method === "zhixing_requestAccounts" || method === "zhixing_accounts") return { result: [key.pubkey] };
+    if (method === "zhixing_requestAccounts") { authorized = true; return { result: [key.pubkey] }; }
+    if (method === "zhixing_accounts") return { result: authorized ? [key.pubkey] : [] };
     if (method === "zhixing_signKnowledgeOp") {
       const { actor, nonce, action } = params[0];
       const signed = await S.signOp(key.signKey, Number(actor), action, Number(nonce));
@@ -44,7 +51,7 @@ export async function injectFakeWallet(page, key, opts = {}) {
     }
     return { error: { code: -32601, message: "Method not found: " + method } };
   });
-  await page.evaluateOnNewDocument(() => {
+  await page.evaluateOnNewDocument((late) => {
     const info = Object.freeze({
       uuid: "11111111-2222-4333-8444-555555555555",
       name: "YeYing Wallet",
@@ -62,8 +69,9 @@ export async function injectFakeWallet(page, key, opts = {}) {
     };
     // 与真钱包一样:注入时宣告一次,之后回应每次 requestProvider
     const announce = () => window.dispatchEvent(new CustomEvent("eip6963:announceProvider", { detail: { info, provider } }));
-    window.addEventListener("eip6963:requestProvider", announce);
-    announce();
-  });
+    // 真钱包的内容脚本比页面脚本晚注入:lateMs 之后才开始回应
+    const start = () => { window.addEventListener("eip6963:requestProvider", announce); announce(); };
+    if (late > 0) setTimeout(start, late); else start();
+  }, Number(opts.lateMs || 0));
   return requests;
 }
