@@ -1,4 +1,4 @@
-// 浏览器签名器与节点逐字节一致的检验。
+// 参考签名器(reference/signer.js,不在网页里加载)与节点逐字节一致的检验。
 //
 //   node tools/explorer/test/signer.test.mjs [path/to/node-binary]
 //
@@ -16,8 +16,8 @@ import { createRequire } from "node:module";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const require = createRequire(import.meta.url);
-require(join(here, "../public/bip39-en.js"));
-const S = require(join(here, "../public/signer.js"));
+require(join(here, "../reference/bip39-en.js"));
+const S = require(join(here, "../reference/signer.js"));
 const BIN = process.argv[2] || join(here, "../../../node/target/release/node");
 
 // 公开的测试助记词(BIP-39 官方测试向量用的全零熵),不是任何真实成员的密钥

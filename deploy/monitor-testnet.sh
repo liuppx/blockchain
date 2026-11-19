@@ -106,16 +106,31 @@ else
   check "chain-progress" 1 "读不到高度"
 fi
 
-heads=""
+# 一致性:在同一个高度上比较块哈希。
+# 不能直接比各节点的最新 head:链约 0.7 秒出一块,逐个读取的间隙里出了新块,
+# 先读的节点还是旧块、后读的已是新块,会误报"不一致"(2026-11-15~19 共 58 次误报)。
+# 做法与 scripts/health-check.sh 相同:取所有节点都已有的高度(最低高度 - 1),比较该块的哈希。
+min_h=""
 for id in $NODES; do
-  hh="$(curl -fsS --max-time 5 "http://127.0.0.1:92$id/head" 2>/dev/null || true)"
-  heads="$heads $hh"
+  v="$(curl -fsS --max-time 5 "http://127.0.0.1:92$id/height" 2>/dev/null || true)"
+  if ! [ "$v" -ge 0 ] 2>/dev/null; then min_h=""; break; fi
+  if [ -z "$min_h" ] || [ "$v" -lt "$min_h" ]; then min_h="$v"; fi
 done
-uniq_heads="$(echo $heads | tr ' ' '\n' | grep -v '^$' | sort -u | wc -l)"
-if [ "$uniq_heads" = "1" ]; then
-  check "node-agreement" 0 "4 个节点 head 一致"
+if [ -z "$min_h" ] || [ "$min_h" -lt 1 ]; then
+  check "node-agreement" 1 "读不到全部节点的高度,无法比较"
 else
-  check "node-agreement" 1 "节点 head 不一致:$heads"
+  at=$((min_h - 1))
+  hashes=""
+  for id in $NODES; do
+    hh="$(curl -fsS --max-time 5 "http://127.0.0.1:92$id/block/$at" 2>/dev/null | sed -n 's/^hash=//p' || true)"
+    hashes="$hashes ${hh:-?}"
+  done
+  uniq_hashes="$(echo $hashes | tr ' ' '\n' | grep -v '^$' | sort -u | wc -l | tr -d ' ')"
+  if [ "$uniq_hashes" = "1" ] && ! echo "$hashes" | grep -qF '?'; then
+    check "node-agreement" 0 "4 个节点在第 $at 块一致($(echo $hashes | awk '{print substr($1,1,16)}')…)"
+  else
+    check "node-agreement" 1 "节点在第 $at 块不一致:$hashes"
+  fi
 fi
 fi
 

@@ -1,5 +1,10 @@
 "use strict";
-// 知行图浏览器签名器:成员在自己的浏览器里持有密钥、签名知识 op,私钥从不离开浏览器。
+// 知行图 op 编码与签名的**参考实现**(JavaScript)。不在网页里加载,也不部署到服务器:
+// 成员的密钥只在夜莺钱包里,网页只把"意图"交给钱包签名(见 public/member.js)。
+// 这份代码只给测试用:test/signer.test.mjs 用它对照 Rust 节点逐字节检验;test/fake-wallet.mjs 用它扮演钱包;
+// 钱包仓库的 tests/zhixing-op.test.mjs 固定了它的输出作为向量。
+//
+// (下面的"本机保存"是早先网页自己保存密钥时的做法,已下线;保留只为测试旧数据的格式。)
 //
 // 与节点(node/src)逐字节一致:
 //   - 助记词 → 种子:BIP-39,PBKDF2-HMAC-SHA512(助记词, "mnemonic"+口令, 2048),取前 32 字节(crypto.rs)

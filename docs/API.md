@@ -187,7 +187,7 @@ POST /rpc/knowledge        知识操作(create / publish / verify / invite)
 
 各操作的可执行工具(在仓库里):
 - 浏览器:https://blockchain.yeying.pub 的「我的身份」与单元页(核验、邀请、写作、修订);
-  装了[夜莺钱包](https://wallet.yeying.pub/)的成员可由钱包保管密钥并签名(钱包接口 `zhixing_requestAccounts` /
+  签名一律在[夜莺钱包](https://wallet.yeying.pub/)里完成,网页不持有、不保存私钥(钱包接口 `zhixing_requestAccounts` /
   `zhixing_signKnowledgeOp`,见 [`tools/explorer/README.md`](../tools/explorer/README.md));
 - 命令行:`node encode-knowledge-op` + `node rpc --path /knowledge --post`。
 

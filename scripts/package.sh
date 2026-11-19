@@ -96,6 +96,8 @@ mkdir -p "$PACKAGE_DIR"/{bin,scripts,config,tools/explorer,testnet,docs}
 cp "$BIN_SRC" "$PACKAGE_DIR/bin/node"
 cp -R "$WORKTREE_DIR/tools/explorer/." "$PACKAGE_DIR/tools/explorer/"
 rm -rf "$PACKAGE_DIR/tools/explorer/node_modules"
+# reference/(参考签名器)与 test/ 只给测试用,不进安装包:部署出去的浏览器里不带任何私钥代码
+rm -rf "$PACKAGE_DIR/tools/explorer/reference" "$PACKAGE_DIR/tools/explorer/test"
 cp "$WORKTREE_DIR/scripts/starter.sh" "$WORKTREE_DIR/scripts/health-check.sh" \
    "$WORKTREE_DIR/scripts/test.sh" "$WORKTREE_DIR/scripts/upgrade.sh" "$PACKAGE_DIR/scripts/"
 cp "$WORKTREE_DIR/testnet/gen.sh" "$PACKAGE_DIR/testnet/"

@@ -8,7 +8,7 @@
   },
   "scripts": {
     "start": "node server.js",
-    "test": "node --test test/signer.test.mjs",
+    "test": "node --test test/signer.test.mjs test/wallet.test.mjs",
     "test:browser": "node --test test/browser.e2e.mjs"
   },
   "engines": {
