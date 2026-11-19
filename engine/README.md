@@ -1,4 +1,4 @@
-# ZhixingGraph 性能引擎（Rust · Milestone 4–5）
+# KnowDoGraph 性能引擎（Rust · Milestone 4–5）
 
 对应白皮书 [`docs/WHITEPAPER.md`](../docs/WHITEPAPER.md) §7.3「性能架构与技术选型」。
 

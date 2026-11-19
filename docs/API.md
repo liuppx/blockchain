@@ -129,7 +129,31 @@ JSONL:第一行是元数据(许可、来源、单元数),其后每行一个单�
 (`id`、`layer`、`domain`、`author`、`cites`、`credibility`、`license`、`bodies[]`)。
 正文缺失时 `text` 为 `null`(链上哈希仍在,可据此去正文仓库取)。
 
+每个单元还带 `version_history`:每个版本的发布人、来源(`human` / `model:<模型>` / `model-verified:<模型>`)、
+正文(语言与哈希)、引用、核验记录与可信度。正文的 `lang` 取自链上记录。
+
 > 用途:喂给大模型训练、做检索索引、做离线分析。许可为 CC BY 4.0,署名即可。
+
+```
+GET /export/units?format=jsonld      同样的内容,用知识互操作词表 v1 表达(JSON-LD,一个 @graph)
+GET /unit/{id}.jsonld                单个单元的 JSON-LD(不含正文全文)
+GET /id/unit/{id}[/v/{n}]            全局标识;Accept: application/ld+json 返回 JSON-LD,浏览器访问跳到单元页
+GET /id/member/{id}   GET /id/domain[/{n}]
+GET /ns/v1/context.jsonld            上下文;另有 vocab / domains / layers / lifecycle 四个 .jsonld
+```
+
+JSON-LD 可被任何 JSON-LD 处理器展开成 RDF、用 SPARQL 查询。词表与标识规则见
+[`docs/design/ontology-v0.1.md`](design/ontology-v0.1.md)。
+
+### 3.7.1 查询(浏览器服务)
+
+```
+GET /lookup?body=<sha256>     → {found, unit, version, versions[], lang}   正文属于哪个单元的哪些版本
+GET /lookup?pubkey=<64 hex>   → {found, account, established}             公钥对应的成员
+```
+
+同一份正文只能属于一个单元,所以提交 `create` / `publish` 后,可以用正文哈希查到它落在哪个单元、哪个版本
+(`POST /rpc/knowledge` 只返回操作哈希)。
 
 ### 3.8 正文仓库
 

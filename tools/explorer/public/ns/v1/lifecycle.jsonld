@@ -1,0 +1,32 @@
+{
+  "@context": "https://blockchain.yeying.pub/ns/v1/context.jsonld",
+  "id": "kdg:lifecycleStates",
+  "type": "ConceptScheme",
+  "prefLabel": { "zh": "知识单元生命周期", "en": "Knowledge unit lifecycle" },
+  "definition": {
+    "zh": "由链上已有的引用与核验关系派生,不是单独存储的状态;任何人都能按同一规则重算。",
+    "en": "Derived from the citations and reviews already on chain, not stored separately; anyone can recompute it with the same rules."
+  },
+  "concepts": [
+    {
+      "id": "kdg:Active", "type": "Concept", "notation": "active", "inScheme": "kdg:lifecycleStates",
+      "prefLabel": { "zh": "活跃", "en": "Active" },
+      "definition": { "zh": "正常参与可信度计算。", "en": "Takes part in credibility as usual." }
+    },
+    {
+      "id": "kdg:Dormant", "type": "Concept", "notation": "dormant", "inScheme": "kdg:lifecycleStates",
+      "prefLabel": { "zh": "休眠", "en": "Dormant" },
+      "definition": { "zh": "长期无人依据、无人核验;仍在链上,仍可被引用与修订。", "en": "Nobody has based anything on it or reviewed it for a long time; still on chain and can still be cited or revised." }
+    },
+    {
+      "id": "kdg:Contested", "type": "Concept", "notation": "contested", "inScheme": "kdg:lifecycleStates",
+      "prefLabel": { "zh": "竞争", "en": "Contested" },
+      "definition": { "zh": "与另一个单元观点相左、并存;链上不强行裁决,由证据与使用随时间分出高下。", "en": "Stands alongside a unit it disagrees with; the chain does not rule, evidence and use decide over time." }
+    },
+    {
+      "id": "kdg:Superseded", "type": "Concept", "notation": "superseded", "inScheme": "kdg:lifecycleStates",
+      "prefLabel": { "zh": "已取代", "en": "Superseded" },
+      "definition": { "zh": "已被另一个单元取代;保留全部历史与署名,但不再向依据它的单元传递可信度。", "en": "Replaced by another unit; keeps its history and attribution but no longer passes credibility to units based on it." }
+    }
+  ]
+}

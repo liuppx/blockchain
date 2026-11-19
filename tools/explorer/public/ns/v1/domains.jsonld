@@ -1,0 +1,34 @@
+{
+  "@context": "https://blockchain.yeying.pub/ns/v1/context.jsonld",
+  "id": "https://blockchain.yeying.pub/id/domain",
+  "type": "ConceptScheme",
+  "prefLabel": { "zh": "知行图领域", "en": "KnowDoGraph domains" },
+  "definition": {
+    "zh": "知识单元所属的领域。链上用数字编号(创世参数 [knowledge] domains),名称只在这里定义。",
+    "en": "The domain a knowledge unit belongs to. On chain a domain is a number (genesis [knowledge] domains); its names are defined only here."
+  },
+  "concepts": [
+    {
+      "id": "https://blockchain.yeying.pub/id/domain/1",
+      "type": "Concept",
+      "notation": "1",
+      "inScheme": "https://blockchain.yeying.pub/id/domain",
+      "prefLabel": { "zh": "大模型应用开发", "en": "LLM application development" },
+      "definition": {
+        "zh": "面向想真正理解 AI 的开发者:大模型的原理、能力边界与应用开发方法。",
+        "en": "For developers who want to understand AI: how large language models work, where they fail, and how to build with them."
+      }
+    },
+    {
+      "id": "https://blockchain.yeying.pub/id/domain/2",
+      "type": "Concept",
+      "notation": "2",
+      "inScheme": "https://blockchain.yeying.pub/id/domain",
+      "prefLabel": { "zh": "运动健身", "en": "Exercise and fitness" },
+      "definition": {
+        "zh": "面向久坐、时间少的现代成年人:可解释的运动原理与具体做法。",
+        "en": "For sedentary, time-poor adults: explainable exercise principles and how to apply them."
+      }
+    }
+  ]
+}

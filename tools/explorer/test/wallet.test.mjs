@@ -55,9 +55,14 @@ test("被服务的 public/ 里没有私钥代码", () => {
   assert.ok(!existsSync(join(PUBLIC, "bip39-en.js")), "public/bip39-en.js 不应存在");
   const FORBIDDEN = [/ZXSigner/, /BIP39_EN/, /Ed25519/i, /PBKDF2/i, /deriveBits/, /deriveKey/, /importKey/,
     /subtle\.(sign|encrypt|decrypt)/, /getRandomValues/, /mnemonic/i, /scrypt/i, /keccak/i, /\bseed\b/i];
-  for (const f of readdirSync(PUBLIC)) {
-    const src = readFileSync(join(PUBLIC, f), "utf8");
-    for (const re of FORBIDDEN) assert.doesNotMatch(src, re, `public/${f} 里出现了 ${re}`);
+  // 递归扫描网页会执行的代码(.js / .html);ns/v1/*.jsonld 是词表数据,里面描述"ed25519 公钥"不是代码
+  const files = readdirSync(PUBLIC, { recursive: true, withFileTypes: true })
+    .filter((d) => d.isFile() && /\.(js|html)$/.test(d.name))
+    .map((d) => join(d.parentPath || d.path, d.name));
+  assert.ok(files.length > 5, "应扫描到 public/ 下的文件");
+  for (const f of files) {
+    const src = readFileSync(f, "utf8");
+    for (const re of FORBIDDEN) assert.doesNotMatch(src, re, `${f.slice(PUBLIC.length + 1)} 里出现了 ${re}`);
   }
 });
 

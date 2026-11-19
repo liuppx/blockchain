@@ -1,4 +1,4 @@
-# ZhixingGraph 经济仿真（Milestone 2）
+# KnowDoGraph 经济仿真（Milestone 2）
 
 对应白皮书 [`docs/WHITEPAPER.md`](../docs/WHITEPAPER.md) 附录 **B.3**（agent-based simulation）。
 纯 Python 标准库实现，**无需安装任何依赖**。

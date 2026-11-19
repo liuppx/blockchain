@@ -72,6 +72,17 @@ PORT=8080 NODE_RPC=http://127.0.0.1:9221 npm start      # 或: node server.js
 - **支持**:核验(通过 / 需修改,"通过"须先勾选单元的全部核验要点)、邀请、写新单元与修订。批量导入目录仍用 `tools/kimport.py`。
 - 提交需要写入令牌(组织者私下提供),保存在本机 `localStorage`。本地开发链(`./cmd up`)的写入令牌是 `local-dev-token`。
 
+## 知识互操作词表(JSON-LD)
+
+链上的知识单元可以用 JSON-LD 公开取用,规范见 [`docs/design/ontology-v0.1.md`](../../docs/design/ontology-v0.1.md):
+
+- `public/ns/v1/`:上下文、词表、领域 / 层级 / 生命周期概念方案(**领域名称只在 `domains.jsonld` 定义**,网页启动时载入);
+- `ontology.js`:链上单元详情 → JSON-LD(纯函数,导出与按标识取用共用);
+- `GET /export/units?format=jsonld`、`GET /unit/{id}.jsonld`、`GET /id/unit/{id}[/v/{n}]`、`/id/member/{id}`、`/id/domain[/{n}]`;
+- `GET /lookup?body=<sha256>` / `?pubkey=<hex>`:正文属于哪个单元的哪些版本、公钥对应哪个成员。
+
+测试:`node --test tools/explorer/test/ontology.test.mjs`(不需要真实的链)。
+
 ## 用夜莺钱包登录
 
 [夜莺钱包](https://wallet.yeying.pub/)原生支持知行图:知行图账户就是钱包里的普通账户(「账户管理 → 导入钱包」里网络选「知行图」,用助记词 / `node keygen` 的密钥文件导入——

@@ -1,4 +1,4 @@
-# 知行图 · ZhixingGraph
+# 知行图 · KnowDoGraph
 
 > **让人类和大模型写下的一切，都可被人类解释。**
 

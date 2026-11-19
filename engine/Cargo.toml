@@ -2,7 +2,7 @@
 name = "zhixing-engine"
 version = "0.1.0"
 edition = "2021"
-description = "Performance-critical cognitive-graph + ΔK engine for ZhixingGraph (whitepaper §7.3)"
+description = "Performance-critical cognitive-graph + ΔK engine for KnowDoGraph (whitepaper §7.3)"
 license = "MIT"
 
 [lib]

@@ -15,6 +15,8 @@ const path = require("path");
 const http = require("http");
 const crypto = require("crypto");
 
+const { unitToJsonLd, memberToJsonLd, LICENSE_URL } = require("./ontology.js");
+
 const LICENSE = "CC-BY-4.0";
 const CJK = /[㐀-鿿豈-﫿]/;
 
@@ -54,6 +56,12 @@ class KnowledgeIndex {
     this.unitTerms = new Map();// unitId → Set(term)
     this.builtAt = 0;
     this.unitsFetchedAt = 0;
+    // 单元详情(RPC /unit/{id}:每个版本的发布人、来源、正文、引用、核验、可信度)。
+    // 只有单元的版本数或核验 / 可信度变化时才重新拉取。
+    this.details = new Map();   // unitId → { sig, detail }
+    this.bodyOwner = new Map(); // 正文哈希 → { unit, version, lang }
+    this.members = new Map();   // 账户号 → { id, pubkey, established }
+    this.membersFetchedAt = 0;
   }
 
   rpcJson(p) {
@@ -112,10 +120,64 @@ class KnowledgeIndex {
     }
   }
 
+  /** 单元详情的变化签名:版本数、核验数、可信度、生命周期任一变化就重新拉详情。 */
+  static detailSig(u) {
+    const c = u.credibility || {};
+    return [u.versions, c.passes, c.needs, c.self_bps, c.effective_bps, u.lifecycle].join("|");
+  }
+
+  async refreshDetails() {
+    const stale = this.units.filter((u) => {
+      const known = this.details.get(String(u.id));
+      return !known || known.sig !== KnowledgeIndex.detailSig(u);
+    });
+    // 并发拉取,但不压垮节点
+    for (let i = 0; i < stale.length; i += 8) {
+      await Promise.all(stale.slice(i, i + 8).map(async (u) => {
+        try {
+          const detail = await this.rpcJson("/unit/" + u.id);
+          if (detail && detail.id != null) {
+            detail.lifecycle = u.lifecycle;
+            this.details.set(String(u.id), { sig: KnowledgeIndex.detailSig(u), detail });
+          }
+        } catch (_) { /* 下次再拉 */ }
+      }));
+    }
+    this.bodyOwner = new Map();
+    for (const { detail } of this.details.values()) {
+      for (const v of detail.versions || []) {
+        for (const b of v.bodies || []) {
+          // 同一份正文只能属于一个单元(U2);同一单元的多个版本可以复用同一份正文:
+          // version 记最早出现的版本,versions 列出所有用到它的版本
+          const known = this.bodyOwner.get(b.hash);
+          if (!known) this.bodyOwner.set(b.hash, { unit: String(detail.id), version: String(v.n), versions: [String(v.n)], lang: b.lang });
+          else if (known.unit === String(detail.id)) known.versions.push(String(v.n));
+        }
+      }
+    }
+  }
+
+  /** 成员与公钥(换钥可能改变公钥,所以几分钟刷新一次)。 */
+  async refreshMembers(maxAgeMs = 5 * 60 * 1000) {
+    if (this.membersFetchedAt && Date.now() - this.membersFetchedAt < maxAgeMs) return;
+    const page = await this.rpcJson("/members?limit=500");
+    const next = new Map();
+    for (const m of page.items || []) {
+      try {
+        const a = await this.rpcJson("/account/" + m.id);
+        next.set(String(m.id), { id: String(m.id), pubkey: String(a.pubkey || "").toLowerCase(), established: !!m.established });
+      } catch (_) { /* 跳过 */ }
+    }
+    this.members = next;
+    this.membersFetchedAt = Date.now();
+  }
+
   // 把正文挂到单元上,并建索引
   async build() {
     await this.refreshUnits();
     await this.refreshBodies();
+    await this.refreshDetails();
+    try { await this.refreshMembers(); } catch (_) { /* 成员查询失败不影响检索 */ }
     this.postings = new Map();
     this.unitTerms = new Map();
     for (const u of this.units) {
@@ -259,8 +321,8 @@ class KnowledgeIndex {
         });
       }
     }
-    if (opts.domain) out = out.filter((g) => g.domain === String(opts.domain));
-    return out;
+    // 注意:out 是 const,不能重新赋值(否则 /gaps?domain= 会抛 "Assignment to constant variable")
+    return opts.domain ? out.filter((g) => g.domain === String(opts.domain)) : out;
   }
 
   /** 按领域的覆盖情况:每个领域有多少单元、多少已确立、多少无人依据。 */
@@ -287,10 +349,13 @@ class KnowledgeIndex {
     const out = [];
     for (const u of this.units) {
       const bodies = [];
+      const detail = (this.details.get(String(u.id)) || {}).detail;
       for (const h of u.body_hashes || []) {
         const b = this.bodies.get(h);
+        // 语言取自链上记录(以前写死为 zh)
+        const owner = this.bodyOwner.get(h);
         bodies.push({
-          lang: "zh",
+          lang: owner ? owner.lang : "zh",
           sha256: h,
           url: "/bodies/" + h,
           text: b ? b.text : null,     // 正文缺失时为 null(链上哈希仍在)
@@ -304,10 +369,54 @@ class KnowledgeIndex {
         cites: u.cites || [],
         license: LICENSE,
         bodies,
+        // 每个版本的发布人、来源、正文、引用、核验与可信度(只增字段,与旧格式兼容)
+        version_history: detail ? (detail.versions || []).map((v) => ({
+          n: v.n, publisher: v.publisher, published_height: v.published_height, source: v.source,
+          bodies: (v.bodies || []).map((b) => ({ lang: b.lang, sha256: b.hash })),
+          cites: v.cites || [], verifications: v.verifications || [], credibility: v.credibility || null,
+        })) : null,
       });
     }
     return out;
   }
+
+  bodyText(hash) {
+    const b = this.bodies.get(hash);
+    return b ? { text: b.text, title: b.title } : null;
+  }
+
+  /** 单元的 JSON-LD(含全部版本;withBodies 时带正文全文)。找不到返回 null。 */
+  unitJsonLd(id, { withBodies = false, withContext = true } = {}) {
+    const known = this.details.get(String(id));
+    if (!known) return null;
+    return unitToJsonLd(known.detail, { withContext, bodyText: withBodies ? (h) => this.bodyText(h) : null });
+  }
+
+  /** 导出全部单元的 JSON-LD(每个单元一个自包含文档,带正文)。 */
+  async exportJsonLd() {
+    await this.ensureFresh(0);
+    return this.units
+      .map((u) => this.unitJsonLd(u.id, { withBodies: true }))
+      .filter(Boolean);
+  }
+
+  /** 正文哈希 → 它属于哪个单元的哪个版本(同一份正文只能属于一个单元)。 */
+  lookupBody(hash) {
+    const h = String(hash || "").toLowerCase();
+    return this.bodyOwner.get(h) || null;
+  }
+
+  /** 公钥 → 链上成员(账户号、是否已过见习期)。不是成员返回 null。 */
+  lookupPubkey(pubkey) {
+    const pk = String(pubkey || "").toLowerCase();
+    for (const m of this.members.values()) if (m.pubkey === pk) return m;
+    return null;
+  }
+
+  memberJsonLd(id) {
+    const m = this.members.get(String(id));
+    return m ? memberToJsonLd(m) : null;
+  }
 }
 
-module.exports = { KnowledgeIndex, tokenize, excerpt, LICENSE };
+module.exports = { KnowledgeIndex, tokenize, excerpt, LICENSE, LICENSE_URL };

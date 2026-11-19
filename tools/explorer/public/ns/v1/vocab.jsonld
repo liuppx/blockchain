@@ -1,0 +1,65 @@
+{
+  "@context": "https://blockchain.yeying.pub/ns/v1/context.jsonld",
+  "@graph": [
+    {
+      "id": "https://blockchain.yeying.pub/ns/v1",
+      "type": "owl:Ontology",
+      "label": { "zh": "知行图知识互操作词表 v1", "en": "KnowDoGraph knowledge interchange vocabulary v1" },
+      "comment": {
+        "zh": "知行图链上知识单元的公开表达。只为通行标准里没有的概念新造词,其余复用 schema.org、W3C PROV-O、Dublin Core、SKOS。规范:docs/design/ontology-v0.1.md。",
+        "en": "Public representation of knowledge units on the KnowDoGraph chain. New terms only where common standards have none; everything else reuses schema.org, W3C PROV-O, Dublin Core and SKOS. Spec: docs/design/ontology-v0.1.md."
+      }
+    },
+
+    { "id": "kdg:KnowledgeUnit", "type": "rdfs:Class", "subClassOf": "schema:CreativeWork",
+      "label": { "zh": "知识单元", "en": "Knowledge unit" },
+      "comment": { "zh": "只讲一件事、自身能读懂的一条知识。全部修改以版本保存。", "en": "One self-contained piece of knowledge about a single thing. Every change is kept as a version." } },
+    { "id": "kdg:UnitVersion", "type": "rdfs:Class", "subClassOf": "prov:Entity",
+      "label": { "zh": "单元版本", "en": "Unit version" },
+      "comment": { "zh": "知识单元的一个版本:正文、来源、引用都记在版本上;核验针对具体版本。", "en": "One version of a unit; bodies, source and citations belong to the version, and reviews target a specific version." } },
+    { "id": "kdg:Verification", "type": "rdfs:Class", "subClassOf": ["prov:Activity", "schema:Review"],
+      "label": { "zh": "核验", "en": "Verification" },
+      "comment": { "zh": "一位成员对某个版本给出的结论,永久记录在链上。", "en": "A member's verdict on one version, recorded permanently on chain." } },
+
+    { "id": "kdg:layer", "type": "rdf:Property", "label": { "zh": "层级", "en": "layer" },
+      "comment": { "zh": "取值见概念方案 kdg:layers。", "en": "Values from concept scheme kdg:layers." } },
+    { "id": "kdg:domain", "type": "rdf:Property", "label": { "zh": "领域", "en": "domain" },
+      "comment": { "zh": "取值见概念方案 https://blockchain.yeying.pub/id/domain。", "en": "Values from concept scheme https://blockchain.yeying.pub/id/domain." } },
+    { "id": "kdg:lifecycle", "type": "rdf:Property", "label": { "zh": "生命周期", "en": "lifecycle" },
+      "comment": { "zh": "取值见概念方案 kdg:lifecycleStates;由链上关系派生。", "en": "Values from kdg:lifecycleStates; derived from on-chain relations." } },
+    { "id": "kdg:hasVersion", "type": "rdf:Property", "subPropertyOf": "dcterms:hasVersion",
+      "label": { "zh": "版本", "en": "has version" }, "comment": { "zh": "按版本号排列的版本列表。", "en": "Versions in order." } },
+    { "id": "kdg:latestVersion", "type": "rdf:Property", "label": { "zh": "最新版本", "en": "latest version" } },
+    { "id": "kdg:createdAtHeight", "type": "rdf:Property", "label": { "zh": "创建时的区块高度", "en": "created at block height" } },
+    { "id": "kdg:publishedAtHeight", "type": "rdf:Property", "label": { "zh": "发布时的区块高度", "en": "published at block height" } },
+
+    { "id": "kdg:sourceType", "type": "rdf:Property", "label": { "zh": "来源类型", "en": "source type" },
+      "comment": { "zh": "人工撰写 / 模型生成 / 模型生成且经人工修改核对(发布者自报)。", "en": "Human-authored / model-generated / model-generated and checked by a human (self-declared by the publisher)." } },
+    { "id": "kdg:HumanAuthored", "label": { "zh": "人工撰写", "en": "Human-authored" } },
+    { "id": "kdg:ModelGenerated", "label": { "zh": "模型生成", "en": "Model-generated" } },
+    { "id": "kdg:ModelGeneratedHumanVerified", "label": { "zh": "模型生成,经人工修改核对", "en": "Model-generated, checked by a human" } },
+
+    { "id": "kdg:basedOn", "type": "rdf:Property", "subPropertyOf": "dcterms:references",
+      "label": { "zh": "依据", "en": "based on" },
+      "comment": { "zh": "本版本建立在被引版本之上。有效可信度沿依据取最小:地基不可信,上层也不可信。", "en": "This version builds on the cited version. Effective credibility is the minimum along basedOn: a weak foundation makes everything above it weak." } },
+
+    { "id": "kdg:hasVerification", "type": "rdf:Property", "label": { "zh": "核验记录", "en": "has verification" } },
+    { "id": "kdg:verdict", "type": "rdf:Property", "label": { "zh": "结论", "en": "verdict" } },
+    { "id": "kdg:Pass", "label": { "zh": "通过", "en": "Pass" } },
+    { "id": "kdg:NeedsRevision", "label": { "zh": "需修改", "en": "Needs revision" } },
+    { "id": "kdg:atHeight", "type": "rdf:Property", "label": { "zh": "所在区块高度", "en": "at block height" } },
+    { "id": "kdg:noteHash", "type": "rdf:Property", "label": { "zh": "核验说明的哈希", "en": "review note hash" },
+      "comment": { "zh": "核验说明正文的 SHA-256(说明本身不上链)。", "en": "SHA-256 of the review note text (the note itself is not on chain)." } },
+
+    { "id": "kdg:selfCredibility", "type": "rdf:Property", "label": { "zh": "自身可信度", "en": "own credibility" },
+      "comment": { "zh": "只看本版本的核验记录,0 到 1。", "en": "From this version's reviews alone, 0 to 1." } },
+    { "id": "kdg:effectiveCredibility", "type": "rdf:Property", "label": { "zh": "有效可信度", "en": "effective credibility" },
+      "comment": { "zh": "自身可信度与所有依据的有效可信度取最小,0 到 1;任何人可按链上记录重算。", "en": "Minimum of own credibility and the effective credibility of everything it is based on, 0 to 1; recomputable from on-chain records." } },
+    { "id": "kdg:bottleneck", "type": "rdf:Property", "label": { "zh": "可信度瓶颈", "en": "credibility bottleneck" },
+      "comment": { "zh": "拉低有效可信度的那个依据版本。", "en": "The based-on version that limits effective credibility." } },
+
+    { "id": "kdg:accountNumber", "type": "rdf:Property", "label": { "zh": "链上账户号", "en": "account number" } },
+    { "id": "kdg:pubkey", "type": "rdf:Property", "label": { "zh": "公钥", "en": "public key" },
+      "comment": { "zh": "成员的 ed25519 公钥,64 位十六进制。", "en": "The member's ed25519 public key, 64 hex characters." } }
+  ]
+}

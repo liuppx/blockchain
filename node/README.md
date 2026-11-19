@@ -1,4 +1,4 @@
-# ZhixingGraph 参考节点（Rust · Milestone 6–24）
+# KnowDoGraph 参考节点（Rust · Milestone 6–24）
 
 对应白皮书 [`docs/WHITEPAPER.md`](../docs/WHITEPAPER.md) §5「PoK 共识」与 §7「技术架构」。
 

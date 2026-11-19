@@ -2,7 +2,7 @@
 name = "zhixing-node"
 version = "0.1.0"
 edition = "2021"
-description = "Reference PoK consensus node for ZhixingGraph: a deterministic state machine over the ΔK engine"
+description = "Reference PoK consensus node for KnowDoGraph: a deterministic state machine over the ΔK engine"
 license = "MIT"
 
 [lib]

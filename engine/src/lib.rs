@@ -1,4 +1,4 @@
-//! Performance-critical cognitive-graph + ΔK engine for ZhixingGraph.
+//! Performance-critical cognitive-graph + ΔK engine for KnowDoGraph.
 //!
 //! This is the Rust port of the hot path defined in `sim/delta_k.py` and
 //! whitepaper appendix B.2.3. It is the same contract, re-implemented for the
