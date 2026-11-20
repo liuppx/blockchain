@@ -14387,6 +14387,113 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn rpc_key_rotation_swaps_an_account_key_and_keeps_the_account_id() {
+        // M241: `POST /key-rotation` stages a KeyRotation signed by the account's CURRENT key.
+        // After it commits: the account keeps its id and nonce advances; the old key can no
+        // longer authorize anything (a second rotation signed by it is rejected).
+        let dir = tmp_dir("rpc-key-rotation");
+        let mut cfg = node_config(50, 22011, &[50], dir.clone());
+        let rpc_addr = "127.0.0.1:22051";
+        cfg.rpc = Some(crate::config::RpcConfig {
+            enabled: true,
+            listen: rpc_addr.into(),
+            auth_token: String::new(),
+            enable_tls: false,
+        });
+        let mut genesis = test_genesis();
+        genesis.validators = vec![(50, kp(50).public(), 1)]; // quorum 1 ⇒ self-commit
+        let _node = Node::start(cfg, genesis, Some(kp(50)), None)
+            .await
+            .expect("start node");
+
+        async fn post(addr: &str, path: &str, body: &[u8]) -> String {
+            let mut req = format!(
+                "POST {path} HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            )
+            .into_bytes();
+            req.extend_from_slice(body);
+            let mut s = TcpStream::connect(addr).await.expect("connect rpc");
+            s.write_all(&req).await.expect("send post");
+            let mut resp = Vec::new();
+            s.read_to_end(&mut resp).await.expect("read response");
+            String::from_utf8_lossy(&resp).into_owned()
+        }
+        async fn get(addr: &str, path: &str) -> String {
+            let req =
+                format!("GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
+            let mut s = TcpStream::connect(addr).await.expect("connect rpc");
+            s.write_all(req.as_bytes()).await.expect("send get");
+            let mut resp = Vec::new();
+            s.read_to_end(&mut resp).await.expect("read response");
+            String::from_utf8_lossy(&resp).into_owned()
+        }
+        fn body_of(resp: &str) -> &str {
+            resp.split_once("\r\n\r\n").map(|(_, b)| b).unwrap_or("")
+        }
+
+        // The new key: a fresh keypair not bound to any account.
+        let new_kp = Keypair::from_seed([0x5a; 32]);
+        let new_pub = new_kp.public();
+        // Signed by the CURRENT key (account #1's key), nonce = the account's nonce.
+        let op = crate::KeyRotation {
+            account: 1,
+            new_pubkey: new_pub,
+            nonce: 0,
+            signature: [0u8; 64],
+        }
+        .signed(&kp(1));
+        let bytes = crate::codec::encode_key_rotation(&op);
+        let resp = post(rpc_addr, "/key-rotation", &bytes).await;
+        assert!(
+            resp.starts_with("HTTP/1.1 200 OK"),
+            "rotation status: {resp}"
+        );
+
+        // Wait until the account's key on chain is the new one.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let accounts = get(rpc_addr, "/accounts").await;
+            let body = body_of(&accounts);
+            if body.contains(&crate::hash::hex(&new_pub)) {
+                // The account id is unchanged, and its nonce advanced (the old key is dead).
+                assert!(body.contains("id=1 "), "account #1 keeps its id: {body}");
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "rotation never applied: {body}"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+
+        // A second rotation signed by the OLD key is rejected (it is no longer account #1's key).
+        let stale = crate::KeyRotation {
+            account: 1,
+            new_pubkey: Keypair::from_seed([0x6b; 32]).public(),
+            nonce: 1,
+            signature: [0u8; 64],
+        }
+        .signed(&kp(1));
+        let resp = post(
+            rpc_addr,
+            "/key-rotation",
+            &crate::codec::encode_key_rotation(&stale),
+        )
+        .await;
+        assert!(
+            resp.starts_with("HTTP/1.1 422"),
+            "stale key must be rejected: {resp}"
+        );
+        assert!(
+            body_of(&resp).contains("signature"),
+            "reason mentions the signature: {resp}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
     async fn rpc_validate_rejects_invalid_tx() {
         // M115: a tx from an unknown author fails static validation ⇒ 422 with a reason.
         let dir = tmp_dir("rpc-validate-reject");
