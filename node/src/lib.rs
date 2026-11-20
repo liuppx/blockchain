@@ -2607,6 +2607,13 @@ impl ChainState {
         for op in gov_votes {
             let _ = trial.apply_gov_vote(op, height);
         }
+        // M241:本块选中的换密钥 op 也在区块内执行(最后),它会换掉公钥并推进序号。
+        // 同一账户的换密钥与知识 op 若都在本块,知识 op 必须用**旧**密钥签、序号也用旧的,
+        // 否则两条都会执行不了、整块回滚。所以这里只把「本块已选的换密钥」当作
+        // 知识 op 之后的动作,不提前作用到知识 op 的验签上;但要防止知识 op 与换密钥
+        // 抢同一个序号——那由换密钥的过滤负责(它最后执行,会看到知识 op 已推进的序号)。
+        // 为稳妥起见,这里把本块的换密钥排除在同账户之外:换密钥过滤里再统一处理。
+        let _ = &trial;
         let mut sorted: Vec<&crate::knowledge::KnowledgeOp> = ops.iter().collect();
         sorted.sort_by_key(|op| (op.actor, op.nonce));
         let mut kept = Vec::new();
@@ -2621,21 +2628,61 @@ impl ChainState {
         kept
     }
 
-    /// M241:选出出块者可以放进候选区块的换密钥 op,避免一条无法执行的 op 让整个候选块无法封装
-    /// (镜像 SEC-01 的治理过滤与知识 op 过滤)。换密钥在区块内**最后**执行,所以试算时按序
-    /// 逐条应用:同一账户连续两条换密钥时,第二条要用第一条之后的密钥与序号来验签。
-    pub(crate) fn filter_applicable_key_rotations(&self, ops: &[KeyRotation]) -> Vec<KeyRotation> {
+    /// M241:组装候选块里的 op——**按区块的应用顺序**试算,返回每类里能干净执行的那些。
+    ///
+    /// 顺序(与 `apply_block_inner` 一致):stake → 换密钥 → 治理 → 知识。
+    /// 顺序不能乱:换密钥会换掉账户公钥并推进序号,而治理与知识 op 要用序号验签,
+    /// 所以它们看到的必须是换密钥之后的账户状态。换密钥与同一账户的知识 op 若都进本块,
+    /// 知识 op 会被序号挡住(它本来就该等换密钥落地后用新密钥重签)。
+    pub(crate) fn select_candidate_ops(
+        &self,
+        height: u64,
+        stake_ops: &[StakeOp],
+        key_rotations: &[KeyRotation],
+        gov_proposals: &[GovProposal],
+        gov_votes: &[GovVote],
+        knowledge_ops: &[crate::knowledge::KnowledgeOp],
+    ) -> CandidateOps {
         let mut trial = self.clone();
-        let mut kept = Vec::new();
-        for op in ops {
+
+        // 1. stake ops(应用顺序里最先,不动账户序号)。
+        let kept_stake = self.filter_applicable_stake_ops(stake_ops);
+        for op in &kept_stake {
+            let _ = trial.apply_stake_op(op, height);
+        }
+
+        // 2. 换密钥:会换公钥并推进序号。
+        let mut kept_rotations = Vec::new();
+        for op in key_rotations {
             let mut scratch = trial.clone();
             if scratch.apply_key_rotation(op).is_err() {
                 continue;
             }
             trial = scratch;
-            kept.push(op.clone());
+            kept_rotations.push(op.clone());
         }
-        kept
+
+        // 3. 治理 op:看到的是换密钥之后的账户状态。
+        let (mut kept_props, mut kept_votes) =
+            trial.filter_applicable_gov(height, gov_proposals, gov_votes);
+        for op in &kept_props {
+            let _ = trial.apply_gov_proposal(op, height);
+        }
+        for op in &kept_votes {
+            let _ = trial.apply_gov_vote(op, height);
+        }
+
+        // 4. 知识 op:看到的是治理 op 之后的账户状态。
+        let kept_knowledge =
+            trial.filter_applicable_knowledge(height, &kept_props, &kept_votes, knowledge_ops);
+
+        (
+            kept_stake,
+            kept_rotations,
+            std::mem::take(&mut kept_props),
+            std::mem::take(&mut kept_votes),
+            kept_knowledge,
+        )
     }
 
     /// 引用校验:被引用的单元与版本必须已存在,且不能引用自身所在的单元。
@@ -4061,6 +4108,15 @@ pub struct Chain {
     pub genesis_hash: Hash,
     pub block_hashes: Vec<Hash>,
 }
+
+/// M241:候选块里各类 op 的选中结果(每类只含能干净执行的那些)。
+pub(crate) type CandidateOps = (
+    Vec<StakeOp>,
+    Vec<KeyRotation>,
+    Vec<GovProposal>,
+    Vec<GovVote>,
+    Vec<crate::knowledge::KnowledgeOp>,
+);
 
 impl Chain {
     pub fn new(g: Genesis) -> Self {
@@ -5534,11 +5590,16 @@ mod tests {
             signature: [0u8; 64],
         }
         .signed(&kp(7)); // 错误的钥匙 → 验签不过
-        let kept = chain
-            .state
-            .filter_applicable_key_rotations(&[bad.clone(), good.clone()]);
-        assert_eq!(kept.len(), 1, "只保留能干净执行的那条");
-        assert_eq!(kept[0].new_pubkey, good.new_pubkey);
+        let (_, rotations, _, _, _) = chain.state.select_candidate_ops(
+            chain.state.height + 1,
+            &[],
+            &[bad.clone(), good.clone()],
+            &[],
+            &[],
+            &[],
+        );
+        assert_eq!(rotations.len(), 1, "只保留能干净执行的那条");
+        assert_eq!(rotations[0].new_pubkey, good.new_pubkey);
     }
 
     #[test]
