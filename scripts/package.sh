@@ -114,7 +114,7 @@ cat > "$PACKAGE_DIR/config/README.md" <<'EOF'
 - `tokens.env` — RPC 写令牌与指标令牌(600)
 EOF
 cat > "$PACKAGE_DIR/README.md" <<EOF
-# 知行图测试网节点(安装包 $PACKAGE_ROOT)
+# 知行图测试网节点(安装包 ${PACKAGE_ROOT})
 
 - \`bin/node\` — 节点程序
 - \`scripts/starter.sh\` — 启停(\`start|stop|restart\`)
@@ -124,7 +124,7 @@ cat > "$PACKAGE_DIR/README.md" <<EOF
 - \`config/\` — 配置与密钥(安装后放,不在包内)
 - 链数据目录由 \`ZHIXING_DATA_DIR\` 指定(默认 \`/data/zhixing-testnet\`)
 
-版本 $VERSION,源码 $SOURCE_SHA。
+版本 ${VERSION},源码 ${SOURCE_SHA}。
 EOF
 
 tar -czf "$STAGE_DIR/$PACKAGE_NAME" -C "$STAGE_DIR" "$PACKAGE_ROOT"
