@@ -484,6 +484,13 @@ enum Cmd {
         op: Box<crate::GovVote>,
         reply: oneshot::Sender<Result<Hash, crate::ChainError>>,
     },
+    /// M241: submit a signed `KeyRotation` (account key swap) to a running node (stage + flood).
+    /// The write counterpart of the read side; verifies the signature against the account's
+    /// **current** key before staging, and `Ok(hash)` once staged.
+    SubmitKeyRotation {
+        op: Box<crate::KeyRotation>,
+        reply: oneshot::Sender<Result<Hash, crate::ChainError>>,
+    },
     /// M229: submit a signed bond/unbond `StakeOp` to a running node (stage + flood), the
     /// write counterpart to the `/bonds` read. Verifies the signature; `Ok(hash)` once staged.
     SubmitStakeOp {
@@ -1922,6 +1929,28 @@ async fn run_actor(mut actor: Actor, mut rx: mpsc::UnboundedReceiver<Cmd>) {
                     .map(|(&id, m)| (id, m.clone(), state.knowledge.is_established(id, h)))
                     .collect();
                 let _ = reply.send(list);
+            }
+            Cmd::SubmitKeyRotation { op, reply } => {
+                // M241: verify the account's CURRENT key authorized the swap, then stage + flood.
+                // (The nonce check and the active-validator guard live in `apply_key_rotation`,
+                // which rolls the whole block back on failure — same discipline as stake ops.)
+                let res = match actor.node.chain.state.accounts.get(&op.account) {
+                    Some(acct)
+                        if verify(
+                            &acct.pubkey,
+                            &crate::codec::keyrotation_signing_bytes(&op),
+                            &op.signature,
+                        ) =>
+                    {
+                        let h = op.hash();
+                        let out = actor.node.submit_local_key_rotation(*op);
+                        actor.route(out);
+                        Ok(h)
+                    }
+                    Some(_) => Err(crate::ChainError::BadSignature(op.account)),
+                    None => Err(crate::ChainError::UnknownAccount(op.account)),
+                };
+                let _ = reply.send(res);
             }
             Cmd::SubmitStakeOp { op, reply } => {
                 // M229: verify the account's signature, then stage + flood the stake op
@@ -8320,6 +8349,44 @@ async fn serve_rpc_conn(
                 ok_body(fmt, &hex, &format!("{{\"hash\":{}}}", json_str(&hex)))
             }
             Ok(Err(e)) => error_body(fmt, knowledge_reject_status(&e), &e.to_string()),
+            Err(_) => http_response("503 Service Unavailable", "node stopped"),
+        };
+        let _ = stream.write_all(resp.as_bytes()).await;
+        let _ = stream.flush().await;
+        return;
+    }
+    if path == "/key-rotation" {
+        // M241: `POST /key-rotation` carries a raw codec-encoded KeyRotation (the account's
+        // current key authorizes the swap to a new pubkey). Same shape as `/stake`.
+        let op = match crate::codec::decode_key_rotation(&body) {
+            Ok(op) => op,
+            Err(e) => {
+                let _ = stream
+                    .write_all(error_body(fmt, "400 Bad Request", &e.to_string()).as_bytes())
+                    .await;
+                let _ = stream.flush().await;
+                return;
+            }
+        };
+        let (reply, rx) = oneshot::channel();
+        if cmd
+            .send(Cmd::SubmitKeyRotation {
+                op: Box::new(op),
+                reply,
+            })
+            .is_err()
+        {
+            let _ = stream
+                .write_all(http_response("503 Service Unavailable", "node stopped").as_bytes())
+                .await;
+            return;
+        }
+        let resp = match rx.await {
+            Ok(Ok(h)) => {
+                let hex = crate::hash::hex(&h);
+                ok_body(fmt, &hex, &format!("{{\"hash\":{}}}", json_str(&hex)))
+            }
+            Ok(Err(e)) => error_body(fmt, "422 Unprocessable Entity", &e.to_string()),
             Err(_) => http_response("503 Service Unavailable", "node stopped"),
         };
         let _ = stream.write_all(resp.as_bytes()).await;
