@@ -5140,6 +5140,39 @@ mod tests {
     }
 
     #[test]
+    fn knowledge_op_signed_by_the_wallet_verifies_here() {
+        // M241:跨实现的互操作检查——夜莺钱包(JS)编码并签名的知识 op,链(Rust)必须能解码并验签通过。
+        // 这条 op 由钱包的 `signKnowledgeOp` 产生(助记词 "abandon … about" 的第 0 个标准账户)。
+        let hex = "00000000000000070003000000020000000000000002000000027a68010101010101010101010101010101010101010101010101010101010101010100000002656e0202020202020202020202020202020202020202020202020202020202020202010000000f636c617564652d6f7075732d352d3500000000000000010000000000000001000000010000000000000000008e670334a9f9eda23e2274b9b80478fd5ec5dc4d83d9d2f06baf4301b644ae0f8f197950f1c74e0e09c5c5634503eb5cf8f83987bf83c3e852dca4b55b75a104";
+        let bytes: Vec<u8> = hex
+            .as_bytes()
+            .chunks(2)
+            .map(|pair| {
+                u8::from_str_radix(std::str::from_utf8(pair).expect("ascii"), 16)
+                    .expect("hex digit")
+            })
+            .collect();
+        let op = decode_knowledge_op(&bytes).expect("链能解码钱包产生的 op");
+        assert_eq!(op.actor, 7);
+        assert_eq!(op.nonce, 0);
+        assert!(op.is_well_formed().is_ok(), "{op:?}");
+        // 签名用的是钱包那把钥匙(助记词 "abandon … about" → 标准路径 m/44'/1105'/0'/0'/0')
+        let pk = crate::Keypair::from_seed(crate::crypto::slip10_ed25519(
+            &crate::crypto::mnemonic_to_bip39_seed(
+                "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about",
+                "",
+            )
+            .unwrap(),
+            &crate::crypto::kdg_standard_path(0),
+        ))
+        .public();
+        assert!(
+            crate::crypto::verify(&pk, &knowledge_op_signing_bytes(&op), &op.signature),
+            "链必须能验过钱包的签名"
+        );
+    }
+
+    #[test]
     fn knowledge_op_decoder_rejects_malformed_input() {
         let good = encode_knowledge_op(&tests_sample_knowledge_op());
         // 未知动作标签(第 8 字节,紧跟 actor)
