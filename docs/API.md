@@ -204,6 +204,7 @@ PUT  /bodies/<sha256>          需写入令牌;服务端校验 sha256(body) == <
 
 ```
 POST /rpc/knowledge        知识操作(create / publish / verify / invite)
+POST /rpc/key-rotation     账户换密钥(用**当前**密钥签名,把账户的公钥换成新的)
 ```
 
 请求体是 op 的规范编码(二进制),不是 JSON;`Authorization: Bearer <写入令牌>`。
@@ -214,6 +215,18 @@ POST /rpc/knowledge        知识操作(create / publish / verify / invite)
   签名一律在[夜莺钱包](https://wallet.yeying.pub/)里完成,网页不持有、不保存私钥(钱包接口 `zhixing_requestAccounts` /
   `zhixing_signKnowledgeOp`,见 [`tools/explorer/README.md`](../tools/explorer/README.md));
 - 命令行:`node encode-knowledge-op` + `node rpc --path /knowledge --post`。
+
+**换密钥**(成员换设备或换备份方式时用):账户编号、成员身份、见习期与全部历史都不变,
+只是之后的知识 op 改用新密钥签名。旧密钥立刻失效(再用它签的任何操作都会被拒)。
+
+```sh
+node keygen --out new.seed --new-mnemonic          # 新密钥(标准派生,m/44'/1105'/0'/0'/0')
+node encode-key-rotation --key-file old.seed --out rot.bin \
+    --account <账户号> --nonce <当前序号> --new-pubkey <新公钥>
+node rpc --path /key-rotation --post rot.bin
+```
+
+换完之后把新密钥放进钱包、删掉旧的知行图账户即可。
 
 ## 7. 限流
 

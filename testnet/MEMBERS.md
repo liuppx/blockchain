@@ -58,12 +58,31 @@
 - 知行图账户不随钱包的备份同步走:助记词或密钥文件要自己保管好。
 - 钱包「网站管理」里能看到哪些网站连接过你的知行图账户,可以随时撤销。
 
+### 换密钥(换了设备或换备份方式)
+
+账户编号、成员身份、见习期与全部历史都不变,只是之后的操作改用新密钥签名;旧密钥立刻失效。
+在钱包里创建新的知行图钱包(标准派生),然后用**旧**密钥签一次换密钥:
+
+```sh
+cd node && cargo build --release
+node keygen --out new.seed --new-mnemonic          # 新密钥
+node encode-key-rotation --key-file old.seed --out rot.bin \
+    --account <账户号> --nonce <当前序号> --new-pubkey <新公钥>
+node rpc --path /key-rotation --post rot.bin
+```
+
+序号(`--nonce`)是当前账户的序号,可以在浏览器「我的身份」页或 `curl /rpc/accounts` 里看到。
+换完之后把新密钥放进钱包、删掉旧的知行图账户。
+
 ### 用命令行生成(可选)
 
 ```sh
 cd node && cargo build --release      # 生成 node/target/release/node
 node keygen --new-mnemonic --encrypt --out zhixing-member.json
 ```
+
+助记词按**标准规则**派生(SLIP-0010 ed25519,`m/44'/1105'/0'/0'/0'`;1105 是 KnowDoGraph 在
+SLIP-0044 的编号),与夜莺钱包「创建钱包 → 知行图钱包」逐字节一致——同一组助记词在两边是同一个账户。
 
 程序会让你设置一个密码,然后打印公钥(发给组织者)、密钥文件(自己保存)和助记词(抄在纸上)。
 然后在钱包里「导入密钥文件」(选 `zhixing-member.json`,输入它的口令)或「用助记词导入」即可。
