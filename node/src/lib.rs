@@ -2621,6 +2621,23 @@ impl ChainState {
         kept
     }
 
+    /// M241:选出出块者可以放进候选区块的换密钥 op,避免一条无法执行的 op 让整个候选块无法封装
+    /// (镜像 SEC-01 的治理过滤与知识 op 过滤)。换密钥在区块内**最后**执行,所以试算时按序
+    /// 逐条应用:同一账户连续两条换密钥时,第二条要用第一条之后的密钥与序号来验签。
+    pub(crate) fn filter_applicable_key_rotations(&self, ops: &[KeyRotation]) -> Vec<KeyRotation> {
+        let mut trial = self.clone();
+        let mut kept = Vec::new();
+        for op in ops {
+            let mut scratch = trial.clone();
+            if scratch.apply_key_rotation(op).is_err() {
+                continue;
+            }
+            trial = scratch;
+            kept.push(op.clone());
+        }
+        kept
+    }
+
     /// 引用校验:被引用的单元与版本必须已存在,且不能引用自身所在的单元。
     /// 新版本只能引用已存在的版本,所以版本级引用图天然无环(无需额外检测)。
     fn check_knowledge_cites(
@@ -5497,6 +5514,31 @@ mod tests {
         chain.commit(&mut b).expect("within-cap bond admitted");
         assert_eq!(chain.state.validators.get(1).unwrap().power, 1000);
         assert!(chain.state.supply_conserved());
+    }
+
+    #[test]
+    fn filter_applicable_key_rotations_drops_an_unusable_one() {
+        // M241:一条签错的换密钥 op 不能进候选块(否则整块无法封装、出块卡住)。
+        let chain = Chain::new(base_genesis());
+        let good = KeyRotation {
+            account: 1,
+            new_pubkey: kp(99).public(),
+            nonce: 0,
+            signature: [0u8; 64],
+        }
+        .signed(&kp(1));
+        let bad = KeyRotation {
+            account: 1,
+            new_pubkey: kp(98).public(),
+            nonce: 0,
+            signature: [0u8; 64],
+        }
+        .signed(&kp(7)); // 错误的钥匙 → 验签不过
+        let kept = chain
+            .state
+            .filter_applicable_key_rotations(&[bad.clone(), good.clone()]);
+        assert_eq!(kept.len(), 1, "只保留能干净执行的那条");
+        assert_eq!(kept[0].new_pubkey, good.new_pubkey);
     }
 
     #[test]

@@ -1517,7 +1517,12 @@ impl GossipNode {
             .state
             .filter_applicable_stake_ops(&self.pending_stake_ops);
         candidate.slashing_evidence = self.pending_evidence.clone();
-        candidate.key_rotations = self.pending_key_rotations.clone();
+        // M241:只把能干净执行的换密钥 op 放进候选块(与 stake / gov / 知识 op 同样的纪律),
+        // 否则一条过期或签错的 op 会让整个候选块无法封装,把出块卡住。
+        candidate.key_rotations = self
+            .chain
+            .state
+            .filter_applicable_key_rotations(&self.pending_key_rotations);
         // SEC-01: include only governance ops that apply cleanly against current state
         // (in block order), so a stale/invalid staged op can't make the whole candidate
         // unproposable and stall production.
