@@ -246,14 +246,19 @@
       <kv><b>公钥</b><span class='mono'>${esc(session.pubkey)}</span></kv>
       <kv><b>密钥</b><span>由夜莺钱包保管 <span class='mut'>(每次签名都在钱包里确认;本机不保存任何密钥)</span></span></kv>
       <kv><b>状态</b><span id='idState'>${acct ? `账户 ${esc(acct.id)} · ${acct.established ? "已过见习期" : "见习期中(核验照常记录,但暂不计入可信度)"}` : "这个公钥还不是测试网成员:把它发给邀请你的成员"}</span></kv>
+      ${acct ? "" : `<p><button id='idCopyPk'>复制公钥</button> <span id='idCopyMsg' class='mut'>发给邀请你的成员;对方邀请后,刷新本页就能看到你的账户号</span></p>`}
       <p><button id='idLock'>退出</button></p>
       <h3 class='md'>写入令牌</h3>
       <p class='mut'>提交核验需要一个写入令牌,由组织者私下提供。它只用于防止刷写入,不代表你的身份。</p>
       <p><input id='idTok' type='password' size='40' placeholder='${U.token() ? "已保存(输入新值可替换)" : "粘贴写入令牌"}'> <button id='idTokSave'>保存</button> <span id='idTokMsg'></span></p>
       ${acct && acct.established ? `<h3 class='md'>邀请新成员</h3>
-        <p class='mut'>新成员用 <code>node keygen</code> 生成密钥、在钱包「账户管理 → 导入钱包 → 知行图」里导入后,把公钥(钱包里的账户地址)发给你。新成员有见习期;每位成员每天最多邀请一人。</p>
+        <p class='mut'>新成员在夜莺钱包「账户管理 → 创建钱包 → 知行图钱包」里创建账户,用钱包登录本站后点「复制公钥」发给你。新成员有见习期;每位成员每天最多邀请一人。</p>
         <p><input id='invPk' size='70' placeholder='新成员的公钥(64 位十六进制)'> <button id='invGo'>邀请</button> <span id='invMsg'></span></p>` : ""}`);
     el("idLock").addEventListener("click", () => { session = null; status(); showIdentity(); });
+    if (el("idCopyPk")) el("idCopyPk").addEventListener("click", async () => {
+      try { await navigator.clipboard.writeText(session.pubkey); msg("idCopyMsg", "已复制。发给邀请你的成员;对方邀请后,刷新本页", "ok"); }
+      catch (_) { msg("idCopyMsg", "复制失败,请手动选中上面的公钥复制", "err"); }
+    });
     el("idTokSave").addEventListener("click", () => { U.setToken(el("idTok").value); el("idTok").value = ""; msg("idTokMsg", "已保存", "ok"); });
     if (el("invGo")) el("invGo").addEventListener("click", async () => {
       const pk = el("invPk").value.trim().toLowerCase();
@@ -262,7 +267,7 @@
       try {
         msg("invMsg", "签名并提交中…");
         const n = await submit({ type: "invite", pubkey: pk });
-        msg("invMsg", (await waitNonce(n)) ? "已入块。新成员现在可以在钱包里导入密钥了" : "已提交,等待入块(稍后在成员列表查看)", "ok");
+        msg("invMsg", (await waitNonce(n)) ? "已入块。请告诉新成员刷新页面,就能看到自己的账户号" : "已提交,等待入块(稍后在成员列表查看)", "ok");
       } catch (e) { msg("invMsg", e.message, "err"); }
     });
   }
