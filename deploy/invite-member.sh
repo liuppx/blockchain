@@ -70,7 +70,9 @@ echo "邀请人:账户 #$INVITER(序号 $NONCE)"
 if [[ -n "${RPC_TOKEN:-}" ]]; then
   TOKEN="$RPC_TOKEN"
 else
-  TOKEN="$("${SSH[@]}" "grep '^RPC_TOKEN=' /opt/deploy/zhixing-testnet/config/node21.toml | cut -d'\"' -f2")"
+  # 写入令牌在节点的 [rpc] auth_token 里(不是 tokens.env 的 RPC_TOKEN——那个是给外部用的另一份)
+  TOKEN="$("${SSH[@]}" "sed -n '/^\[rpc\]/,/^\[/p' /opt/deploy/zhixing-testnet/config/node21.toml | grep -m1 'auth_token' | sed -E 's/.*=\s*\"([^\"]*)\".*/\1/'")"
+  if [[ -z "$TOKEN" ]]; then echo "取不到写入令牌" >&2; exit 1; fi
 fi
 RESP="$(curl -s --max-time 30 -X POST \
   -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/octet-stream" \
