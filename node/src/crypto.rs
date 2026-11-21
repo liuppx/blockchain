@@ -500,18 +500,16 @@ static BIP39_WORDLIST: [&str; 2048] = [
     "zoo",
 ];
 
-// ---- KDG 标准派生(SLIP-0044 coin type 1105 + SLIP-0010 ed25519) --------------------------
+// ---- 知行图成员密钥派生(SLIP-0044 coin type 1105 + SLIP-0010 ed25519) ---------------------
 //
-// 旧规则(`mnemonic_to_seed`):ed25519 种子 = BIP-39 种子的前 32 字节。一组助记词只对应一个账户,
-// 而且导出这把私钥就交出了主种子的一半。新成员一律用标准规则;旧规则只为兼容既有密钥保留。
-//
-// 标准规则:m/44'/1105'/account'/0'/0'(SLIP-0010 ed25519,各级都是硬化派生)。
+// 路径 m/44'/1105'/account'/0'/0'(各级都是硬化派生)。`node keygen` / `encrypt-key` 用它,
 // 与夜莺钱包的「知行图钱包」逐字节一致(钱包里同一组助记词得到同一个账户)。
+// (验证人配置里的 `mnemonic = …` 仍走 [`mnemonic_to_seed`],那是验证人密钥,不是成员密钥。)
 
 /// KnowDoGraph 在 SLIP-0044 的币种编号(satoshilabs/slips#2102)。
 pub const KDG_COIN_TYPE: u32 = 1105;
 
-/// BIP-39 助记词 → 完整的 64 字节种子(PBKDF2-HMAC-SHA512,2048 次)。ASCII-only,与 [`mnemonic_to_seed`] 相同。
+/// BIP-39 助记词 → 完整的 64 字节种子(PBKDF2-HMAC-SHA512,2048 次)。ASCII-only。
 pub fn mnemonic_to_bip39_seed(words: &str, passphrase: &str) -> Result<[u8; 64], MnemonicError> {
     if !words.is_ascii() || !passphrase.is_ascii() {
         return Err(MnemonicError::NonAscii);
@@ -613,10 +611,6 @@ mod tests {
             h(&kdg_standard_seed(words, "", 1).unwrap()),
             "de531680773d61fd269879584ec74d573ca325909ea732ab82cd1b6029345b6b"
         );
-        // 与旧规则(种子前 32 字节)不同
-        let mut legacy = [0u8; 32];
-        mnemonic_to_seed(words, "", &mut legacy).unwrap();
-        assert_ne!(legacy, kdg_standard_seed(words, "", 0).unwrap());
     }
 
     #[test]

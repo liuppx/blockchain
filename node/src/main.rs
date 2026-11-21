@@ -446,7 +446,7 @@ fn usage() {
     eprintln!("  node encode-stakeop --key-file F --out F --account N --kind bond|unbond --amount N  M229: author+sign a bond/unbond StakeOp into a raw op file for `node rpc --path /stake --post F`");
     eprintln!("  node inspect-tx --tx F [--pubkey HEX]  decode a codec-encoded tx file and print its fields + content hash; with --pubkey, also verify the signature (the read-side companion to encode-tx)");
     eprintln!("  node keygen --out F [--seed HEX]  generate (or derive from a 64-hex seed) an ed25519 keypair; write the seed file (for encode-tx --key-file) and print the pubkey");
-    eprintln!("  node keygen ... --mnemonic \"..\" [--account N | --legacy]  M241: mnemonics derive by the KDG standard m/44'/1105'/N'/0'/0' (same as YeYing Wallet); --legacy = old rule (first 32 bytes of the BIP-39 seed), only to recover early keys");
+    eprintln!("  node keygen ... --mnemonic \"..\" [--account N]  M241: mnemonics derive by m/44'/1105'/N'/0'/0' (SLIP-0010 ed25519, same as YeYing Wallet)");
     eprintln!("  node keygen ... --new-mnemonic [--encrypt]  M169/M175: generate a fresh BIP-39 mnemonic; --encrypt (M175) writes an encrypted Web3SS keystore to --out (prompts for a password) instead of a plaintext seed file");
     eprintln!("  node keygen ... --genesis-id N [--balance MICRO] [--power P]  also print a ready-to-paste genesis [[accounts]] (and, with --power, [[validators]]) entry");
     eprintln!("  node encrypt-key --out F [--passphrase S] [--force]  M175: encrypt an existing seed (64-hex) or BIP-39 mnemonic (read no-echo from the terminal) into a Web3 Secret Storage v3 keystore (scrypt + AES-128-CTR); prompts for an encryption password; the plaintext never touches disk; refuses to overwrite --out unless --force");
@@ -5053,31 +5053,16 @@ fn cmd_keygen(args: &[String]) {
     let supplied_mnemonic = opt_arg(args, "--mnemonic");
     let passphrase = opt_arg(args, "--passphrase").unwrap_or_default();
     let explicit_seed = opt_arg(args, "--seed");
-    // M241:助记词默认按 KDG 标准派生(SLIP-0010 m/44'/1105'/account'/0'/0',与夜莺钱包一致);
-    // `--legacy` 按旧规则(BIP-39 种子前 32 字节),只用于恢复早期生成的密钥。
-    let legacy = args.iter().any(|a| a == "--legacy");
+    // M241:助记词按 SLIP-0010 ed25519 派生,路径 m/44'/1105'/account'/0'/0'(与夜莺钱包一致)。
     let kdg_account: u32 = opt_arg(args, "--account")
         .map(|s| {
             s.parse()
                 .unwrap_or_else(|_| fail_msg("keygen --account", &"not a u32"))
         })
         .unwrap_or(0);
-    if legacy && opt_arg(args, "--account").is_some() {
-        fail_msg(
-            "keygen flags",
-            "--account only applies to the standard derivation (not --legacy)",
-        );
-    }
     let derive = |words: &str| -> [u8; 32] {
-        if legacy {
-            let mut seed = [0u8; 32];
-            zhixing_node::crypto::mnemonic_to_seed(words, passphrase, &mut seed)
-                .unwrap_or_else(|e| fail_msg("mnemonic derive", &e.to_string()));
-            seed
-        } else {
-            zhixing_node::crypto::kdg_standard_seed(words, passphrase, kdg_account)
-                .unwrap_or_else(|e| fail_msg("mnemonic derive", &e.to_string()))
-        }
+        zhixing_node::crypto::kdg_standard_seed(words, passphrase, kdg_account)
+            .unwrap_or_else(|e| fail_msg("mnemonic derive", &e.to_string()))
     };
 
     if (new_mnemonic || supplied_mnemonic.is_some()) && explicit_seed.is_some() {
@@ -5155,11 +5140,9 @@ fn cmd_keygen(args: &[String]) {
     let mut file_contents = String::new();
     if !mnemonic_text.is_empty() {
         file_contents.push_str("# zhixing-node validator key (M169 · BIP-39)\n");
-        file_contents.push_str(&if legacy {
-            "# derivation: legacy (BIP-39 seed[0..32])\n".to_string()
-        } else {
-            format!("# derivation: m/44'/1105'/{kdg_account}'/0'/0' (SLIP-0010)\n")
-        });
+        file_contents.push_str(&format!(
+            "# derivation: m/44'/1105'/{kdg_account}'/0'/0' (SLIP-0010)\n"
+        ));
         file_contents.push_str(&format!("# mnemonic: {mnemonic_text}\n"));
         file_contents.push_str(&format!(
             "# passphrase: {}\n",
@@ -5218,24 +5201,15 @@ fn cmd_encrypt_key(args: &[String]) {
         zhixing_node::crypto::validate_mnemonic(input)
             .unwrap_or_else(|e| fail_msg("mnemonic validate", &e.to_string()));
         let passphrase = opt_arg(args, "--passphrase").unwrap_or_default();
-        // M241:与 `node keygen` 同一套规则(默认 KDG 标准;`--legacy` 用旧规则),
-        // 否则 keygen 生成的密钥转成加密文件时公钥会变。
-        let legacy = args.iter().any(|a| a == "--legacy");
+        // M241:与 `node keygen` 同一套规则,否则 keygen 生成的密钥转成加密文件时公钥会变。
         let kdg_account: u32 = opt_arg(args, "--account")
             .map(|x| {
                 x.parse()
                     .unwrap_or_else(|_| fail_msg("encrypt-key --account", &"not a u32"))
             })
             .unwrap_or(0);
-        if legacy {
-            let mut s = [0u8; 32];
-            zhixing_node::crypto::mnemonic_to_seed(input, passphrase, &mut s)
-                .unwrap_or_else(|e| fail_msg("mnemonic derive", &e.to_string()));
-            s
-        } else {
-            zhixing_node::crypto::kdg_standard_seed(input, passphrase, kdg_account)
-                .unwrap_or_else(|e| fail_msg("mnemonic derive", &e.to_string()))
-        }
+        zhixing_node::crypto::kdg_standard_seed(input, passphrase, kdg_account)
+            .unwrap_or_else(|e| fail_msg("mnemonic derive", &e.to_string()))
     };
 
     let password = prompt_new_password();
@@ -6724,7 +6698,7 @@ mod tests {
         let words = mnemonic_line.trim_start_matches("# mnemonic:").trim();
         assert_eq!(words.split_whitespace().count(), 24);
         // Sanity: the seed we just read back matches the one we derive from the
-        // mnemonic — M241: by the KDG standard path (not the legacy first-32-bytes rule).
+        // mnemonic — M241: by the KDG path m/44'/1105'/0'/0'/0'.
         let derived = zhixing_node::crypto::kdg_standard_seed(words, "", 0)
             .expect("derive from on-disk mnemonic");
         assert_eq!(seed, derived);
@@ -6735,46 +6709,6 @@ mod tests {
         );
         // And the printed seed hex matches.
         assert_eq!(last_line, seed_hex);
-    }
-
-    #[test]
-    fn keygen_legacy_flag_uses_the_old_derivation_rule() {
-        // M241:`--legacy` 恢复早期规则(BIP-39 种子前 32 字节),默认(无 --legacy)是 KDG 标准路径。
-        let dir = std::env::temp_dir().join(format!("kdg-legacy-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let p = dir.join("legacy.seed");
-        let args = vec![
-            "keygen".to_string(),
-            "--out".to_string(),
-            p.to_string_lossy().to_string(),
-            "--mnemonic".to_string(),
-            "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about".to_string(),
-            "--legacy".to_string(),
-        ];
-        cmd_keygen(&args);
-        let text = std::fs::read_to_string(&p).expect("read");
-        let last_line = text.lines().last().expect("non-empty");
-        let seed = config::decode_seed(last_line, "--seed").expect("last line is a 64-hex seed");
-        let mut legacy = [0u8; 32];
-        zhixing_node::crypto::mnemonic_to_seed(
-            "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about",
-            "",
-            &mut legacy,
-        )
-        .expect("legacy derive");
-        assert_eq!(seed, legacy);
-        assert!(text.contains("# derivation: legacy"), "{text}");
-        // 标准规则下同一个助记词得到的是另一把密钥
-        assert_ne!(
-            seed,
-            zhixing_node::crypto::kdg_standard_seed(
-                "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about",
-                "",
-                0
-            )
-            .unwrap()
-        );
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

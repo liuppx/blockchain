@@ -133,12 +133,9 @@ python3 -m venv /tmp/kdg && /tmp/kdg/bin/pip install pyld rdflib
 
 ## 7b. 密钥派生与换密钥
 
-知行图账户的密钥是 ed25519。派生规则有两种:
-
-| 规则 | 路径 | 用于 |
-|---|---|---|
-| **标准** | SLIP-0010 ed25519,`m/44'/1105'/account'/0'/0'`(1105 = KnowDoGraph 在 SLIP-0044 的编号,satoshilabs/slips#2102) | 新成员;`node keygen` 默认、夜莺钱包「创建钱包 → 知行图钱包」 |
-| 旧 | ed25519 种子 = BIP-39 种子的前 32 字节 | 只为恢复早期生成的密钥(`node keygen --legacy`) |
+知行图账户的密钥是 ed25519,助记词按 SLIP-0010 ed25519 派生,路径 `m/44'/1105'/account'/0'/0'`
+(1105 = KnowDoGraph 在 SLIP-0044 的编号,satoshilabs/slips#2102)。`node keygen` 与夜莺钱包
+「创建钱包 → 知行图钱包」「导入钱包 → 知行图 → 助记词」都用这一条规则。
 
 两边的实现必须逐字节一致:链上有一条测试用钱包(JS)编码并签名的知识 op,链(Rust)解码并验签通过。
 
