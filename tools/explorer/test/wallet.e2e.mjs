@@ -187,6 +187,9 @@ test("钱包登录后核验:网页只递意图,钱包签出的操作被节点接
   await page.goto(WEB + "/?r=1#unit/" + target.id, { waitUntil: "networkidle0" });
   // 站点已授权:页面自动恢复登录,单元页上直接就是核验面板
   await page.waitForSelector("#rvNeeds", { timeout: 30000 });
+  // 判「需修改」要写一句具体是什么不对:它按哈希存进正文仓库,哈希记在链上
+  const NOTE = "组间休息写成了 10 秒,原文是 2–3 分钟";
+  await page.type("#rvNote", NOTE);
   await page.click("#rvNeeds"); // "需修改"不需要勾选核验要点
   const after = await waitFor(async () => { const n = (await rpc("/account/" + m.id)).nonce; return Number(n) > Number(before) ? n : null; }, 30000);
   assert.ok(after, "钱包签出的核验应被节点接受并入块");
@@ -197,11 +200,20 @@ test("钱包登录后核验:网页只递意图,钱包签出的操作被节点接
   const intent = sign.params[0];
   assert.deepEqual(Object.keys(intent).sort(), ["action", "actor", "nonce"]);
   assert.equal(intent.actor, String(m.id));
-  assert.deepEqual(intent.action, { type: "verify", unit: Number(target.id), version: intent.action.version, verdict: "needs-revision" });
+  // 说明的哈希进 action;网页不递待签字节
+  assert.equal(intent.action.type, "verify");
+  assert.equal(intent.action.unit, Number(target.id));
+  assert.equal(intent.action.verdict, "needs-revision");
+  assert.match(intent.action.noteHash || "", /^[0-9a-f]{64}$/, "说明的哈希应进 action");
+  // 说明的原文按哈希存进正文仓库
+  const noteBody = await (await fetch(WEB + "/bodies/" + intent.action.noteHash)).text();
+  assert.equal(noteBody, NOTE, "说明的原文应按哈希存进正文仓库");
 
   const detail = await rpc("/unit/" + target.id);
   const last = detail.versions[detail.versions.length - 1];
-  assert.ok(last.verifications.some((r) => String(r.verifier) === String(m.id)), "链上应能查到这位成员的核验记录");
+  const mine = last.verifications.find((r) => String(r.verifier) === String(m.id));
+  assert.ok(mine, "链上应能查到这位成员的核验记录");
+  assert.equal(mine.note_hash, intent.action.noteHash, "链上应记着说明的哈希");
   await ctx.close();
 });
 

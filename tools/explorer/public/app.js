@@ -474,7 +474,10 @@ async function showUnit(id) {
         `<a class='link' data-unit='${esc(x.unit)}'>#${esc(x.unit)} v${esc(x.version)}</a> <span class='mut'>(${esc(CITE_KIND_ZH[x.kind] || x.kind)})</span>`).join("<br>") : "<span class='mut'>—</span>";
       const stale = c.stale_cites.map(s => `<div class='err'>引用已过时:#${esc(s.unit)} 引用 v${esc(s.cited)},当前 v${esc(s.current)}</div>`).join("");
       const ver = v.verifications.length ? v.verifications.map(r =>
-        `account ${esc(r.verifier)} · ${r.verdict === "pass" ? "通过" : "需修改"} · height ${esc(r.height)}`).join("<br>") : "<span class='mut'>尚无核验</span>";
+        `account ${esc(r.verifier)} · ${r.verdict === "pass" ? "通过" : "需修改"} · height ${esc(r.height)}` +
+        (r.note_hash && !/^0+$/.test(r.note_hash)
+          ? `<br><span class='mut'>说明:${esc(short(r.note_hash))} <a class='link' data-note='${esc(r.note_hash)}'>看原文</a></span>`
+          : "")).join("<br>") : "<span class='mut'>尚无核验</span>";
       const bodies = v.bodies.map(b => `${esc(b.lang)}: <span class='mono hash'>${esc(short(b.hash))}</span>`).join("<br>");
       return `<h2 style='border:0;padding:12px 0 6px'>v${esc(v.n)}</h2>
         <kv><b>publisher / height</b>account ${esc(v.publisher)} · ${esc(v.published_height)}</kv>
@@ -494,6 +497,13 @@ async function showUnit(id) {
     el("kback").addEventListener("click", () => { history.replaceState(null, "", location.pathname); showTab("knowledge"); });
     // latest version expanded; older versions' bodies load too (they are usually the same text)
     el("view").querySelectorAll(".bodyslot").forEach(sl => fillBody(sl, sl.dataset.hash));
+    el("view").querySelectorAll("a[data-note]").forEach(a => a.addEventListener("click", async (e) => {
+      e.preventDefault(); e.stopPropagation();
+      const b = await fetchBody(a.dataset.note);
+      if (!b) { a.textContent = "说明没有上传到正文仓库"; return; }
+      if (!b.ok) { a.textContent = "说明与链上哈希不一致,已拒绝显示"; return; }
+      a.replaceWith(Object.assign(document.createElement("span"), { className: "mdbody", innerHTML: renderMd(b.text) }));
+    }));
     if (window.ZXMember) ZXMember.attachReview(u);
     if (window.ZXAuthor) ZXAuthor.attachUnit(u);
     if (window.ZXExplore) ZXExplore.attachExplore(u);
