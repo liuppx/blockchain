@@ -195,10 +195,18 @@ async function explore(req, res) {
   }
 }
 
-// GET /terrain   认知地形图:把引用关系投影成地形(峰/高原/山脊/山谷/断层)
+// GET /map(旧名 /terrain)  认知地图:引用关系、可信度与标题,供浏览器画图
 async function terrain(req, res) {
   try {
     const t = await TERRAIN.build();
+    // 标题在正文仓库里(链上只有哈希):有就带上,图上才能直接看到每个单元讲什么
+    try {
+      await INDEX.ensureFresh();
+      for (const n of t.nodes) {
+        const b = INDEX.bodies.get(n.body_hash);
+        n.title = b ? b.title : "";
+      }
+    } catch (_) { /* 正文仓库不可用时只是没有标题 */ }
     res.writeHead(200, { "Content-Type": "application/json; charset=utf-8", "Cache-Control": "no-store" })
       .end(JSON.stringify(t));
   } catch (e) {
@@ -357,7 +365,8 @@ http.createServer((req, res) => {
   if (req.url.startsWith("/status/")) return status(req, res);
   if (req.url === "/search" || req.url.startsWith("/search?")) return search(req, res);
   if (apiPathOf(req) === "/assign" || apiPathOf(req) === "/assign/pending") return assign(req, res);
-  if (req.url === "/terrain" || req.url.startsWith("/terrain?")) return terrain(req, res);
+  if (req.url === "/terrain" || req.url.startsWith("/terrain?") ||
+      req.url === "/map" || req.url.startsWith("/map?")) return terrain(req, res);
   // 精确匹配 API 路径:不能用 startsWith("/explore"),否则会吞掉静态文件 /explore.js
   const apiPath = new URL(req.url, "http://x").pathname;
   if (apiPath === "/explore" || apiPath === "/gaps" || apiPath === "/coverage") {

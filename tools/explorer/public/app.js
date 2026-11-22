@@ -67,7 +67,7 @@ async function refreshOverview() {
 }
 
 const TABS = [
-  ["knowledge", "Knowledge"], ["terrain", "地形图"], ["gaps", "缺口"], ["blocks", "Blocks"], ["tx", "Tx lookup"],
+  ["knowledge", "Knowledge"], ["terrain", "认知地图"], ["gaps", "缺口"], ["blocks", "Blocks"], ["tx", "Tx lookup"],
   ["account", "Account"], ["graph", "Graph"],
   ["cnfts", "cNFTs"], ["validators", "Validators"], ["staking", "Staking"],
   ["proposals", "Governance"], ["supply", "Supply"],
@@ -78,7 +78,7 @@ function renderTabs() {
 }
 function showTab(k) {
   TABS.forEach(([t]) => { const b = el("tab-"+t); if (b) b.className = (t===k ? "on" : ""); });
-  ({ knowledge:tabKnowledge, terrain:() => window.ZXTerrain ? ZXTerrain.show() : setView("<span class='mut'>地形图未加载</span>"),
+  ({ knowledge:tabKnowledge, terrain:() => window.ZXTerrain ? ZXTerrain.show() : setView("<span class='mut'>认知地图未加载</span>"),
      gaps:() => window.ZXExplore ? ZXExplore.showGaps() : setView("<span class='mut'>缺口视图未加载</span>"),
      blocks:tabBlocks, tx:tabTx, account:tabAccount, graph:tabGraph, validators:tabValidators,
      staking:tabStaking, proposals:tabProposals, cnfts:tabCnfts, supply:tabSupply })[k]();

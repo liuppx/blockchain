@@ -1,195 +1,276 @@
 "use strict";
-// 认知地形图(浏览器视图)。
+// 认知地图(浏览器视图)。
 //
-// 数据来自 /terrain:链上引用关系与可信度的投影。**不新增链上状态**,也不需要额外权限。
-// 地形元素(白皮书 §9):峰 / 高原 / 山脊 / 山谷 / 断层 / 陡坡。
+// 数据来自 /map:链上的引用关系、可信度,以及正文仓库里的标题。**不新增链上状态**,也不需要额外权限。
+// 读法:列 = 领域,行 = 层级(自下而上 基础 → 解释 → 场景 → 应用);
+//       点的颜色 = 有效可信度(越亮越可信),点的大小 = 有多少单元直接或间接依据它;
+//       实线 = 依据(可信度沿它传递),虚线 = 参见,红线 = 取代。
+// 用 SVG 画:文字清楚、悬停与点击可以落在每个点上。
 (function () {
-  const TAG_ZH = {
-    peak: "峰", plateau: "高原", ridge: "山脊",
-    valley: "山谷", fault: "断层", slope: "坡", plain: "平地",
-  };
-  const TAG_COLOR = {
-    peak: "#d9a441", plateau: "#7d9b76", ridge: "#8b6fc4",
-    valley: "#3b4a5a", fault: "#c4483f", slope: "#4a6d8c", plain: "#39414d",
-  };
+  const NS = "http://www.w3.org/2000/svg";
   const el = (id) => document.getElementById(id);
+  const LAYERS = ["foundation", "explanation", "scenario", "application"];
+  const LAYER_NAME = { foundation: "基础", explanation: "解释", scenario: "场景", application: "应用" };
+  const KIND_NAME = { basis: "依据", "see-also": "参见", supersedes: "取代" };
+  const LIFE_NAME = { active: "活跃", dormant: "休眠", contested: "竞争", superseded: "已取代" };
+  const TAG_NAME = { peak: "峰", plateau: "高原", ridge: "山脊", valley: "山谷", fault: "断层", slope: "坡", plain: "平地" };
+  // 有效可信度 → 单一蓝色色阶(暗底上越亮越可信)。已用 dataviz 校验器在 #0d1117 上校验:单色相、亮度单调、相邻可分辨。
+  const CRED = [[0.15, "#184f95", "0.1"], [0.3, "#256abf", "0.2"], [0.5, "#3987e5", "0.4"], [0.7, "#6da7ec", "0.6"], [Infinity, "#9ec5f4", "0.8+"]];
+  const credColor = (v) => CRED.find(([t]) => v < t)[1];
+  const radius = (n) => 6 + Math.min(10, Math.sqrt(n.downstream || 0) * 3);
+  const domainLabel = (d) => (typeof DOMAIN_ZH !== "undefined" && DOMAIN_ZH[d]) || ("领域 " + d);
 
-  function draw(canvas, data, opts) {
-    const dpr = window.devicePixelRatio || 1;
-    const W = canvas.clientWidth, H = canvas.clientHeight;
-    canvas.width = W * dpr; canvas.height = H * dpr;
-    const ctx = canvas.getContext("2d");
-    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-    ctx.clearRect(0, 0, W, H);
-    ctx.fillStyle = "#0d1117";
-    ctx.fillRect(0, 0, W, H);
+  function svg(tag, attrs, parent) {
+    const e = document.createElementNS(NS, tag);
+    for (const [k, v] of Object.entries(attrs || {})) e.setAttribute(k, v);
+    if (parent) parent.appendChild(e);
+    return e;
+  }
+  const clip = (s, max) => (s.length > max ? s.slice(0, max - 1) + "…" : s);
+  const shortTitle = (t) => (t || "").replace(/[((].*?[))]/g, "").split(/[::,,]/)[0].trim();
 
+  /**
+   * 布局:每个(领域,层级)格子里的点横向排开,放不下就换行。
+   * 先排基础层(按下游数从多到少),再自下而上按"所依据的点的平均横坐标"排上层,最后回头按上层重排基础层——
+   * 两遍重心排序,减少连线交叉。
+   */
+  function layout(data, W) {
     const nodes = data.nodes || [];
-    if (!nodes.length) return;
-    const cols = Math.max(1, ...nodes.map((n) => n.col)) + 1;
-    const rows = Math.max(1, ...nodes.map((n) => n.row)) + 1;
-    const padX = 70, padY = 40, padB = 46;
-    const cw = (W - padX * 2) / cols;
-    const usableH = H - padY - padB;
-    // 每层的带高:层数少时给足高度(地形要有起伏),层数多时压缩
-    const ch = usableH / Math.max(1, rows);
+    const domains = [...new Set(nodes.map((n) => n.domain))].sort((a, b) => Number(a) - Number(b));
+    const layers = LAYERS.filter((l) => nodes.some((n) => n.layer === l));
+    const padL = 64, padR = 16, padT = 40, colGap = 24;
+    const colW = (W - padL - padR - colGap * (domains.length - 1)) / Math.max(1, domains.length);
+    const slot = 128;                       // 每个点占的最小宽度(放得下一行短标题)
+    const perLine = Math.max(1, Math.floor(colW / slot));
+    const lineH = 76;
+    const cell = (d, l) => nodes.filter((n) => n.domain === d && n.layer === l);
+    const x = new Map();
+    const byId = new Map(nodes.map((n) => [n.id, n]));
+    const basisOut = (n) => n.cites.filter((e) => e.kind === "basis").map((e) => e.to).filter((t) => byId.has(t));
+    const basisIn = (n) => n.cited_by.filter((e) => e.kind === "basis").map((e) => e.from);
+    const mean = (ids) => { const xs = ids.map((i) => x.get(i)).filter((v) => v !== undefined); return xs.length ? xs.reduce((a, b) => a + b, 0) / xs.length : null; };
 
-    // 节点位置:每个层级一条带(基础在下),带内按领域分列、同一格里再散开。
-    // 层级带的高度按该层单元数分配(人多的层更宽),避免所有单元挤在一列。
-    const byRow = new Map();
-    for (const n of nodes) {
-      if (!byRow.has(n.row)) byRow.set(n.row, []);
-      byRow.get(n.row).push(n);
-    }
-    const rowHeights = [];
-    let totalUnits = 0;
-    for (const [, list] of byRow) totalUnits += list.length;
-    for (let r = 0; r < rows; r++) {
-      const cnt = (byRow.get(r) || []).length;
-      rowHeights.push(totalUnits ? cnt / totalUnits : 1 / rows);
-    }
-    const pos = new Map();
-    for (let r = 0; r < rows; r++) {
-      const list = (byRow.get(r) || []).sort((a, b) => Number(a.id) - Number(b.id));
-      if (!list.length) continue;
-      const bandH = rowHeights[r] * usableH;
-      const bandBottom = H - padB - rowHeights.slice(0, r).reduce((a, b) => a + b, 0) * usableH;
-      // 带内按领域分组,每组横向排开
-      const byCol = new Map();
-      for (const n of list) {
-        if (!byCol.has(n.col)) byCol.set(n.col, []);
-        byCol.get(n.col).push(n);
-      }
-      const groups = [...byCol.values()];
-      const groupW = (W - padX * 2) / groups.length;
-      groups.forEach((grp, gi) => {
-        const cx = padX + gi * groupW + groupW / 2;
-        const per = Math.max(1, Math.ceil(Math.sqrt(grp.length)));
-        grp.forEach((n, i) => {
-          const gx = Math.floor(i / per), gy = i % per;
-          const spread = Math.min(groupW * 0.75, bandH * 0.75);
-          const ox = (gx - (per - 1) / 2) * (spread / per) * 1.8;
-          const oy = (gy - (per - 1) / 2) * (spread / per) * 1.4;
-          const lift = n.height * (bandH * 0.5);
-          pos.set(n.id, { x: cx + ox, y: bandBottom - lift + oy, n });
-        });
+    // 每层需要几行
+    const linesOf = (l) => Math.max(1, ...domains.map((d) => Math.ceil(cell(d, l).length / perLine)));
+    const rowH = layers.map((l) => linesOf(l) * lineH + 24);
+    const H = padT + rowH.reduce((a, b) => a + b, 0) + 8;
+    // 行的上边界:基础在最下
+    const rowTop = new Map();
+    let y = padT;
+    for (let i = layers.length - 1; i >= 0; i--) { rowTop.set(layers[i], y); y += rowH[i]; }
+
+    const place = (d, l, order) => {
+      const colX = padL + domains.indexOf(d) * (colW + colGap);
+      order.forEach((n, i) => {
+        const line = Math.floor(i / perLine), k = i % perLine;
+        const inLine = Math.min(perLine, order.length - line * perLine);
+        const step = colW / inLine;
+        n._x = colX + step * (k + 0.5);
+        n._w = step;                         // 这个点能用的宽度(决定标题能显示几个字)
+        n._y = rowTop.get(l) + 26 + line * lineH;
+        x.set(n.id, n._x);
       });
+    };
+    const sortBy = (list, key) => list.slice().sort((a, b) => {
+      const ka = key(a), kb = key(b);
+      if (ka === null && kb === null) return Number(a.id) - Number(b.id);
+      if (ka === null) return 1; if (kb === null) return -1;
+      return ka - kb || Number(a.id) - Number(b.id);
+    });
+    // 第一遍:基础按下游数(重要的居中靠前),上层按依据的重心
+    for (const d of domains) {
+      const base = cell(d, "foundation").sort((a, b) => (b.downstream - a.downstream) || (Number(a.id) - Number(b.id)));
+      place(d, "foundation", base);
     }
+    for (const l of layers.filter((l) => l !== "foundation")) for (const d of domains) place(d, l, sortBy(cell(d, l), (n) => mean(basisOut(n))));
+    // 第二遍:基础层按依据它的上层点的重心重排,再重排上层
+    for (const d of domains) place(d, "foundation", sortBy(cell(d, "foundation"), (n) => mean(basisIn(n))));
+    for (const l of layers.filter((l) => l !== "foundation")) for (const d of domains) place(d, l, sortBy(cell(d, l), (n) => mean(basisOut(n))));
+    return { domains, layers, H, padL, padT, colW, colGap, rowTop, rowH, slot: Math.min(slot, colW) };
+  }
 
-    // 层带:底色与名称,让人读得出"这是哪一层"
-    const LAYERS = [["application", "应用"], ["scenario", "场景"], ["explanation", "解释"], ["foundation", "基础"]];
-    ctx.textAlign = "right";
-    ctx.font = "11px ui-monospace,Menlo,monospace";
-    for (let r = 0; r < rows; r++) {
-      const cnt = (byRow.get(r) || []).length;
-      if (!cnt) continue;
-      const bandH = rowHeights[r] * usableH;
-      const bandBottom = H - padB - rowHeights.slice(0, r).reduce((a, b) => a + b, 0) * usableH;
-      ctx.fillStyle = "rgba(255,255,255,.025)";
-      ctx.fillRect(padX - 20, bandBottom - bandH, W - padX * 2 + 40, bandH);
-      ctx.fillStyle = "#6e7681";
-      const name = (LAYERS.find((l) => l[0] === ["foundation", "explanation", "scenario", "application"][r]) || [, ""])[1];
-      ctx.fillText(name + " " + cnt, padX - 26, bandBottom - bandH / 2);
-    }
-    ctx.textAlign = "left";
+  function draw(host, data, onPick) {
+    host.querySelectorAll(":scope > svg").forEach((x) => x.remove());   // 只换图,保留提示框
+    const W = Math.max(640, host.clientWidth);
+    const L = layout(data, W);
+    const root = svg("svg", { width: W, height: L.H, viewBox: `0 0 ${W} ${L.H}`, role: "img",
+      "aria-label": "认知地图:按领域与层级排列的知识单元及其引用关系" });
+    host.insertBefore(root, host.firstChild);
+    root.style.display = "block";
+    root.style.fontFamily = "ui-sans-serif,system-ui,-apple-system,'PingFang SC','Noto Sans CJK SC',sans-serif";
 
-    // 连线:依据(实线)/参见(虚线)/取代(红)
-    ctx.lineWidth = 1;
+    // 层级带与名称
+    L.layers.forEach((l, i) => {
+      const top = L.rowTop.get(l), h = L.rowH[i];
+      svg("rect", { x: 8, y: top, width: W - 16, height: h - 4, rx: 6, fill: i % 2 ? "rgba(255,255,255,.015)" : "rgba(255,255,255,.035)" }, root);
+      const t = svg("text", { x: 20, y: top + h / 2, fill: "#8b949e", "font-size": 12, "dominant-baseline": "middle" }, root);
+      t.textContent = LAYER_NAME[l];
+    });
+    // 领域列标题
+    L.domains.forEach((d, i) => {
+      const cx = L.padL + i * (L.colW + L.colGap) + L.colW / 2;
+      const t = svg("text", { x: cx, y: 22, fill: "#e6edf3", "font-size": 13, "font-weight": 600, "text-anchor": "middle" }, root);
+      t.textContent = domainLabel(d);
+      if (i > 0) svg("line", { x1: cx - L.colW / 2 - L.colGap / 2, x2: cx - L.colW / 2 - L.colGap / 2, y1: 34, y2: L.H - 8,
+        stroke: "#30363d", "stroke-dasharray": "2 4" }, root);
+    });
+
+    const byId = new Map(data.nodes.map((n) => [n.id, n]));
+    // 连线:从依据者指向被依据者;依据在上层,弯向下方
+    const edgeG = svg("g", { fill: "none" }, root);
+    const edgeEls = [];
     for (const e of data.edges || []) {
-      const a = pos.get(e.from), b = pos.get(e.to);
+      const a = byId.get(e.from), b = byId.get(e.to);
       if (!a || !b) continue;
-      ctx.strokeStyle = e.kind === "supersedes" ? "rgba(196,72,63,.65)" :
-        e.kind === "basis" ? "rgba(120,150,190,.34)" : "rgba(140,140,160,.18)";
-      ctx.setLineDash(e.kind === "see-also" ? [3, 3] : []);
-      ctx.beginPath();
-      ctx.moveTo(a.x, a.y);
-      ctx.bezierCurveTo(a.x, (a.y + b.y) / 2, b.x, (a.y + b.y) / 2, b.x, b.y);
-      ctx.stroke();
+      const my = (a._y + b._y) / 2;
+      const p = svg("path", {
+        d: `M${a._x},${a._y} C${a._x},${my} ${b._x},${my} ${b._x},${b._y}`,
+        stroke: e.kind === "supersedes" ? "#f85149" : e.kind === "basis" ? "#6e7f96" : "#4a525e",
+        "stroke-width": e.kind === "basis" ? 1.5 : 1,
+        "stroke-dasharray": e.kind === "see-also" ? "3 4" : "",
+        opacity: e.kind === "see-also" ? 0.6 : 0.8,
+      }, edgeG);
+      edgeEls.push({ el: p, e });
     }
-    ctx.setLineDash([]);
 
-    // 节点:半径按被引数,颜色按地形类型,高度已经体现在 y 上
-    for (const [, p] of pos) {
-      const n = p.n;
-      const r = 3 + Math.min(9, Math.sqrt(n.cited_by.length) * 2.2);
-      ctx.beginPath();
-      ctx.fillStyle = TAG_COLOR[n.tags[0]] || TAG_COLOR.plain;
-      ctx.globalAlpha = 0.35 + 0.65 * (n.effective || 0);
-      ctx.arc(p.x, p.y, r, 0, Math.PI * 2);
-      ctx.fill();
-      ctx.globalAlpha = 1;
-      if (opts && opts.labels && (n.tags[0] === "peak" || n.tags[0] === "ridge" || n.tags[0] === "fault")) {
-        ctx.fillStyle = "#c9d1d9";
-        ctx.font = "11px ui-monospace,Menlo,monospace";
-        ctx.textAlign = "center";
-        ctx.fillText("#" + n.id, p.x, p.y - r - 4);
+    // 节点
+    const nodeG = svg("g", {}, root);
+    const nodeEls = new Map();
+    for (const n of data.nodes) {
+      const g = svg("g", { transform: `translate(${n._x},${n._y})`, tabindex: 0, role: "button",
+        "aria-label": `#${n.id} ${n.title || ""},${LAYER_NAME[n.layer]},可信度 ${n.effective}` }, nodeG);
+      g.style.cursor = "pointer";
+      const r = radius(n);
+      svg("circle", { r: r + 10, fill: "transparent" }, g);                         // 命中区比点大
+      svg("circle", { r, fill: credColor(n.effective), stroke: "#0d1117", "stroke-width": 2,
+        "stroke-dasharray": n.lifecycle === "superseded" ? "3 2" : "",
+        opacity: n.lifecycle === "superseded" ? 0.5 : 1 }, g);
+      // 标题加一圈底色描边:连线从文字下面穿过时字仍然清楚
+      const label = svg("text", { y: r + 15, "text-anchor": "middle", "font-size": 12, fill: "#c9d1d9",
+        stroke: "#11151b", "stroke-width": 4, "stroke-linejoin": "round", "paint-order": "stroke" }, g);
+      const max = Math.max(4, Math.floor(((n._w || L.slot) - 12) / 12.5));
+      label.textContent = clip(`#${n.id} ${shortTitle(n.title)}`.trim(), max);
+      nodeEls.set(n.id, g);
+      const focus = () => highlight(n.id);
+      g.addEventListener("mouseenter", (ev) => { focus(); tip(ev, n); });
+      g.addEventListener("mousemove", (ev) => tip(ev, n));
+      g.addEventListener("mouseleave", () => { highlight(null); tip(null); });
+      g.addEventListener("focus", focus);
+      g.addEventListener("blur", () => highlight(null));
+      g.addEventListener("click", () => onPick(n));
+      g.addEventListener("keydown", (ev) => { if (ev.key === "Enter" || ev.key === " ") { ev.preventDefault(); onPick(n); } });
+    }
+
+    // 悬停:只亮这个点、它连着的线和邻居,其余变淡
+    function highlight(id) {
+      const near = new Set(id ? [id] : []);
+      for (const { e } of edgeEls) if (id && (e.from === id || e.to === id)) { near.add(e.from); near.add(e.to); }
+      // 只淡出圆点,标题文字保持可读(不然整张图会"消失"一块)
+    for (const [nid, g] of nodeEls) {
+      const keep = !id || near.has(nid);
+      const dot = g.querySelector("circle:nth-of-type(2)");
+      if (dot) dot.style.opacity = keep ? 1 : 0.22;
+      const lab = g.querySelector("text");
+      if (lab) lab.style.opacity = keep ? 1 : 0.45;
+    }
+      for (const { el: p, e } of edgeEls) {
+        const on = id && (e.from === id || e.to === id);
+        p.style.opacity = !id ? "" : on ? 1 : 0.06;
+        p.setAttribute("stroke-width", on ? 2.5 : e.kind === "basis" ? 1.5 : 1);
       }
     }
+    // 悬停提示
+    const tipEl = el("mapTip");
+    function tip(ev, n) {
+      if (!tipEl) return;
+      if (!ev) { tipEl.style.display = "none"; return; }
+      tipEl.innerHTML = `<b>#${esc(n.id)} ${esc(n.title || "(正文未上传)")}</b><br>
+        ${esc(LAYER_NAME[n.layer])} · ${esc(domainLabel(n.domain))} · ${esc(LIFE_NAME[n.lifecycle] || n.lifecycle)}<br>
+        有效可信度 <b>${esc(n.effective)}</b> · ${n.passes} 位核验通过<br>
+        ${n.downstream ? `${n.downstream} 个单元直接或间接依据它` : "还没有单元依据它"}`;
+      tipEl.style.display = "block";
+      const box = host.getBoundingClientRect();
+      const tw = tipEl.offsetWidth, th = tipEl.offsetHeight;
+      let left = ev.clientX - box.left + 14;
+      let top = ev.clientY - box.top + 14;
+      if (left + tw > box.width - 4) left = Math.max(4, ev.clientX - box.left - tw - 14);
+      if (top + th > box.height - 4) top = Math.max(4, ev.clientY - box.top - th - 14);
+      tipEl.style.left = left + "px";
+      tipEl.style.top = top + "px";
+    }
+    return root;
+  }
 
-    // 图例(横向一行)
-    ctx.textAlign = "left";
-    ctx.font = "12px ui-monospace,Menlo,monospace";
-    const shown = Object.entries(TAG_ZH).filter(([tag]) => (data.summary.by_tag || {})[tag]);
-    const w = Math.max(80, (W - 40) / Math.max(1, shown.length));
-    shown.forEach(([tag, zh], i) => {
-      const x = 20 + i * w, y = H - 22;
-      ctx.fillStyle = TAG_COLOR[tag];
-      ctx.beginPath(); ctx.arc(x, y - 4, 5, 0, Math.PI * 2); ctx.fill();
-      ctx.fillStyle = "#8b949e";
-      ctx.fillText(zh + " " + ((data.summary.by_tag || {})[tag] || 0), x + 12, y);
-    });
-    return pos;
+  function legend(data) {
+    const s = data.summary || {};
+    const credSw = CRED.map(([, c, label]) =>
+      `<span class='mapLg'><i style='background:${c}'></i>${label}</span>`).join("");
+    return `<div class='mapLegend'>
+      <span><b>颜色</b> 有效可信度 ${credSw}</span>
+      <span><b>大小</b> 依据它的单元数</span>
+      <span><b>连线</b>
+        <span class='mapLg'><svg width='26' height='8'><line x1='0' y1='4' x2='26' y2='4' stroke='#6e7f96' stroke-width='1.5'/></svg>依据</span>
+        <span class='mapLg'><svg width='26' height='8'><line x1='0' y1='4' x2='26' y2='4' stroke='#4a525e' stroke-dasharray='3 4'/></svg>参见</span>
+        <span class='mapLg'><svg width='26' height='8'><line x1='0' y1='4' x2='26' y2='4' stroke='#f85149'/></svg>取代</span>
+      </span>
+      <span class='mut'>${s.nodes} 个单元 · ${s.edges} 条引用 · ${s.domains} 个领域</span>
+    </div>`;
+  }
+
+  function table(data) {
+    const rows = data.nodes.slice().sort((a, b) => (b.downstream - a.downstream) || (Number(a.id) - Number(b.id)));
+    return `<table><tr><th>单元</th><th>标题</th><th>领域</th><th>层级</th><th>有效可信度</th><th>核验通过</th><th>依据它的单元</th><th>状态</th></tr>` +
+      rows.map((n) => `<tr><td><a class='link' data-unit='${esc(n.id)}'>#${esc(n.id)}</a></td><td>${esc(n.title || "—")}</td>
+        <td>${esc(domainLabel(n.domain))}</td><td>${esc(LAYER_NAME[n.layer])}</td><td>${esc(n.effective)}</td>
+        <td>${n.passes}</td><td>${n.downstream}</td><td>${esc(LIFE_NAME[n.lifecycle] || n.lifecycle)}</td></tr>`).join("") + "</table>";
   }
 
   async function show() {
     setView("<span class='mut'>正在读取知识图…</span>");
     let data;
     try {
-      const r = await fetch("/terrain");
+      if (typeof loadDomains === "function" && typeof DOMAIN_ZH !== "undefined" && !Object.keys(DOMAIN_ZH).length) await loadDomains();
+      const r = await fetch("/map");
       if (!r.ok) throw new Error("HTTP " + r.status);
       data = await r.json();
     } catch (e) {
-      setView(`<span class='err'>地形数据读取失败:${esc(e.message)}</span>`);
+      setView(`<span class='err'>认知地图读取失败:${esc(e.message)}</span>`);
       return;
     }
-    const s = data.summary || {};
-    setView(`<h2 style='border:0;padding:0 0 4px'>认知地形图</h2>
-      <p class='mut'>这是知识图的一种读法:横轴是领域,纵轴是层级(自下而上 基础 → 解释 → 场景 → 应用),
-      高度是可信度与被引用程度,颜色是地形类型。<b>数据全部来自链上已有的引用与核验记录</b>,不新增任何链上状态。</p>
-      <p class='mut'>${s.nodes} 个单元 · ${s.edges} 条引用 · ${s.domains} 个领域 ·
-      标签:${Object.entries(s.by_tag || {}).map(([k, v]) => (TAG_ZH[k] || k) + " " + v).join(" · ")}</p>
-      <canvas id='terrainCv' style='width:100%;height:520px;border:1px solid var(--line);border-radius:6px'></canvas>
-      <p class='mut'><label><input type='checkbox' id='terrainLabels' checked> 标出峰 / 山脊 / 断层</label></p>
-      <div id='terrainPick' class='mut'></div>`);
-    const cv = el("terrainCv");
-    let pos = null;
-    const render = () => {
-      pos = draw(cv, data, { labels: el("terrainLabels").checked });
-    };
-    el("terrainLabels").addEventListener("change", render);
-    setTimeout(render, 30);
-    // 点击节点:显示它的地形属性与引用
-    cv.addEventListener("click", (ev) => {
-      const rect = cv.getBoundingClientRect();
-      const x = ev.clientX - rect.left, y = ev.clientY - rect.top;
-      let best = null, bestD = 1e9;
-      for (const [id, p] of pos || []) {
-        const d = Math.hypot(p.x - x, p.y - y);
-        if (d < bestD && d < 18) { bestD = d; best = { id, p }; }
-      }
-      const box = el("terrainPick");
-      if (!best) { box.innerHTML = ""; return; }
-      const n = best.p.n;
-      const cites = n.cites.map((e) => `#${e.to}(${KIND_ZH[e.kind] || e.kind})`).join("、") || "—";
-      const cited = n.cited_by.map((e) => `#${e.from}`).join("、") || "—";
+    if (!(data.nodes || []).length) { setView("<h2 style='border:0;padding:0 0 4px'>认知地图</h2><p class='mut'>链上还没有知识单元。</p>"); return; }
+    setView(`<h2 style='border:0;padding:0 0 4px'>认知地图</h2>
+      <p class='mut'>每个点是一个知识单元。列是领域,行是层级(自下而上 基础 → 解释 → 场景 → 应用),
+      连线是引用。<b>先核验大的、暗的点</b>:很多单元依据它,而它的可信度还低,核验它抬高的最多。
+      数据全部来自链上的引用与核验记录。</p>
+      ${legend(data)}
+      <div id='mapHost' style='position:relative;margin-top:8px;border:1px solid var(--line);border-radius:6px;background:var(--bg);overflow:hidden'>
+        <div id='mapTip' role='tooltip' style='display:none;position:absolute;z-index:2;max-width:320px;pointer-events:none;
+          background:var(--panel);border:1px solid var(--line);border-radius:6px;padding:8px 10px;font-size:12px;line-height:1.6'></div>
+      </div>
+      <div id='mapPick' class='mut'></div>
+      <details style='margin-top:12px'><summary class='mut'>表格视图</summary>${table(data)}</details>`);
+    const host = el("mapHost");
+    const pick = (n) => {
+      const box = el("mapPick");
+      const cites = n.cites.map((e) => `#${esc(e.to)}(${esc(KIND_NAME[e.kind] || e.kind)})`).join("、") || "—";
+      const cited = n.cited_by.map((e) => `#${esc(e.from)}`).join("、") || "—";
       box.innerHTML = `<div style='margin-top:10px;border-top:1px solid var(--line);padding-top:8px'>
-        <b>#${esc(n.id)}</b> · ${esc(n.layer_zh)} · 领域 ${esc(n.domain)} · ${esc(TAG_ZH[n.tags[0]] || n.tags[0])}
-        · 可信度 ${esc(n.effective)} · ${n.passes} 位核验通过 · 被引 ${n.cited_by.length} 次
-        <br>它依据:${esc(cites)}<br>它被引用于:${esc(cited)}
+        <b>#${esc(n.id)} ${esc(n.title || "")}</b> · ${esc(LAYER_NAME[n.layer])} · ${esc(domainLabel(n.domain))}
+        · 有效可信度 ${esc(n.effective)} · ${n.passes} 位核验通过 · ${esc(LIFE_NAME[n.lifecycle] || n.lifecycle)}
+        · 图上的位置:${esc(TAG_NAME[n.tags[0]] || n.tags[0])}
+        <br>它引用:${cites}<br>引用它的:${cited}
         <br><a class='link' data-unit='${esc(n.id)}'>打开这个单元 →</a></div>`;
       box.querySelector("a[data-unit]").addEventListener("click", () => showUnit(n.id));
-    });
+    };
+    const render = () => draw(host, data, pick);
+    render();
+    // 宽度变了就重排(只在这个视图还在时)
+    let t = null;
+    const onResize = () => { if (!document.body.contains(host)) return window.removeEventListener("resize", onResize); clearTimeout(t); t = setTimeout(render, 150); };
+    window.addEventListener("resize", onResize);
+    document.querySelectorAll("#view a[data-unit]").forEach((a) => a.addEventListener("click", () => showUnit(a.dataset.unit)));
   }
 
-  window.ZXTerrain = { show, draw };
+  window.ZXMap = { show, draw, layout };
+  window.ZXTerrain = window.ZXMap;   // 旧名,兼容
 })();

@@ -67,4 +67,4 @@ python3 sim/run.py --rust         # 用 Rust 后端跑全部场景矩阵
 
 - 当前 kNN 为暴力线性扫描；生产环境应换 HNSW / IVF 等 ANN 索引（可引入 `hnsw_rs` 等 crate）。
 - 嵌入维度固定为 8（`DIM`）以利缓存与自动向量化；实际维度更高时需重新评估。
-- pyo3 绑定已就绪（Milestone 5）；后续可进一步编译到 WASM 供前端认知地形图使用，或通过 FFI 暴露给链上节点。
+- pyo3 绑定已就绪（Milestone 5）；后续可进一步编译到 WASM 供前端认知地图使用，或通过 FFI 暴露给链上节点。
