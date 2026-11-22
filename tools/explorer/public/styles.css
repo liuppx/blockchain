@@ -55,3 +55,7 @@ select { background:#0d1117; color:var(--fg); border:1px solid var(--line); bord
 .mapLegend b { color:var(--fg); font-weight:600; margin-right:6px; }
 .mapLg { display:inline-flex; align-items:center; gap:4px; margin-right:8px; }
 .mapLg i { display:inline-block; width:10px; height:10px; border-radius:50%; }
+.mapBar { display:flex; flex-wrap:wrap; align-items:center; gap:8px 16px; margin:8px 0 2px; font-size:12px; }
+.mapSeg { display:inline-flex; border:1px solid var(--line); border-radius:6px; overflow:hidden; }
+.mapSeg button { border:0; border-radius:0; margin:0; padding:4px 14px; background:transparent; color:var(--mut); }
+.mapSeg button[aria-pressed="true"] { background:var(--panel); color:var(--fg); }
