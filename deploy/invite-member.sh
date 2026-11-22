@@ -62,6 +62,25 @@ if [[ "$FILE_PK" != "$CUR_PK" ]]; then
 fi
 echo "邀请人:账户 #$INVITER(序号 $NONCE)"
 
+# 新成员已经在链上了就不用再邀请
+case "$(curl -s --max-time 20 "$SITE/lookup?pubkey=$PUBKEY")" in
+  *'"found":true'*) echo "这个公钥已经是成员了,不用再邀请" >&2; exit 1 ;;
+esac
+
+# 邀请冷却:每位成员每 COOLDOWN 块最多邀请一人。提交前先算,冷却中就直接说还要等多久
+COOLDOWN="${INVITE_COOLDOWN_BLOCKS:-86400}"
+SEC_PER_BLOCK="${SECONDS_PER_BLOCK:-1.2}"   # 测试网实测约 1.2 秒一块
+LAST="$(curl -s --max-time 20 "$RPC/members" | awk -v a="$INVITER" '$1=="id="a {for(i=1;i<=NF;i++) if($i~/^last_invite_height=/){split($i,kv,"=");print kv[2]}}')"
+HEIGHT="$(curl -s --max-time 20 "$RPC/height" | tr -dc '0-9')"
+if [[ -n "$LAST" && "$LAST" != "0" && -n "$HEIGHT" ]]; then
+  LEFT=$(( LAST + COOLDOWN - HEIGHT ))
+  if (( LEFT > 0 )); then
+    HOURS="$(awk -v b="$LEFT" -v s="$SEC_PER_BLOCK" 'BEGIN{printf "%.1f", b*s/3600}')"
+    echo "账户 #$INVITER 还在邀请冷却中:上次邀请在高度 $LAST,还要再等 $LEFT 块(约 $HOURS 小时)" >&2
+    exit 1
+  fi
+fi
+
 # 签名(本地)
 "$NODE_BIN" encode-knowledge-op --key-file "$KEY_FILE" --out "$WORK/invite.bin" \
   --actor "$INVITER" --nonce "$NONCE" --action invite --pubkey "$PUBKEY" >/dev/null
@@ -78,6 +97,11 @@ RESP="$(curl -s --max-time 30 -X POST \
   -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/octet-stream" \
   --data-binary "@$WORK/invite.bin" "$RPC/knowledge")"
 echo "  提交结果:$RESP"
+# 链接受时只回一个 64 位十六进制的 op 哈希;别的都是拒绝原因,直接退出,不再等
+if [[ ! "$RESP" =~ ^[0-9a-f]{64}$ ]]; then
+  echo "链拒绝了这条邀请:$RESP" >&2
+  exit 1
+fi
 
 # 等入块:新成员的账户号
 for _ in $(seq 1 60); do
