@@ -35,11 +35,13 @@ ssh "$HOST" "systemctl is-active $SERVICE; md5sum $DEST/public/member.js $DEST/p
 echo "== 同步 → $HOST:$DEST"
 # --delete 让远端不留旧文件;排除本机依赖、测试与日志。
 # reference/ 是 op 编码与签名的参考实现(只给测试用),不部署:服务器上不放任何私钥代码。
+# scripts/ 是开发机上的构建脚本(如重新生成 public/vendor/three),也不部署。
 # 注意:node_modules 不在远端安装(浏览器服务零依赖),排除它以免传垃圾。
 rsync -az --delete \
   --exclude 'node_modules' \
   --exclude 'test' \
   --exclude 'reference' \
+  --exclude 'scripts' \
   --exclude '*.log' \
   --exclude 'package-lock.json' \
   "$SRC/" "$HOST:$DEST/"
