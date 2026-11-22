@@ -113,6 +113,36 @@ ZHIXING_SKIP_NODES=1 ZHIXING_CHECK_TUNNEL=1 /opt/zhixing/deploy/monitor-testnet.
 链自身的 Prometheus 指标与告警规则见 [`docs/ops/`](../docs/ops/)(`zhixing_height`、`zhixing_peers_connected`、
 `zhixing_slashing_events_total` 等);本机未部署 Prometheus,故用上面的定时脚本覆盖同样的关键指标。
 
+## 正文镜像(新机)
+
+链上只存正文的 SHA-256,正文本身在旧机的正文仓库里(`/opt/zhixing/bodies`)。仓库只有一份时,
+那台机器的盘坏了,链上的哈希就成了空壳。新机上因此留一份**可核对的副本**:
+
+| 项 | 位置 |
+|---|---|
+| 副本目录 | `/data/zhixing-testnet/bodies-mirror/`(正文按哈希存,另有 `STATUS.json` 与 `MANIFEST.json`) |
+| 定时任务 | `/etc/cron.d/zhixing-body-mirror`(每小时第 17 分)→ `/opt/zhixing/deploy/body-mirror.sh` |
+| 工具 | `/opt/zhixing/tools/body_mirror.py`(仓库 `tools/body_mirror.py`,纯标准库) |
+| 监控 | `monitor-testnet.sh` 读 `STATUS.json`:副本是否齐全、是否按时更新、主仓库是否丢了正文;异常照旧发飞书 |
+
+副本收的是链上**全部版本**的正文,以及核验时写了说明的那些说明正文(`note_hash`;全 0 表示没写说明)。
+每份都重新核对 SHA-256,哈希不符的内容一个字节都不落盘。
+
+```sh
+# 手动跑一次(新机)
+/opt/zhixing/deploy/body-mirror.sh
+tail -6 /opt/logs/zhixing-body-mirror.log
+
+# 只检查主仓库是否完整(任何机器;不写盘,缺了就非零退出)
+/opt/zhixing/tools/body_mirror.py --check
+
+# 主仓库丢了正文时,用副本补回去(写入令牌放环境变量,不进命令行)
+ZHIXING_BODY_TOKEN=… python3 /opt/zhixing/tools/body_mirror.py \
+  --dest /data/zhixing-testnet/bodies-mirror --restore-to https://blockchain.yeying.pub
+```
+
+`tools/body_mirror.py` 也能单独用:任何人都能拿链上的引用去核对正文,不需要信任浏览器服务。
+
 ## 已停用
 
 | 文件 | 原因 |
