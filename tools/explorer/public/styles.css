@@ -59,3 +59,8 @@ select { background:#0d1117; color:var(--fg); border:1px solid var(--line); bord
 .mapSeg { display:inline-flex; border:1px solid var(--line); border-radius:6px; overflow:hidden; }
 .mapSeg button { border:0; border-radius:0; margin:0; padding:4px 14px; background:transparent; color:var(--mut); }
 .mapSeg button[aria-pressed="true"] { background:var(--panel); color:var(--fg); }
+/* 立体视图(three.js)的文字:HTML 叠加,带底色描边,连线和山体从下面穿过时仍清楚 */
+.m3Lbl span { display:inline-block; transform:translateY(-50%); font-size:12px; color:#c9d1d9; white-space:nowrap;
+  text-shadow:0 0 3px #0d1117, 0 0 3px #0d1117, 0 0 6px #0d1117; transition:opacity .15s; }
+.m3Axis { font-size:12px; color:#8b949e; text-shadow:0 0 4px #0d1117; }
+.m3Dom { font-size:13px; font-weight:600; color:#e6edf3; text-shadow:0 0 4px #0d1117; }

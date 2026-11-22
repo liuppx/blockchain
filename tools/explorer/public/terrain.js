@@ -212,6 +212,26 @@
   const rgbOf = (h) => { const n = parseInt(h.slice(1), 16); return [(n >> 16) & 255, (n >> 8) & 255, n & 255]; };
   const TERRAIN_LO = rgbOf("#141920"), TERRAIN_HI = rgbOf("#5a6678");
 
+  // 立体视图的入口:先试 three.js(WebGL,更好看),不支持就用下面手写的 Canvas 版。
+  // three.js 只在切到「立体」时才下载(动态 import),平面图与首页不受影响。
+  let threePromise = null;
+  function loadThree() {
+    if (!threePromise) threePromise = import("./map3d.js").catch((e) => { threePromise = null; throw e; });
+    return threePromise;
+  }
+
+  async function mount3d(host, data, onPick) {
+    let inst = null;
+    try {
+      const mod = await loadThree();
+      inst = mod.mount(host, data, onPick, api);
+      if (inst) return inst;
+    } catch (e) {
+      console.warn("three.js 立体视图不可用,改用内置版本:", e && e.message);
+    }
+    return draw3d(host, data, onPick);       // 手写版:同样的接口
+  }
+
   function draw3d(host, data, onPick) {
     host.querySelectorAll(":scope > svg, :scope > canvas").forEach((x) => x.remove());
     const dpr = window.devicePixelRatio || 1;
@@ -569,17 +589,22 @@
         <br><a class='link' data-unit='${esc(n.id)}'>打开这个单元 →</a></div>`;
       box.querySelector("a[data-unit]").addEventListener("click", () => showUnit(n.id));
     };
-    let mode = "2d", ctl3d = null;
-    const render = () => {
+    let mode = "2d", ctl3d = null, gen = 0;
+    const render = async () => {
+      const my = ++gen;                       // 快速来回切时,旧的那次挂载要作废
       if (ctl3d) { ctl3d.stop(); ctl3d = null; }
       showTip(host, null);
-      if (mode === "3d") ctl3d = draw3d(host, data, pick);
-      else { host.querySelectorAll(":scope > canvas").forEach((x) => x.remove()); draw(host, data, pick); }
       el("mapLegendBox").innerHTML = legend(data, mode);
       el("map2d").setAttribute("aria-pressed", String(mode === "2d"));
       el("map3d").setAttribute("aria-pressed", String(mode === "3d"));
       el("map3dCtl").style.display = mode === "3d" ? "" : "none";
-      if (ctl3d) el("mapSpin").textContent = ctl3d.auto ? "暂停旋转" : "自动旋转";
+      if (mode === "2d") { host.querySelectorAll(":scope > canvas").forEach((x) => x.remove()); draw(host, data, pick); return; }
+      const ctl = await mount3d(host, data, pick);
+      if (my !== gen) { ctl && ctl.stop(); return; }   // 已经切走了
+      ctl3d = ctl;
+      const spin = (on) => { el("mapSpin").textContent = on ? "暂停旋转" : "自动旋转"; };
+      spin(ctl && ctl.auto);
+      if (ctl && "onAuto" in ctl) ctl.onAuto = spin;   // 用户一拖就停转,按钮跟着变
     };
     el("map2d").addEventListener("click", () => { if (mode !== "2d") { mode = "2d"; render(); } });
     el("map3d").addEventListener("click", () => { if (mode !== "3d") { mode = "3d"; render(); } });
@@ -588,11 +613,17 @@
     render();
     // 宽度变了就重排(只在这个视图还在时)
     let t = null;
-    const onResize = () => { if (!document.body.contains(host)) return window.removeEventListener("resize", onResize); clearTimeout(t); t = setTimeout(render, 150); };
+    const onResize = () => {
+      if (!document.body.contains(host)) return window.removeEventListener("resize", onResize);
+      clearTimeout(t);
+      t = setTimeout(() => { if (mode === "3d" && ctl3d && ctl3d.resize) ctl3d.resize(); else render(); }, 150);
+    };
     window.addEventListener("resize", onResize);
     document.querySelectorAll("#view a[data-unit]").forEach((a) => a.addEventListener("click", () => showUnit(a.dataset.unit)));
   }
 
-  window.ZXMap = { show, draw, draw3d, layout };
+  // 立体视图用到的公共件(手写版与 three.js 版共用)
+  const api = { layout, credColor, clip, shortTitle, domainLabel, LAYER_NAME, showTip };
+  window.ZXMap = { show, draw, draw3d, mount3d, layout };
   window.ZXTerrain = window.ZXMap;   // 旧名,兼容
 })();
