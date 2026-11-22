@@ -1,5 +1,5 @@
 "use strict";
-// 认知地形图:把知识图渲染成可导航的地形。
+// 认知地图:把知识图(引用关系与可信度)整理成可导航的图。
 //
 // 数据来源:链上的引用关系(依据 / 参见 / 取代)与可信度——**不新增任何链上状态**。
 // 地形元素的定义(白皮书 §9):
@@ -114,6 +114,13 @@ class TerrainBuilder {
       n.importance = (1 + basisIn * 1.5 + n.passes * 0.6) * layerW;
       // 领域连通性:山脊要连接多个领域
       n.domains = [...new Set([n.domain, ...n.cited_by.map((e) => (byId.get(e.to) || {}).domain).filter(Boolean)])];
+    }
+    // 下游:直接或间接依据它的单元数
+    const basisUp = new Map(nodes.map((n) => [n.id, n.cited_by.filter((e) => e.kind === "basis").map((e) => e.from)]));
+    for (const n of nodes) {
+      const seen = new Set(), todo = [...(basisUp.get(n.id) || [])];
+      while (todo.length) { const x = todo.pop(); if (seen.has(x) || x === n.id) continue; seen.add(x); todo.push(...(basisUp.get(x) || [])); }
+      n.downstream = seen.size;
     }
     // 地形分类
     for (const n of nodes) {

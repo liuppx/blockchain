@@ -1509,32 +1509,25 @@ impl GossipNode {
                 gov_votes: Vec::new(),
                 knowledge_ops: Vec::new(),
             });
-        // M235: include only stake-ops that apply cleanly AND don't trip the §10.11 share cap,
-        // so a stale/over-cap bond can't make the whole candidate unsealable and stall
-        // production (mirrors the gov filter below / SEC-01).
-        candidate.stake_ops = self
-            .chain
-            .state
-            .filter_applicable_stake_ops(&self.pending_stake_ops);
         candidate.slashing_evidence = self.pending_evidence.clone();
-        candidate.key_rotations = self.pending_key_rotations.clone();
-        // SEC-01: include only governance ops that apply cleanly against current state
-        // (in block order), so a stale/invalid staged op can't make the whole candidate
-        // unproposable and stall production.
-        let (gp, gv) = self.chain.state.filter_applicable_gov(
-            self.chain.state.height + 1,
-            &self.pending_gov_proposals,
-            &self.pending_gov_votes,
-        );
-        // K4:知识 op 在治理 op 之后执行、共用账户序号,所以在已选入的治理 op 之上过滤。
-        candidate.knowledge_ops = self.chain.state.filter_applicable_knowledge(
-            self.chain.state.height + 1,
-            &gp,
-            &gv,
-            &self.pending_knowledge_ops,
-        );
-        candidate.gov_proposals = gp;
-        candidate.gov_votes = gv;
+        // M241:候选块里的各类 op 按**区块的应用顺序**(stake → 换密钥 → 治理 → 知识)在同一个
+        // 试算副本上挑出来:每类只保留能干净执行的那些,一条过期或签错的 op 就不会让整个
+        // 候选块无法封装、把出块卡住。顺序不能乱——换密钥会换掉公钥并推进序号,后面的 op
+        // 必须看到换密钥之后的账户状态。
+        let (kept_stake, kept_rotations, kept_props, kept_votes, kept_knowledge) =
+            self.chain.state.select_candidate_ops(
+                self.chain.state.height + 1,
+                &self.pending_stake_ops,
+                &self.pending_key_rotations,
+                &self.pending_gov_proposals,
+                &self.pending_gov_votes,
+                &self.pending_knowledge_ops,
+            );
+        candidate.stake_ops = kept_stake;
+        candidate.key_rotations = kept_rotations;
+        candidate.gov_proposals = kept_props;
+        candidate.gov_votes = kept_votes;
+        candidate.knowledge_ops = kept_knowledge;
         // M122: this node is the proposer of the block it builds — credit its own
         // validator id so the tx fees route to it. Only a block actually elected and
         // committed keeps this; a losing candidate is discarded.

@@ -30,6 +30,8 @@ __pycache__/
 
 # ./cmd single-node local network state (keystores + data + logs; never commit)
 /.localnet/
+# 试运行的答案材料(埋错清单、红队剧本):结束前只有组织者持有,不进 git;开始时只公布它的 SHA-256
+/.pilot/
 
 # YeYing Project local task state
 /.project/

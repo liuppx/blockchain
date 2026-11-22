@@ -484,6 +484,13 @@ enum Cmd {
         op: Box<crate::GovVote>,
         reply: oneshot::Sender<Result<Hash, crate::ChainError>>,
     },
+    /// M241: submit a signed `KeyRotation` (account key swap) to a running node (stage + flood).
+    /// The write counterpart of the read side; verifies the signature against the account's
+    /// **current** key before staging, and `Ok(hash)` once staged.
+    SubmitKeyRotation {
+        op: Box<crate::KeyRotation>,
+        reply: oneshot::Sender<Result<Hash, crate::ChainError>>,
+    },
     /// M229: submit a signed bond/unbond `StakeOp` to a running node (stage + flood), the
     /// write counterpart to the `/bonds` read. Verifies the signature; `Ok(hash)` once staged.
     SubmitStakeOp {
@@ -1922,6 +1929,28 @@ async fn run_actor(mut actor: Actor, mut rx: mpsc::UnboundedReceiver<Cmd>) {
                     .map(|(&id, m)| (id, m.clone(), state.knowledge.is_established(id, h)))
                     .collect();
                 let _ = reply.send(list);
+            }
+            Cmd::SubmitKeyRotation { op, reply } => {
+                // M241: verify the account's CURRENT key authorized the swap, then stage + flood.
+                // (The nonce check and the active-validator guard live in `apply_key_rotation`,
+                // which rolls the whole block back on failure — same discipline as stake ops.)
+                let res = match actor.node.chain.state.accounts.get(&op.account) {
+                    Some(acct)
+                        if verify(
+                            &acct.pubkey,
+                            &crate::codec::keyrotation_signing_bytes(&op),
+                            &op.signature,
+                        ) =>
+                    {
+                        let h = op.hash();
+                        let out = actor.node.submit_local_key_rotation(*op);
+                        actor.route(out);
+                        Ok(h)
+                    }
+                    Some(_) => Err(crate::ChainError::BadSignature(op.account)),
+                    None => Err(crate::ChainError::UnknownAccount(op.account)),
+                };
+                let _ = reply.send(res);
             }
             Cmd::SubmitStakeOp { op, reply } => {
                 // M229: verify the account's signature, then stage + flood the stake op
@@ -8326,6 +8355,44 @@ async fn serve_rpc_conn(
         let _ = stream.flush().await;
         return;
     }
+    if path == "/key-rotation" {
+        // M241: `POST /key-rotation` carries a raw codec-encoded KeyRotation (the account's
+        // current key authorizes the swap to a new pubkey). Same shape as `/stake`.
+        let op = match crate::codec::decode_key_rotation(&body) {
+            Ok(op) => op,
+            Err(e) => {
+                let _ = stream
+                    .write_all(error_body(fmt, "400 Bad Request", &e.to_string()).as_bytes())
+                    .await;
+                let _ = stream.flush().await;
+                return;
+            }
+        };
+        let (reply, rx) = oneshot::channel();
+        if cmd
+            .send(Cmd::SubmitKeyRotation {
+                op: Box::new(op),
+                reply,
+            })
+            .is_err()
+        {
+            let _ = stream
+                .write_all(http_response("503 Service Unavailable", "node stopped").as_bytes())
+                .await;
+            return;
+        }
+        let resp = match rx.await {
+            Ok(Ok(h)) => {
+                let hex = crate::hash::hex(&h);
+                ok_body(fmt, &hex, &format!("{{\"hash\":{}}}", json_str(&hex)))
+            }
+            Ok(Err(e)) => error_body(fmt, "422 Unprocessable Entity", &e.to_string()),
+            Err(_) => http_response("503 Service Unavailable", "node stopped"),
+        };
+        let _ = stream.write_all(resp.as_bytes()).await;
+        let _ = stream.flush().await;
+        return;
+    }
     if path == "/stake" {
         // M229: `POST /stake` carries a raw codec-encoded StakeOp (bond/unbond); the actor
         // verifies the signature, stages + floods it, and replies the op hash.
@@ -14315,6 +14382,113 @@ mod tests {
         // Pre-flight must NOT admit the tx: the mempool stays empty.
         let mem = get(rpc_addr, "/mempool").await;
         assert_eq!(body_of(&mem), "total=0", "validate must not admit: {mem}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn rpc_key_rotation_swaps_an_account_key_and_keeps_the_account_id() {
+        // M241: `POST /key-rotation` stages a KeyRotation signed by the account's CURRENT key.
+        // After it commits: the account keeps its id and nonce advances; the old key can no
+        // longer authorize anything (a second rotation signed by it is rejected).
+        let dir = tmp_dir("rpc-key-rotation");
+        let mut cfg = node_config(50, 22011, &[50], dir.clone());
+        let rpc_addr = "127.0.0.1:22051";
+        cfg.rpc = Some(crate::config::RpcConfig {
+            enabled: true,
+            listen: rpc_addr.into(),
+            auth_token: String::new(),
+            enable_tls: false,
+        });
+        let mut genesis = test_genesis();
+        genesis.validators = vec![(50, kp(50).public(), 1)]; // quorum 1 ⇒ self-commit
+        let _node = Node::start(cfg, genesis, Some(kp(50)), None)
+            .await
+            .expect("start node");
+
+        async fn post(addr: &str, path: &str, body: &[u8]) -> String {
+            let mut req = format!(
+                "POST {path} HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            )
+            .into_bytes();
+            req.extend_from_slice(body);
+            let mut s = TcpStream::connect(addr).await.expect("connect rpc");
+            s.write_all(&req).await.expect("send post");
+            let mut resp = Vec::new();
+            s.read_to_end(&mut resp).await.expect("read response");
+            String::from_utf8_lossy(&resp).into_owned()
+        }
+        async fn get(addr: &str, path: &str) -> String {
+            let req =
+                format!("GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
+            let mut s = TcpStream::connect(addr).await.expect("connect rpc");
+            s.write_all(req.as_bytes()).await.expect("send get");
+            let mut resp = Vec::new();
+            s.read_to_end(&mut resp).await.expect("read response");
+            String::from_utf8_lossy(&resp).into_owned()
+        }
+        fn body_of(resp: &str) -> &str {
+            resp.split_once("\r\n\r\n").map(|(_, b)| b).unwrap_or("")
+        }
+
+        // The new key: a fresh keypair not bound to any account.
+        let new_kp = Keypair::from_seed([0x5a; 32]);
+        let new_pub = new_kp.public();
+        // Signed by the CURRENT key (account #1's key), nonce = the account's nonce.
+        let op = crate::KeyRotation {
+            account: 1,
+            new_pubkey: new_pub,
+            nonce: 0,
+            signature: [0u8; 64],
+        }
+        .signed(&kp(1));
+        let bytes = crate::codec::encode_key_rotation(&op);
+        let resp = post(rpc_addr, "/key-rotation", &bytes).await;
+        assert!(
+            resp.starts_with("HTTP/1.1 200 OK"),
+            "rotation status: {resp}"
+        );
+
+        // Wait until the account's key on chain is the new one.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let accounts = get(rpc_addr, "/accounts").await;
+            let body = body_of(&accounts);
+            if body.contains(&crate::hash::hex(&new_pub)) {
+                // The account id is unchanged, and its nonce advanced (the old key is dead).
+                assert!(body.contains("id=1 "), "account #1 keeps its id: {body}");
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "rotation never applied: {body}"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+
+        // A second rotation signed by the OLD key is rejected (it is no longer account #1's key).
+        let stale = crate::KeyRotation {
+            account: 1,
+            new_pubkey: Keypair::from_seed([0x6b; 32]).public(),
+            nonce: 1,
+            signature: [0u8; 64],
+        }
+        .signed(&kp(1));
+        let resp = post(
+            rpc_addr,
+            "/key-rotation",
+            &crate::codec::encode_key_rotation(&stale),
+        )
+        .await;
+        assert!(
+            resp.starts_with("HTTP/1.1 422"),
+            "stale key must be rejected: {resp}"
+        );
+        assert!(
+            body_of(&resp).contains("signature"),
+            "reason mentions the signature: {resp}"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }

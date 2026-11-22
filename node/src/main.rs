@@ -333,6 +333,7 @@ fn main() {
         "encode-gov-proposal" => cmd_encode_gov_proposal(&args),
         "encode-gov-vote" => cmd_encode_gov_vote(&args),
         "encode-knowledge-op" => cmd_encode_knowledge_op(&args),
+        "encode-key-rotation" => cmd_encode_key_rotation(&args),
         "hash-content" => cmd_hash_content(&args),
         "encode-stakeop" => cmd_encode_stakeop(&args),
         "keygen" => cmd_keygen(&args),
@@ -439,11 +440,13 @@ fn usage() {
     eprintln!("  node encode-tx --key-file F --out F --author N --domain N --stake N --embedding f,..(DIM) --review R:S.. --repl-success N --repl-total N --timestamp-days F [--fee MICRO] [--nonce N] [--config F]  author+sign a tx offline into a submit-tx file; print its hash; M122: --fee paid to the proposer (default 0), --nonce must equal the author's account nonce (default 0); M233: --key-file is a raw 64-hex seed OR an encrypted keystore (ZHIXING_KEYSTORE_PASSWORD) — same for encode-stakeop/encode-gov-*");
     eprintln!("  node encode-gov-proposal --key-file F --out F --proposer N --param name=value --voting-period N [--nonce N]  M228: author+sign a GovProposal (param: base_emission|slash_bps|decay_half_life) into a raw op file for `node rpc --path /gov/proposal --post F`");
     eprintln!("  node encode-gov-vote --key-file F --out F --proposal-id N --voter N --approve true|false [--nonce N]  M228: author+sign a GovVote into a raw op file for `node rpc --path /gov/vote --post F`");
+    eprintln!("  node encode-key-rotation --key-file F --out F --account N --nonce N --new-pubkey HEX   M241: sign an account key swap with the CURRENT key; submit with `node rpc --path /key-rotation --post F`");
     eprintln!("  node encode-knowledge-op --key-file F --out F --actor N [--nonce N] --action create|publish|verify|invite ...  K5: author+sign a knowledge op for `node rpc --path /knowledge --post F`. create: --layer foundation|explanation|scenario|application --domain N --body LANG:SHA256HEX.. --source human|model:ID|model-verified:ID [--cite UNIT:VER:basis|see-also|supersedes ..]; publish: --unit N + body/source/cite; verify: --unit N --version N --verdict pass|needs-revision [--note-hash HEX]; invite: --pubkey HEX");
     eprintln!("  node hash-content --file F [--store DIR]  K5: print the SHA-256 of a knowledge body file (the hash a version records on chain); --store copies it to DIR/<hash> (content-addressed body store)");
     eprintln!("  node encode-stakeop --key-file F --out F --account N --kind bond|unbond --amount N  M229: author+sign a bond/unbond StakeOp into a raw op file for `node rpc --path /stake --post F`");
     eprintln!("  node inspect-tx --tx F [--pubkey HEX]  decode a codec-encoded tx file and print its fields + content hash; with --pubkey, also verify the signature (the read-side companion to encode-tx)");
     eprintln!("  node keygen --out F [--seed HEX]  generate (or derive from a 64-hex seed) an ed25519 keypair; write the seed file (for encode-tx --key-file) and print the pubkey");
+    eprintln!("  node keygen ... --mnemonic \"..\" [--account N]  M241: mnemonics derive by m/44'/1105'/N'/0'/0' (SLIP-0010 ed25519, same as YeYing Wallet)");
     eprintln!("  node keygen ... --new-mnemonic [--encrypt]  M169/M175: generate a fresh BIP-39 mnemonic; --encrypt (M175) writes an encrypted Web3SS keystore to --out (prompts for a password) instead of a plaintext seed file");
     eprintln!("  node keygen ... --genesis-id N [--balance MICRO] [--power P]  also print a ready-to-paste genesis [[accounts]] (and, with --power, [[validators]]) entry");
     eprintln!("  node encrypt-key --out F [--passphrase S] [--force]  M175: encrypt an existing seed (64-hex) or BIP-39 mnemonic (read no-echo from the terminal) into a Web3 Secret Storage v3 keystore (scrypt + AES-128-CTR); prompts for an encryption password; the plaintext never touches disk; refuses to overwrite --out unless --force");
@@ -4864,6 +4867,38 @@ fn cmd_encode_knowledge_op(args: &[String]) {
     println!("out {out_path}");
 }
 
+/// M241:签一条账户换密钥的 op(用账户**当前**的密钥签),写出原始字节,
+/// 交给 `node rpc --path /key-rotation --post F` 提交。换完后账户编号、成员身份与全部历史不变,
+/// 之后的知识 op 改用新密钥签名。
+fn cmd_encode_key_rotation(args: &[String]) {
+    let key_path = req_arg(args, "--key-file");
+    let out_path = req_arg(args, "--out");
+    let account: u64 = parse_arg(args, "--account");
+    let nonce: u64 = parse_arg(args, "--nonce");
+    let new_pubkey = parse_hash32(req_arg(args, "--new-pubkey"))
+        .unwrap_or_else(|e| fail_msg("encode-key-rotation new-pubkey", &e));
+    let kp = Keypair::from_seed(read_seed_from_key_file(key_path));
+    if kp.public() == new_pubkey {
+        fail_msg("encode-key-rotation", &"new pubkey equals the current key");
+    }
+    let op = KeyRotation {
+        account,
+        new_pubkey,
+        nonce,
+        signature: [0u8; 64],
+    }
+    .signed(&kp);
+    let bytes = zhixing_node::codec::encode_key_rotation(&op);
+    if let Err(e) = zhixing_node::codec::decode_key_rotation(&bytes) {
+        fail_msg("encode-key-rotation self-check", &e);
+    }
+    std::fs::write(out_path, &bytes).unwrap_or_else(|e| fail("write op file", e));
+    println!("current {}", hex(&kp.public()));
+    println!("new     {}", hex(&new_pubkey));
+    println!("encoded {}", hex(&op.hash()));
+    println!("out {out_path}");
+}
+
 /// K5:计算知识正文文件的 SHA-256(版本在链上记录的正是这个哈希)。`--store DIR` 时把文件复制为
 /// `DIR/<hash>`,形成以哈希为文件名的内容寻址正文仓库(测试网阶段正文存放于 Git 仓库)。
 fn cmd_hash_content(args: &[String]) {
@@ -5018,6 +5053,17 @@ fn cmd_keygen(args: &[String]) {
     let supplied_mnemonic = opt_arg(args, "--mnemonic");
     let passphrase = opt_arg(args, "--passphrase").unwrap_or_default();
     let explicit_seed = opt_arg(args, "--seed");
+    // M241:助记词按 SLIP-0010 ed25519 派生,路径 m/44'/1105'/account'/0'/0'(与夜莺钱包一致)。
+    let kdg_account: u32 = opt_arg(args, "--account")
+        .map(|s| {
+            s.parse()
+                .unwrap_or_else(|_| fail_msg("keygen --account", &"not a u32"))
+        })
+        .unwrap_or(0);
+    let derive = |words: &str| -> [u8; 32] {
+        zhixing_node::crypto::kdg_standard_seed(words, passphrase, kdg_account)
+            .unwrap_or_else(|e| fail_msg("mnemonic derive", &e.to_string()))
+    };
 
     if (new_mnemonic || supplied_mnemonic.is_some()) && explicit_seed.is_some() {
         fail_msg(
@@ -5039,18 +5085,12 @@ fn cmd_keygen(args: &[String]) {
             .unwrap_or_else(|e| fail_msg("keygen rng", &e.to_string()));
         let words = zhixing_node::crypto::mnemonic_generate(&entropy)
             .unwrap_or_else(|e| fail_msg("mnemonic generate", &e.to_string()));
-        let mut seed = [0u8; 32];
-        zhixing_node::crypto::mnemonic_to_seed(&words, passphrase, &mut seed)
-            .unwrap_or_else(|e| fail_msg("mnemonic derive", &e.to_string()));
-        (seed, words)
+        (derive(&words), words)
     } else if let Some(words) = supplied_mnemonic {
         // Re-derive from a known mnemonic (recovery / test fixture).
         zhixing_node::crypto::validate_mnemonic(words)
             .unwrap_or_else(|e| fail_msg("mnemonic validate", &e.to_string()));
-        let mut seed = [0u8; 32];
-        zhixing_node::crypto::mnemonic_to_seed(words, passphrase, &mut seed)
-            .unwrap_or_else(|e| fail_msg("mnemonic derive", &e.to_string()));
-        (seed, words.to_string())
+        (derive(words), words.to_string())
     } else {
         // Legacy `--seed <64hex>` or fresh CSPRNG.
         let seed = match explicit_seed {
@@ -5100,6 +5140,9 @@ fn cmd_keygen(args: &[String]) {
     let mut file_contents = String::new();
     if !mnemonic_text.is_empty() {
         file_contents.push_str("# zhixing-node validator key (M169 · BIP-39)\n");
+        file_contents.push_str(&format!(
+            "# derivation: m/44'/1105'/{kdg_account}'/0'/0' (SLIP-0010)\n"
+        ));
         file_contents.push_str(&format!("# mnemonic: {mnemonic_text}\n"));
         file_contents.push_str(&format!(
             "# passphrase: {}\n",
@@ -5158,10 +5201,15 @@ fn cmd_encrypt_key(args: &[String]) {
         zhixing_node::crypto::validate_mnemonic(input)
             .unwrap_or_else(|e| fail_msg("mnemonic validate", &e.to_string()));
         let passphrase = opt_arg(args, "--passphrase").unwrap_or_default();
-        let mut s = [0u8; 32];
-        zhixing_node::crypto::mnemonic_to_seed(input, passphrase, &mut s)
-            .unwrap_or_else(|e| fail_msg("mnemonic derive", &e.to_string()));
-        s
+        // M241:与 `node keygen` 同一套规则,否则 keygen 生成的密钥转成加密文件时公钥会变。
+        let kdg_account: u32 = opt_arg(args, "--account")
+            .map(|x| {
+                x.parse()
+                    .unwrap_or_else(|_| fail_msg("encrypt-key --account", &"not a u32"))
+            })
+            .unwrap_or(0);
+        zhixing_node::crypto::kdg_standard_seed(input, passphrase, kdg_account)
+            .unwrap_or_else(|e| fail_msg("mnemonic derive", &e.to_string()))
     };
 
     let password = prompt_new_password();
@@ -6649,12 +6697,16 @@ mod tests {
             .expect("mnemonic line");
         let words = mnemonic_line.trim_start_matches("# mnemonic:").trim();
         assert_eq!(words.split_whitespace().count(), 24);
-        // Sanity: the seed we just read back matches the one we derive
-        // from the mnemonic + empty passphrase.
-        let mut derived = [0u8; 32];
-        zhixing_node::crypto::mnemonic_to_seed(words, "", &mut derived)
+        // Sanity: the seed we just read back matches the one we derive from the
+        // mnemonic — M241: by the KDG path m/44'/1105'/0'/0'/0'.
+        let derived = zhixing_node::crypto::kdg_standard_seed(words, "", 0)
             .expect("derive from on-disk mnemonic");
         assert_eq!(seed, derived);
+        // The file records which derivation rule was used.
+        assert!(
+            text.contains("# derivation: m/44'/1105'/0'/0'/0'"),
+            "{text}"
+        );
         // And the printed seed hex matches.
         assert_eq!(last_line, seed_hex);
     }

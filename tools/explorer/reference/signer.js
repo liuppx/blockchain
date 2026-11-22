@@ -89,7 +89,27 @@
     const key = await subtle.importKey("raw", enc.encode(norm), "PBKDF2", false, ["deriveBits"]);
     const bits = await subtle.deriveBits(
       { name: "PBKDF2", hash: "SHA-512", salt: enc.encode("mnemonic" + passphrase), iterations: 2048 }, key, 512);
-    return new Uint8Array(bits).slice(0, 32);
+    // 知行图成员密钥:SLIP-0010 ed25519,路径 m/44'/1105'/0'/0'/0'(与节点 keygen、夜莺钱包一致)
+    return slip10Ed25519(new Uint8Array(bits), [44, 1105, 0, 0, 0]);
+  }
+
+  async function hmacSha512(key, data) {
+    const k = await subtle.importKey("raw", key, { name: "HMAC", hash: "SHA-512" }, false, ["sign"]);
+    return new Uint8Array(await subtle.sign("HMAC", k, data));
+  }
+
+  /** SLIP-0010 ed25519(各级硬化):返回路径末端的 32 字节种子。 */
+  async function slip10Ed25519(seed, path) {
+    let I = await hmacSha512(enc.encode("ed25519 seed"), seed);
+    let key = I.slice(0, 32), chain = I.slice(32);
+    for (const index of path) {
+      const data = new Uint8Array(37);
+      data.set(key, 1);
+      new DataView(data.buffer).setUint32(33, (index | 0x80000000) >>> 0, false);
+      I = await hmacSha512(chain, data);
+      key = I.slice(0, 32); chain = I.slice(32);
+    }
+    return key;
   }
 
   // ---- ed25519 ----------------------------------------------------------------

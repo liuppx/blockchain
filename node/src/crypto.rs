@@ -500,6 +500,64 @@ static BIP39_WORDLIST: [&str; 2048] = [
     "zoo",
 ];
 
+// ---- 知行图成员密钥派生(SLIP-0044 coin type 1105 + SLIP-0010 ed25519) ---------------------
+//
+// 路径 m/44'/1105'/account'/0'/0'(各级都是硬化派生)。`node keygen` / `encrypt-key` 用它,
+// 与夜莺钱包的「知行图钱包」逐字节一致(钱包里同一组助记词得到同一个账户)。
+// (验证人配置里的 `mnemonic = …` 仍走 [`mnemonic_to_seed`],那是验证人密钥,不是成员密钥。)
+
+/// KnowDoGraph 在 SLIP-0044 的币种编号(satoshilabs/slips#2102)。
+pub const KDG_COIN_TYPE: u32 = 1105;
+
+/// BIP-39 助记词 → 完整的 64 字节种子(PBKDF2-HMAC-SHA512,2048 次)。ASCII-only。
+pub fn mnemonic_to_bip39_seed(words: &str, passphrase: &str) -> Result<[u8; 64], MnemonicError> {
+    if !words.is_ascii() || !passphrase.is_ascii() {
+        return Err(MnemonicError::NonAscii);
+    }
+    let salt = format!("mnemonic{}", passphrase);
+    let mut full = [0u8; 64];
+    pbkdf2_hmac_sha512(words.as_bytes(), salt.as_bytes(), 2048, &mut full);
+    Ok(full)
+}
+
+/// SLIP-0010 ed25519 派生:返回路径末端的 32 字节私钥种子(可直接给 [`Keypair::from_seed`])。
+/// ed25519 只有硬化派生,所以 `path` 里的每一级都会自动加上 `0x8000_0000`。
+pub fn slip10_ed25519(seed: &[u8], path: &[u32]) -> [u8; 32] {
+    use hmac::{Hmac, Mac};
+    type HmacSha512 = Hmac<sha2::Sha512>;
+    let mut mac = HmacSha512::new_from_slice(b"ed25519 seed").expect("HMAC accepts any key length");
+    mac.update(seed);
+    let i = mac.finalize().into_bytes();
+    let (mut key, mut chain) = ([0u8; 32], [0u8; 32]);
+    key.copy_from_slice(&i[..32]);
+    chain.copy_from_slice(&i[32..]);
+    for &index in path {
+        let mut mac = HmacSha512::new_from_slice(&chain).expect("HMAC accepts any key length");
+        mac.update(&[0u8]);
+        mac.update(&key);
+        mac.update(&(index | 0x8000_0000).to_be_bytes());
+        let i = mac.finalize().into_bytes();
+        key.copy_from_slice(&i[..32]);
+        chain.copy_from_slice(&i[32..]);
+    }
+    key
+}
+
+/// KDG 标准路径 m/44'/1105'/account'/0'/0'。
+pub fn kdg_standard_path(account: u32) -> [u32; 5] {
+    [44, KDG_COIN_TYPE, account, 0, 0]
+}
+
+/// 助记词 → KDG 标准规则下第 `account` 个账户的 ed25519 种子。
+pub fn kdg_standard_seed(
+    words: &str,
+    passphrase: &str,
+    account: u32,
+) -> Result<[u8; 32], MnemonicError> {
+    let seed = mnemonic_to_bip39_seed(words, passphrase)?;
+    Ok(slip10_ed25519(&seed, &kdg_standard_path(account)))
+}
+
 /// PBKDF2-HMAC-SHA512 (RFC 8018 §5.2, `dkLen = 64`, `c = 2048`).
 /// Used by `mnemonic_to_seed`; the BIP-39 32-byte ed25519 seed is the
 /// **first 32 bytes** of the 64-byte output. The actual PBKDF2 is the
@@ -514,6 +572,46 @@ fn pbkdf2_hmac_sha512(password: &[u8], salt: &[u8], iter_count: u32, out: &mut [
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn h(b: &[u8]) -> String {
+        b.iter().map(|x| format!("{x:02x}")).collect()
+    }
+
+    #[test]
+    fn slip10_ed25519_official_vector_1() {
+        // SLIP-0010 "Test vector 1 for ed25519"
+        let seed: Vec<u8> = (0u8..16).collect();
+        assert_eq!(
+            h(&slip10_ed25519(&seed, &[])),
+            "2b4be7f19ee27bbf30c667b642d5f4aa69fd169872f8fc3059c08ebae2eb19e7"
+        );
+        assert_eq!(
+            h(&slip10_ed25519(&seed, &[0])),
+            "68e0fe46dfb67e368c75379acec591dad19df3cde26e63b93a8e704f1dade7a3"
+        );
+        assert_eq!(
+            h(&slip10_ed25519(&seed, &[0, 1])),
+            "b1d0bad404bf35da785a64ca1ac54b2617211d2777696fbffaf208f746ae84f2"
+        );
+        assert_eq!(
+            h(&slip10_ed25519(&seed, &[0, 1, 2, 2, 1_000_000_000])),
+            "8f94d394a8e8fd6b1bc2f3f49f5c47e385281d5c17e65324b0f62483e37e8793"
+        );
+    }
+
+    #[test]
+    fn kdg_standard_seed_fixture_matches_wallet() {
+        // 与夜莺钱包 tests/zhixing-standard-derivation.test.mjs 共用的固定样例
+        let words = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
+        assert_eq!(
+            h(&kdg_standard_seed(words, "", 0).unwrap()),
+            "d16a35cc44e08e1e1370212fbc4a8843239c54e117f304ee970fca2cd5816ca4"
+        );
+        assert_eq!(
+            h(&kdg_standard_seed(words, "", 1).unwrap()),
+            "de531680773d61fd269879584ec74d573ca325909ea732ab82cd1b6029345b6b"
+        );
+    }
 
     #[test]
     fn sign_and_verify_roundtrip() {

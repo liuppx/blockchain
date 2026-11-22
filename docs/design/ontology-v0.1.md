@@ -131,6 +131,21 @@ python3 -m venv /tmp/kdg && /tmp/kdg/bin/pip install pyld rdflib
 # 把上下文 URL 映射到本地文件后:jsonld.expand → to_rdf → rdflib.Graph → SPARQL
 ```
 
+## 7b. 密钥派生与换密钥
+
+知行图账户的密钥是 ed25519,助记词按 SLIP-0010 ed25519 派生,路径 `m/44'/1105'/account'/0'/0'`
+(1105 = KnowDoGraph 在 SLIP-0044 的编号,satoshilabs/slips#2102)。`node keygen` 与夜莺钱包
+「创建钱包 → 知行图钱包」「导入钱包 → 知行图 → 助记词」都用这一条规则。
+
+两边的实现必须逐字节一致:链上有一条测试用钱包(JS)编码并签名的知识 op,链(Rust)解码并验签通过。
+
+**换密钥**(`POST /rpc/key-rotation`):账户用**当前**密钥签名,把账户的公钥换成新的。
+账户编号、成员身份、见习期与全部历史都不变;旧密钥立刻失效。成员换设备或换备份方式时用,
+步骤见 [`testnet/MEMBERS.md`](../../testnet/MEMBERS.md)。
+
+对互操作的影响:`kdg:pubkey` 指向的是**当前**公钥;换密钥后同一 IRI(`/id/member/2`)指向的公钥会变。
+词表本身不用改。
+
 ## 8. 从 Knowledge 发布到知行图(映射)
 
 Knowledge(社区的知识生产工作台)里的条目可以「上链到知行图」。签名在浏览器里由夜莺钱包完成,

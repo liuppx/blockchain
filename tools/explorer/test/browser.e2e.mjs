@@ -82,8 +82,8 @@ async function loginWithWallet(p) {
     && !!document.getElementById("idState"), { timeout: 30000 });
 }
 
-// 测试公钥(公开测试助记词 "abandon … art" 的公钥)。
-const TEST_PUBKEY = "1de352e44cd333672593f2334a730e180aaf290de89aa16d480de594e34e2961";
+// 测试公钥(公开测试助记词 "abandon … art" 派生出的公钥),从假钱包里那把密钥直接取,不写死。
+const TEST_PUBKEY = TEST_KEY.pubkey;
 
 // 确保测试公钥在链上是成员:用账户 1 的种子签一个 invite。链上已有该成员时跳过。
 // 需要链的写权限(本地开发链默认开放);失败时抛出明确信息而不是让用例莫名失败。

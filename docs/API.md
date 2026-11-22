@@ -97,13 +97,13 @@ GET /search?q=<关键词>&domain=2&layer=foundation&limit=50
 跨**标题与正文**检索(正文在正文仓库,链上只有哈希)。中文按单字与双字组合匹配,英文按词匹配。
 返回:`items[]`(`id`、`title`、`excerpt` 摘要、`body_url`、`credibility`、`score` 命中分,标题命中加权)。
 
-### 3.5 认知地形图(浏览器服务)
+### 3.5 认知地图(浏览器服务)
 
 ```
-GET /terrain
+GET /map            (旧路径 /terrain 仍可用)
 ```
 
-把链上的引用关系与可信度投影成地形数据:每个单元给出层级、领域、核验通过数、有效可信度、被引/引用的次数、
+把链上的引用关系与可信度整理成地图数据:每个单元另带**标题**(来自正文仓库)与**下游单元数**(直接或间接依据它的单元数);每个单元给出层级、领域、核验通过数、有效可信度、被引/引用的次数、
 重要性、**地形类型**(峰 / 高原 / 山脊 / 山谷 / 断层 / 坡 / 平地)与高度;另有全部引用边(依据 / 参见 / 取代)。
 数据全部来自链上已有的记录,**不新增任何链上状态**。
 
@@ -204,6 +204,7 @@ PUT  /bodies/<sha256>          需写入令牌;服务端校验 sha256(body) == <
 
 ```
 POST /rpc/knowledge        知识操作(create / publish / verify / invite)
+POST /rpc/key-rotation     账户换密钥(用**当前**密钥签名,把账户的公钥换成新的)
 ```
 
 请求体是 op 的规范编码(二进制),不是 JSON;`Authorization: Bearer <写入令牌>`。
@@ -214,6 +215,18 @@ POST /rpc/knowledge        知识操作(create / publish / verify / invite)
   签名一律在[夜莺钱包](https://wallet.yeying.pub/)里完成,网页不持有、不保存私钥(钱包接口 `zhixing_requestAccounts` /
   `zhixing_signKnowledgeOp`,见 [`tools/explorer/README.md`](../tools/explorer/README.md));
 - 命令行:`node encode-knowledge-op` + `node rpc --path /knowledge --post`。
+
+**换密钥**(成员换设备或换备份方式时用):账户编号、成员身份、见习期与全部历史都不变,
+只是之后的知识 op 改用新密钥签名。旧密钥立刻失效(再用它签的任何操作都会被拒)。
+
+```sh
+node keygen --out new.seed --new-mnemonic          # 新密钥(标准派生,m/44'/1105'/0'/0'/0')
+node encode-key-rotation --key-file old.seed --out rot.bin \
+    --account <账户号> --nonce <当前序号> --new-pubkey <新公钥>
+node rpc --path /key-rotation --post rot.bin
+```
+
+换完之后把新密钥放进钱包、删掉旧的知行图账户即可。
 
 ## 7. 限流
 

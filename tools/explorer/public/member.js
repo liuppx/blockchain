@@ -172,6 +172,19 @@
     return m.trim();
   }
 
+  /** 把正文 / 说明按哈希存进正文仓库(内容寻址:文件名就是 sha256)。 */
+  async function uploadBody(bytes, hash) {
+    const token = U.token();
+    if (!token) throw new Error("还没有填写写入令牌(在「我的身份」里设置)");
+    const r = await fetch("/bodies/" + hash, {
+      method: "PUT", body: bytes,
+      headers: { "Authorization": "Bearer " + token, "Content-Type": "text/markdown; charset=utf-8" },
+    });
+    if (r.status === 401) throw new Error("写入令牌不对");
+    if (r.status === 413) throw new Error("说明太长(上限 64 KiB)");
+    if (!r.ok) throw new Error(`上传失败(HTTP ${r.status}):${(await r.text()).trim()}`);
+  }
+
   async function submit(action) {
     if (!session || !session.account) throw new Error("请先用夜莺钱包登录;且该身份必须已是测试网成员");
     const token = U.token();
@@ -246,14 +259,19 @@
       <kv><b>公钥</b><span class='mono'>${esc(session.pubkey)}</span></kv>
       <kv><b>密钥</b><span>由夜莺钱包保管 <span class='mut'>(每次签名都在钱包里确认;本机不保存任何密钥)</span></span></kv>
       <kv><b>状态</b><span id='idState'>${acct ? `账户 ${esc(acct.id)} · ${acct.established ? "已过见习期" : "见习期中(核验照常记录,但暂不计入可信度)"}` : "这个公钥还不是测试网成员:把它发给邀请你的成员"}</span></kv>
+      ${acct ? "" : `<p><button id='idCopyPk'>复制公钥</button> <span id='idCopyMsg' class='mut'>发给邀请你的成员;对方邀请后,刷新本页就能看到你的账户号</span></p>`}
       <p><button id='idLock'>退出</button></p>
       <h3 class='md'>写入令牌</h3>
       <p class='mut'>提交核验需要一个写入令牌,由组织者私下提供。它只用于防止刷写入,不代表你的身份。</p>
       <p><input id='idTok' type='password' size='40' placeholder='${U.token() ? "已保存(输入新值可替换)" : "粘贴写入令牌"}'> <button id='idTokSave'>保存</button> <span id='idTokMsg'></span></p>
       ${acct && acct.established ? `<h3 class='md'>邀请新成员</h3>
-        <p class='mut'>新成员用 <code>node keygen</code> 生成密钥、在钱包「账户管理 → 导入钱包 → 知行图」里导入后,把公钥(钱包里的账户地址)发给你。新成员有见习期;每位成员每天最多邀请一人。</p>
+        <p class='mut'>新成员在夜莺钱包「账户管理 → 创建钱包 → 知行图钱包」里创建账户,用钱包登录本站后点「复制公钥」发给你。新成员有见习期;每位成员每天最多邀请一人。</p>
         <p><input id='invPk' size='70' placeholder='新成员的公钥(64 位十六进制)'> <button id='invGo'>邀请</button> <span id='invMsg'></span></p>` : ""}`);
     el("idLock").addEventListener("click", () => { session = null; status(); showIdentity(); });
+    if (el("idCopyPk")) el("idCopyPk").addEventListener("click", async () => {
+      try { await navigator.clipboard.writeText(session.pubkey); msg("idCopyMsg", "已复制。发给邀请你的成员;对方邀请后,刷新本页", "ok"); }
+      catch (_) { msg("idCopyMsg", "复制失败,请手动选中上面的公钥复制", "err"); }
+    });
     el("idTokSave").addEventListener("click", () => { U.setToken(el("idTok").value); el("idTok").value = ""; msg("idTokMsg", "已保存", "ok"); });
     if (el("invGo")) el("invGo").addEventListener("click", async () => {
       const pk = el("invPk").value.trim().toLowerCase();
@@ -262,7 +280,7 @@
       try {
         msg("invMsg", "签名并提交中…");
         const n = await submit({ type: "invite", pubkey: pk });
-        msg("invMsg", (await waitNonce(n)) ? "已入块。新成员现在可以在钱包里导入密钥了" : "已提交,等待入块(稍后在成员列表查看)", "ok");
+        msg("invMsg", (await waitNonce(n)) ? "已入块。请告诉新成员刷新页面,就能看到自己的账户号" : "已提交,等待入块(稍后在成员列表查看)", "ok");
       } catch (e) { msg("invMsg", e.message, "err"); }
     });
   }
@@ -321,11 +339,18 @@
       ? `<p>请逐条确认单元末尾的"核验要点"(勾选全部后才能给"通过"):</p><ol class='checklist'>${items.map((t, i) =>
           `<li><label><input type='checkbox' class='rvChk' id='rvc${i}'> ${mdInline(t)}</label></li>`).join("")}</ol>`
       : "<p class='mut'>这个单元没有列出核验要点;请按领域的审查清单逐项检查。</p>";
-    slot.innerHTML = head + assignNote + (mine ? `<p>你之前的结论:<b>${mine.verdict === "pass" ? "通过" : "需修改"}</b>(高度 ${esc(mine.height)})。再次提交会以最新的结论为准。</p>` : "")
+    // 已有核验的说明(链上只记哈希,原文在正文仓库里)
+    const notes = (v.verifications || []).filter((x) => x.note_hash && !/^0+$/.test(x.note_hash));
+    const noteLines = notes.length
+      ? `<p class='mut'>已有核验说明:${notes.map((x) => `#${esc(x.verifier)} <a class='link' data-note='${esc(x.note_hash)}'>看原文</a>`).join("、")}</p>`
+      : "";
+    slot.innerHTML = head + assignNote + noteLines + (mine ? `<p>你之前的结论:<b>${mine.verdict === "pass" ? "通过" : "需修改"}</b>(高度 ${esc(mine.height)})。再次提交会以最新的结论为准。</p>` : "")
       + (me.established ? "" : "<p class='err'>你还在见习期:核验照常记录,但暂不计入可信度。</p>")
       + checks
       + `<p class='mut'>你只对<b>核验当时能知道的事</b>负责;后来出现的新证据推翻它,是"诚实的错",不会受罚。
          有真正的学术争议时,不要强行判对错,可以写一个观点不同的新单元。</p>
+         <p class='mut'>判「需修改」时写一句具体是什么不对(会记在链上,修订者按它改);判「通过」可以留空。</p>
+         <p><input id='rvNote' size='70' placeholder='说明(可选):例如「组间休息写成 10 秒,原文是 2–3 分钟」'></p>
          <p><button id='rvPass'>通过</button> <button id='rvNeeds'>需修改</button> <span id='rvMsg'></span></p>`;
     const passBtn = el("rvPass");
     const sync = () => { passBtn.disabled = items.length > 0 && ![...document.querySelectorAll(".rvChk")].every((c) => c.checked); };
@@ -333,16 +358,37 @@
     sync();
     const go = async (verdict) => {
       const label = verdict === "pass" ? "通过" : "需修改";
+      const note = (el("rvNote")?.value || "").trim();
+      if (verdict === "needs-revision" && !note) {
+        msg("rvMsg", "判「需修改」请先写一句具体是什么不对", "err");
+        return;
+      }
       if (!confirm(`以账户 ${me.id} 的身份,对单元 #${u.id} 的 v${vn} 给出"${label}"?\n这条记录会永久保存在链上。`)) return;
       try {
         msg("rvMsg", "在钱包里签名…");
-        const n = await submit({ type: "verify", unit: Number(u.id), version: vn, verdict });
+        // 说明的哈希记在链上(正文在正文仓库里);不写说明就是全零哈希
+        let noteHash = "00".repeat(32);
+        if (note) {
+          const bytes = new TextEncoder().encode(note);
+          const d = await crypto.subtle.digest("SHA-256", bytes);
+          const hash = [...new Uint8Array(d)].map((b) => b.toString(16).padStart(2, "0")).join("");
+          await uploadBody(bytes, hash);
+          noteHash = hash;
+        }
+        const n = await submit({ type: "verify", unit: Number(u.id), version: vn, verdict, noteHash });
         msg("rvMsg", "已提交,等待入块…");
         if (await waitNonce(n)) showUnit(u.id); else msg("rvMsg", "已提交,稍后刷新查看", "ok");
       } catch (e) { msg("rvMsg", e.message, "err"); }
     };
     passBtn.addEventListener("click", () => go("pass"));
     el("rvNeeds").addEventListener("click", () => go("needs-revision"));
+    slot.querySelectorAll("a[data-note]").forEach((a) => a.addEventListener("click", async (e) => {
+      e.preventDefault(); e.stopPropagation();
+      const b = await fetchBody(a.dataset.note);
+      if (!b) { a.textContent = "说明没有上传到正文仓库"; return; }
+      if (!b.ok) { a.textContent = "说明与链上哈希不一致,已拒绝显示"; return; }
+      a.replaceWith(Object.assign(document.createElement("span"), { className: "mdbody", innerHTML: renderMd(b.text) }));
+    }));
   }
 
   // ---- 挂到页面上 -------------------------------------------------------------
