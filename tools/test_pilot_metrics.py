@@ -69,6 +69,17 @@ class Metrics(unittest.TestCase):
         self.assertEqual(rt["collusive_passes"], 1)
         self.assertEqual(rt["caught_after"], [40])
 
+    def test_note_quality(self):
+        units = [{"id": "5", "domain": "2", "versions": [
+            {"n": "1", "publisher": "1", "published_height": "10", "verifications": [
+                {"verifier": "2", "verdict": "needs-revision", "height": "20", "note_hash": "ab" * 32},
+                {"verifier": "3", "verdict": "needs-revision", "height": "21", "note_hash": "0" * 64},
+                {"verifier": "4", "verdict": "pass", "height": "22", "note_hash": "0" * 64},
+            ]}]}]
+        nq = pm.note_quality(units)["2"]
+        self.assertEqual((nq["with_note"], nq["needs"]), (1, 2), "只算「需修改」;全零哈希等于没写")
+        self.assertEqual(nq["notes"][0]["verifier"], "2")
+
     def test_assignment_compliance(self):
         done, total = pm.assignment_compliance(UNITS, {("1", "2"): ["2", "4"]})
         self.assertEqual((done, total), (1, 2))

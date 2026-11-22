@@ -158,6 +158,27 @@ def red_team(units: list[dict], red: list, since: int = 0) -> dict:
     return out
 
 
+ZERO = "0" * 64
+
+
+def note_quality(units: list[dict], since: int = 0) -> dict:
+    """每个领域:「需修改」里写了说明的比例。没写说明的「需修改」修订者无从改起,也统计不了发现了什么错。"""
+    out: dict[str, dict] = {}
+    for u in units:
+        d = out.setdefault(str(u["domain"]), {"needs": 0, "with_note": 0, "notes": []})
+        for v in u["versions"]:
+            for r in reviews_of(v, since):
+                if r["verdict"] != NEEDS:
+                    continue
+                d["needs"] += 1
+                h = str(r.get("note_hash") or ZERO)
+                if h != ZERO:
+                    d["with_note"] += 1
+                    d["notes"].append({"unit": str(u["id"]), "version": str(v["n"]),
+                                       "verifier": str(r["verifier"]), "note_hash": h})
+    return out
+
+
 def assignment_compliance(units: list[dict], assignments: dict) -> tuple[int, int]:
     """被指派的人里,有几位真的核验了这个版本。"""
     assigned = done = 0
@@ -194,6 +215,16 @@ def report(units, members, assignments, key, since, sec_per_block) -> str:
                      f"{d['reviews']} | {blocks(d['median_wait'], sec_per_block)} |")
     done, total = assignment_compliance(units, assignments)
     lines += ["", f"被指派者完成率:{pct(done, total)}" + ("" if total else "(没有读到指派数据:加 --site)"), ""]
+    nq = note_quality(units, since)
+    lines += ["### 「需修改」的说明", "", "| 领域 | 写了说明的「需修改」 |", "|---|---|"]
+    for dom, d in sorted(nq.items()):
+        lines.append(f"| {DOMAIN.get(dom, dom)} | {pct(d['with_note'], d['needs'])} |")
+    listed = [n for d in nq.values() for n in d["notes"]]
+    if listed:
+        lines += ["", "说明原文在正文仓库:`<浏览器>/bodies/<哈希>`。", ""]
+        for n in listed:
+            lines.append(f"- 单元 #{n['unit']} v{n['version']} · 核验人 #{n['verifier']} · `{n['note_hash'][:16]}…`")
+    lines.append("")
 
     if not key:
         lines += ["## 发现错误的能力 / 担保 / 红队", "",
