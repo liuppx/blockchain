@@ -153,6 +153,7 @@ fn demo_genesis() -> Genesis {
             .map(|v| (v.id, v.pubkey, v.power))
             .collect(),
         bridge_sources: vec![],
+        upgrades: Default::default(),
     }
 }
 
@@ -3837,12 +3838,15 @@ fn cmd_check_config(config_path: String) {
 fn genesis_identity(config_path: &str) -> Result<String, config::ConfigError> {
     let cfg = config::load_node_config(config_path)?;
     let genesis = config::load_genesis(&cfg.genesis)?.to_genesis()?;
+    let upgrades = genesis.upgrades.describe();
     let (state, gh) = ChainState::genesis(genesis);
+    // 升级时刻表不进创世哈希(见 `upgrade` 模块),所以单独打印一行,与创世哈希一起带外核对。
     Ok(format!(
-        "genesis_hash {}\nstate_root {}\nvalidators {}",
+        "genesis_hash {}\nstate_root {}\nvalidators {}\nupgrades {}",
         hex(&gh),
         hex(&state.state_root()),
         state.validators.validators().len(),
+        upgrades,
     ))
 }
 
@@ -6985,9 +6989,41 @@ mod tests {
             "{out}"
         );
         assert!(out.contains("\nvalidators 1"), "{out}");
+        assert!(
+            out.ends_with("\nupgrades none"),
+            "没有排期时明确打印 none:{out}"
+        );
         // Deterministic: a second run over the same config prints identical output.
         assert_eq!(genesis_identity(&cpath).expect("again"), out);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn upgrade_schedule_is_printed_but_does_not_change_the_genesis_hash() {
+        // 给一条已在运行的链排升级,链的身份(创世哈希)必须不变——否则已有的区块与证书全部作废。
+        let (_s, pubkey) = keygen_derive(seed_for(1));
+        let body = valid_genesis_body(&pubkey);
+        let (plain, dir_a) = write_check_config_fixture("upg0", &body, "");
+        let scheduled_body =
+            format!("{body}\n[[upgrades]]\nname = \"knowledge-economy-v1\"\nheight = 1000\n");
+        let (sched, dir_b) = write_check_config_fixture("upg1", &scheduled_body, "");
+        let a = genesis_identity(&plain).expect("plain");
+        let b = genesis_identity(&sched).expect("scheduled");
+        let first3 = |s: &str| s.lines().take(3).collect::<Vec<_>>().join("\n");
+        assert_eq!(
+            first3(&a),
+            first3(&b),
+            "创世哈希、创世状态根、验证人不受时刻表影响"
+        );
+        assert!(b.ends_with("\nupgrades knowledge-economy-v1@1000"), "{b}");
+        // 不认识的升级名:拒绝,而不是静默忽略
+        let bad_body = format!("{body}\n[[upgrades]]\nname = \"no-such-upgrade\"\nheight = 5\n");
+        let (bad, dir_c) = write_check_config_fixture("upg2", &bad_body, "");
+        let err = genesis_identity(&bad).expect_err("unknown upgrade must be rejected");
+        assert!(format!("{err:?}").contains("no-such-upgrade"), "{err:?}");
+        for d in [dir_a, dir_b, dir_c] {
+            let _ = std::fs::remove_dir_all(&d);
+        }
     }
 
     #[test]

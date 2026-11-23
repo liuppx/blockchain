@@ -1028,6 +1028,10 @@ pub struct GenesisConfig {
     /// (旧 ΔK 提交开启、无见习期、无邀请冷却、未登记领域)。
     #[serde(default)]
     pub knowledge: Option<KnowledgeGenesisConfig>,
+    /// 按高度激活的协议升级,`[[upgrades]] name = "…" height = N`。可选;缺省为空(不排任何升级)。
+    /// **不进创世哈希**——用 `node genesis-hash` 打印出来带外核对。不认识的升级名会被拒绝。
+    #[serde(default)]
+    pub upgrades: Vec<UpgradeConfig>,
     #[serde(default)]
     pub timestamp_days: f32,
     #[serde(default)]
@@ -1160,6 +1164,12 @@ impl GenesisConfig {
             timestamp_days: self.timestamp_days,
             validators,
             bridge_sources: Vec::new(),
+            upgrades: crate::upgrade::UpgradeSchedule::from_entries(
+                self.upgrades.iter().map(|u| (u.name.as_str(), u.height)),
+            )
+            .map_err(|e| ConfigError::BadGenesis {
+                detail: format!("[[upgrades]]: {e}"),
+            })?,
         })
     }
 }
@@ -1223,6 +1233,15 @@ pub fn load_node_config(path: &str) -> Result<NodeConfig, ConfigError> {
 }
 
 /// Read + parse a genesis TOML.
+/// 创世 `[[upgrades]]` 的一项。
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
+pub struct UpgradeConfig {
+    /// 升级名,如 `knowledge-economy-v1`。
+    pub name: String,
+    /// 从这个高度的区块起按新规则执行(含该高度)。
+    pub height: u64,
+}
+
 /// 测试网阶段 1:创世 `[knowledge]` 段。
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
 pub struct KnowledgeGenesisConfig {
@@ -2459,6 +2478,7 @@ mod tests {
                 })
                 .collect(),
             params: None,
+            upgrades: Vec::new(),
         };
         let g = gc.to_genesis().unwrap();
         assert_eq!(g.accounts.len(), 3);
@@ -2504,6 +2524,7 @@ mod tests {
             timestamp_days: 0.0,
             validators: vec![],
             params: None,
+            upgrades: Vec::new(),
         };
         assert!(matches!(gc.to_genesis(), Err(ConfigError::BadHex { .. })));
 
@@ -2848,6 +2869,7 @@ mod tests {
                 })
                 .collect(),
             params: None,
+            upgrades: Vec::new(),
         };
         std::fs::write(
             dir.join("genesis.toml"),

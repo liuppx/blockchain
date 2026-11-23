@@ -2357,6 +2357,8 @@ pub fn decode_snapshot(buf: &[u8]) -> Result<ChainState, CodecError> {
         bridge_minted,
         bridge_sources,
         genesis_hash,
+        // 升级时刻表不在快照里:从快照启动的节点由 `GossipNode::from_snapshot` 从创世配置补上。
+        upgrades: crate::upgrade::UpgradeSchedule::default(),
     })
 }
 
@@ -4515,6 +4517,7 @@ mod tests {
             timestamp_days: 1.5,
             validators: vec![(21, pk(21), 3), (22, pk(22), 1)],
             bridge_sources: vec![],
+            upgrades: Default::default(),
         };
         let (mut s, _gh) = ChainState::genesis(g);
         // Poke the stake + bridge fields so they are non-empty in the snapshot.

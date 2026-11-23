@@ -3,7 +3,7 @@
 set -euo pipefail
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
-OUT="$HERE/out"
+OUT="${TESTNET_OUT:-$HERE/out}"   # 演练可指到别处,不碰 testnet/out
 
 for d in "$OUT"/n*/; do
   d="${d%/}"

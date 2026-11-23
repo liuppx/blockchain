@@ -434,6 +434,10 @@ impl SeenSet {
 pub struct GossipNode {
     pub id: u64,
     pub chain: Chain,
+    /// 最近一次"证书有效、却在本地执行不了"的区块高度。这种情况说明**本节点的规则与法定数不同**
+    /// (典型:升级时刻表不一致,或没升级就过了 H*)——节点会停在这里而不是分叉,但必须说出原因,
+    /// 否则运维只看到一个不动的节点。每个高度只记一次,避免对等节点重发时刷屏。
+    rejected_certified: Option<u64>,
     /// M28: cached genesis so we can replay from genesis when serving a
     /// `Diff` envelope (which needs `state_at_h1` to compute the diff
     /// body). `Chain::new` only stores `state` post-genesis, so the
@@ -501,6 +505,7 @@ impl GossipNode {
     ) -> Self {
         GossipNode {
             id,
+            rejected_certified: None,
             chain: Chain::new(genesis.clone()),
             genesis,
             mempool: Mempool::new(max_txs),
@@ -544,9 +549,13 @@ impl GossipNode {
         max_txs: usize,
         peers: impl IntoIterator<Item = u64>,
     ) -> Self {
+        // 快照不带升级时刻表,一律以本节点的创世配置为准。
+        let mut snapshot = snapshot;
+        snapshot.upgrades = genesis.upgrades.clone();
         let base_height = snapshot.height;
         GossipNode {
             id,
+            rejected_certified: None,
             chain: Chain::from_snapshot(snapshot.clone(), head),
             genesis,
             mempool: Mempool::new(max_txs),
@@ -1372,7 +1381,19 @@ impl GossipNode {
         if cert.verify(&self.chain.state.validators).is_err() {
             return false;
         }
-        if self.chain.commit(&mut block).is_err() {
+        if let Err(e) = self.chain.commit(&mut block) {
+            // 证书是 >2/3 法定数签过的,本地却执行不了:本节点与网络的规则不一致。
+            if self.rejected_certified != Some(block.height) {
+                self.rejected_certified = Some(block.height);
+                tracing::error!(
+                    node = self.id,
+                    height = block.height,
+                    error = %e,
+                    upgrades = %self.chain.state.upgrades.describe(),
+                    "certified block does not apply locally — this node's rules differ from the quorum \
+                     (check the [[upgrades]] schedule in genesis and the node version); halting here instead of forking"
+                );
+            }
             return false;
         }
         self.mempool.remove_included(&block);
@@ -3801,6 +3822,7 @@ mod tests {
                 .map(|&id| (id, kp(id).public(), 1))
                 .collect(),
             bridge_sources: vec![],
+            upgrades: Default::default(),
         }
     }
 
@@ -4032,6 +4054,7 @@ mod tests {
             timestamp_days: 0.0,
             validators: vec![(21, kp(21).public(), 1)],
             bridge_sources: vec![],
+            upgrades: Default::default(),
         };
         fn seed_for(id: u64) -> [u8; 32] {
             let mut s = [0u8; 32];
@@ -4084,6 +4107,7 @@ mod tests {
             timestamp_days: 0.0,
             validators: vec![(21, kp(21).public(), 1)],
             bridge_sources: vec![],
+            upgrades: Default::default(),
         };
         let mut gb = ga.clone();
         gb.timestamp_days = 1.0;

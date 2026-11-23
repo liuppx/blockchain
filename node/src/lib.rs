@@ -42,6 +42,7 @@ pub mod remote_signer;
 pub mod round;
 pub mod signer;
 pub mod store;
+pub mod upgrade;
 pub mod validator;
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -1142,6 +1143,10 @@ pub struct ChainState {
     /// a constant of this chain's identity, not mutable state, and folding
     /// it would make the genesis block's hash a self-reference.
     pub genesis_hash: Hash,
+    /// 升级时刻表,来自创世配置。**不在快照里、不进 `state_root` 本身**;
+    /// 只有"在当前高度已生效的升级"折入 `state_root`(见 [`Self::state_root`])。
+    /// 从快照启动的节点由 `GossipNode::from_snapshot` 从创世配置补上。
+    pub upgrades: crate::upgrade::UpgradeSchedule,
 }
 
 /// Genesis configuration.
@@ -1177,6 +1182,9 @@ pub struct Genesis {
     /// follower registry. Seeds `ChainState::bridge_sources` in
     /// [`Self::genesis_split`].
     pub bridge_sources: Vec<BridgeSourceSeed>,
+    /// 按高度激活的协议升级(`upgrade` 模块)。**不进创世哈希**:给已在运行的链排一次升级,
+    /// 链的身份不变;空表(默认)时行为与引入它之前逐字节相同。
+    pub upgrades: crate::upgrade::UpgradeSchedule,
 }
 
 #[derive(Clone, Debug)]
@@ -1882,6 +1890,7 @@ impl ChainState {
             // Block's hash to know `gh`), but the value is unused by
             // `state_root()` (genesis_hash is excluded by design).
             genesis_hash: [0u8; 32],
+            upgrades: g.upgrades.clone(),
         };
         // genesis "block" hash: height 0, zero prev, no txs, no validator updates.
         // Its commitment is the genesis validator set (the set that certifies
@@ -3762,6 +3771,17 @@ impl ChainState {
         e.f32(p.decay);
         e.f32(p.fresh_min);
         e.f32(p.delta_k_min);
+        // 按高度激活的升级:从 H* 起折入"哪些升级已生效"。H* 之前什么都不追加,
+        // 状态根与引入升级机制之前逐字节相同;时刻表不一致的节点在 H* 当块就算出不同的根(停下而不是分叉)。
+        let active: Vec<_> = self.upgrades.active_at(self.height).collect();
+        if !active.is_empty() {
+            e.string("upgrades");
+            e.u64(active.len() as u64);
+            for (u, h) in active {
+                e.u8(u.tag());
+                e.u64(h);
+            }
+        }
         sha256(&e.0)
     }
 
@@ -4365,6 +4385,111 @@ mod tests {
         Keypair::from_seed(seed)
     }
 
+    // ---- 按高度激活的升级(upgrade 模块)----------------------------------------
+
+    fn scheduled(h: u64) -> Genesis {
+        let mut g = base_genesis();
+        g.upgrades = crate::upgrade::UpgradeSchedule::default()
+            .with(crate::upgrade::Upgrade::KnowledgeEconomyV1, h);
+        g
+    }
+
+    /// 在 `chain` 上出 `n` 个空块,返回这些块(已封装、已提交)。
+    fn grow(chain: &mut Chain, n: u64) -> Vec<Block> {
+        let mut out = Vec::new();
+        for _ in 0..n {
+            let h = chain.state.height + 1;
+            let mut b = block(chain, h, vec![]);
+            chain.commit(&mut b).expect("commit empty block");
+            out.push(b);
+        }
+        out
+    }
+
+    #[test]
+    fn a_future_upgrade_changes_nothing_before_its_height() {
+        // 排了升级但还没到 H*:创世哈希、每个区块哈希、每个状态根都与没排升级的链逐字节相同。
+        // 这是"给已在运行的链排升级"不破坏已有区块与证书的前提。
+        let mut plain = Chain::new(base_genesis());
+        let mut sched = Chain::new(scheduled(10));
+        assert_eq!(
+            plain.genesis_hash, sched.genesis_hash,
+            "创世哈希不受时刻表影响"
+        );
+        let a = grow(&mut plain, 9);
+        let b = grow(&mut sched, 9);
+        for (x, y) in a.iter().zip(&b) {
+            assert_eq!(x.state_root, y.state_root, "高度 {} 的状态根", x.height);
+            assert_eq!(x.hash(), y.hash(), "高度 {} 的区块哈希", x.height);
+        }
+        // 反过来:没排升级的节点能原样重放排了升级的那条链的前 9 个块
+        let (g, gh) = ChainState::genesis(base_genesis());
+        Chain::replay_from(g, gh, &b).expect("H* 之前两种节点可以互相重放");
+    }
+
+    #[test]
+    fn the_state_root_commits_to_the_upgrade_from_its_height() {
+        let mut plain = Chain::new(base_genesis());
+        let mut sched = Chain::new(scheduled(5));
+        let a = grow(&mut plain, 5);
+        let b = grow(&mut sched, 5);
+        assert_eq!(a[3].state_root, b[3].state_root, "H*-1 仍相同");
+        assert_ne!(
+            a[4].state_root, b[4].state_root,
+            "H* 当块起状态根折入已生效的升级"
+        );
+        // 排了同一张时刻表的节点能重放并一路验证下去
+        let (g, gh) = ChainState::genesis(scheduled(5));
+        let replayed = Chain::replay_from(g, gh, &b).expect("相同时刻表:重放一致");
+        assert_eq!(replayed.state.state_root(), sched.state.state_root());
+    }
+
+    #[test]
+    fn a_node_with_a_different_schedule_stops_at_the_upgrade_instead_of_forking() {
+        // 时刻表不一致(例如有节点没升级、或写错了高度)时,必须在 H* 当块就报错停下,
+        // 而不是接受区块、带着不同的规则继续往下走。
+        let mut sched = Chain::new(scheduled(5));
+        let blocks = grow(&mut sched, 6);
+        for other in [base_genesis(), scheduled(6)] {
+            let (g, gh) = ChainState::genesis(other);
+            match Chain::replay_from(g, gh, &blocks) {
+                Err(ChainError::StateRootMismatch { height }) => {
+                    assert_eq!(height, 5, "停在 H* 当块,不早也不晚")
+                }
+                other => panic!(
+                    "应当在 H* 报 StateRootMismatch,实际 {:?}",
+                    other.map(|c| c.state.height)
+                ),
+            }
+        }
+    }
+
+    #[test]
+    fn an_upgrade_active_from_genesis_is_a_different_chain() {
+        // H* = 0:从创世起就是新规则,链的身份随之不同(新起的链,不影响已在运行的链)。
+        let plain = Chain::new(base_genesis());
+        let fresh = Chain::new(scheduled(0));
+        assert_ne!(plain.genesis_hash, fresh.genesis_hash);
+    }
+
+    #[test]
+    fn a_snapshot_past_the_upgrade_needs_the_schedule_to_verify() {
+        // 快照里没有时刻表:从过了 H* 的快照启动时,必须先从创世配置补上时刻表,才对得上证书签过的根。
+        let mut sched = Chain::new(scheduled(3));
+        let blocks = grow(&mut sched, 5);
+        let tip = blocks.last().unwrap();
+        let bytes = crate::codec::encode_snapshot(&sched.state);
+        let mut restored = crate::codec::decode_snapshot(&bytes).expect("decode");
+        assert!(restored.upgrades.is_empty(), "快照本身不带时刻表");
+        assert_ne!(restored.state_root(), tip.state_root, "不补时刻表就对不上");
+        restored.upgrades = scheduled(3).upgrades;
+        assert_eq!(
+            restored.state_root(),
+            tip.state_root,
+            "补上后与证书签过的根一致"
+        );
+    }
+
     fn base_genesis() -> Genesis {
         Genesis {
             accounts: vec![
@@ -4387,6 +4512,7 @@ mod tests {
                 (23, kp(23).public(), 1),
             ],
             bridge_sources: vec![],
+            upgrades: Default::default(),
         }
     }
 

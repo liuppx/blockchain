@@ -879,6 +879,7 @@ pub struct Node {
 /// so `Node::start` fails fast without touching the on-disk log.
 fn load_snapshot_boot(
     s: &crate::config::SnapshotBootConfig,
+    upgrades: &crate::upgrade::UpgradeSchedule,
 ) -> io::Result<(crate::ChainState, Hash)> {
     // M141: the authoritative coherence gate (cert XOR trusted-set is an error). Runs
     // here — the one point both the TOML and the CLI keypath converge — because
@@ -886,12 +887,15 @@ fn load_snapshot_boot(
     s.validate()
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
     let bytes = std::fs::read(&s.path)?;
-    let state = crate::codec::decode_snapshot(&bytes).map_err(|e| {
+    let mut state = crate::codec::decode_snapshot(&bytes).map_err(|e| {
         io::Error::new(
             io::ErrorKind::InvalidData,
             format!("decode snapshot {}: {e:?}", s.path),
         )
     })?;
+    // 快照里没有升级时刻表(它来自创世配置)。必须在核对头之前补上:快照高度已过 H* 时,
+    // state_root 折入了已生效的升级,不补就对不上证书签过的根。
+    state.upgrades = upgrades.clone();
     let header_bytes = hex_to_bytes(&s.header_hex).ok_or_else(|| {
         io::Error::new(
             io::ErrorKind::InvalidData,
@@ -8646,7 +8650,7 @@ impl Node {
         // The default path (no `snapshot` config) is byte-identical to pre-M140.
         let snapshot_boot: Option<(crate::ChainState, Hash)> = match cfg.snapshot.as_ref() {
             Some(s) => {
-                let (state, head) = load_snapshot_boot(s)?;
+                let (state, head) = load_snapshot_boot(s, &genesis.upgrades)?;
                 match plan_snapshot_logs(state.height, blocks.first().map(|b| b.height))? {
                     SnapshotLogPlan::EmptyFresh => { /* blocks/certs already empty */ }
                     SnapshotLogPlan::ResumeTail => { /* keep the tail; load_certified below */ }
@@ -9220,6 +9224,7 @@ fn load_light_snapshot_seed(
     s: &crate::config::SnapshotBootConfig,
     my_id: u64,
     peer_ids: &[u64],
+    upgrades: &crate::upgrade::UpgradeSchedule,
 ) -> io::Result<crate::net::LightGossipNode> {
     s.validate()
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
@@ -9230,12 +9235,13 @@ fn load_light_snapshot_seed(
         )
     })?;
     let bytes = std::fs::read(&s.path)?;
-    let state = crate::codec::decode_snapshot(&bytes).map_err(|e| {
+    let mut state = crate::codec::decode_snapshot(&bytes).map_err(|e| {
         io::Error::new(
             io::ErrorKind::InvalidData,
             format!("decode snapshot {}: {e:?}", s.path),
         )
     })?;
+    state.upgrades = upgrades.clone(); // 同上:核对证书签过的根之前补上时刻表
     let header =
         crate::codec::decode_header_any(&hex_to_bytes(&s.header_hex).ok_or_else(|| {
             io::Error::new(io::ErrorKind::InvalidData, "header_hex not valid hex")
@@ -9313,7 +9319,7 @@ impl LightNode {
             ));
         }
         let mut node = match (cfg.snapshot.as_ref(), cfg.checkpoint.as_ref()) {
-            (Some(s), _) => load_light_snapshot_seed(s, my_id, &peer_ids)?,
+            (Some(s), _) => load_light_snapshot_seed(s, my_id, &peer_ids, &genesis.upgrades)?,
             (_, Some(cp)) => {
                 let (head, set) = cp.decode().map_err(cfg_io)?;
                 crate::net::LightGossipNode::from_checkpoint(
@@ -10441,6 +10447,7 @@ mod tests {
                 .map(|&id| (id, kp(id).public(), 1))
                 .collect(),
             bridge_sources: vec![],
+            upgrades: Default::default(),
         }
     }
     fn test_vset() -> ValidatorSet {
@@ -12830,6 +12837,7 @@ mod tests {
             timestamp_days: 0.0,
             validators: vec![(21, kp(21).public(), 1)],
             bridge_sources: vec![],
+            upgrades: Default::default(),
         };
         // Destination chain B (distinct genesis hash via a different timestamp).
         let mut gb = ga.clone();
@@ -16466,6 +16474,7 @@ mod tests {
             timestamp_days: 0.0,
             validators: vec![(21, kp(21).public(), 1)],
             bridge_sources: vec![],
+            upgrades: Default::default(),
         };
         let mut gb = ga.clone();
         gb.timestamp_days = 1.0;
@@ -17642,6 +17651,7 @@ vote_b.validator=5 vote_b.height=9 vote_b.round=2 vote_b.block_hash={b_h} vote_b
             timestamp_days: 0.0,
             validators: vec![(21, kp(21).public(), 1)],
             bridge_sources: vec![],
+            upgrades: Default::default(),
         };
         fn seed_for(id: u64) -> [u8; 32] {
             let mut s = [0u8; 32];
@@ -20291,7 +20301,8 @@ vote_b.validator=5 vote_b.height=9 vote_b.round=2 vote_b.block_hash={b_h} vote_b
             cert_hex: Some(crate::hash::hex(&crate::codec::encode_commit(&cert))),
             trusted_validators: tv,
         };
-        let (st, head) = load_snapshot_boot(&s).expect("valid quorum cert accepted");
+        let (st, head) =
+            load_snapshot_boot(&s, &Default::default()).expect("valid quorum cert accepted");
         assert_eq!(st.height, state.height);
         assert_eq!(head, header.hash());
         let _ = std::fs::remove_dir_all(&dir);
@@ -20315,7 +20326,7 @@ vote_b.validator=5 vote_b.height=9 vote_b.round=2 vote_b.block_hash={b_h} vote_b
             trusted_validators: tv,
         };
         assert!(
-            load_snapshot_boot(&s).is_err(),
+            load_snapshot_boot(&s, &Default::default()).is_err(),
             "forged snapshot must be rejected"
         );
         let _ = std::fs::remove_dir_all(&dir);
@@ -20350,7 +20361,7 @@ vote_b.validator=5 vote_b.height=9 vote_b.round=2 vote_b.block_hash={b_h} vote_b
             trusted_validators: tv,
         };
         assert!(
-            load_snapshot_boot(&s).is_err(),
+            load_snapshot_boot(&s, &Default::default()).is_err(),
             "cert below quorum must be rejected"
         );
         let _ = std::fs::remove_dir_all(&dir);
@@ -20384,7 +20395,7 @@ vote_b.validator=5 vote_b.height=9 vote_b.round=2 vote_b.block_hash={b_h} vote_b
             trusted_validators: tv,
         };
         assert!(
-            load_snapshot_boot(&s).is_err(),
+            load_snapshot_boot(&s, &Default::default()).is_err(),
             "cert for a different block_hash must be rejected"
         );
         let _ = std::fs::remove_dir_all(&dir);
@@ -20404,7 +20415,7 @@ vote_b.validator=5 vote_b.height=9 vote_b.round=2 vote_b.block_hash={b_h} vote_b
             cert_hex: Some(cert_hex),
             trusted_validators: vec![],
         };
-        match load_snapshot_boot(&cert_only) {
+        match load_snapshot_boot(&cert_only, &Default::default()) {
             Err(e) => assert!(e.to_string().contains("snapshot"), "coherence error: {e}"),
             Ok(_) => panic!("cert without trusted set must be rejected"),
         }
@@ -20415,7 +20426,7 @@ vote_b.validator=5 vote_b.height=9 vote_b.round=2 vote_b.block_hash={b_h} vote_b
             cert_hex: None,
             trusted_validators: tv,
         };
-        assert!(load_snapshot_boot(&set_only).is_err());
+        assert!(load_snapshot_boot(&set_only, &Default::default()).is_err());
     }
 
     #[test]
@@ -20434,7 +20445,7 @@ vote_b.validator=5 vote_b.height=9 vote_b.round=2 vote_b.block_hash={b_h} vote_b
             trusted_validators: vec![],
         };
         assert!(
-            load_snapshot_boot(&ok).is_ok(),
+            load_snapshot_boot(&ok, &Default::default()).is_ok(),
             "M135-only good snapshot accepted"
         );
         // Forged.
@@ -20448,7 +20459,7 @@ vote_b.validator=5 vote_b.height=9 vote_b.round=2 vote_b.block_hash={b_h} vote_b
             trusted_validators: vec![],
         };
         assert!(
-            load_snapshot_boot(&bad).is_err(),
+            load_snapshot_boot(&bad, &Default::default()).is_err(),
             "M135-only forged snapshot rejected"
         );
         let _ = std::fs::remove_dir_all(&dir);
