@@ -110,6 +110,7 @@ class Params:
     period_days: float = 30.0  # 一期多少天
     mapping: str = "time"  # time:所有按月标定的量换算成同样的**真实时间**(基线,仿真与已发布结果一致)
     # chain:按上链 v1 的字面读法——设计稿里的"期"就是结算期(天),不再折算成月
+    # hybrid:天结算,时长(锁定期、半衰期、平滑窗口)按真实时间;追加指派每 3 天一次、见习期 7 天(链上的实际值)
     burn: bool = True  # 关:只增不缩(不销毁、不收缩),对应 v1 的"只前馈"
     slashing: bool = True  # 关:挑战成功只让错误单元退出,不罚没锁定收益、不限流放行者(v1 还没有挑战与罚没)
 
@@ -190,12 +191,15 @@ def per_period(p: Params) -> tuple[Params, float, bool]:
         q = replace(q, probation=7, vesting=6, k_smooth=3)
     else:
         q = replace(q, k_smooth=max(1, round(p.k_smooth * m)))
+        if p.mapping == "hybrid":
+            q = replace(q, probation=7)  # 链上的见习期是 7 天
     return q, m, p.mapping == "chain"
 
 
 class Sim:
     def __init__(self, p: Params, seed: int):
         p, self.M, self.chain = per_period(p)
+        self.hybrid = p.mapping == "hybrid" and self.M != 1.0
         self.Y = round(12 * self.M)  # 每年几期
         self.p, self.r = p, random.Random(seed)
         self.members: list = []
@@ -578,8 +582,9 @@ class Sim:
                 self.queue = {}
             for aid in list(self.queue):
                 self.queue[aid] = [u for u in self.queue[aid] if u.established < 0 and not u.removed and self.t - u.born < self.lit(24)]
+            topup = 3 if self.hybrid else self.lit(3)  # hybrid:每 3 天追加一次(链上的规则)
             for u in self.pending:  # 迟迟凑不够通过的,追加指派 1 人(上限 8 人)
-                if self.t - u.born >= self.lit(3) and len(u.assigned) < 8 and len(self.counted(u.passes, u)) < 2:
+                if self.t - u.born >= topup and len(u.assigned) < 8 and len(self.counted(u.passes, u)) < 2:
                     self.assign(u, 1)
         # 每期开始时缓存候选集(期内的变化下一期才可见,对月度粒度的模型影响可忽略)
         live = [u for u in self.units if self.live(u)]
@@ -831,28 +836,29 @@ ELASTIC = [
 
 # 第七轮:上链 v1 —— 换成天结算、只前馈、只锁不罚
 V1 = {"assigned": True, "share_exp": 0.5, "elastic": True, "k_cred_cap": 0.6,
-      "burn": False, "slashing": False}
+      "burn": False, "slashing": False, "rent": 0.0}  # v1 没有租金,也就没有"付不起租金就休眠"
 V1_CHAIN = V1 | {"mapping": "chain"}
 V1_TIME = V1 | {"mapping": "time"}
+V1_HYB = V1 | {"mapping": "hybrid", "period_days": 1.0}
 CHAIN = [
-    # —— 天结算(链的字面读法):设计稿里的"期"就是天 ——
-    ("v1_day", "上链 v1:天结算 + 只前馈 + 只锁不罚(设计稿的字面读法)",
-     V1_CHAIN | {"period_days": 1.0}),
-    ("v1_day_nofee", "上链 v1,外部付费不到来(测试网的实际情况)", V1_CHAIN | {"period_days": 1.0, "fee_max": 0.0}),
-    ("v1_day_slash", "上链 v1 + 挑战成功时罚没锁定收益并限流(对照:v1 缺的那块)", V1_CHAIN | {"period_days": 1.0, "slashing": True}),
-    ("v1_day_norevpay", "上链 v1,核验报酬关(对照:核验还有没有人做)",
-     V1_CHAIN | {"period_days": 1.0, "split_review": 0.0, "split_pool": 0.85}),
-    ("v1_day_noassign", "上链 v1,核验人不由协议指派", V1_CHAIN | {"period_days": 1.0, "assigned": False}),
-    ("v1_day_mal20", "上链 v1 + 作恶者 20%", V1_CHAIN | {"period_days": 1.0, "frac_mal": 0.20}),
-    ("v1_day_mal35", "上链 v1 + 作恶者 35%", V1_CHAIN | {"period_days": 1.0, "frac_mal": 0.35}),
-    ("v1_day_lazy50", "上链 v1 + 走过场的核验者 50%", V1_CHAIN | {"period_days": 1.0, "frac_lazy": 0.50}),
-    ("v1_day_pump", "上链 v1 + 作恶者持续追加通过(刷知识量)", V1_CHAIN | {"period_days": 1.0, "frac_mal": 0.20, "mal_pump": True}),
-    # —— 天结算但按真实时间换算(等价的另一种读法) ——
-    ("v1_day_time", "上链 v1:天结算,所有按月标定的量折算成同样的真实时间", V1_TIME | {"period_days": 1.0}),
-    ("v1_week", "上链 v1:周结算(链的字面读法)", V1_CHAIN | {"period_days": 7.0}),
-    ("v1_month", "上链 v1:月结算(基线:与已发布结果可比)", V1_CHAIN | {"period_days": 30.0}),
-    ("v1_month_slash", "月结算,v1 + 罚没(对照)", V1_CHAIN | {"period_days": 30.0, "slashing": True}),
-    ("v1_month_burn", "月结算,v1 + 允许销毁收缩(对照)", V1_CHAIN | {"period_days": 30.0, "burn": True}),
+    # —— 推荐读法:天结算,时长按真实时间,追加指派每 3 天、见习期 7 天 ——
+    ("v1", "上链 v1(推荐读法):天结算 + 只前馈 + 只锁不罚,无租金", V1_HYB),
+    ("v1_slash", "v1 + 挑战成功时罚没锁定收益并限流(v1 缺的那块)", V1_HYB | {"slashing": True}),
+    ("v1_nofee", "v1,外部付费不到来(测试网的实际情况)", V1_HYB | {"fee_max": 0.0}),
+    ("v1_norevpay", "v1,核验报酬关", V1_HYB | {"split_review": 0.0, "split_pool": 0.85}),
+    ("v1_noassign", "v1,核验人不由协议指派", V1_HYB | {"assigned": False}),
+    ("v1_mal20", "v1 + 作恶者 20%", V1_HYB | {"frac_mal": 0.20}),
+    ("v1_mal35", "v1 + 作恶者 35%", V1_HYB | {"frac_mal": 0.35}),
+    ("v1_lazy50", "v1 + 走过场的核验者 50%", V1_HYB | {"frac_lazy": 0.50}),
+    ("v1_pump", "v1 + 作恶者持续追加通过(刷知识量)", V1_HYB | {"frac_mal": 0.20, "mal_pump": True}),
+    ("v1_slash_mal20", "v1 + 罚没 + 作恶者 20%", V1_HYB | {"slashing": True, "frac_mal": 0.20}),
+    # —— 另外两种读法(对照) ——
+    ("v1_literal", "字面读法:期就是天(锁定 6 天、基础层半衰期 120 天)", V1_CHAIN | {"period_days": 1.0}),
+    ("v1_literal_slash", "字面读法 + 罚没", V1_CHAIN | {"period_days": 1.0, "slashing": True}),
+    ("v1_time", "真实时间读法:全部按月标定的量折算(追加指派每 3 个月)", V1_TIME | {"period_days": 1.0}),
+    # —— 月结算(与已发布结果可比) ——
+    ("v1_month", "月结算 v1", V1_CHAIN | {"period_days": 30.0}),
+    ("v1_month_slash", "月结算 v1 + 罚没", V1_CHAIN | {"period_days": 30.0, "slashing": True}),
 ]
 
 # v1 关心的是行为:核验有没有人做、确立得了多少、钱有没有流向作恶者
@@ -894,9 +900,21 @@ ECOLS = [
 ]
 
 
+def _one(args):
+    p, s = args
+    return Sim(p, s).run()
+
+
+def mean_metrics(ms: list) -> dict:
+    out = {}
+    for k in ms[0]:
+        xs = [m[k] for m in ms if not (isinstance(m[k], float) and math.isnan(m[k]))]
+        out[k] = statistics.mean(xs) if xs else float("nan")
+    return out
+
+
 def run_scenario(p: Params, seeds: int) -> dict:
-    ms = [Sim(p, s).run() for s in range(seeds)]
-    return {k: statistics.mean(m[k] for m in ms) for k in ms[0]}
+    return mean_metrics([Sim(p, s).run() for s in range(seeds)])
 
 
 def table(results, cols=None) -> str:
@@ -965,17 +983,28 @@ def main():
     ap.add_argument("--steps", type=int, default=120)
     ap.add_argument("--md", action="store_true")
     ap.add_argument("--only", help="逗号分隔的场景名")
+    ap.add_argument("--jobs", type=int, default=1, help="并行进程数(结果与串行相同)")
     ap.add_argument("--suite", choices=("rules", "elastic", "v1", "all"), default="all")
     a = ap.parse_args()
     base = Params(steps=a.steps)
     only = set(a.only.split(",")) if a.only else None
 
     def run(scen):
+        todo = [(n, d, replace(base, **o)) for n, d, o in scen if not only or n in only]
+        if a.jobs <= 1:
+            out = []
+            for name, desc, p in todo:
+                out.append((name, desc, run_scenario(p, a.seeds)))
+                print(f"done {name}", flush=True)
+            return out
+        # 并行:每个(场景, 种子)是一个独立任务;各自有固定种子,结果与串行完全相同
+        from concurrent.futures import ProcessPoolExecutor
+        jobs = [(p, s) for _, _, p in todo for s in range(a.seeds)]
+        with ProcessPoolExecutor(max_workers=a.jobs) as ex:
+            res = list(ex.map(_one, jobs))
         out = []
-        for name, desc, over in scen:
-            if only and name not in only:
-                continue
-            out.append((name, desc, run_scenario(replace(base, **over), a.seeds)))
+        for i, (name, desc, _) in enumerate(todo):
+            out.append((name, desc, mean_metrics(res[i * a.seeds:(i + 1) * a.seeds])))
             print(f"done {name}", flush=True)
         return out
 
