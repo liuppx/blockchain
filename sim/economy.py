@@ -106,6 +106,12 @@ class Params:
     shock_frac: float = 0.0
     shrink_step: int = -1  # 从这一期起社区萎缩:不再有新人,行动数降为 shrink_actions
     shrink_actions: int = 1
+    # 第七轮(上链 v1):结算期长、映射方式与 v1 的简化
+    period_days: float = 30.0  # 一期多少天
+    mapping: str = "time"  # time:所有按月标定的量换算成同样的**真实时间**(基线,仿真与已发布结果一致)
+    # chain:按上链 v1 的字面读法——设计稿里的"期"就是结算期(天),不再折算成月
+    burn: bool = True  # 关:只增不缩(不销毁、不收缩),对应 v1 的"只前馈"
+    slashing: bool = True  # 关:挑战成功只让错误单元退出,不罚没锁定收益、不限流放行者(v1 还没有挑战与罚没)
 
 
 @dataclass
@@ -149,8 +155,48 @@ class Unit:
     assigned: set = field(default_factory=set)
 
 
+def per_period(p: Params) -> tuple[Params, float, bool]:
+    """把参数换算到 period_days 的期长。
+
+    返回(换算后的参数, 每月几期 M, 是否按链的字面读法换算)。
+
+    两种映射:
+    - **time**:所有按月标定的量换算成同样的**真实时间**。时长(期数)× M:步数、锁定期、增发半衰期、
+      外部付费曲线、平滑窗口、冲击时刻;每期的量 ÷ M:行动数、新人数、增发、外部付费、租金、追加通过;
+      每期的增益与上限按复利换算:r_max → (1+r)^(1/M) − 1;kp、ki ÷ M。
+      核验的检出率、错误率、挑战比例是"每次行动"的属性,与期长无关,不换算。
+      M = 1(按月结算)时**完全等价于原来的仿真**,所以已发布的结果仍然可比。
+    - **chain**:按上链 v1 的字面读法——设计稿里的"期"就是结算期(天)。见 Sim 里的 lit()/mon()。
+
+    诚实边界:两种映射回答的是同一个问题("换成天结算后结论还成立吗"),但它们对"期"的理解不同,
+    所以结果不同是预期的;选哪个是产品决定,不是技术决定。
+    """
+    m = 30.0 / p.period_days
+    if m == 1.0:
+        return p, 1.0, p.mapping == "chain"
+    q = replace(
+        p,
+        steps=round(p.steps * m), probation=max(1, round(p.probation * m)), vesting=round(p.vesting * m),
+        emission_half_life=round(p.emission_half_life * m), fee_mid=round(p.fee_mid * m), fee_width=p.fee_width * m,
+        shock_step=round(p.shock_step * m) if p.shock_step >= 0 else -1,
+        shrink_step=round(p.shrink_step * m) if p.shrink_step >= 0 else -1,
+        actions=p.actions / m, shrink_actions=p.shrink_actions / m, growth=p.growth / m,
+        e0=p.e0 / m, fee_max=p.fee_max / m, rent=p.rent / m, pump_actions=p.pump_actions / m,
+        unit_cap=p.unit_cap / m,
+        r_max=(1 + p.r_max) ** (1 / m) - 1 if p.r_max < 1 else p.r_max, kp=p.kp / m, ki=p.ki / m,
+    )
+    if p.mapping == "chain":
+        # 链的字面读法:设计稿里的数字就是"期"(天)
+        q = replace(q, probation=7, vesting=6, k_smooth=3)
+    else:
+        q = replace(q, k_smooth=max(1, round(p.k_smooth * m)))
+    return q, m, p.mapping == "chain"
+
+
 class Sim:
     def __init__(self, p: Params, seed: int):
+        p, self.M, self.chain = per_period(p)
+        self.Y = round(12 * self.M)  # 每年几期
         self.p, self.r = p, random.Random(seed)
         self.members: list = []
         self.queue: dict = {}
@@ -177,6 +223,21 @@ class Sim:
         for _ in range(p.founders):
             self.add_agent("honest", founder=True)
 
+    def n_of(self, x: float) -> int:
+        """期望为 x 的随机整数(期长变短后每期行动数会小于 1)。
+
+        x 是整数时不消耗随机数——否则随机序列会变,基线(M=1)就对不上原来的仿真了。"""
+        frac = x % 1
+        return int(x) + (1 if frac > 1e-12 and self.r.random() < frac else 0)
+
+    def months(self, n: float) -> int:
+        """n 个月对应几期(真实时间)。"""
+        return max(1, round(n * self.M))
+
+    def lit(self, n: int) -> int:
+        """设计稿里的"n 期":time 映射下是 n 个月(真实时间),chain 映射下就是 n 个结算期(天)。"""
+        return n if self.chain else self.months(n)
+
     # -- 参与者 ---------------------------------------------------------------
     def add_agent(self, kind, founder=False):
         a = Agent(len(self.agents), kind, self.t, founder=founder)
@@ -191,7 +252,8 @@ class Sim:
     def importance(self, u: Unit) -> float:
         if not self.p.importance_decay:
             return u.i_last
-        return u.i_last * 2 ** (-(self.t - u.t_last) / HALF_LIFE[u.layer])
+        hl = HALF_LIFE[u.layer] * (1.0 if self.chain else self.M)
+        return u.i_last * 2 ** (-(self.t - u.t_last) / hl)
 
     def bump(self, u: Unit, w: float):
         u.i_last = self.importance(u) + w
@@ -314,11 +376,13 @@ class Sim:
         if u.removed or u.author == a.id or u.correct or not u.detectable or r.random() >= p.detect_p:
             return
         u.removed = True
+        if not p.slashing:  # v1:错误单元退出,但没有罚没与限流
+            return
         pot = self.slash(u.author, u.id)
         for i in getattr(u, "_approvers", []):
             pot += self.slash(i, u.id)
-            self.agents[i].banned_until = self.t + 6  # 放行了可检出错误:暂停计入 6 期(M6 式限流)
-        self.agents[u.author].banned_until = self.t + 6
+            self.agents[i].banned_until = self.t + self.lit(6)  # 放行了可检出错误:暂停计入 6 期(M6 式限流)
+        self.agents[u.author].banned_until = self.t + self.lit(6)
         self.lock(a, pot * 0.5, None, review=True)
         self.burned += pot * 0.5
 
@@ -389,6 +453,8 @@ class Sim:
             # 知识量减少时同样跟着收缩,但收缩与纠偏合计每期不超过 r_max,避免一次冲击引发剧烈通缩。
             ff = p.k_money * (ks - ks_prev) if p.feedforward else 0.0
             desired = ff + correction
+            if not p.burn:  # v1:只增不缩——知识量下降时停止增发,但不销毁
+                desired = max(0.0, desired)
             if desired < 0:
                 desired = max(desired, -p.r_max * base)
             if desired >= 0:
@@ -436,7 +502,7 @@ class Sim:
             if u.removed:
                 continue
             inc = got.get(u.id, 0.0)
-            u.income = (u.income + [inc])[-12:]
+            u.income = (u.income + [inc])[-self.lit(12):]
             u.total_income += inc
             if p.rent_tax > 0:
                 rent = min(inc, inc * p.rent_tax * rent_mult)
@@ -449,10 +515,10 @@ class Sim:
             if net > 0:
                 self.lock(self.agents[u.author], net, u.id)
             if p.rent_tax > 0:
-                unused = u.established >= 0 and t - u.established >= 12 and self.importance(u) < p.i_alive
+                unused = u.established >= 0 and t - u.established >= self.lit(12) and self.importance(u) < p.i_alive
                 dies = not u.dormant and unused
             else:
-                dies = not u.dormant and t - u.born >= 12 and sum(u.income) < 12 * rent
+                dies = not u.dormant and t - u.born >= self.lit(12) and sum(u.income) < self.lit(12) * rent
             if dies:
                 u.dormant = True
                 if u.correct and u.established >= 0 and u.cited:
@@ -467,7 +533,7 @@ class Sim:
             self.treasury += rpool
         self.review_credits = {}
         if live:
-            self.per_unit_reward[t] = pool / len(live)
+            self.per_unit_reward[t] = pool / len(live) * self.M  # 折算成每月,不同期长可比
         self.m_hist.append(self.minted - self.burned)
         self.last_burn = self.burned - burned_before
         # 释放
@@ -484,7 +550,7 @@ class Sim:
                     keep.append((rel, amt, src))
             a.locked = keep
         self.paid_flow[t] = (fpaid, allflow)
-        if t == 11:
+        if t == self.Y - 1:
             self.minted_y1 = self.minted
         founders = sum(a.paid for a in self.agents if a.founder)
         allp = sum(a.paid for a in self.agents)
@@ -499,24 +565,21 @@ class Sim:
             for u in r.sample(est, int(len(est) * p.shock_frac)):
                 u.removed = True
         shrinking = 0 <= p.shrink_step <= self.t
-        if shrinking:
-            actions = p.shrink_actions
-        else:
-            actions = p.actions
+        actions_mean = p.shrink_actions if shrinking else p.actions
         if len(self.agents) < p.max_agents and not shrinking:
             n = int(p.growth) + (1 if r.random() < p.growth % 1 else 0)
             for _ in range(n):
                 x = r.random()
                 self.add_agent("mal" if x < p.frac_mal else "lazy" if x < p.frac_mal + p.frac_lazy else "honest")
-        self.pending = [u for u in self.units if u.established < 0 and not u.removed and self.t - u.born < 24]
+        self.pending = [u for u in self.units if u.established < 0 and not u.removed and self.t - u.born < self.lit(24)]
         self.members = [a for a in self.agents if self.established_member(a)]
         if p.assigned:
             if not hasattr(self, "queue"):
                 self.queue = {}
             for aid in list(self.queue):
-                self.queue[aid] = [u for u in self.queue[aid] if u.established < 0 and not u.removed and self.t - u.born < 24]
-            for u in self.pending:  # 迟迟凑不够通过的,追加指派(上限 8 人)
-                if self.t - u.born >= 3 and len(u.assigned) < 8 and len(self.counted(u.passes, u)) < 2:
+                self.queue[aid] = [u for u in self.queue[aid] if u.established < 0 and not u.removed and self.t - u.born < self.lit(24)]
+            for u in self.pending:  # 迟迟凑不够通过的,追加指派 1 人(上限 8 人)
+                if self.t - u.born >= self.lit(3) and len(u.assigned) < 8 and len(self.counted(u.passes, u)) < 2:
                     self.assign(u, 1)
         # 每期开始时缓存候选集(期内的变化下一期才可见,对月度粒度的模型影响可忽略)
         live = [u for u in self.units if self.live(u)]
@@ -541,7 +604,7 @@ class Sim:
         before_w = {a.id: a.earned_write for a in self.agents}
         before_r = {a.id: a.earned_review for a in self.agents}
         for a in self.agents:
-            for _ in range(actions):
+            for _ in range(self.n_of(actions_mean)):
                 if r.random() < a.f_review:
                     reviewed[a.id] += 1
                     self.review(a)
@@ -553,7 +616,7 @@ class Sim:
             for a in self.agents:
                 if a.kind != "mal" or not est:
                     continue
-                for _ in range(p.pump_actions):
+                for _ in range(self.n_of(p.pump_actions)):
                     u = r.choice(est)
                     if u.author != a.id and a.id not in u.passes:
                         u.passes.append(a.id)
@@ -564,9 +627,13 @@ class Sim:
                     continue
                 gw = (a.earned_write - before_w[a.id]) / max(1, wrote[a.id])
                 gr = (a.earned_review - before_r[a.id]) / max(1, reviewed[a.id])
-                a.ema_w = 0.8 * a.ema_w + 0.2 * gw
-                a.ema_r = 0.8 * a.ema_r + 0.2 * gr
-                a.f_review += 0.03 if a.ema_r > a.ema_w else -0.03
+                if not wrote[a.id] and not reviewed[a.id]:
+                    continue  # 这一期没有行动:没有新信息
+                keep = 0.8 ** (1 / self.M)
+                a.ema_w = keep * a.ema_w + (1 - keep) * gw
+                a.ema_r = keep * a.ema_r + (1 - keep) * gr
+                step = 0.03 / self.M
+                a.f_review += step if a.ema_r > a.ema_w else -step
                 a.f_review = min(0.9, max(0.15 if a.kind == "honest" else 0.05, a.f_review))
         self.t += 1
 
@@ -595,11 +662,13 @@ class Sim:
         good_live = [u for u in units if u.correct and u.established >= 0 and not u.removed]
 
         def pur(year):
-            ts = [v for k, v in self.per_unit_reward.items() if year * 12 - 12 <= k < year * 12]
+            Y = self.Y
+            ts = [v for k, v in self.per_unit_reward.items() if year * Y - Y <= k < year * Y]
             return statistics.mean(ts) if ts else 0.0
 
         def fs(year):  # 当年流量中创始者的占比
-            ks = [k for k in self.paid_flow if year * 12 - 12 <= k < year * 12]
+            Y = self.Y
+            ks = [k for k in self.paid_flow if year * Y - Y <= k < year * Y]
             f = sum(self.paid_flow[k][0] for k in ks)
             a = sum(self.paid_flow[k][1] for k in ks)
             return f / a if a else 0.0
@@ -610,10 +679,11 @@ class Sim:
 
         cap = p.e0 * p.emission_half_life / math.log(2)
         mk = [m / k for m, k in zip(self.m_hist, self.k_hist) if k > 0]
-        mk_tail = mk[36:] if len(mk) > 48 else mk
+        Y = self.Y
+        mk_tail = mk[3 * Y:] if len(mk) > 4 * Y else mk
         yearly = []
-        for y in range(3, p.steps // 12):
-            a0, a1 = self.m_hist[y * 12 - 1], self.m_hist[min(len(self.m_hist) - 1, y * 12 + 11)]
+        for y in range(3, p.steps // Y):
+            a0, a1 = self.m_hist[y * Y - 1], self.m_hist[min(len(self.m_hist) - 1, y * Y + Y - 1)]
             if a0 > 0:
                 yearly.append((a1 - a0) / a0)
         kend = self.k_hist[-1] if self.k_hist else 0.0
@@ -635,7 +705,7 @@ class Sim:
             "mal_pop": n_mal / n_all,
             "ring_share": ring_inc / inc_all,
             "established_frac": len(est) / max(1, len(units)),
-            "est_delay": statistics.mean(self.est_delay) if self.est_delay else float("nan"),
+            "est_delay": statistics.mean(self.est_delay) / self.M if self.est_delay else float("nan"),  # 月
             "err_in_est": sum(1 for u in est if not u.correct and not u.removed) / max(1, sum(1 for u in est if not u.removed)),
             "review_share": rev / max(1e-9, rev + wri),
             "f_review": statistics.mean(fr) if fr else 0.0,
@@ -759,6 +829,49 @@ ELASTIC = [
     ("k_honest_cap", "无攻击,仅饱和(检验饱和对诚实网络的代价)", EL2 | {"k_cred_cap": 0.6}),
 ]
 
+# 第七轮:上链 v1 —— 换成天结算、只前馈、只锁不罚
+V1 = {"assigned": True, "share_exp": 0.5, "elastic": True, "k_cred_cap": 0.6,
+      "burn": False, "slashing": False}
+V1_CHAIN = V1 | {"mapping": "chain"}
+V1_TIME = V1 | {"mapping": "time"}
+CHAIN = [
+    # —— 天结算(链的字面读法):设计稿里的"期"就是天 ——
+    ("v1_day", "上链 v1:天结算 + 只前馈 + 只锁不罚(设计稿的字面读法)",
+     V1_CHAIN | {"period_days": 1.0}),
+    ("v1_day_nofee", "上链 v1,外部付费不到来(测试网的实际情况)", V1_CHAIN | {"period_days": 1.0, "fee_max": 0.0}),
+    ("v1_day_slash", "上链 v1 + 挑战成功时罚没锁定收益并限流(对照:v1 缺的那块)", V1_CHAIN | {"period_days": 1.0, "slashing": True}),
+    ("v1_day_norevpay", "上链 v1,核验报酬关(对照:核验还有没有人做)",
+     V1_CHAIN | {"period_days": 1.0, "split_review": 0.0, "split_pool": 0.85}),
+    ("v1_day_noassign", "上链 v1,核验人不由协议指派", V1_CHAIN | {"period_days": 1.0, "assigned": False}),
+    ("v1_day_mal20", "上链 v1 + 作恶者 20%", V1_CHAIN | {"period_days": 1.0, "frac_mal": 0.20}),
+    ("v1_day_mal35", "上链 v1 + 作恶者 35%", V1_CHAIN | {"period_days": 1.0, "frac_mal": 0.35}),
+    ("v1_day_lazy50", "上链 v1 + 走过场的核验者 50%", V1_CHAIN | {"period_days": 1.0, "frac_lazy": 0.50}),
+    ("v1_day_pump", "上链 v1 + 作恶者持续追加通过(刷知识量)", V1_CHAIN | {"period_days": 1.0, "frac_mal": 0.20, "mal_pump": True}),
+    # —— 天结算但按真实时间换算(等价的另一种读法) ——
+    ("v1_day_time", "上链 v1:天结算,所有按月标定的量折算成同样的真实时间", V1_TIME | {"period_days": 1.0}),
+    ("v1_week", "上链 v1:周结算(链的字面读法)", V1_CHAIN | {"period_days": 7.0}),
+    ("v1_month", "上链 v1:月结算(基线:与已发布结果可比)", V1_CHAIN | {"period_days": 30.0}),
+    ("v1_month_slash", "月结算,v1 + 罚没(对照)", V1_CHAIN | {"period_days": 30.0, "slashing": True}),
+    ("v1_month_burn", "月结算,v1 + 允许销毁收缩(对照)", V1_CHAIN | {"period_days": 30.0, "burn": True}),
+]
+
+# v1 关心的是行为:核验有没有人做、确立得了多少、钱有没有流向作恶者
+V1COLS = [
+    ("err_in_est", "已确立单元中的错误", "{:.3f}"),
+    ("mal_share", "作恶者收入占比", "{:.3f}"),
+    ("mal_pop", "作恶者人数占比", "{:.2f}"),
+    ("established_frac", "单元确立比例", "{:.2f}"),
+    ("est_delay", "确立耗时(月)", "{:.1f}"),
+    ("f_review", "诚实者核验比例", "{:.2f}"),
+    ("review_share", "核验收入占比", "{:.2f}"),
+    ("mk_cv", "货币/知识量波动", "{:.3f}"),
+    ("mk_end", "末期 货币/知识量(目标 200)", "{:.0f}"),
+    ("k_end", "末期知识量", "{:.0f}"),
+    ("kmal_amp", "作恶单元放大倍数", "{:.2f}"),
+    ("dormant_good", "休眠的好单元", "{:.3f}"),
+    ("founder_stock", "创始者持有累计收入", "{:.2f}"),
+]
+
 ECOLS = [
     ("mk_cv", "每单位知识的货币量波动(变异系数)", "{:.3f}"),
     ("mk_end", "末期 货币量/知识量", "{:.0f}"),
@@ -827,13 +940,32 @@ ELASTIC_READING = """## 第四轮:弹性供应(锚定知识量)
   `k_*` 场景中追加通过是作恶者的**额外**行动,不占用写与核验的预算,以便单独衡量放大效应。"""
 
 
+V1_READING = """## 第七轮:上链 v1
+
+把结算周期从"月"换成"天"以后,仿真里所有按月标定的参数怎么读,有两种读法:
+
+- **链的字面读法**(`mapping="chain"`):设计稿里的"期"就是结算期(天)。锁定期 6 期 = 6 天,
+  重要性半衰期 基础 120 期 = 120 天。见习期 7 期(链上就是 7 天)。
+- **真实时间读法**(`mapping="time"`):所有按月标定的量折算成同样的真实时间(锁定期 6 期 = 6 个月)。
+  这是"换个周期但行为不变"的对照。
+
+两种读法回答同一个问题("换成天结算后结论还成立吗"),但对"期"的理解不同,结果不同是预期的。
+**选哪个是产品决定,不是技术决定**——见设计稿 `docs/design/knowledge-economy-v1.md` §4。
+
+另外三个 v1 的简化:只前馈(不销毁、不收缩)、只锁不罚(没有挑战与罚没)、可信度计入上限 0.6。
+
+- **每单位知识的货币量波动**:变异系数越小,货币量越紧地跟着知识量走。
+- **已确立单元中的错误**:这是质量的核心指标。
+- **核验收入占比**:核验报酬在总发放里的份额。`v1_day_norevpay` 是它的对照。
+- **诚实者核验比例**:社区愿不愿意做核验。"""
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--seeds", type=int, default=4)
     ap.add_argument("--steps", type=int, default=120)
     ap.add_argument("--md", action="store_true")
     ap.add_argument("--only", help="逗号分隔的场景名")
-    ap.add_argument("--suite", choices=("rules", "elastic", "all"), default="all")
+    ap.add_argument("--suite", choices=("rules", "elastic", "v1", "all"), default="all")
     a = ap.parse_args()
     base = Params(steps=a.steps)
     only = set(a.only.split(",")) if a.only else None
@@ -849,9 +981,11 @@ def main():
 
     rules = run(SCENARIOS) if a.suite in ("rules", "all") else []
     el = run(ELASTIC) if a.suite in ("elastic", "all") else []
+    v1 = run(CHAIN) if a.suite in ("v1", "all") else []
     t1 = table(rules) if rules else ""
     t2 = table(el, ECOLS) if el else ""
-    print(t1 + "\n\n" + t2)
+    t3 = table(v1, V1COLS) if v1 else ""
+    print(t1 + "\n\n" + t2 + ("\n\n" + t3 if t3 else ""))
     if a.md:
         with open("sim/ECONOMY.md", "w", encoding="utf-8") as f:
             f.write("<!-- 由 sim/economy.py --md 自动生成,勿手改 -->\n")
@@ -859,6 +993,8 @@ def main():
             f.write(READING + "\n\n")
             f.write("## 第一至三轮:分配规则\n\n" + t1 + "\n\n")
             f.write(ELASTIC_READING + "\n\n" + t2 + "\n")
+            if v1:
+                f.write("\n## 第七轮:上链 v1(天结算、只前馈、只锁不罚)\n\n" + V1_READING + "\n\n" + t3 + "\n")
 
 
 if __name__ == "__main__":
