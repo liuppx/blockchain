@@ -1909,8 +1909,14 @@ async fn run_actor(mut actor: Actor, mut rx: mpsc::UnboundedReceiver<Cmd>) {
                 let locks = e
                     .locks
                     .iter()
-                    .map(|(w, l)| (*w, l.locked, l.next_release_height, l.released))
+                    .map(|(w, l)| (*w, l.locked, l.next_release_height, l.released, l.earned))
                     .collect();
+                let period = (
+                    state.economy.period.settled,
+                    state.economy.period.total_issued,
+                    state.economy.period.treasury,
+                    state.economy.period.k_history.len(),
+                );
                 let _ = reply.send(EconomySummary {
                     active: state.economy_active(state.height),
                     activation_height: state.upgrades.activation(up),
@@ -1918,6 +1924,7 @@ async fn run_actor(mut actor: Actor, mut rx: mpsc::UnboundedReceiver<Cmd>) {
                     importance,
                     review_scores,
                     locks,
+                    period,
                 });
             }
             Cmd::QueryUnits { reply } => {
@@ -3515,8 +3522,10 @@ struct EconomySummary {
     importance: Vec<(u64, String, String)>, // (单元, 重要性 Q32, 层级)
     /// 每个账户的核验得分。
     review_scores: Vec<(u64, u64)>,
-    /// 每个账户的锁定账本:(账户, 锁定额, 释放高度, 已释放)。
-    locks: Vec<(u64, u64, u64, u64)>,
+    /// 每个账户的锁定账本:(账户, 锁定额, 释放高度, 已释放, 累计获得)。
+    locks: Vec<(u64, u64, u64, u64, u64)>,
+    /// 结算状态:(已结算期数, 累计增发, 国库, 知识量历史长度)。
+    period: (u64, u64, u64, usize),
 }
 
 struct UnitSummary {
@@ -3884,11 +3893,15 @@ fn format_economy(e: &EconomySummary) -> String {
     for (who, score) in &e.review_scores {
         out.push_str(&format!("score account={who} points={score}\n"));
     }
-    for (who, locked, release, released) in &e.locks {
+    for (who, locked, release, released, earned) in &e.locks {
         out.push_str(&format!(
-            "lock account={who} locked={locked} release_height={release} released={released}\n"
+            "lock account={who} locked={locked} release_height={release} released={released} earned={earned}\n"
         ));
     }
+    out.push_str(&format!(
+        "period settled={} issued={} treasury={} k_history={}\n",
+        e.period.0, e.period.1, e.period.2, e.period.3
+    ));
     out.trim_end().to_string()
 }
 
@@ -3920,10 +3933,41 @@ fn json_economy(e: &EconomySummary) -> String {
         })
         .collect::<Vec<_>>()
         .join(",");
+    let scores = e
+        .review_scores
+        .iter()
+        .map(|(who, pts)| {
+            format!(
+                "{{\"account\":{},\"points\":{}}}",
+                json_u64(*who),
+                json_u64(*pts)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+    let locks = e
+        .locks
+        .iter()
+        .map(|(who, locked, release, released, earned)| {
+            format!(
+                "{{\"account\":{},\"locked\":{},\"release_height\":{},\"released\":{},\"earned\":{}}}",
+                json_u64(*who),
+                json_u64(*locked),
+                json_u64(*release),
+                json_u64(*released),
+                json_u64(*earned)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",");
     format!(
-        "{{\"active\":{},\"activation_height\":{},\"versions\":[{versions}],\"importance\":[{importance}]}}",
+        "{{\"active\":{},\"activation_height\":{},\"versions\":[{versions}],\"importance\":[{importance}],\"review_scores\":[{scores}],\"locks\":[{locks}],\"period\":{{\"settled\":{},\"issued\":{},\"treasury\":{},\"k_history\":{}}}}}",
         e.active,
-        e.activation_height.map(json_u64).unwrap_or_else(|| "null".into())
+        e.activation_height.map(json_u64).unwrap_or_else(|| "null".into()),
+        json_u64(e.period.0),
+        json_u64(e.period.1),
+        json_u64(e.period.2),
+        json_u64(e.period.3 as u64)
     )
 }
 
@@ -12111,6 +12155,23 @@ mod tests {
         assert!(t.starts_with("HTTP/1.1 200 OK"), "{t}");
         assert!(t.contains("active=false"), "没排升级时未激活:{t}");
         assert!(t.contains("versions=0"), "{t}");
+        assert!(t.contains("period settled=0 issued=0"), "还没结算过:{t}");
+        // JSON 形式:整体能解析,并带齐全部字段
+        let j = get(rpc_addr, "/economy?format=json").await;
+        let body = j.split("\r\n\r\n").nth(1).expect("body");
+        let v: serde_json::Value = serde_json::from_str(body).expect("valid JSON");
+        for k in [
+            "active",
+            "versions",
+            "importance",
+            "review_scores",
+            "locks",
+            "period",
+        ] {
+            assert!(v.get(k).is_some(), "JSON 缺字段 {k}:{body}");
+        }
+        // u64 在 JSON 里按项目惯例编码为字符串(JS 超过 2^53 会丢精度)
+        assert_eq!(v["period"]["settled"], serde_json::json!("0"));
 
         let _ = std::fs::remove_dir_all(&dir);
     }

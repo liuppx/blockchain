@@ -1293,7 +1293,15 @@ pub(crate) fn enc_economy_state(e: &mut Enc, x: &crate::economy::EconomyState) {
         e.u64(led.locked);
         e.u64(led.next_release_height);
         e.u64(led.released);
+        e.u64(led.earned);
     }
+    e.u64(x.period.settled);
+    e.u64(x.period.k_history.len() as u64);
+    for k in &x.period.k_history {
+        e.u64(*k);
+    }
+    e.u64(x.period.total_issued);
+    e.u64(x.period.treasury);
 }
 
 fn dec_economy_state(d: &mut Dec) -> Result<crate::economy::EconomyState, CodecError> {
@@ -1356,20 +1364,37 @@ fn dec_economy_state(d: &mut Dec) -> Result<crate::economy::EconomyState, CodecE
         let locked = d.u64()?;
         let next_release_height = d.u64()?;
         let released = d.u64()?;
+        let earned = d.u64()?;
         locks.insert(
             who,
             crate::economy::LockLedger {
                 locked,
                 next_release_height,
                 released,
+                earned,
             },
         );
     }
+    let settled = d.u64()?;
+    let n = d.count()?;
+    let mut k_history = Vec::with_capacity(prealloc(n));
+    for _ in 0..n {
+        k_history.push(d.u64()?);
+    }
+    let total_issued = d.u64()?;
+    let treasury = d.u64()?;
+    let period = crate::economy::PeriodState {
+        settled,
+        k_history,
+        total_issued,
+        treasury,
+    };
     Ok(crate::economy::EconomyState {
         versions,
         importance,
         review_scores,
         locks,
+        period,
     })
 }
 

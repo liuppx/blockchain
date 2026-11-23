@@ -2126,6 +2126,11 @@ impl ChainState {
         }
         // 知识经济 v1:凑不够通过的版本,每 3 天追加指派 1 人(H* 起)。
         self.economy_topups(new_height, &block.prev_hash);
+        // 知识经济 v1:到期释放锁定的收益、每到一个结算周期结算一次(H* 起)。
+        self.economy_release(new_height);
+        if new_height.is_multiple_of(crate::economy::PERIOD_BLOCKS) {
+            self.economy_settle(new_height);
+        }
 
         // on-chain validator-set transition: explicit updates PLUS the changes
         // implied by this block's staking ops (power == bonded stake). Both take
@@ -2870,6 +2875,172 @@ impl ChainState {
             let acc = self.economy.importance.entry(target).or_default();
             crate::economy::bump(acc, w, half_life, height);
         }
+    }
+
+    /// 知识经济 v1:结算一次(每天一次)。
+    ///
+    /// 知识量 K = Σ(已确立单元的 min(有效可信度, 0.6) × min(√重要性, 3))。
+    /// 有效可信度是**递归**的(依据链上游的地基不牢,上层也不可信),所以每期**全量重算**——
+    /// 每天一次、单元数上万时也只是十万次运算,比增量维护简单得多、也不容易出错。
+    /// 增发只跟随知识量的增长(只前馈、不销毁),按 3 期滑动均值;
+    /// 分成 60% 知识池 / 25% 核验池 / 15% 国库;知识池的 20% 沿"依据"上溯。
+    /// 测试网只记积分、不发币(设计稿决定 #7)。
+    fn economy_settle(&mut self, height: u64) {
+        use crate::economy::*;
+        if !self.economy_active(height) {
+            return;
+        }
+        // --- 1. 知识量 K ---
+        let mut established: Vec<(u64, u32)> = self
+            .economy
+            .versions
+            .iter()
+            .filter(|(_, v)| v.established_height.is_some())
+            .map(|(k, _)| *k)
+            .collect();
+        established.sort(); // 确定性:按 (单元, 版本) 排序
+        let mut k_q32: u64 = 0;
+        let mut weights: Vec<u64> = Vec::with_capacity(established.len());
+        let mut units: Vec<u64> = Vec::with_capacity(established.len());
+        for (unit, version) in &established {
+            let eff_bps = self
+                .knowledge
+                .credibility(*unit, *version)
+                .map(|c| c.effective_bps)
+                .unwrap_or(0);
+            let cred_q32 = ((eff_bps.min(K_CRED_CAP_BPS as u32) as u64) << 32) / 10_000;
+            // 重要性:已确立的单元至少有 I0 = 1;按当前高度惰性衰减
+            let layer = self
+                .knowledge
+                .units
+                .get(unit)
+                .map(|u| u.layer)
+                .unwrap_or(crate::knowledge::Layer::Foundation);
+            let hl = IMPORTANCE_HALF_LIFE_BLOCKS[layer as usize];
+            let imp = self
+                .economy
+                .importance
+                .get(unit)
+                .map(|acc| crate::economy::importance_at(acc, hl, height))
+                .unwrap_or(0);
+            let sqrt_imp = crate::economy::sqrt_q32(imp).min(K_IMP_CAP_Q32);
+            let v = ((cred_q32 as u128 * sqrt_imp as u128) >> 32) as u64;
+            k_q32 = k_q32.saturating_add(v);
+            // 分配权重:√重要性(与仿真的 share_exp=0.5 一致)
+            weights.push(crate::economy::sqrt_q32(imp));
+            units.push(*unit);
+        }
+        // --- 2. 增发:只前馈,k × (K 本期 − K 上期),用 3 期滑动均值 ---
+        self.economy.period.k_history.push(k_q32);
+        // 保留 2×K_SMOOTH 期:本期窗口与上期窗口(仿真的 `k_hist[-k_smooth:]` 与 `[-k_smooth-1:-1]`)
+        if self.economy.period.k_history.len() > 2 * K_SMOOTH {
+            self.economy.period.k_history.remove(0);
+        }
+        let hist = self.economy.period.k_history.clone();
+        if hist.len() < K_SMOOTH + 1 {
+            return; // 还没有足够的期数,先不发
+        }
+        // 两个窗口都取 K_SMOOTH 期,与仿真一致(`k_hist[-k_smooth:]` 与 `k_hist[-k_smooth-1:-1]`):
+        // 本期窗口是最近 K_SMOOTH 期,上期窗口**滞后一期**(与本期窗口重叠),所以 K 刚涨上去时
+        // 增发会分几步跟上,而不是一次到位。
+        let mean_of = |w: &[u64]| -> u64 { w.iter().sum::<u64>() / K_SMOOTH as u64 };
+        let n = hist.len();
+        let mean_now: u64 = mean_of(&hist[n - K_SMOOTH..]);
+        let mean_prev: u64 = mean_of(&hist[n - K_SMOOTH - 1..n - 1]);
+        if mean_now <= mean_prev {
+            return; // 知识量没涨 ⇒ 不增发(只增不缩)
+        }
+        let delta = mean_now - mean_prev;
+        let issued = ((K_MONEY as u128 * delta as u128) >> 32) as u64;
+
+        // --- 3. 分成 ---
+        let pool = (issued as u128 * SPLIT_POOL_BPS as u128 / 10_000) as u64;
+        let rpool = (issued as u128 * SPLIT_REVIEW_BPS as u128 / 10_000) as u64;
+        let to_treasury = issued - pool - rpool;
+
+        // --- 4. 知识池:按 √重要性分给发布者,20% 沿"依据"上溯 ---
+        let release = height + LOCK_BLOCKS;
+        let (shares, remainder) = crate::economy::distribute_by_weight(pool, &weights);
+        for (i, share) in shares.iter().enumerate() {
+            let unit = units[i];
+            let up = ((*share as u128 * UPSTREAM_BPS as u128) / 10_000) as u64;
+            let share = share - up;
+            let publisher = self
+                .knowledge
+                .units
+                .get(&unit)
+                .map(|u| u.author)
+                .unwrap_or(0);
+            self.economy.credit_locked(publisher, share, release);
+            // 上溯:给这个单元依据的、由别人写的单元的作者
+            let cites: Vec<u64> = self
+                .knowledge
+                .units
+                .get(&unit)
+                .map(|u| {
+                    let last = u.versions.last().expect("has version");
+                    last.payload
+                        .cites
+                        .iter()
+                        .filter(|c| c.kind == crate::knowledge::CiteKind::Basis)
+                        .filter_map(|c| self.knowledge.units.get(&c.unit))
+                        .filter(|t| t.author != publisher)
+                        .map(|t| t.author)
+                        .collect()
+                })
+                .unwrap_or_default();
+            if !cites.is_empty() {
+                let each = up / cites.len() as u64;
+                for &author in &cites {
+                    self.economy.credit_locked(author, each, release);
+                }
+                // 整除的零头也要发出去,不能凭空消失
+                let leftover = up - each * cites.len() as u64;
+                if leftover > 0 {
+                    let first = *cites.first().expect("non-empty");
+                    self.economy.credit_locked(first, leftover, release);
+                }
+            } else {
+                // 没有可上溯的对象(同作者引用、或没有依据):这部分留给发布者
+                self.economy.credit_locked(publisher, up, release);
+            }
+        }
+        // --- 5. 核验池:按累计得分分 ---
+        let verifiers: Vec<u64> = self.economy.review_scores.keys().copied().collect();
+        let scores: Vec<u64> = verifiers
+            .iter()
+            .map(|w| self.economy.review_scores.get(w).copied().unwrap_or(0))
+            .collect();
+        // 这一期没人有得分时,核验池整体回国库;有得分时按分数分,零头也回国库。
+        let review_left = if !verifiers.is_empty() && scores.iter().any(|s| *s > 0) {
+            let (shares, rest) = crate::economy::distribute_by_weight(rpool, &scores);
+            for (i, share) in shares.iter().enumerate() {
+                self.economy.credit_locked(verifiers[i], *share, release);
+            }
+            rest
+        } else {
+            rpool
+        };
+        // --- 6. 记账 ---
+        self.economy.period.total_issued = self.economy.period.total_issued.saturating_add(issued);
+        self.economy.period.treasury = self
+            .economy
+            .period
+            .treasury
+            .saturating_add(to_treasury)
+            .saturating_add(remainder)
+            .saturating_add(review_left);
+        self.economy.period.settled += 1;
+        // 结算完清空得分表(仿真里每期结算后清空 `review_credits`)
+        self.economy.review_scores.clear();
+    }
+
+    /// 知识经济 v1:释放到期锁定的收益(每天一次即可,但每块都查也便宜)。
+    fn economy_release(&mut self, height: u64) {
+        if !self.economy_active(height) {
+            return;
+        }
+        self.economy.release_locks(height);
     }
 
     /// 知识经济 v1:每块末尾,对还没确立、指派人数不到上限、且距上次指派已满 3 天的版本追加 1 位。
@@ -6579,6 +6750,138 @@ mod tests {
     }
 
     #[test]
+    fn settlement_issues_nothing_until_it_has_enough_periods() {
+        use crate::knowledge::Layer;
+        let mut chain = Chain::new(egenesis(1));
+        let op = kop(&chain, 1, create(Layer::Foundation, 2, vec![]));
+        commit_ops(&mut chain, vec![op]);
+        let a = chain.state.economy.versions[&(1, 1)].assigned.clone();
+        for who in [a[0], a[1]] {
+            let v = verify(&chain, who, 1, 1, true);
+            commit_ops(&mut chain, vec![v]);
+        }
+        // 还没到结算周期:不发
+        chain.state.economy_settle(chain.state.height);
+        assert_eq!(chain.state.economy.period.settled, 0);
+        assert_eq!(chain.state.economy.period.total_issued, 0);
+        // 结算了几期、但知识量窗口还没攒够:仍不发
+        for _ in 0..3 {
+            chain.state.economy_settle(chain.state.height + 1);
+        }
+        assert_eq!(chain.state.economy.period.total_issued, 0, "窗口不够就不发");
+    }
+
+    #[test]
+    fn settlement_issues_and_splits_when_knowledge_grows() {
+        use crate::knowledge::Layer;
+        let mut chain = Chain::new(egenesis(1));
+        let op = kop(&chain, 1, create(Layer::Foundation, 2, vec![]));
+        commit_ops(&mut chain, vec![op]);
+        let a = chain.state.economy.versions[&(1, 1)].assigned.clone();
+        for who in [a[0], a[1]] {
+            let v = verify(&chain, who, 1, 1, true);
+            commit_ops(&mut chain, vec![v]);
+        }
+        // 先结几期(知识量不变 ⇒ 不增发),再确立第二个单元让知识量涨上去,继续结几期 ⇒ 增发
+        for period in 1..=4u64 {
+            chain
+                .state
+                .economy_settle(period * crate::economy::PERIOD_BLOCKS);
+        }
+        assert_eq!(
+            chain.state.economy.period.total_issued, 0,
+            "知识量没涨就不增发"
+        );
+        // 第二个单元被确立 ⇒ 知识量上升
+        let op = kop(&chain, 2, create(Layer::Foundation, 2, vec![]));
+        commit_ops(&mut chain, vec![op]);
+        let b = chain.state.economy.versions[&(2, 1)].assigned.clone();
+        for who in [b[0], b[1]] {
+            let v = verify(&chain, who, 2, 1, true);
+            commit_ops(&mut chain, vec![v]);
+        }
+        for period in 5..=9u64 {
+            chain
+                .state
+                .economy_settle(period * crate::economy::PERIOD_BLOCKS);
+        }
+        let issued_total = chain.state.economy.period.total_issued;
+        assert!(issued_total > 0, "知识量涨了就要增发");
+        // 分成:国库拿 15% 左右
+        assert!(chain.state.economy.period.treasury > 0);
+        // 发布者(账户 1)与核验人都拿到积分
+        let publisher = chain
+            .state
+            .economy
+            .locks
+            .get(&1)
+            .cloned()
+            .unwrap_or_default();
+        assert!(publisher.earned > 0, "发布者应有积分");
+        let verifier = chain
+            .state
+            .economy
+            .locks
+            .get(&a[0])
+            .cloned()
+            .unwrap_or_default();
+        assert!(verifier.earned > 0, "核验人应有积分");
+    }
+
+    #[test]
+    fn settlement_never_mints_more_than_it_issues() {
+        use crate::knowledge::Layer;
+        let mut chain = Chain::new(egenesis(1));
+        let op = kop(&chain, 1, create(Layer::Foundation, 2, vec![]));
+        commit_ops(&mut chain, vec![op]);
+        let a = chain.state.economy.versions[&(1, 1)].assigned.clone();
+        for who in [a[0], a[1]] {
+            let v = verify(&chain, who, 1, 1, true);
+            commit_ops(&mut chain, vec![v]);
+        }
+        for period in 1..=6u64 {
+            chain
+                .state
+                .economy_settle(period * crate::economy::PERIOD_BLOCKS);
+        }
+        let total_earned: u64 = chain.state.economy.locks.values().map(|l| l.earned).sum();
+        let issued = chain.state.economy.period.total_issued;
+        assert!(
+            total_earned <= issued,
+            "分出去的不能超过发出的:{total_earned} > {issued}"
+        );
+        assert!(
+            issued == total_earned + chain.state.economy.period.treasury,
+            "发出的 = 分出去的 + 国库"
+        );
+    }
+
+    #[test]
+    fn distribution_never_exceeds_the_pool() {
+        let (shares, rest) = crate::economy::distribute_by_weight(100, &[1, 1, 1]);
+        assert_eq!(shares.iter().sum::<u64>() + rest, 100);
+        assert_eq!(shares, vec![33, 33, 33]);
+        assert_eq!(rest, 1, "零头归国库");
+        // 权重全零:全部归国库
+        let (shares, rest) = crate::economy::distribute_by_weight(100, &[0, 0]);
+        assert_eq!(shares, vec![0, 0]);
+        assert_eq!(rest, 100);
+        // 空池
+        let (shares, rest) = crate::economy::distribute_by_weight(0, &[1, 2]);
+        assert_eq!(shares, vec![0, 0]);
+        assert_eq!(rest, 0);
+    }
+
+    #[test]
+    fn integer_sqrt_matches_the_real_value() {
+        for x in [0u64, 1, 2, 3, 4, 100, 9999, 1 << 31, 1 << 32, 3 << 32] {
+            let got = crate::economy::sqrt_q32(x) as f64 / (1u64 << 32) as f64;
+            let want = (x as f64 / (1u64 << 32) as f64).sqrt();
+            assert!((got - want).abs() < 1e-9, "sqrt({x}): {got} vs {want}");
+        }
+    }
+
+    #[test]
     fn the_lock_ledger_releases_when_it_matures() {
         let mut e = crate::economy::EconomyState::default();
         e.locks.insert(
@@ -6587,6 +6890,7 @@ mod tests {
                 locked: 100,
                 next_release_height: 50,
                 released: 0,
+                earned: 100,
             },
         );
         assert_eq!(e.release_locks(49), 0, "没到期不释放");

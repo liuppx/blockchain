@@ -147,6 +147,93 @@ pub struct EconomyState {
     /// 每个账户的锁定账本:已锁定的收益(还没到释放期)、释放期。
     /// 测试网阶段只记积分、不发币(设计稿决定 #7),但账本先跑起来,主网创世时按主网规则重算。
     pub locks: BTreeMap<u64, LockLedger>,
+    /// 结算状态(期号、知识量历史、累计增发、国库)。
+    pub period: PeriodState,
+}
+
+// ---- 结算(S3)------------------------------------------------------------------
+
+/// 结算期长(区块数):1 天(测试网约 1 块/秒)。
+pub const PERIOD_BLOCKS: u64 = 86_400;
+/// 收益锁定期(区块数):180 天(hybrid 读法,§4.1)。
+pub const LOCK_BLOCKS: u64 = 180 * 86_400;
+/// 每单位知识量对应的增发(µCOG)。仿真里 `k_money=200`(抽象单位),这里按 1 COG = 10^6 µCOG。
+pub const K_MONEY: u64 = 200 * 1_000_000;
+/// 分成(万分比):知识池 60% / 核验池 25% / 其余 15% 进国库。
+pub const SPLIT_POOL_BPS: u64 = 6000;
+pub const SPLIT_REVIEW_BPS: u64 = 2500;
+/// 知识池里沿"依据"上溯的比例(万分比):20%。
+pub const UPSTREAM_BPS: u64 = 2000;
+/// 知识量里可信度的计入上限(万分比):2 位净通过即饱和(0.6)。
+pub const K_CRED_CAP_BPS: u64 = 6000;
+/// 知识量里 √重要性的上限(Q32):3.0。
+pub const K_IMP_CAP_Q32: u64 = 3 << 32;
+/// 知识量的滑动窗口(期数):3。
+pub const K_SMOOTH: usize = 3;
+
+/// 结算状态。
+#[derive(Clone, Debug, PartialEq, Eq, Default)]
+pub struct PeriodState {
+    /// 已完成的结算次数。
+    pub settled: u64,
+    /// 最近若干期的知识量 K(Q32);够 2×K_SMOOTH 期才发第一次。
+    pub k_history: Vec<u64>,
+    /// 累计增发(µCOG)。
+    pub total_issued: u64,
+    /// 累计进国库(µCOG)。
+    pub treasury: u64,
+}
+
+/// 一个账户的积分账本(测试网只记积分、不发币,设计稿决定 #7)。
+#[derive(Clone, Debug, PartialEq, Eq, Default)]
+pub struct PointLedger {
+    /// 累计获得。
+    pub earned: u64,
+    /// 锁定中(还没到释放期)。
+    pub locked: u64,
+    /// 已释放。
+    pub released: u64,
+    /// 释放高度。
+    pub release_height: u64,
+}
+
+/// 按权重分配一个池子:返回每项的份额,以及没分完的零头(归国库)。
+///
+/// **全程向下取整**,中间用 u128——绝不凭空造钱:分出去的总数不会超过池子。
+pub fn distribute_by_weight(pool: u64, weights: &[u64]) -> (Vec<u64>, u64) {
+    let sum: u128 = weights.iter().map(|w| *w as u128).sum();
+    if sum == 0 {
+        return (vec![0; weights.len()], pool);
+    }
+    let mut out = Vec::with_capacity(weights.len());
+    let mut used: u128 = 0;
+    for w in weights {
+        let share = ((pool as u128) * (*w as u128) / sum) as u64;
+        used += share as u128;
+        out.push(share);
+    }
+    (out, (pool as u128 - used) as u64)
+}
+
+/// Q32 开平方:√(x / 2^32) · 2^32 = isqrt(x << 32)。整数牛顿法,不用浮点。
+pub fn sqrt_q32(x: u64) -> u64 {
+    if x == 0 {
+        return 0;
+    }
+    isqrt_u128((x as u128) << 32) as u64
+}
+
+fn isqrt_u128(n: u128) -> u128 {
+    if n == 0 {
+        return 0;
+    }
+    let mut x = n;
+    let mut y = x.div_ceil(2);
+    while y < x {
+        x = y;
+        y = (x + n / x) / 2;
+    }
+    x
 }
 
 /// 一个账户的锁定账本。
@@ -158,6 +245,8 @@ pub struct LockLedger {
     pub next_release_height: u64,
     /// 累计已释放。
     pub released: u64,
+    /// 累计获得(含仍在锁定的)。
+    pub earned: u64,
 }
 
 impl EconomyState {
@@ -181,6 +270,17 @@ impl EconomyState {
     /// 把账户的得分清零(结算时把得分转成收益之后调用;仿真里每期结算后清空 `review_credits`)。
     pub fn take_credits(&mut self, verifier: u64) -> u64 {
         self.review_scores.get(&verifier).copied().unwrap_or(0)
+    }
+
+    /// 记一笔收益:累计 + 锁定,释放期取最晚的那一笔。
+    pub fn credit_locked(&mut self, who: u64, amount: u64, release_height: u64) {
+        if amount == 0 {
+            return;
+        }
+        let led = self.locks.entry(who).or_default();
+        led.earned = led.earned.saturating_add(amount);
+        led.locked = led.locked.saturating_add(amount);
+        led.next_release_height = led.next_release_height.max(release_height);
     }
 
     /// 释放到期锁定的收益,返回释放的数额。
