@@ -2802,6 +2802,49 @@ impl ChainState {
                 .expect("checked");
             ve.established_height = Some(height);
             ve.approvers = passes;
+            // 确立 ⇒ 这个单元开始有重要性(I0 = 1),并把它依据/参见的、别人写的单元也加分。
+            // 与仿真一致(`sim/economy.py` `try_establish` → `bump(u, i0)` → `count_citations`)。
+            let acc = self.economy.importance.entry(unit).or_default();
+            acc.value = crate::economy::ESTABLISH_IMPORTANCE;
+            acc.last_height = height;
+            self.economy_count_citations(unit, version, height);
+        }
+    }
+
+    /// 一个单元确立时,把它依据(+1)/参见(+0.25)的、由**别人**写的单元的重要性加上去。
+    /// 同作者引用不计(仿真里也是这样:`if t.author != u.author`)。
+    fn economy_count_citations(&mut self, unit: u64, version: u32, height: u64) {
+        let Some(u) = self.knowledge.units.get(&unit) else {
+            return;
+        };
+        let Some(v) = u.versions.get((version as usize).wrapping_sub(1)) else {
+            return;
+        };
+        let author = u.author;
+        let cites: Vec<(u64, bool)> = v
+            .payload
+            .cites
+            .iter()
+            .map(|c| (c.unit, matches!(c.kind, crate::knowledge::CiteKind::Basis)))
+            .collect();
+        for (target, is_basis) in cites {
+            if target == unit {
+                continue;
+            }
+            let Some(t) = self.knowledge.units.get(&target) else {
+                continue;
+            };
+            if t.author == author {
+                continue; // 同作者引用不计
+            }
+            let half_life = crate::economy::IMPORTANCE_HALF_LIFE_BLOCKS[t.layer as usize];
+            let w = if is_basis {
+                crate::economy::BASIS_WEIGHT
+            } else {
+                crate::economy::SEE_ALSO_WEIGHT
+            };
+            let acc = self.economy.importance.entry(target).or_default();
+            crate::economy::bump(acc, w, half_life, height);
         }
     }
 
@@ -6275,6 +6318,153 @@ mod tests {
         );
         commit_ops(&mut chain, vec![op]);
         assert_eq!(chain.state.economy.versions[&(1, 2)].assigned.len(), 4);
+    }
+
+    #[test]
+    fn importance_starts_at_one_when_a_unit_is_established() {
+        use crate::knowledge::Layer;
+        let mut chain = Chain::new(egenesis(1));
+        let op = kop(&chain, 1, create(Layer::Foundation, 2, vec![]));
+        commit_ops(&mut chain, vec![op]);
+        assert!(
+            !chain.state.economy.importance.contains_key(&1),
+            "没确立就没有重要性"
+        );
+        let a = chain.state.economy.versions[&(1, 1)].assigned.clone();
+        let ops = vec![
+            verify(&chain, a[0], 1, 1, true),
+            verify(&chain, a[1], 1, 1, true),
+        ];
+        commit_ops(&mut chain, ops);
+        let acc = &chain.state.economy.importance[&1];
+        assert_eq!(acc.value, crate::economy::ESTABLISH_IMPORTANCE, "I0 = 1.0");
+        assert_eq!(acc.last_height, chain.state.height);
+    }
+
+    #[test]
+    fn establishing_a_citing_unit_raises_the_importance_of_what_it_cites() {
+        use crate::knowledge::{Cite, CiteKind, Layer};
+        let mut chain = Chain::new(egenesis(1));
+        // 单元 1(账户 1 写)与单元 2(账户 2 写);单元 3(账户 3 写)依据单元 1、参见单元 2。
+        let mut chain = {
+            let op = kop(&chain, 1, create(Layer::Foundation, 2, vec![]));
+            commit_ops(&mut chain, vec![op]);
+            let op = kop(&chain, 2, create(Layer::Foundation, 2, vec![]));
+            commit_ops(&mut chain, vec![op]);
+            let cites = vec![
+                Cite {
+                    unit: 1,
+                    version: 1,
+                    kind: CiteKind::Basis,
+                },
+                Cite {
+                    unit: 2,
+                    version: 1,
+                    kind: CiteKind::SeeAlso,
+                },
+            ];
+            let op = kop(&chain, 3, create(Layer::Application, 2, cites));
+            commit_ops(&mut chain, vec![op]);
+            chain
+        };
+        // 确立单元 3 ⇒ 单元 1 加 1.0(依据)、单元 2 加 0.25(参见)
+        let a = chain.state.economy.versions[&(3, 1)].assigned.clone();
+        let ops = vec![
+            verify(&chain, a[0], 3, 1, true),
+            verify(&chain, a[1], 3, 1, true),
+        ];
+        commit_ops(&mut chain, ops);
+        let one = crate::economy::importance_at(
+            &chain.state.economy.importance[&1],
+            crate::economy::IMPORTANCE_HALF_LIFE_BLOCKS[0],
+            chain.state.height,
+        );
+        let two = crate::economy::importance_at(
+            &chain.state.economy.importance[&2],
+            crate::economy::IMPORTANCE_HALF_LIFE_BLOCKS[0],
+            chain.state.height,
+        );
+        assert_eq!(one, crate::economy::BASIS_WEIGHT, "依据 +1.0");
+        assert_eq!(two, crate::economy::SEE_ALSO_WEIGHT, "参见 +0.25");
+    }
+
+    #[test]
+    fn a_unit_does_not_gain_importance_from_its_own_citations() {
+        use crate::knowledge::{Cite, CiteKind, Layer};
+        let mut chain = Chain::new(egenesis(1));
+        let op = kop(&chain, 1, create(Layer::Foundation, 2, vec![]));
+        commit_ops(&mut chain, vec![op]);
+        // 账户 1 再建一个单元,依据自己写的单元 1
+        let cites = vec![Cite {
+            unit: 1,
+            version: 1,
+            kind: CiteKind::Basis,
+        }];
+        let op = kop(&chain, 1, create(Layer::Application, 2, cites));
+        commit_ops(&mut chain, vec![op]);
+        // 先确立单元 1(它自己就有 I0 = 1),再确立单元 2
+        let a1 = chain.state.economy.versions[&(1, 1)].assigned.clone();
+        let ops = vec![
+            verify(&chain, a1[0], 1, 1, true),
+            verify(&chain, a1[1], 1, 1, true),
+        ];
+        commit_ops(&mut chain, ops);
+        let before = chain.state.economy.importance[&1].value;
+        let a = chain.state.economy.versions[&(2, 1)].assigned.clone();
+        let ops = vec![
+            verify(&chain, a[0], 2, 1, true),
+            verify(&chain, a[1], 2, 1, true),
+        ];
+        commit_ops(&mut chain, ops);
+        let acc = chain
+            .state
+            .economy
+            .importance
+            .get(&1)
+            .expect("unit 1 established");
+        assert_eq!(acc.value, before, "同作者引用不加分(只有它自己的 I0)");
+        assert_eq!(
+            acc.value,
+            crate::economy::ESTABLISH_IMPORTANCE,
+            "同作者引用不加分"
+        );
+    }
+
+    #[test]
+    fn importance_decays_over_time_with_the_layer_half_life() {
+        use crate::knowledge::Layer;
+        let mut chain = Chain::new(egenesis(1));
+        let op = kop(&chain, 1, create(Layer::Foundation, 2, vec![]));
+        commit_ops(&mut chain, vec![op]);
+        let a = chain.state.economy.versions[&(1, 1)].assigned.clone();
+        let ops = vec![
+            verify(&chain, a[0], 1, 1, true),
+            verify(&chain, a[1], 1, 1, true),
+        ];
+        commit_ops(&mut chain, ops);
+        let acc = &chain.state.economy.importance[&1];
+        let hl = crate::economy::IMPORTANCE_HALF_LIFE_BLOCKS[0];
+        let at = chain.state.height;
+        assert_eq!(
+            crate::economy::importance_at(acc, hl, at),
+            crate::economy::ESTABLISH_IMPORTANCE
+        );
+        // 一个半衰期后减半(允许 1 个量化单位误差)
+        let half = crate::economy::importance_at(acc, hl, at + hl);
+        let expect = crate::economy::ESTABLISH_IMPORTANCE / 2;
+        assert!(half.abs_diff(expect) <= 1, "{half} vs {expect}");
+    }
+
+    #[test]
+    fn economy_is_inert_before_activation_even_for_importance() {
+        use crate::knowledge::Layer;
+        let mut chain = Chain::new(egenesis(1000));
+        let op = kop(&chain, 1, create(Layer::Foundation, 2, vec![]));
+        commit_ops(&mut chain, vec![op]);
+        let ops = vec![verify(&chain, 2, 1, 1, true), verify(&chain, 3, 1, 1, true)];
+        commit_ops(&mut chain, ops);
+        assert!(chain.state.economy.importance.is_empty());
+        assert!(chain.state.economy.is_empty());
     }
 
     #[test]

@@ -1275,6 +1275,12 @@ pub(crate) fn enc_economy_state(e: &mut Enc, x: &crate::economy::EconomyState) {
             e.u64(*a);
         }
     }
+    e.u64(x.importance.len() as u64);
+    for (unit, acc) in &x.importance {
+        e.u64(*unit);
+        e.u64(acc.value);
+        e.u64(acc.last_height);
+    }
 }
 
 fn dec_economy_state(d: &mut Dec) -> Result<crate::economy::EconomyState, CodecError> {
@@ -1309,7 +1315,18 @@ fn dec_economy_state(d: &mut Dec) -> Result<crate::economy::EconomyState, CodecE
             },
         );
     }
-    Ok(crate::economy::EconomyState { versions })
+    let mut importance = std::collections::BTreeMap::new();
+    let n = d.count()?;
+    for _ in 0..n {
+        let unit = d.u64()?;
+        let value = d.u64()?;
+        let last_height = d.u64()?;
+        importance.insert(unit, crate::economy::ImportanceAcc { value, last_height });
+    }
+    Ok(crate::economy::EconomyState {
+        versions,
+        importance,
+    })
 }
 
 /// 知识模块状态的规范编码:`state_root` 与快照共用(BTreeMap / BTreeSet 有序迭代 ⇒ 字节规范)。

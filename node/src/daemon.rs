@@ -512,6 +512,10 @@ enum Cmd {
         id: u64,
         reply: oneshot::Sender<Option<UnitDetail>>,
     },
+    /// 知识经济 v1 的状态:每个版本的指派与确立、每个单元的重要性。
+    QueryEconomy {
+        reply: oneshot::Sender<EconomySummary>,
+    },
     /// K5:成员目录(按 id 排序),附当前是否已过见习期。
     QueryMembers {
         reply: oneshot::Sender<Vec<(u64, crate::knowledge::Member, bool)>>,
@@ -1866,6 +1870,47 @@ async fn run_actor(mut actor: Actor, mut rx: mpsc::UnboundedReceiver<Cmd>) {
                     Err(e) => Err(e),
                 };
                 let _ = reply.send(res);
+            }
+            Cmd::QueryEconomy { reply } => {
+                let state = &actor.node.chain.state;
+                let e = &state.economy;
+                let up = crate::upgrade::Upgrade::KnowledgeEconomyV1;
+                let versions = e
+                    .versions
+                    .iter()
+                    .map(|((unit, version), v)| EconomyVersion {
+                        unit: *unit,
+                        version: *version,
+                        assigned: v.assigned.clone(),
+                        established_height: v.established_height,
+                        approvers: v.approvers.clone(),
+                    })
+                    .collect();
+                let importance = e
+                    .importance
+                    .iter()
+                    .map(|(unit, acc)| {
+                        let layer = state
+                            .knowledge
+                            .units
+                            .get(unit)
+                            .map(|u| u.layer)
+                            .unwrap_or(crate::knowledge::Layer::Foundation);
+                        let hl = crate::economy::IMPORTANCE_HALF_LIFE_BLOCKS[layer as usize];
+                        let v = crate::economy::importance_at(acc, hl, state.height);
+                        (
+                            *unit,
+                            crate::hash::hex(&v.to_be_bytes()),
+                            layer_name(layer).to_string(),
+                        )
+                    })
+                    .collect();
+                let _ = reply.send(EconomySummary {
+                    active: state.economy_active(state.height),
+                    activation_height: state.upgrades.activation(up),
+                    versions,
+                    importance,
+                });
             }
             Cmd::QueryUnits { reply } => {
                 let k = &actor.node.chain.state.knowledge;
@@ -3443,6 +3488,25 @@ fn knowledge_reject_status(e: &crate::ChainError) -> &'static str {
 }
 
 /// K5:知识单元目录的一项。
+/// 一个版本在知识经济里的状态(给 RPC 用)。
+struct EconomyVersion {
+    unit: u64,
+    version: u32,
+    assigned: Vec<u64>,
+    established_height: Option<u64>,
+    approvers: Vec<u64>,
+}
+
+/// 知识经济 v1 的完整摘要(给 RPC 用)。
+struct EconomySummary {
+    /// 升级是否已激活,以及激活高度。
+    active: bool,
+    activation_height: Option<u64>,
+    versions: Vec<EconomyVersion>,
+    /// 每个单元的当前重要性(已按当前高度惰性衰减)。
+    importance: Vec<(u64, String, String)>, // (单元, 重要性 Q32, 层级)
+}
+
 struct UnitSummary {
     id: u64,
     author: u64,
@@ -3772,6 +3836,77 @@ fn json_member_listing(ms: &[(u64, crate::knowledge::Member, bool)]) -> String {
     format!("[{items}]")
 }
 
+/// 知识经济状态的文本形式。
+fn format_economy(e: &EconomySummary) -> String {
+    let mut out = String::new();
+    out.push_str(&format!(
+        "active={} activation_height={} versions={} importance={}\n",
+        e.active,
+        e.activation_height
+            .map(|h| h.to_string())
+            .unwrap_or_else(|| "-".into()),
+        e.versions.len(),
+        e.importance.len()
+    ));
+    for v in &e.versions {
+        out.push_str(&format!(
+            "unit={} version={} assigned={} established={} approvers={}\n",
+            v.unit,
+            v.version,
+            v.assigned
+                .iter()
+                .map(|a| a.to_string())
+                .collect::<Vec<_>>()
+                .join(","),
+            v.established_height
+                .map(|h| h.to_string())
+                .unwrap_or_else(|| "-".into()),
+            v.approvers.len()
+        ));
+    }
+    for (unit, value, layer) in &e.importance {
+        out.push_str(&format!(
+            "importance unit={unit} value={value} layer={layer}\n"
+        ));
+    }
+    out.trim_end().to_string()
+}
+
+/// 知识经济状态的 JSON 形式。
+fn json_economy(e: &EconomySummary) -> String {
+    let versions = e
+        .versions
+        .iter()
+        .map(|v| {
+            format!(
+                "{{\"unit\":{},\"version\":{},\"assigned\":[{}],\"established_height\":{},\"approvers\":[{}]}}",
+                json_u64(v.unit),
+                json_u64(v.version as u64),
+                v.assigned.iter().map(|a| json_u64(*a)).collect::<Vec<_>>().join(","),
+                v.established_height.map(json_u64).unwrap_or_else(|| "null".into()),
+                v.approvers.iter().map(|a| json_u64(*a)).collect::<Vec<_>>().join(",")
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+    let importance = e
+        .importance
+        .iter()
+        .map(|(unit, value, layer)| {
+            format!(
+                "{{\"unit\":{},\"value_q32\":\"{value}\",\"layer\":\"{layer}\"}}",
+                json_u64(*unit)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+    format!(
+        "{{\"active\":{},\"activation_height\":{},\"versions\":[{versions}],\"importance\":[{importance}]}}",
+        e.active,
+        e.activation_height.map(json_u64).unwrap_or_else(|| "null".into())
+    )
+}
+
 fn http_response(status_line: &str, body: &str) -> String {
     // M66: delegate to the Content-Type-aware builder with the historic plaintext type,
     // so every pre-M66 caller's output stays byte-identical.
@@ -4010,6 +4145,8 @@ enum GetRoute {
     Unit(u64),
     /// K5:`GET /members` 成员目录。
     Members,
+    /// 知识经济 v1 的状态:每个版本的指派与确立、每个单元的重要性。
+    Economy,
     Health,
     Height,
     Head,
@@ -4539,6 +4676,7 @@ fn route_get(path: &str) -> GetRoute {
         // K5:知识单元目录与成员目录(精确匹配);单个单元走下方 `/unit/` 前缀。
         "/units" => GetRoute::Units,
         "/members" => GetRoute::Members,
+        "/economy" => GetRoute::Economy,
         // M86: the plain cognitive-graph directory. Exact-match; the `/graph/` prefix
         // (single reads/proofs) is handled in the fallthrough arm below, where `/graph/`
         // with an empty id already resolves to `NotFound`.
@@ -5203,6 +5341,7 @@ const READ_ROUTES: &[&str] = &[
     "/proposals",
     "/units",
     "/members",
+    "/economy",
     "/graph",
     "/bonds",
     "/unbonding",
@@ -7405,6 +7544,17 @@ async fn serve_rpc_conn(
                         Ok(None) => {
                             error_body(fmt, "404 Not Found", &format!("no knowledge unit {id}"))
                         }
+                        Err(_) => http_response("503 Service Unavailable", "node stopped"),
+                    }
+                }
+            }
+            GetRoute::Economy => {
+                let (reply, rx) = oneshot::channel();
+                if cmd.send(Cmd::QueryEconomy { reply }).is_err() {
+                    http_response("503 Service Unavailable", "node stopped")
+                } else {
+                    match rx.await {
+                        Ok(e) => ok_body(fmt, &format_economy(&e), &json_economy(&e)),
                         Err(_) => http_response("503 Service Unavailable", "node stopped"),
                     }
                 }
@@ -11896,6 +12046,51 @@ mod tests {
         }
         let t = post(rpc_addr, &enc(&prop(1, 999))).await;
         assert!(t.starts_with("HTTP/1.1 429"), "expected 429, got: {t}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn rpc_economy_reports_the_state() {
+        // 知识经济 v1:GET /economy 返回是否已激活、各版本的指派与确立、各单元的重要性。
+        // 链没排升级时应报告 active=false 且没有任何版本。
+        let dir = tmp_dir("rpc-economy");
+        let mut cfg = node_config(21, 21471, &[21], dir.clone());
+        let rpc_addr = "127.0.0.1:21493";
+        cfg.rpc = Some(crate::config::RpcConfig {
+            enabled: true,
+            listen: rpc_addr.into(),
+            auth_token: String::new(),
+            enable_tls: false,
+        });
+        let mut genesis = test_genesis();
+        genesis.validators = vec![(21, kp(21).public(), 1)];
+        let _node = Node::start(cfg, genesis, Some(kp(21)), None)
+            .await
+            .expect("start node");
+        tokio::time::sleep(Duration::from_millis(150)).await;
+
+        async fn get(addr: &str, path: &str) -> String {
+            let mut s = TcpStream::connect(addr).await.expect("connect rpc");
+            let req =
+                format!("GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
+            s.write_all(req.as_bytes()).await.expect("send");
+            let mut resp = Vec::new();
+            let mut buf = [0u8; 1024];
+            loop {
+                let n = s.read(&mut buf).await.expect("read");
+                if n == 0 {
+                    break;
+                }
+                resp.extend_from_slice(&buf[..n]);
+            }
+            String::from_utf8_lossy(&resp).to_string()
+        }
+
+        let t = get(rpc_addr, "/economy").await;
+        assert!(t.starts_with("HTTP/1.1 200 OK"), "{t}");
+        assert!(t.contains("active=false"), "没排升级时未激活:{t}");
+        assert!(t.contains("versions=0"), "{t}");
 
         let _ = std::fs::remove_dir_all(&dir);
     }

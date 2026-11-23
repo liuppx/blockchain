@@ -27,6 +27,98 @@ pub const ESTABLISH_MIN_PASSES: u32 = 2;
 /// 追加指派的间隔:3 天(测试网约 1 块/秒)。设计稿 §4.1 的 hybrid 读法——链上的实际规则。
 pub const TOPUP_INTERVAL_BLOCKS: u64 = 3 * 86_400;
 
+// ---- 重要性(S2b)--------------------------------------------------------------
+
+/// 重要性的定点表示:Q32(1.0 = 2^32)。
+pub type Importance = u64;
+
+/// 各层级的半衰期(区块数)。测试网约 1 块/秒:
+/// 基础 3600 天、解释 1440 天、场景 720 天、应用 360 天。
+///
+/// **为什么是这些数**:仿真的期 = 月,链上的期 = 天。设计稿 §4.1 的 hybrid 读法把时长按真实时间换算,
+/// 所以基础层仍是 10 年(120 个月),而不是字面读法的 120 天。字面读法实测有可测量的坏处
+/// (货币偏离目标 72%、作恶单元放大 1.48 倍),见设计稿 §5.1。
+pub const IMPORTANCE_HALF_LIFE_BLOCKS: [u64; 4] = [
+    3600 * 86_400, // 基础:10 年
+    1440 * 86_400, // 解释:4 年
+    720 * 86_400,  // 场景:2 年
+    360 * 86_400,  // 应用:1 年
+];
+
+/// 一次"参见"引用加的重要性:0.25(Q32)。
+pub const SEE_ALSO_WEIGHT: Importance = 1 << 30;
+
+/// 2^(-1/2^i),Q32,i = 1..=24。**用整数算分数次幂**:共识规则不能用 `powf`——
+/// 浮点结果不保证在不同机器上逐位相同,那会让不同节点算出不同的重要性。
+/// 表由 60 位精度的十进制运算四舍五入到 Q32 得到(见 `pow_neg_frac_table_is_exact` 测试)。
+const POW_NEG_FRAC: [u64; 24] = [
+    3037000500, 3611622603, 3938502376, 4112874773, 4202935003, 4248701965, 4271771996, 4283353945,
+    4289156690, 4292061010, 4293513907, 4294240540, 4294603903, 4294785595, 4294876445, 4294921870,
+    4294944583, 4294955939, 4294961618, 4294964457, 4294965876, 4294966586, 4294966941, 4294967119,
+];
+
+/// 2^(-x) 的 Q32 值,其中 x = num/den ∈ [0, ∞)。**全部整数运算**,所有节点结果逐位相同。
+///
+/// 做法:整数部分 q = ⌊x⌋ 用移位;小数部分按二进制位展开 x 的前 24 位,
+/// 第 i 位为 1 就乘上 2^(-1/2^i)(查表)。截断在第 24 位,相对误差 < 2^-24·ln2 ≈ 4e-8,
+/// 对"重要性"这个量绰绰有余。
+pub fn pow2_neg_q32(num: u64, den: u64) -> u64 {
+    const ONE: u64 = 1 << 32;
+    if num == 0 || den == 0 {
+        return ONE;
+    }
+    let q = num / den;
+    if q >= 32 {
+        return 0; // 2^-32 以下,Q32 里就是 0
+    }
+    let mut out: u64 = ONE >> q;
+    let mut rem = num % den;
+    for &f in POW_NEG_FRAC.iter() {
+        if rem == 0 {
+            break;
+        }
+        // 小数的下一位:rem·2 / den
+        let twice = (rem as u128) * 2;
+        if twice >= den as u128 {
+            out = ((out as u128 * f as u128) >> 32) as u64;
+            rem = (twice - den as u128) as u64;
+        } else {
+            rem = twice as u64;
+        }
+    }
+    out
+}
+
+/// 一个单元的重要性累计。**只记最后一次被更新时的值与高度**,衰减在读取时惰性计算
+/// (设计稿 §3:链上不存全量重算的结果)。
+#[derive(Clone, Debug, PartialEq, Eq, Default)]
+pub struct ImportanceAcc {
+    /// 累计的重要性(Q32),截至 `last_height`。
+    pub value: Importance,
+    /// 上次更新时的高度。
+    pub last_height: u64,
+}
+
+/// 重要性计算:在 `height` 时刻的累计值(惰性衰减)。
+pub fn importance_at(acc: &ImportanceAcc, half_life_blocks: u64, height: u64) -> Importance {
+    if height <= acc.last_height {
+        return acc.value;
+    }
+    let d = pow2_neg_q32(height - acc.last_height, half_life_blocks);
+    ((acc.value as u128 * d as u128) >> 32) as u64
+}
+
+/// 给 `acc` 加 `w`:先把旧值衰减到 `height`,再加上 `w`,记下新的高度。
+pub fn bump(acc: &mut ImportanceAcc, w: Importance, half_life_blocks: u64, height: u64) {
+    acc.value = importance_at(acc, half_life_blocks, height).saturating_add(w);
+    acc.last_height = height;
+}
+
+/// 一次"依据"引用加的重要性:1.0(Q32)。
+pub const BASIS_WEIGHT: Importance = 1 << 32;
+/// 确立时的起始重要性 I0 = 1.0(`sim/economy.py` `i0=1.0`)。
+pub const ESTABLISH_IMPORTANCE: Importance = 1 << 32;
+
 /// 一个版本的指派与确立状态。
 #[derive(Clone, Debug, PartialEq, Eq, Default)]
 pub struct VersionEconomy {
@@ -45,6 +137,9 @@ pub struct VersionEconomy {
 pub struct EconomyState {
     /// 每个 (单元, 版本) 的指派与确立。只记 H\* 及以后发布的版本。
     pub versions: BTreeMap<(u64, u32), VersionEconomy>,
+    /// 每个单元的重要性(按单元,不按版本:被引用的是"这条知识",版本只是它的修订)。
+    /// 只在单元有过一次确立、或被已确立的他人单元引用时才出现。
+    pub importance: BTreeMap<u64, ImportanceAcc>,
 }
 
 impl EconomyState {
@@ -184,6 +279,71 @@ mod tests {
         assert_eq!(p, vec![11, 12]);
         assert_eq!(n, 1);
         assert!(meets_establishment(p.len(), n));
+    }
+
+    const ONE: u64 = 1 << 32;
+
+    #[test]
+    fn pow_neg_frac_table_is_exact() {
+        // 表的每一项都应是 2^(-1/2^i)·2^32 四舍五入的结果。用 f64 复核(f64 有 53 位精度,
+        // 足够判断 Q32 的取整),**只在测试里用浮点**,共识代码不碰浮点。
+        for (k, &v) in POW_NEG_FRAC.iter().enumerate() {
+            let i = (k + 1) as i32;
+            let exact = 2f64.powf(-1.0 / 2f64.powi(i)) * ONE as f64;
+            assert!(
+                (v as f64 - exact).abs() <= 0.5 + 1e-6,
+                "i={i}: {v} vs {exact}"
+            );
+        }
+    }
+
+    #[test]
+    fn integer_decay_matches_the_real_value() {
+        let cases = [
+            (0u64, 7u64),
+            (1, 2),
+            (1, 1),
+            (3, 2),
+            (5, 4),
+            (7, 3),
+            (100, 99),
+            (12345, 100_000),
+        ];
+        for (num, den) in cases {
+            let got = pow2_neg_q32(num, den) as f64 / ONE as f64;
+            let want = 2f64.powf(-(num as f64) / den as f64);
+            assert!(
+                (got - want).abs() < 1e-6,
+                "2^-({num}/{den}): {got} vs {want}"
+            );
+        }
+        assert_eq!(pow2_neg_q32(0, 5), ONE);
+        assert_eq!(pow2_neg_q32(5, 5), ONE / 2, "整半衰期精确");
+        assert_eq!(pow2_neg_q32(10, 5), ONE / 4);
+        assert_eq!(pow2_neg_q32(32 * 5, 5), 0, "衰减到 Q32 以下就是 0");
+    }
+
+    #[test]
+    fn importance_decays_lazily_and_bumps_add_on_top() {
+        let hl = 1000;
+        let mut acc = ImportanceAcc::default();
+        bump(&mut acc, BASIS_WEIGHT, hl, 100);
+        assert_eq!(importance_at(&acc, hl, 100), ONE);
+        assert_eq!(importance_at(&acc, hl, 1100), ONE / 2, "过一个半衰期减半");
+        bump(&mut acc, SEE_ALSO_WEIGHT, hl, 1100);
+        assert_eq!(acc.value, ONE / 2 + ONE / 4, "先衰减,再加");
+        assert_eq!(acc.last_height, 1100);
+        // 惰性:不读就不变
+        assert_eq!(acc.value, ONE / 2 + ONE / 4);
+    }
+
+    #[test]
+    fn half_lives_follow_the_hybrid_reading() {
+        let day = 86_400;
+        assert_eq!(
+            IMPORTANCE_HALF_LIFE_BLOCKS,
+            [3600 * day, 1440 * day, 720 * day, 360 * day]
+        );
     }
 
     #[test]
