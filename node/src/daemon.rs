@@ -1905,11 +1905,19 @@ async fn run_actor(mut actor: Actor, mut rx: mpsc::UnboundedReceiver<Cmd>) {
                         )
                     })
                     .collect();
+                let review_scores = e.review_scores.iter().map(|(w, s)| (*w, *s)).collect();
+                let locks = e
+                    .locks
+                    .iter()
+                    .map(|(w, l)| (*w, l.locked, l.next_release_height, l.released))
+                    .collect();
                 let _ = reply.send(EconomySummary {
                     active: state.economy_active(state.height),
                     activation_height: state.upgrades.activation(up),
                     versions,
                     importance,
+                    review_scores,
+                    locks,
                 });
             }
             Cmd::QueryUnits { reply } => {
@@ -3505,6 +3513,10 @@ struct EconomySummary {
     versions: Vec<EconomyVersion>,
     /// 每个单元的当前重要性(已按当前高度惰性衰减)。
     importance: Vec<(u64, String, String)>, // (单元, 重要性 Q32, 层级)
+    /// 每个账户的核验得分。
+    review_scores: Vec<(u64, u64)>,
+    /// 每个账户的锁定账本:(账户, 锁定额, 释放高度, 已释放)。
+    locks: Vec<(u64, u64, u64, u64)>,
 }
 
 struct UnitSummary {
@@ -3867,6 +3879,14 @@ fn format_economy(e: &EconomySummary) -> String {
     for (unit, value, layer) in &e.importance {
         out.push_str(&format!(
             "importance unit={unit} value={value} layer={layer}\n"
+        ));
+    }
+    for (who, score) in &e.review_scores {
+        out.push_str(&format!("score account={who} points={score}\n"));
+    }
+    for (who, locked, release, released) in &e.locks {
+        out.push_str(&format!(
+            "lock account={who} locked={locked} release_height={release} released={released}\n"
         ));
     }
     out.trim_end().to_string()

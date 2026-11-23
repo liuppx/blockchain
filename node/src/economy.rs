@@ -130,6 +130,8 @@ pub struct VersionEconomy {
     pub established_height: Option<u64>,
     /// 促成确立的核验人(确立那一刻计入的"通过"者),之后不变。
     pub approvers: Vec<u64>,
+    /// 「需修改」一致认可(≥2 位)的报酬是否已记过(只记一次)。
+    pub needs_paid: bool,
 }
 
 /// 知识经济的全部链上状态。H\* 之前为空。
@@ -140,6 +142,22 @@ pub struct EconomyState {
     /// 每个单元的重要性(按单元,不按版本:被引用的是"这条知识",版本只是它的修订)。
     /// 只在单元有过一次确立、或被已确立的他人单元引用时才出现。
     pub importance: BTreeMap<u64, ImportanceAcc>,
+    /// 每个账户的核验得分(累计)。见 [`EconomyState::grant_credits`]。
+    pub review_scores: BTreeMap<u64, u64>,
+    /// 每个账户的锁定账本:已锁定的收益(还没到释放期)、释放期。
+    /// 测试网阶段只记积分、不发币(设计稿决定 #7),但账本先跑起来,主网创世时按主网规则重算。
+    pub locks: BTreeMap<u64, LockLedger>,
+}
+
+/// 一个账户的锁定账本。
+#[derive(Clone, Debug, PartialEq, Eq, Default)]
+pub struct LockLedger {
+    /// 尚未释放的锁定额(以"分"为单位,定点)。
+    pub locked: u64,
+    /// 下一笔释放的高度。
+    pub next_release_height: u64,
+    /// 累计已释放。
+    pub released: u64,
 }
 
 impl EconomyState {
@@ -153,6 +171,33 @@ impl EconomyState {
             .values()
             .filter(|v| v.established_height.is_some())
             .count()
+    }
+
+    /// 给核验人记 1 分。
+    pub fn grant_credit(&mut self, verifier: u64) {
+        *self.review_scores.entry(verifier).or_insert(0) += 1;
+    }
+
+    /// 把账户的得分清零(结算时把得分转成收益之后调用;仿真里每期结算后清空 `review_credits`)。
+    pub fn take_credits(&mut self, verifier: u64) -> u64 {
+        self.review_scores.get(&verifier).copied().unwrap_or(0)
+    }
+
+    /// 释放到期锁定的收益,返回释放的数额。
+    pub fn release_locks(&mut self, height: u64) -> u64 {
+        let mut released = 0u64;
+        for led in self.locks.values_mut() {
+            if led.locked > 0 && height >= led.next_release_height {
+                released = released.saturating_add(led.locked);
+                led.released = led.released.saturating_add(led.locked);
+                led.locked = 0;
+            }
+        }
+        if released > 0 {
+            // 清理已释放完的账户,免得账本无限增长
+            self.locks.retain(|_, l| l.locked > 0 || l.released > 0);
+        }
+        released
     }
 }
 

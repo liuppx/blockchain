@@ -2752,6 +2752,7 @@ impl ChainState {
                 last_assigned_height: height,
                 established_height: None,
                 approvers: Vec::new(),
+                needs_paid: false,
             },
         );
     }
@@ -2794,6 +2795,25 @@ impl ChainState {
             crate::economy::counted(&ve.assigned, publisher, &verdicts, |who, h| {
                 k.is_established(who, h)
             });
+        // 「需修改」被至少 2 位一致认可 ⇒ 这些人各记 1 分(仿真同款规则),每个版本只记一次。
+        if needs >= 2 && !ve.needs_paid {
+            let needers: Vec<u64> = verdicts
+                .iter()
+                .filter(|(who, pass, h)| {
+                    !*pass
+                        && *who != publisher
+                        && ve.assigned.contains(who)
+                        && k.is_established(*who, *h)
+                })
+                .map(|(who, _, _)| *who)
+                .collect();
+            for who in &needers {
+                self.economy.grant_credit(*who);
+            }
+            if let Some(ve) = self.economy.versions.get_mut(&(unit, version)) {
+                ve.needs_paid = true;
+            }
+        }
         if crate::economy::meets_establishment(passes.len(), needs) {
             let ve = self
                 .economy
@@ -2801,7 +2821,11 @@ impl ChainState {
                 .get_mut(&(unit, version))
                 .expect("checked");
             ve.established_height = Some(height);
-            ve.approvers = passes;
+            ve.approvers = passes.clone();
+            // 核验报酬:促成确立的核验人各记 1 分(仿真 `try_establish`:`review_credits[i] += 1`)。
+            for who in &passes {
+                self.economy.grant_credit(*who);
+            }
             // 确立 ⇒ 这个单元开始有重要性(I0 = 1),并把它依据/参见的、别人写的单元也加分。
             // 与仿真一致(`sim/economy.py` `try_establish` → `bump(u, i0)` → `count_citations`)。
             let acc = self.economy.importance.entry(unit).or_default();
@@ -6453,6 +6477,123 @@ mod tests {
         let half = crate::economy::importance_at(acc, hl, at + hl);
         let expect = crate::economy::ESTABLISH_IMPORTANCE / 2;
         assert!(half.abs_diff(expect) <= 1, "{half} vs {expect}");
+    }
+
+    #[test]
+    fn verifiers_get_a_credit_for_establishing_a_unit() {
+        use crate::knowledge::Layer;
+        let mut chain = Chain::new(egenesis(1));
+        let op = kop(&chain, 1, create(Layer::Foundation, 2, vec![]));
+        commit_ops(&mut chain, vec![op]);
+        let a = chain.state.economy.versions[&(1, 1)].assigned.clone();
+        let ops = vec![
+            verify(&chain, a[0], 1, 1, true),
+            verify(&chain, a[1], 1, 1, true),
+        ];
+        commit_ops(&mut chain, ops);
+        // 促成确立的两位各 1 分;没被指派的、没核验的都是 0
+        assert_eq!(chain.state.economy.review_scores.get(&a[0]), Some(&1));
+        assert_eq!(chain.state.economy.review_scores.get(&a[1]), Some(&1));
+        let outsider = (2..=7).find(|m| !a.contains(m)).expect("outsider");
+        assert_eq!(chain.state.economy.review_scores.get(&outsider), None);
+        assert_eq!(
+            chain.state.economy.review_scores.get(&1),
+            None,
+            "发布者不得分"
+        );
+    }
+
+    #[test]
+    fn a_credit_is_granted_once_when_two_members_agree_on_needs_revision() {
+        use crate::knowledge::Layer;
+        let mut chain = Chain::new(egenesis(1));
+        let op = kop(&chain, 1, create(Layer::Foundation, 2, vec![]));
+        commit_ops(&mut chain, vec![op]);
+        let a = chain.state.economy.versions[&(1, 1)].assigned.clone();
+        // 1 位「需修改」:不够,不记分
+        let v = verify(&chain, a[0], 1, 1, false);
+        commit_ops(&mut chain, vec![v]);
+        assert_eq!(
+            chain.state.economy.review_scores.get(&a[0]),
+            None,
+            "1 位不算一致"
+        );
+        // 第 2 位也「需修改」:一致,两人各 1 分
+        let v = verify(&chain, a[1], 1, 1, false);
+        commit_ops(&mut chain, vec![v]);
+        assert_eq!(chain.state.economy.review_scores.get(&a[0]), Some(&1));
+        assert_eq!(chain.state.economy.review_scores.get(&a[1]), Some(&1));
+        // 再来一位:不再重复记分
+        let v = verify(&chain, a[2], 1, 1, false);
+        commit_ops(&mut chain, vec![v]);
+        assert_eq!(
+            chain.state.economy.review_scores.get(&a[2]),
+            None,
+            "只记一次"
+        );
+        assert_eq!(chain.state.economy.review_scores.get(&a[0]), Some(&1));
+    }
+
+    #[test]
+    fn scores_accumulate_across_units() {
+        use crate::knowledge::Layer;
+        let mut chain = Chain::new(egenesis(1));
+        let op = kop(&chain, 1, create(Layer::Foundation, 2, vec![]));
+        commit_ops(&mut chain, vec![op]);
+        let op = kop(&chain, 2, create(Layer::Foundation, 2, vec![]));
+        commit_ops(&mut chain, vec![op]);
+        let a1 = chain.state.economy.versions[&(1, 1)].assigned.clone();
+        let a2 = chain.state.economy.versions[&(2, 1)].assigned.clone();
+        // 一条一条提交:同一个人可能既在 a1 又在 a2 里,同一块里两条 op 的序号会撞。
+        for (who, unit) in [(a1[0], 1u64), (a1[1], 1), (a2[0], 2), (a2[1], 2)] {
+            let v = verify(&chain, who, unit, 1, true);
+            commit_ops(&mut chain, vec![v]);
+        }
+        // 只有实际核验过的那 4 位有分;同一人可能既在 a1 又在 a2 里 ⇒ 2 分
+        for who in [a1[0], a1[1], a2[0], a2[1]] {
+            let score = chain
+                .state
+                .economy
+                .review_scores
+                .get(&who)
+                .copied()
+                .unwrap_or(0);
+            assert!((1..=2).contains(&score), "{who} 得分 {score}");
+        }
+        // 被指派但没核验的人没有分
+        for &who in a1.iter().chain(a2.iter()) {
+            if [a1[0], a1[1], a2[0], a2[1]].contains(&who) {
+                continue;
+            }
+            assert_eq!(
+                chain.state.economy.review_scores.get(&who),
+                None,
+                "{who} 没核验过,不该有分"
+            );
+        }
+        assert_eq!(
+            chain.state.economy.review_scores.values().sum::<u64>(),
+            4,
+            "两次确立共 4 分"
+        );
+    }
+
+    #[test]
+    fn the_lock_ledger_releases_when_it_matures() {
+        let mut e = crate::economy::EconomyState::default();
+        e.locks.insert(
+            3,
+            crate::economy::LockLedger {
+                locked: 100,
+                next_release_height: 50,
+                released: 0,
+            },
+        );
+        assert_eq!(e.release_locks(49), 0, "没到期不释放");
+        assert_eq!(e.release_locks(50), 100);
+        assert_eq!(e.locks[&3].locked, 0);
+        assert_eq!(e.locks[&3].released, 100);
+        assert_eq!(e.release_locks(51), 0, "不会重复释放");
     }
 
     #[test]
