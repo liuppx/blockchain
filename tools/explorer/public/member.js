@@ -260,6 +260,7 @@
       <kv><b>密钥</b><span>由夜莺钱包保管 <span class='mut'>(每次签名都在钱包里确认;本机不保存任何密钥)</span></span></kv>
       <kv><b>状态</b><span id='idState'>${acct ? `账户 ${esc(acct.id)} · ${acct.established ? "已过见习期" : "见习期中(核验照常记录,但暂不计入可信度)"}` : "这个公钥还不是测试网成员:把它发给邀请你的成员"}</span></kv>
       ${acct ? "" : `<p><button id='idCopyPk'>复制公钥</button> <span id='idCopyMsg' class='mut'>发给邀请你的成员;对方邀请后,刷新本页就能看到你的账户号</span></p>`}
+      ${acct ? "<div id='idEcon'><p class='mut'>正在读取你的核验任务与积分…</p></div>" : ""}
       <p><button id='idLock'>退出</button></p>
       <h3 class='md'>写入令牌</h3>
       <p class='mut'>提交核验需要一个写入令牌,由组织者私下提供。它只用于防止刷写入,不代表你的身份。</p>
@@ -268,6 +269,7 @@
         <p class='mut'>新成员在夜莺钱包「账户管理 → 创建钱包 → 知行图钱包」里创建账户,用钱包登录本站后点「复制公钥」发给你。新成员有见习期;每位成员每天最多邀请一人。</p>
         <p><input id='invPk' size='70' placeholder='新成员的公钥(64 位十六进制)'> <button id='invGo'>邀请</button> <span id='invMsg'></span></p>` : ""}`);
     el("idLock").addEventListener("click", () => { session = null; status(); showIdentity(); });
+    if (acct) renderEconomy(acct.id).catch(() => { if (el("idEcon")) el("idEcon").innerHTML = ""; });
     if (el("idCopyPk")) el("idCopyPk").addEventListener("click", async () => {
       try { await navigator.clipboard.writeText(session.pubkey); msg("idCopyMsg", "已复制。发给邀请你的成员;对方邀请后,刷新本页", "ok"); }
       catch (_) { msg("idCopyMsg", "复制失败,请手动选中上面的公钥复制", "err"); }
@@ -283,6 +285,40 @@
         msg("invMsg", (await waitNonce(n)) ? "已入块。请告诉新成员刷新页面,就能看到自己的账户号" : "已提交,等待入块(稍后在成员列表查看)", "ok");
       } catch (e) { msg("invMsg", e.message, "err"); }
     });
+  }
+
+  /**
+   * 知识经济面板:待我核验(协议指派)、我的积分与锁定。
+   * 积分只记在链上状态里——测试网阶段不发币。µ 单位按 10^6 折算成"分"显示。
+   */
+  async function renderEconomy(me) {
+    const box = el("idEcon");
+    if (!box) return;
+    const [econ, pend] = await Promise.all([
+      fetch("/rpc/economy", { headers: { Accept: "application/json" } }).then((r) => r.ok ? r.json() : null).catch(() => null),
+      fetch("/assign?member=" + encodeURIComponent(me)).then((r) => r.ok ? r.json() : null).catch(() => null),
+    ]);
+    const active = !!(econ && econ.active);
+    const pts = (v) => (Number(v || 0) / 1e6).toLocaleString("zh-CN", { maximumFractionDigits: 2 });
+    const mine = active && econ.locks ? econ.locks.find((x) => String(x.account) === String(me)) : null;
+    const score = active && econ.review_scores ? econ.review_scores.find((x) => String(x.account) === String(me)) : null;
+    const items = (pend && pend.items) || [];
+    const todo = items.length
+      ? `<ul>${items.map((a) => `<li><a class='link' data-unit='${esc(a.unit)}'>单元 #${esc(a.unit)} v${esc(a.version)}</a>` +
+          `${a.source === "chain" ? "" : " <span class='mut'>(提示)</span>"}</li>`).join("")}</ul>`
+      : "<p class='mut'>目前没有指派给你、且还没核验的版本。</p>";
+    const head = active
+      ? `<p class='mut'>知识经济已于高度 ${esc(econ.activation_height)} 激活:版本由协议指派核验人,只有被指派者的结论计入确立;` +
+        "促成确立的核验人各得 1 分,每天结算一次,积分锁定 180 天后释放。<b>测试网只记积分,不发币。</b></p>"
+      : "<p class='mut'>知识经济尚未激活。下面的「待我核验」由浏览器按区块哈希算出,只是提示。</p>";
+    box.innerHTML = `<h3 class='md'>核验任务与积分</h3>${head}
+      <h4>待我核验(${items.length})</h4>${todo}
+      ${active ? `<kv><b>本期得分</b><span>${score ? esc(score.points) : 0} 分 <span class='mut'>(结算后清零,转成积分)</span></span></kv>
+        <kv><b>累计积分</b><span>${mine ? pts(mine.earned) : 0}</span></kv>
+        <kv><b>锁定中</b><span>${mine ? pts(mine.locked) : 0}${mine && Number(mine.locked) > 0 ? ` <span class='mut'>(高度 ${esc(mine.release_height)} 释放)</span>` : ""}</span></kv>
+        <kv><b>已释放</b><span>${mine ? pts(mine.released) : 0}</span></kv>
+        <p class='mut'>全网:已结算 ${esc(econ.period.settled)} 期,累计增发 ${pts(econ.period.issued)},国库 ${pts(econ.period.treasury)}。</p>` : ""}`;
+    box.querySelectorAll("a[data-unit]").forEach((a) => a.addEventListener("click", () => showUnit(a.dataset.unit)));
   }
 
   function checklistFrom(text) {
@@ -316,19 +352,33 @@
       return;
     }
     const mine = v.verifications.find((r) => String(r.verifier) === String(me.id));
-    // 核验人指派(服务侧确定性计算;现阶段只是提示,链仍接受所有成员的核验)
+    // 核验人指派。知识经济激活后由**协议**指派、写在链上,只有被指派者的结论计入确立与报酬;
+    // 激活之前只是浏览器算出的提示,链仍接受所有成员的核验。
     let assignNote = "";
     try {
       const a = await (await fetch("/assign?unit=" + encodeURIComponent(u.id) + "&version=" + vn)).json();
       if (a && a.assigned && a.assigned.length) {
         const isMine = a.assigned.includes(String(me.id));
-        assignNote = `<p class='mut'>本版指派给 ${a.assigned.map((x) => "#" + x).join("、")}` +
-          `${isMine ? "<b>(包括你)</b>" : ""}。指派由区块哈希确定性算出,任何人都能复核;` +
-          `现阶段只是提示,链仍接受所有成员的核验。</p>`;
+        const who = a.assigned.map((x) => "#" + esc(x)).join("、");
+        if (a.source === "chain") {
+          if (a.established_height != null) {
+            assignNote = `<p class='mut'>本版已于高度 ${esc(a.established_height)} 确立` +
+              `(促成确立:${(a.approvers || []).map((x) => "#" + esc(x)).join("、")})。确立不可撤销,再核验不会计入报酬。</p>`;
+          } else {
+            assignNote = `<p>本版由协议指派给 ${who}${isMine ? " <b>(包括你)</b>" : ""}。` +
+              (isMine
+                ? "你的结论会计入确立;促成确立的核验人各得 1 分,结算时按分数分核验报酬。"
+                : "<span class='mut'>你不在指派名单里:可以核验并记录说明,但结论不计入确立,也不得分。</span>") +
+              "</p>";
+          }
+        } else {
+          assignNote = `<p class='mut'>本版建议由 ${who} 核验${isMine ? "<b>(包括你)</b>" : ""}。` +
+            `指派由区块哈希确定性算出,任何人都能复核;知识经济尚未激活,现阶段只是提示,链仍接受所有成员的核验。</p>`;
+        }
         const others = a.verifications.filter((x) => x.assigned);
         if (others.length) {
           assignNote += `<p class='mut'>已有指派者的结论:${others.map((x) =>
-            `#${x.verifier} ${x.verdict === "pass" ? "通过" : "需修改"}`).join("、")}</p>`;
+            `#${esc(x.verifier)} ${x.verdict === "pass" ? "通过" : "需修改"}`).join("、")}</p>`;
         }
       }
     } catch (_) { /* 指派不可用不影响核验 */ }

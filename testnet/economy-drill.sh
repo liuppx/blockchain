@@ -24,6 +24,7 @@ export TESTNET_OUT="$DRILL_DIR/net"
 OUT="$TESTNET_OUT"
 
 cleanup() {
+  [ -f "$DRILL_DIR/explorer.pid" ] && kill "$(cat "$DRILL_DIR/explorer.pid")" 2>/dev/null || true
   "$HERE/down.sh" >/dev/null 2>&1 || true
   if [ "${KEEP:-0}" = 1 ]; then echo "(保留演练目录 $OUT)"; else rm -rf "$DRILL_DIR"; fi
 }
@@ -151,5 +152,49 @@ for id in 21 22 23 24; do
   fi
 done
 echo "  ✓ 4 个节点一致"
+
+# 7) 浏览器服务:/assign 读的是链上指派(source=chain,enforced=true)
+if [ "${WITH_EXPLORER:-0}" = 1 ]; then
+  echo "== 7) 浏览器服务按链上指派给出「待我核验」"
+  EXP_PORT=18088
+  # 端口被占(例如上一次演练遗留的浏览器服务)就拒绝:否则新服务绑不上端口,
+  # 检查会悄悄打到旧进程上、跑的是旧代码——这次就是这样被误导过。
+  if command -v lsof >/dev/null && lsof -nP -iTCP:$EXP_PORT -sTCP:LISTEN >/dev/null 2>&1; then
+    echo "端口 $EXP_PORT 已被占用(遗留的浏览器服务?):$(lsof -nP -iTCP:$EXP_PORT -sTCP:LISTEN | tail -1)" >&2; exit 1
+  fi
+  # 起浏览器服务并**记下真正的 node 进程号**:
+  # `( ... & echo $! )` 里的 $! 是子 shell 的号,不是 node 的——之前因此 kill 不掉它,
+  # 下一个演练就撞上"端口被占",检查悄悄打到了旧进程上。
+  ( cd "$ROOT/tools/explorer" && exec env PORT=$EXP_PORT NODE_RPC="$RPC" node server.js ) >"$DRILL_DIR/explorer.log" 2>&1 &
+  EXP_PID=$!
+  echo "$EXP_PID" > "$DRILL_DIR/explorer.pid"
+  for _ in $(seq 1 20); do curl -sf "http://127.0.0.1:$EXP_PORT/" >/dev/null && break; sleep 0.5; done
+  kill -0 "$EXP_PID" 2>/dev/null || { echo "浏览器服务没起来:" >&2; tail -5 "$DRILL_DIR/explorer.log" >&2; exit 1; }
+  # 确认端口确实是我们刚起的这个进程在听
+  if command -v lsof >/dev/null; then
+    lsof -nP -iTCP:$EXP_PORT -sTCP:LISTEN -a -p "$EXP_PID" >/dev/null 2>&1 \
+      || { echo "端口 $EXP_PORT 不是我们起的进程在监听" >&2; exit 1; }
+  fi
+  A="$(curl -sf "http://127.0.0.1:$EXP_PORT/assign?unit=2&version=1")"
+  echo "  /assign 单元 #2:$A" | cut -c1-200
+  echo "$A" | grep -q '"source":"chain"' || { echo "浏览器没有用链上指派" >&2; kill "$(cat "$DRILL_DIR/explorer.pid")"; exit 1; }
+  echo "$A" | grep -q '"enforced":true' || { echo "链上指派应标为强制" >&2; kill "$(cat "$DRILL_DIR/explorer.pid")"; exit 1; }
+  A1="$(curl -sf "http://127.0.0.1:$EXP_PORT/assign?unit=1&version=1")"
+  echo "$A1" | grep -q '"source":"hint"' || { echo "激活前的单元 #1 应退回提示" >&2; kill "$(cat "$DRILL_DIR/explorer.pid")"; exit 1; }
+  P="$(curl -sf "http://127.0.0.1:$EXP_PORT/assign?member=${A2[2]}")"
+  echo "  /assign 成员 #${A2[2]}:$(echo "$P" | cut -c1-120)"
+  echo "$P" | grep -q '"enforced":true' || { echo "待我核验应标为强制" >&2; kill "$(cat "$DRILL_DIR/explorer.pid")"; exit 1; }
+  echo "$P" | grep -q '"unit":"2"' && { echo "单元 #2 已确立,不该出现在待我核验里" >&2; kill "$(cat "$DRILL_DIR/explorer.pid")"; exit 1; }
+  if echo "$P" | grep -q '"source":"hint"'; then
+    echo "激活后,激活前发布的单元(只有提示)不该列为任务:$P" | cut -c1-300 >&2; exit 1
+  fi
+  # 8) 网页:「我的身份」页显示核验任务与积分(需要钱包登录;这里直接调页面的取数函数)
+  UI="$(curl -sf -H "Accept: application/json" "http://127.0.0.1:$EXP_PORT/rpc/economy" | head -c 80)"
+  echo "  浏览器读到经济状态:${UI:0:60}"
+  # 浏览器读经济状态用的是 JSON(代理会转发 Accept);文本形式里没有引号
+  curl -sf -H "Accept: application/json" "http://127.0.0.1:$EXP_PORT/rpc/economy" | grep -q '"active":true' \
+    || { echo "浏览器读到的经济状态不是已激活" >&2; exit 1; }
+  echo "  ✓ 浏览器以链上指派为准;已确立的不再待核验;激活前的退回提示;经济状态可读"
+fi
 
 echo "OK:激活不追溯;发布即指派;2 位通过即确立并得分;知识量上涨即增发并分到人;锁定期满释放;全网一致"

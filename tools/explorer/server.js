@@ -153,8 +153,13 @@ async function assign(req, res) {
   try {
     const member = u.searchParams.get("member");
     if (member) {
-      const list = await ASSIGNER.pendingFor(member);
-      return json({ member, count: list.length, items: list, enforced: false });
+      // 列表与「是否强制」用同一份链上状态(否则激活、确立刚发生时两者可能不一致)
+      const out = await ASSIGNER.withEconomy(async () => {
+        const econ = await ASSIGNER.economy();
+        const list = await ASSIGNER.pendingFor(member);
+        return { member, count: list.length, items: list, enforced: !!(econ && econ.active) };
+      });
+      return json(out);
     }
     const unit = u.searchParams.get("unit");
     if (!unit) return json({ error: "missing unit" }, 400);
