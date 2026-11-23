@@ -857,8 +857,8 @@ CHAIN = [
     ("v1_literal_slash", "字面读法 + 罚没", V1_CHAIN | {"period_days": 1.0, "slashing": True}),
     ("v1_time", "真实时间读法:全部按月标定的量折算(追加指派每 3 个月)", V1_TIME | {"period_days": 1.0}),
     # —— 月结算(与已发布结果可比) ——
-    ("v1_month", "月结算 v1", V1_CHAIN | {"period_days": 30.0}),
-    ("v1_month_slash", "月结算 v1 + 罚没", V1_CHAIN | {"period_days": 30.0, "slashing": True}),
+    ("v1_month", "月结算 v1(10 年,与已发布结果可比)", V1_CHAIN | {"period_days": 30.0, "steps": 120}),
+    ("v1_month_slash", "月结算 v1 + 罚没(10 年)", V1_CHAIN | {"period_days": 30.0, "steps": 120, "slashing": True}),
 ]
 
 # v1 关心的是行为:核验有没有人做、确立得了多少、钱有没有流向作恶者
@@ -980,7 +980,8 @@ V1_READING = """## 第七轮:上链 v1
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--seeds", type=int, default=4)
-    ap.add_argument("--steps", type=int, default=120)
+    ap.add_argument("--steps", type=int, default=60,
+                    help="仿真多少个月(天/周结算时自动乘到相应的期数;默认 60 个月 = 5 年)")
     ap.add_argument("--md", action="store_true")
     ap.add_argument("--only", help="逗号分隔的场景名")
     ap.add_argument("--jobs", type=int, default=1, help="并行进程数(结果与串行相同)")
