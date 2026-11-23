@@ -1164,12 +1164,30 @@ impl GenesisConfig {
             timestamp_days: self.timestamp_days,
             validators,
             bridge_sources: Vec::new(),
-            upgrades: crate::upgrade::UpgradeSchedule::from_entries(
-                self.upgrades.iter().map(|u| (u.name.as_str(), u.height)),
-            )
-            .map_err(|e| ConfigError::BadGenesis {
-                detail: format!("[[upgrades]]: {e}"),
-            })?,
+            upgrades: {
+                let bad = |e: crate::upgrade::UpgradeError| ConfigError::BadGenesis {
+                    detail: format!("[[upgrades]]: {e}"),
+                };
+                let mut sched = crate::upgrade::UpgradeSchedule::from_entries(
+                    self.upgrades.iter().map(|u| (u.name.as_str(), u.height)),
+                )
+                .map_err(bad)?;
+                // 节奏只能写在知识经济那一条上
+                if let Some(u) = self
+                    .upgrades
+                    .iter()
+                    .find(|u| u.name == "knowledge-economy-v1")
+                {
+                    let d = crate::upgrade::EconomyCadence::default();
+                    let c = crate::upgrade::EconomyCadence {
+                        period_blocks: u.period_blocks.unwrap_or(d.period_blocks),
+                        lock_blocks: u.lock_blocks.unwrap_or(d.lock_blocks),
+                        topup_blocks: u.topup_blocks.unwrap_or(d.topup_blocks),
+                    };
+                    sched = sched.with_cadence(c).map_err(bad)?;
+                }
+                sched
+            },
         })
     }
 }
@@ -1240,6 +1258,15 @@ pub struct UpgradeConfig {
     pub name: String,
     /// 从这个高度的区块起按新规则执行(含该高度)。
     pub height: u64,
+    /// 知识经济的结算周期(区块数)。可选,默认 86400(约 1 天)。只对 `knowledge-economy-v1` 有意义。
+    #[serde(default)]
+    pub period_blocks: Option<u64>,
+    /// 收益锁定期(区块数)。可选,默认 180 天。
+    #[serde(default)]
+    pub lock_blocks: Option<u64>,
+    /// 追加指派间隔(区块数)。可选,默认 3 天。
+    #[serde(default)]
+    pub topup_blocks: Option<u64>,
 }
 
 /// 测试网阶段 1:创世 `[knowledge]` 段。

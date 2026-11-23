@@ -2128,7 +2128,7 @@ impl ChainState {
         self.economy_topups(new_height, &block.prev_hash);
         // 知识经济 v1:到期释放锁定的收益、每到一个结算周期结算一次(H* 起)。
         self.economy_release(new_height);
-        if new_height.is_multiple_of(crate::economy::PERIOD_BLOCKS) {
+        if new_height.is_multiple_of(self.upgrades.cadence().period_blocks) {
             self.economy_settle(new_height);
         }
 
@@ -2959,7 +2959,7 @@ impl ChainState {
         let to_treasury = issued - pool - rpool;
 
         // --- 4. 知识池:按 √重要性分给发布者,20% 沿"依据"上溯 ---
-        let release = height + LOCK_BLOCKS;
+        let release = height + self.upgrades.cadence().lock_blocks;
         let (shares, remainder) = crate::economy::distribute_by_weight(pool, &weights);
         for (i, share) in shares.iter().enumerate() {
             let unit = units[i];
@@ -3049,7 +3049,7 @@ impl ChainState {
         if !self.economy_active(height) || self.economy.versions.is_empty() {
             return;
         }
-        let interval = crate::economy::TOPUP_INTERVAL_BLOCKS;
+        let interval = self.upgrades.cadence().topup_blocks;
         let due: Vec<(u64, u32)> = self
             .economy
             .versions
@@ -4185,6 +4185,11 @@ impl ChainState {
                 e.u8(u.tag());
                 e.u64(h);
             }
+            // 节奏也折入:节奏不一致的节点在 H* 当块就算出不同的根(停下而不是分叉)
+            let c = self.upgrades.cadence();
+            e.u64(c.period_blocks);
+            e.u64(c.lock_blocks);
+            e.u64(c.topup_blocks);
         }
         // 知识经济 v1:激活以后折入它的状态(激活之前它恒为空,也不追加任何字节)。
         if self.economy_active(self.height) {
@@ -6443,7 +6448,7 @@ mod tests {
         let published = chain.state.height;
         assert_eq!(chain.state.economy.versions[&(1, 1)].assigned.len(), 4);
         // 直接推进到 3 天后:只用状态层,避免出 25 万个块
-        let interval = crate::economy::TOPUP_INTERVAL_BLOCKS;
+        let interval = crate::upgrade::EconomyCadence::default().topup_blocks;
         let mut st = chain.state.clone();
         st.economy_topups(published + interval - 1, &[3u8; 32]);
         assert_eq!(
@@ -6786,7 +6791,7 @@ mod tests {
         for period in 1..=4u64 {
             chain
                 .state
-                .economy_settle(period * crate::economy::PERIOD_BLOCKS);
+                .economy_settle(period * crate::upgrade::EconomyCadence::default().period_blocks);
         }
         assert_eq!(
             chain.state.economy.period.total_issued, 0,
@@ -6803,7 +6808,7 @@ mod tests {
         for period in 5..=9u64 {
             chain
                 .state
-                .economy_settle(period * crate::economy::PERIOD_BLOCKS);
+                .economy_settle(period * crate::upgrade::EconomyCadence::default().period_blocks);
         }
         let issued_total = chain.state.economy.period.total_issued;
         assert!(issued_total > 0, "知识量涨了就要增发");
@@ -6842,7 +6847,7 @@ mod tests {
         for period in 1..=6u64 {
             chain
                 .state
-                .economy_settle(period * crate::economy::PERIOD_BLOCKS);
+                .economy_settle(period * crate::upgrade::EconomyCadence::default().period_blocks);
         }
         let total_earned: u64 = chain.state.economy.locks.values().map(|l| l.earned).sum();
         let issued = chain.state.economy.period.total_issued;
@@ -6854,6 +6859,66 @@ mod tests {
             issued == total_earned + chain.state.economy.period.treasury,
             "发出的 = 分出去的 + 国库"
         );
+    }
+
+    #[test]
+    fn a_short_cadence_settles_on_its_own_boundary_through_real_blocks() {
+        // 节奏从 [[upgrades]] 来:结算周期 4 块 ⇒ 每 4 块真的结算一次(走完整的区块应用路径,
+        // 不是直接调 economy_settle)。这是本地演练能在几分钟里走完一轮的前提。
+        use crate::knowledge::Layer;
+        let mut g = egenesis(1);
+        g.upgrades = g
+            .upgrades
+            .with_cadence(crate::upgrade::EconomyCadence {
+                period_blocks: 4,
+                lock_blocks: 40,
+                topup_blocks: 6,
+            })
+            .unwrap();
+        let mut chain = Chain::new(g);
+        let op = kop(&chain, 1, create(Layer::Foundation, 2, vec![]));
+        commit_ops(&mut chain, vec![op]);
+        let a = chain.state.economy.versions[&(1, 1)].assigned.clone();
+        for who in [a[0], a[1]] {
+            let v = verify(&chain, who, 1, 1, true);
+            commit_ops(&mut chain, vec![v]);
+        }
+        let h0 = chain.state.height;
+        grow(&mut chain, 12);
+        // 这 12 块里跨过了 3 个周期边界(4 的倍数),每个边界记一次知识量
+        let boundaries = (h0 + 12) / 4 - h0 / 4;
+        assert_eq!(
+            chain.state.economy.period.k_history.len() as u64,
+            boundaries.min(6),
+            "每 4 块结算一次:高度 {h0}→{}",
+            chain.state.height
+        );
+    }
+
+    #[test]
+    fn nodes_with_a_different_cadence_stop_at_activation() {
+        // 节奏不进创世哈希,但从 H* 起折入状态根:节奏不同的节点在 H* 停下,而不是分叉。
+        let mut fast = scheduled(5);
+        fast.upgrades = fast
+            .upgrades
+            .with_cadence(crate::upgrade::EconomyCadence {
+                period_blocks: 4,
+                lock_blocks: 40,
+                topup_blocks: 6,
+            })
+            .unwrap();
+        let mut chain = Chain::new(fast);
+        assert_eq!(
+            chain.genesis_hash,
+            Chain::new(scheduled(5)).genesis_hash,
+            "节奏不进创世哈希"
+        );
+        let blocks = grow(&mut chain, 6);
+        let (g, gh) = ChainState::genesis(scheduled(5)); // 默认节奏
+        match Chain::replay_from(g, gh, &blocks) {
+            Err(ChainError::StateRootMismatch { height }) => assert_eq!(height, 5),
+            other => panic!("应当在 H* 停下,实际 {:?}", other.map(|c| c.state.height)),
+        }
     }
 
     #[test]

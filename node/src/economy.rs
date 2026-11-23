@@ -24,8 +24,8 @@ pub const ASSIGN_INITIAL: usize = 4;
 pub const ASSIGN_MAX: usize = 8;
 /// 确立所需的、被指派且计入的"通过"人数下限。
 pub const ESTABLISH_MIN_PASSES: u32 = 2;
-/// 追加指派的间隔:3 天(测试网约 1 块/秒)。设计稿 §4.1 的 hybrid 读法——链上的实际规则。
-pub const TOPUP_INTERVAL_BLOCKS: u64 = 3 * 86_400;
+// 追加指派的间隔、结算周期、锁定期都在 `upgrade::EconomyCadence` 里(可在 [[upgrades]] 覆盖),
+// 那里是唯一的来源;这里不再重复定义,免得两处数字漂移。
 
 // ---- 重要性(S2b)--------------------------------------------------------------
 
@@ -153,10 +153,6 @@ pub struct EconomyState {
 
 // ---- 结算(S3)------------------------------------------------------------------
 
-/// 结算期长(区块数):1 天(测试网约 1 块/秒)。
-pub const PERIOD_BLOCKS: u64 = 86_400;
-/// 收益锁定期(区块数):180 天(hybrid 读法,§4.1)。
-pub const LOCK_BLOCKS: u64 = 180 * 86_400;
 /// 每单位知识量对应的增发(µCOG)。仿真里 `k_money=200`(抽象单位),这里按 1 COG = 10^6 µCOG。
 pub const K_MONEY: u64 = 200 * 1_000_000;
 /// 分成(万分比):知识池 60% / 核验池 25% / 其余 15% 进国库。

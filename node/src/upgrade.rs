@@ -64,6 +64,8 @@ pub enum UpgradeError {
     Unknown(String),
     /// 同一个升级写了两次。
     Duplicate(Upgrade),
+    /// 节奏参数里有 0。
+    BadCadence,
 }
 
 impl fmt::Display for UpgradeError {
@@ -78,6 +80,34 @@ impl fmt::Display for UpgradeError {
                 )
             }
             UpgradeError::Duplicate(u) => write!(f, "upgrade {u} is scheduled twice"),
+            UpgradeError::BadCadence => {
+                write!(
+                    f,
+                    "economy cadence (period/lock/topup blocks) must all be > 0"
+                )
+            }
+        }
+    }
+}
+
+/// 知识经济 v1 的节奏参数(结算周期、锁定期、追加指派间隔),单位是区块数。
+///
+/// 默认值是设计稿的取值(测试网约 1 块/秒:结算 1 天、锁定 180 天、追加 3 天)。
+/// 可以在 `[[upgrades]]` 里覆盖——本地演练用短周期,几分钟就能走完一轮结算。
+/// 它和时刻表一样**不进创世哈希**,但从 H* 起折入 `state_root`:节奏不一致的节点在 H* 当块停下,不分叉。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct EconomyCadence {
+    pub period_blocks: u64,
+    pub lock_blocks: u64,
+    pub topup_blocks: u64,
+}
+
+impl Default for EconomyCadence {
+    fn default() -> Self {
+        EconomyCadence {
+            period_blocks: 86_400,
+            lock_blocks: 180 * 86_400,
+            topup_blocks: 3 * 86_400,
         }
     }
 }
@@ -86,6 +116,8 @@ impl fmt::Display for UpgradeError {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct UpgradeSchedule {
     heights: BTreeMap<Upgrade, u64>,
+    /// 知识经济 v1 的节奏(未设置时用默认值)。
+    cadence: EconomyCadence,
 }
 
 impl UpgradeSchedule {
@@ -101,7 +133,24 @@ impl UpgradeSchedule {
                 return Err(UpgradeError::Duplicate(u));
             }
         }
-        Ok(UpgradeSchedule { heights })
+        Ok(UpgradeSchedule {
+            heights,
+            cadence: EconomyCadence::default(),
+        })
+    }
+
+    /// 覆盖知识经济的节奏。0 值无效(会让结算每块都跑、或锁定立即到期),拒绝。
+    pub fn with_cadence(mut self, c: EconomyCadence) -> Result<Self, UpgradeError> {
+        if c.period_blocks == 0 || c.lock_blocks == 0 || c.topup_blocks == 0 {
+            return Err(UpgradeError::BadCadence);
+        }
+        self.cadence = c;
+        Ok(self)
+    }
+
+    /// 知识经济的节奏。
+    pub fn cadence(&self) -> EconomyCadence {
+        self.cadence
     }
 
     /// 直接给定(测试与内部使用)。
@@ -138,14 +187,24 @@ impl UpgradeSchedule {
     }
 
     /// 给运维核对用的一行文字,例如 `knowledge-economy-v1@1100000`;空表为 `none`。
+    /// 节奏不是默认值时一并打印(`period=…,lock=…,topup=…`),便于带外核对。
     pub fn describe(&self) -> String {
         if self.is_empty() {
             return "none".to_string();
         }
-        self.entries()
+        let mut out = self
+            .entries()
             .map(|(u, h)| format!("{u}@{h}"))
             .collect::<Vec<_>>()
-            .join(",")
+            .join(",");
+        if self.cadence != EconomyCadence::default() {
+            let c = self.cadence;
+            out.push_str(&format!(
+                " (period={},lock={},topup={})",
+                c.period_blocks, c.lock_blocks, c.topup_blocks
+            ));
+        }
+        out
     }
 }
 
@@ -194,6 +253,33 @@ mod tests {
         assert!(s.is_empty());
         assert!(!s.is_active(Upgrade::KnowledgeEconomyV1, u64::MAX));
         assert_eq!(s.describe(), "none");
+    }
+
+    #[test]
+    fn cadence_defaults_to_the_design_values_and_can_be_overridden() {
+        let s = UpgradeSchedule::default().with(Upgrade::KnowledgeEconomyV1, 9);
+        assert_eq!(s.cadence(), EconomyCadence::default());
+        assert_eq!(s.cadence().period_blocks, 86_400, "默认 1 天");
+        assert_eq!(s.describe(), "knowledge-economy-v1@9", "默认节奏不打印");
+        let fast = EconomyCadence {
+            period_blocks: 10,
+            lock_blocks: 30,
+            topup_blocks: 5,
+        };
+        let s = s.with_cadence(fast).unwrap();
+        assert_eq!(s.cadence(), fast);
+        assert_eq!(
+            s.describe(),
+            "knowledge-economy-v1@9 (period=10,lock=30,topup=5)"
+        );
+        let zero = EconomyCadence {
+            period_blocks: 0,
+            ..fast
+        };
+        assert_eq!(
+            UpgradeSchedule::default().with_cadence(zero),
+            Err(UpgradeError::BadCadence)
+        );
     }
 
     #[test]

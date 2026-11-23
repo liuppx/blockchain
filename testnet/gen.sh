@@ -15,6 +15,9 @@
 #   --upgrade NAME=HEIGHT
 #                   schedule a height-activated protocol upgrade (genesis `[[upgrades]]`; repeatable).
 #                   It does not change the genesis hash — `genesis-hash` prints it on its own line.
+#   --economy-cadence PERIOD,LOCK,TOPUP
+#                   blocks per settlement / lock / verifier top-up for knowledge-economy-v1
+#                   (default 86400,15552000,259200 = 1 day / 180 days / 3 days). Drills use short ones.
 #
 # TESTNET_OUT=DIR redirects all output (default testnet/out). Use it for drills so the
 # existing testnet/out (keystores!) is never touched.
@@ -36,6 +39,7 @@ MEMBERS=""      # K7: --members FILE ⇒ genesis accounts from a member list (me
 PROBATION_BLOCKS=604800      # 7 days at 1 block/s (VISION §4d; sim round 3: newcomer weight starts near zero)
 INVITE_COOLDOWN_BLOCKS=86400 # 1 day: each member invites at most one person per day
 UPGRADES=()                  # --upgrade NAME=HEIGHT (repeatable)
+CADENCE=""                   # --economy-cadence PERIOD,LOCK,TOPUP
 while [ $# -gt 0 ]; do
   case "$1" in
     -n) N="$2"; shift 2 ;;
@@ -45,6 +49,7 @@ while [ $# -gt 0 ]; do
     --members) MEMBERS="$2"; shift 2 ;;
     --drill) PROBATION_BLOCKS=60; INVITE_COOLDOWN_BLOCKS=30; shift ;;
     --upgrade) UPGRADES+=("$2"); shift 2 ;;
+    --economy-cadence) CADENCE="$2"; shift 2 ;;
     --force) FORCE=1; shift ;;
     *) echo "usage: $0 [-n VALIDATORS] [-a ACCOUNTS] [--signer id1,id2,...] [--permissioned] [--members FILE] [--drill] [--force]" >&2; exit 2 ;;
   esac
@@ -159,6 +164,10 @@ GEN="$OUT/genesis.toml"
   for u in ${UPGRADES[@]+"${UPGRADES[@]}"}; do
     case "$u" in *=*) ;; *) echo "--upgrade expects NAME=HEIGHT, got: $u" >&2; exit 2 ;; esac
     echo; echo "[[upgrades]]"; echo "name = \"${u%%=*}\""; echo "height = ${u#*=}"
+    if [ "${u%%=*}" = "knowledge-economy-v1" ] && [ -n "$CADENCE" ]; then
+      IFS=, read -r cp cl ct <<< "$CADENCE"
+      echo "period_blocks = $cp"; echo "lock_blocks = $cl"; echo "topup_blocks = $ct"
+    fi
   done
 } > "$GEN"
 # Off-chain member registry (names never go on chain): id ↔ name ↔ focus.
