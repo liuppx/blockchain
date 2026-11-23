@@ -1252,6 +1252,66 @@ fn dec_knowledge_op(d: &mut Dec) -> Result<crate::knowledge::KnowledgeOp, CodecE
     })
 }
 
+/// 知识经济状态的规范编码:`state_root`(激活以后)与快照共用。BTreeMap 有序迭代 ⇒ 字节规范。
+pub(crate) fn enc_economy_state(e: &mut Enc, x: &crate::economy::EconomyState) {
+    e.u64(x.versions.len() as u64);
+    for ((unit, version), v) in &x.versions {
+        e.u64(*unit);
+        e.u32(*version);
+        e.u64(v.assigned.len() as u64);
+        for a in &v.assigned {
+            e.u64(*a);
+        }
+        e.u64(v.last_assigned_height);
+        match v.established_height {
+            None => e.u8(0),
+            Some(h) => {
+                e.u8(1);
+                e.u64(h);
+            }
+        }
+        e.u64(v.approvers.len() as u64);
+        for a in &v.approvers {
+            e.u64(*a);
+        }
+    }
+}
+
+fn dec_economy_state(d: &mut Dec) -> Result<crate::economy::EconomyState, CodecError> {
+    let mut versions = std::collections::BTreeMap::new();
+    let n = d.count()?;
+    for _ in 0..n {
+        let unit = d.u64()?;
+        let version = d.u32()?;
+        let na = d.count()?;
+        let mut assigned = Vec::with_capacity(prealloc(na));
+        for _ in 0..na {
+            assigned.push(d.u64()?);
+        }
+        let last_assigned_height = d.u64()?;
+        let established_height = match d.u8()? {
+            0 => None,
+            1 => Some(d.u64()?),
+            other => return Err(CodecError::BadEnum(other as u32)),
+        };
+        let np = d.count()?;
+        let mut approvers = Vec::with_capacity(prealloc(np));
+        for _ in 0..np {
+            approvers.push(d.u64()?);
+        }
+        versions.insert(
+            (unit, version),
+            crate::economy::VersionEconomy {
+                assigned,
+                last_assigned_height,
+                established_height,
+                approvers,
+            },
+        );
+    }
+    Ok(crate::economy::EconomyState { versions })
+}
+
 /// 知识模块状态的规范编码:`state_root` 与快照共用(BTreeMap / BTreeSet 有序迭代 ⇒ 字节规范)。
 pub(crate) fn enc_knowledge_state(e: &mut Enc, k: &crate::knowledge::KnowledgeState) {
     e.u64(k.units.len() as u64);
@@ -1971,7 +2031,12 @@ pub fn decode_account(buf: &[u8]) -> Result<Account, CodecError> {
 /// `state_root`). A v5 snapshot lacks it, so v5 is now rejected — regenerate.
 ///
 /// v7(测试网阶段 1):追加知识模块状态(单元、版本、核验、成员、领域与参数)。v6 快照缺少该段,被拒——重新生成。
-pub const SNAPSHOT_VERSION: u32 = 7;
+///
+/// v8(知识经济 v1):追加知识经济状态(指派、确立)。**v7 快照仍可读**:v7 的链还没激活知识经济,
+/// 它的经济状态本来就是空的,读成空即与 v7 当时的链完全一致——不必为一次升级重新生成快照。
+pub const SNAPSHOT_VERSION: u32 = 8;
+/// 仍可读取的最老快照版本。
+pub const SNAPSHOT_MIN_VERSION: u32 = 7;
 
 /// Write the account's state fields into the shared stream (same layout as
 /// [`encode_account`], inlined so the snapshot controls framing).
@@ -2147,6 +2212,8 @@ pub fn encode_snapshot(s: &ChainState) -> Vec<u8> {
     }
     // v7:知识模块状态(与 state_root 共用同一份规范编码)。
     enc_knowledge_state(&mut e, &s.knowledge);
+    // v8:知识经济状态(与 state_root 共用同一份规范编码)。
+    enc_economy_state(&mut e, &s.economy);
     e.0
 }
 
@@ -2155,7 +2222,7 @@ pub fn encode_snapshot(s: &ChainState) -> Vec<u8> {
 pub fn decode_snapshot(buf: &[u8]) -> Result<ChainState, CodecError> {
     let mut d = Dec { buf, pos: 0 };
     let version = d.u32()?;
-    if version != SNAPSHOT_VERSION {
+    if !(SNAPSHOT_MIN_VERSION..=SNAPSHOT_VERSION).contains(&version) {
         return Err(CodecError::BadEnum(version));
     }
     let height = d.u64()?;
@@ -2326,6 +2393,11 @@ pub fn decode_snapshot(buf: &[u8]) -> Result<ChainState, CodecError> {
         );
     }
     let knowledge = dec_knowledge_state(&mut d)?;
+    let economy = if version >= 8 {
+        dec_economy_state(&mut d)?
+    } else {
+        crate::economy::EconomyState::default()
+    };
     if d.pos != d.buf.len() {
         return Err(CodecError::TrailingBytes);
     }
@@ -2359,6 +2431,7 @@ pub fn decode_snapshot(buf: &[u8]) -> Result<ChainState, CodecError> {
         genesis_hash,
         // 升级时刻表不在快照里:从快照启动的节点由 `GossipNode::from_snapshot` 从创世配置补上。
         upgrades: crate::upgrade::UpgradeSchedule::default(),
+        economy,
     })
 }
 

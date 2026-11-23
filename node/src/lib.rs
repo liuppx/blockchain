@@ -30,6 +30,7 @@ pub mod consensus;
 pub mod crypto;
 pub mod daemon;
 pub mod driver;
+pub mod economy;
 pub mod hash;
 pub mod keystore;
 pub mod knowledge;
@@ -1147,6 +1148,9 @@ pub struct ChainState {
     /// 只有"在当前高度已生效的升级"折入 `state_root`(见 [`Self::state_root`])。
     /// 从快照启动的节点由 `GossipNode::from_snapshot` 从创世配置补上。
     pub upgrades: crate::upgrade::UpgradeSchedule,
+    /// 知识经济 v1 的链上状态(`economy` 模块)。升级 `knowledge-economy-v1` 激活之前恒为空,
+    /// 也不进 `state_root`——H* 之前与升级前逐字节相同。
+    pub economy: crate::economy::EconomyState,
 }
 
 /// Genesis configuration.
@@ -1891,6 +1895,7 @@ impl ChainState {
             // `state_root()` (genesis_hash is excluded by design).
             genesis_hash: [0u8; 32],
             upgrades: g.upgrades.clone(),
+            economy: Default::default(),
         };
         // genesis "block" hash: height 0, zero prev, no txs, no validator updates.
         // Its commitment is the genesis validator set (the set that certifies
@@ -2117,8 +2122,10 @@ impl ChainState {
             return Err(ChainError::TooManyKnowledgeOps(block.knowledge_ops.len()));
         }
         for op in &block.knowledge_ops {
-            self.apply_knowledge_op(op, new_height)?;
+            self.apply_knowledge_op_in_block(op, new_height, &block.prev_hash)?;
         }
+        // 知识经济 v1:凑不够通过的版本,每 3 天追加指派 1 人(H* 起)。
+        self.economy_topups(new_height, &block.prev_hash);
 
         // on-chain validator-set transition: explicit updates PLUS the changes
         // implied by this block's staking ops (power == bonded stake). Both take
@@ -2358,6 +2365,24 @@ impl ChainState {
         op: &crate::knowledge::KnowledgeOp,
         height: u64,
     ) -> Result<(), ChainError> {
+        // 只用于"这条 op 能否执行"的判断(候选筛选、测试)。指派种子不影响能否执行——
+        // 知识经济的指派与确立从不让一条 op 失败——所以这里用全零哈希,结论与真实区块相同。
+        self.apply_knowledge_op_in_block(op, height, &[0u8; 32])
+    }
+
+    /// 知识经济 v1 是否已激活(升级 `knowledge-economy-v1` 到了 H*)。
+    pub(crate) fn economy_active(&self, height: u64) -> bool {
+        self.upgrades
+            .is_active(crate::upgrade::Upgrade::KnowledgeEconomyV1, height)
+    }
+
+    /// 在区块里执行一条知识 op;`prev_hash` 是这块的上一块哈希(知识经济的指派种子)。
+    pub(crate) fn apply_knowledge_op_in_block(
+        &mut self,
+        op: &crate::knowledge::KnowledgeOp,
+        height: u64,
+        prev_hash: &Hash,
+    ) -> Result<(), ChainError> {
         use crate::knowledge::{KnowledgeAction, KnowledgeUnit, Member, UnitVersion, Verification};
         op.is_well_formed()
             .map_err(ChainError::KnowledgeMalformed)?;
@@ -2420,6 +2445,7 @@ impl ChainState {
                         }],
                     },
                 );
+                self.economy_assign(id, 1, op.actor, height, prev_hash);
                 self.knowledge.next_unit_id += 1;
             }
             KnowledgeAction::PublishVersion { unit, version } => {
@@ -2432,6 +2458,7 @@ impl ChainState {
                     u.versions.len() as u32 + 1
                 };
                 self.check_knowledge_cites(Some(*unit), &version.cites)?;
+                let publisher = op.actor;
                 self.knowledge
                     .units
                     .get_mut(unit)
@@ -2439,10 +2466,11 @@ impl ChainState {
                     .versions
                     .push(UnitVersion {
                         n,
-                        publisher: op.actor,
+                        publisher,
                         payload: version.clone(),
                         published_height: height,
                     });
+                self.economy_assign(*unit, n, publisher, height, prev_hash);
             }
             KnowledgeAction::Verify {
                 unit,
@@ -2479,6 +2507,7 @@ impl ChainState {
                         height,
                     },
                 );
+                self.economy_maybe_establish(*unit, *version, height);
             }
             KnowledgeAction::Invite { pubkey } => {
                 if !self.knowledge.is_established(op.actor, height) {
@@ -2692,6 +2721,143 @@ impl ChainState {
             std::mem::take(&mut kept_votes),
             kept_knowledge,
         )
+    }
+
+    /// 知识经济 v1:新版本发布时,从**发布那一刻**过了见习期、且不是发布者的成员里抽 4 位核验人。
+    /// H* 之前什么都不做。候选按成员编号排序,种子 = 上一块哈希 ‖ 单元 ‖ 版本 ‖ 轮次 0。
+    fn economy_assign(
+        &mut self,
+        unit: u64,
+        version: u32,
+        publisher: u64,
+        height: u64,
+        prev_hash: &Hash,
+    ) {
+        if !self.economy_active(height) {
+            return;
+        }
+        let pool: Vec<u64> = self
+            .knowledge
+            .members
+            .keys()
+            .copied()
+            .filter(|&m| m != publisher && self.knowledge.is_established(m, height))
+            .collect();
+        let seed = crate::economy::assign_seed(prev_hash, unit, version, 0);
+        let assigned = crate::economy::draw(&pool, &seed, crate::economy::ASSIGN_INITIAL);
+        self.economy.versions.insert(
+            (unit, version),
+            crate::economy::VersionEconomy {
+                assigned,
+                last_assigned_height: height,
+                established_height: None,
+                approvers: Vec::new(),
+            },
+        );
+    }
+
+    /// 知识经济 v1:一次核验之后,看这个版本是否第一次满足确立条件;满足就记下(不可逆)。
+    /// 只看被指派的人;已确立的版本不再改动。H* 之前发布的版本没有指派记录,不参与。
+    fn economy_maybe_establish(&mut self, unit: u64, version: u32, height: u64) {
+        if !self.economy_active(height) {
+            return;
+        }
+        let Some(ve) = self.economy.versions.get(&(unit, version)) else {
+            return;
+        };
+        if ve.established_height.is_some() {
+            return;
+        }
+        let publisher = match self
+            .knowledge
+            .units
+            .get(&unit)
+            .and_then(|u| u.versions.get((version as usize).wrapping_sub(1)))
+        {
+            Some(v) => v.publisher,
+            None => return,
+        };
+        let verdicts: Vec<(u64, bool, u64)> = self
+            .knowledge
+            .verifications
+            .range((unit, version, 0)..=(unit, version, u64::MAX))
+            .map(|(_, r)| {
+                (
+                    r.verifier,
+                    matches!(r.verdict, crate::knowledge::Verdict::Pass),
+                    r.height,
+                )
+            })
+            .collect();
+        let k = &self.knowledge;
+        let (passes, needs) =
+            crate::economy::counted(&ve.assigned, publisher, &verdicts, |who, h| {
+                k.is_established(who, h)
+            });
+        if crate::economy::meets_establishment(passes.len(), needs) {
+            let ve = self
+                .economy
+                .versions
+                .get_mut(&(unit, version))
+                .expect("checked");
+            ve.established_height = Some(height);
+            ve.approvers = passes;
+        }
+    }
+
+    /// 知识经济 v1:每块末尾,对还没确立、指派人数不到上限、且距上次指派已满 3 天的版本追加 1 位。
+    /// 只在 H* 起执行。按 (单元, 版本) 有序遍历,所有节点结果一致。
+    fn economy_topups(&mut self, height: u64, prev_hash: &Hash) {
+        if !self.economy_active(height) || self.economy.versions.is_empty() {
+            return;
+        }
+        let interval = crate::economy::TOPUP_INTERVAL_BLOCKS;
+        let due: Vec<(u64, u32)> = self
+            .economy
+            .versions
+            .iter()
+            .filter(|(_, v)| {
+                v.established_height.is_none()
+                    && v.assigned.len() < crate::economy::ASSIGN_MAX
+                    && height >= v.last_assigned_height.saturating_add(interval)
+            })
+            .map(|(k, _)| *k)
+            .collect();
+        for (unit, version) in due {
+            let publisher = match self
+                .knowledge
+                .units
+                .get(&unit)
+                .and_then(|u| u.versions.get((version as usize).wrapping_sub(1)))
+            {
+                Some(v) => v.publisher,
+                None => continue,
+            };
+            let ve = self.economy.versions.get(&(unit, version)).expect("listed");
+            let already: std::collections::BTreeSet<u64> = ve.assigned.iter().copied().collect();
+            let round = ve.assigned.len() as u32; // 每追加一次轮次 +1,种子随之不同
+            let pool: Vec<u64> = self
+                .knowledge
+                .members
+                .keys()
+                .copied()
+                .filter(|&m| {
+                    m != publisher
+                        && !already.contains(&m)
+                        && self.knowledge.is_established(m, height)
+                })
+                .collect();
+            let seed = crate::economy::assign_seed(prev_hash, unit, version, round);
+            let extra = crate::economy::draw(&pool, &seed, 1);
+            let ve = self
+                .economy
+                .versions
+                .get_mut(&(unit, version))
+                .expect("listed");
+            ve.assigned.extend(extra);
+            // 没人可追加时也推进计时,避免每块都重算同一批版本
+            ve.last_assigned_height = height;
+        }
     }
 
     /// 引用校验:被引用的单元与版本必须已存在,且不能引用自身所在的单元。
@@ -3781,6 +3947,11 @@ impl ChainState {
                 e.u8(u.tag());
                 e.u64(h);
             }
+        }
+        // 知识经济 v1:激活以后折入它的状态(激活之前它恒为空,也不追加任何字节)。
+        if self.economy_active(self.height) {
+            e.string("economy");
+            codec::enc_economy_state(&mut e, &self.economy);
         }
         sha256(&e.0)
     }
@@ -5887,6 +6058,243 @@ mod tests {
             chain.state.supply_conserved(),
             "knowledge ops never mint or move money"
         );
+    }
+
+    // ---- 知识经济 v1(S2a):指派与不可逆的确立 -------------------------------
+
+    /// 7 位成员(1..=7)、不设见习期、经济从 `h` 起激活。
+    fn egenesis(h: u64) -> Genesis {
+        let mut g = kgenesis(0, 0, false);
+        g.accounts = (1..=7).map(|i| (i, 30 * MICRO, kp(i).public())).collect();
+        g.upgrades = crate::upgrade::UpgradeSchedule::default()
+            .with(crate::upgrade::Upgrade::KnowledgeEconomyV1, h);
+        g
+    }
+
+    fn commit_ops(chain: &mut Chain, ops: Vec<crate::knowledge::KnowledgeOp>) {
+        let mut b = kblock(chain, ops);
+        chain.commit(&mut b).expect("commit knowledge block");
+    }
+
+    fn verify(
+        chain: &Chain,
+        who: u64,
+        unit: u64,
+        version: u32,
+        pass: bool,
+    ) -> crate::knowledge::KnowledgeOp {
+        use crate::knowledge::*;
+        kop(
+            chain,
+            who,
+            KnowledgeAction::Verify {
+                unit,
+                version,
+                verdict: if pass {
+                    Verdict::Pass
+                } else {
+                    Verdict::NeedsRevision
+                },
+                note_hash: [0u8; 32],
+            },
+        )
+    }
+
+    #[test]
+    fn economy_assigns_four_non_publishers_when_a_version_is_published() {
+        use crate::knowledge::Layer;
+        let mut chain = Chain::new(egenesis(1));
+        let op = kop(&chain, 1, create(Layer::Foundation, 2, vec![]));
+        commit_ops(&mut chain, vec![op]);
+        let ve = &chain.state.economy.versions[&(1, 1)];
+        assert_eq!(ve.assigned.len(), crate::economy::ASSIGN_INITIAL);
+        assert!(!ve.assigned.contains(&1), "发布者不会被指派核验自己");
+        let set: std::collections::BTreeSet<_> = ve.assigned.iter().collect();
+        assert_eq!(set.len(), 4, "不重复");
+        assert!(ve.established_height.is_none());
+    }
+
+    #[test]
+    fn economy_establishes_once_two_assigned_members_pass_and_never_reverts() {
+        use crate::knowledge::Layer;
+        let mut chain = Chain::new(egenesis(1));
+        let op = kop(&chain, 1, create(Layer::Foundation, 2, vec![]));
+        commit_ops(&mut chain, vec![op]);
+        let assigned = chain.state.economy.versions[&(1, 1)].assigned.clone();
+        let outsider = (2..=7)
+            .find(|m| !assigned.contains(m))
+            .expect("7 位成员,4 位被指派");
+
+        // 没被指派的人通过:不计入
+        let v = verify(&chain, outsider, 1, 1, true);
+        commit_ops(&mut chain, vec![v]);
+        assert!(
+            chain.state.economy.versions[&(1, 1)]
+                .established_height
+                .is_none(),
+            "未指派者不计入"
+        );
+
+        // 1 位被指派者通过:还不够
+        let v = verify(&chain, assigned[0], 1, 1, true);
+        commit_ops(&mut chain, vec![v]);
+        assert!(
+            chain.state.economy.versions[&(1, 1)]
+                .established_height
+                .is_none(),
+            "1 位不够"
+        );
+
+        // 第 2 位通过:确立
+        let v = verify(&chain, assigned[1], 1, 1, true);
+        commit_ops(&mut chain, vec![v]);
+        let at = chain.state.height;
+        let ve = &chain.state.economy.versions[&(1, 1)];
+        assert_eq!(ve.established_height, Some(at));
+        assert_eq!(
+            ve.approvers,
+            vec![assigned[0], assigned[1]]
+                .into_iter()
+                .collect::<std::collections::BTreeSet<_>>()
+                .into_iter()
+                .collect::<Vec<_>>()
+        );
+
+        // 之后两位被指派者都改判"需修改":确立不撤销(设计稿决定 #4)
+        let a = verify(&chain, assigned[2], 1, 1, false);
+        let b = verify(&chain, assigned[3], 1, 1, false);
+        commit_ops(&mut chain, vec![a, b]);
+        let c = verify(&chain, assigned[0], 1, 1, false);
+        commit_ops(&mut chain, vec![c]);
+        let ve = &chain.state.economy.versions[&(1, 1)];
+        assert_eq!(ve.established_height, Some(at), "确立不可逆");
+        assert_eq!(chain.state.economy.established_count(), 1);
+    }
+
+    #[test]
+    fn economy_needs_more_passes_than_needs_revision() {
+        use crate::knowledge::Layer;
+        let mut chain = Chain::new(egenesis(1));
+        let op = kop(&chain, 1, create(Layer::Foundation, 2, vec![]));
+        commit_ops(&mut chain, vec![op]);
+        let a = chain.state.economy.versions[&(1, 1)].assigned.clone();
+        let ops = vec![
+            verify(&chain, a[0], 1, 1, false),
+            verify(&chain, a[1], 1, 1, false),
+        ];
+        commit_ops(&mut chain, ops);
+        let ops = vec![
+            verify(&chain, a[2], 1, 1, true),
+            verify(&chain, a[3], 1, 1, true),
+        ];
+        commit_ops(&mut chain, ops);
+        assert!(
+            chain.state.economy.versions[&(1, 1)]
+                .established_height
+                .is_none(),
+            "2 通过对 2 需修改:不确立"
+        );
+    }
+
+    #[test]
+    fn economy_tops_up_one_verifier_every_three_days() {
+        use crate::knowledge::Layer;
+        let mut chain = Chain::new(egenesis(1));
+        let op = kop(&chain, 1, create(Layer::Foundation, 2, vec![]));
+        commit_ops(&mut chain, vec![op]);
+        let published = chain.state.height;
+        assert_eq!(chain.state.economy.versions[&(1, 1)].assigned.len(), 4);
+        // 直接推进到 3 天后:只用状态层,避免出 25 万个块
+        let interval = crate::economy::TOPUP_INTERVAL_BLOCKS;
+        let mut st = chain.state.clone();
+        st.economy_topups(published + interval - 1, &[3u8; 32]);
+        assert_eq!(
+            st.economy.versions[&(1, 1)].assigned.len(),
+            4,
+            "未满 3 天不追加"
+        );
+        st.economy_topups(published + interval, &[3u8; 32]);
+        let after = &st.economy.versions[&(1, 1)];
+        assert_eq!(after.assigned.len(), 5, "满 3 天追加 1 位");
+        assert!(!after.assigned.contains(&1));
+        // 7 位成员减发布者只有 6 人:再过 3 天追加第 6 位,之后无人可加
+        st.economy_topups(published + 2 * interval, &[4u8; 32]);
+        st.economy_topups(published + 3 * interval, &[5u8; 32]);
+        assert_eq!(
+            st.economy.versions[&(1, 1)].assigned.len(),
+            6,
+            "候选用完就停"
+        );
+    }
+
+    #[test]
+    fn economy_is_inert_and_invisible_before_activation() {
+        // 激活之前:不指派、不确立、经济状态为空,状态根与没排升级的链逐块相同。
+        use crate::knowledge::Layer;
+        let mut sched = Chain::new(egenesis(1000));
+        let mut plain = Chain::new({
+            let mut g = egenesis(1000);
+            g.upgrades = Default::default();
+            g
+        });
+        // 两条链用**同一份**载荷(`payload()` 每次给不同的正文哈希,不能各自调用)
+        let action = create(Layer::Foundation, 2, vec![]);
+        for chain in [&mut sched, &mut plain] {
+            let op = kop(chain, 1, action.clone());
+            commit_ops(chain, vec![op]);
+            let ops = vec![verify(chain, 2, 1, 1, true), verify(chain, 3, 1, 1, true)];
+            commit_ops(chain, ops);
+        }
+        assert!(sched.state.economy.is_empty(), "激活前不记任何经济状态");
+        assert_eq!(sched.state.state_root(), plain.state.state_root());
+        assert_eq!(sched.head, plain.head, "区块哈希相同");
+    }
+
+    #[test]
+    fn economy_ignores_versions_published_before_activation() {
+        // H* 之前发布的版本没有指派记录,H* 之后对它的核验也不会让它进入经济(不追溯)。
+        use crate::knowledge::Layer;
+        let mut chain = Chain::new(egenesis(3));
+        let op = kop(&chain, 1, create(Layer::Foundation, 2, vec![])); // 高度 1
+        commit_ops(&mut chain, vec![op]);
+        grow(&mut chain, 2); // 高度 3 = H*
+        let ops = vec![verify(&chain, 2, 1, 1, true), verify(&chain, 3, 1, 1, true)];
+        commit_ops(&mut chain, ops);
+        assert!(
+            !chain.state.economy.versions.contains_key(&(1, 1)),
+            "不追溯"
+        );
+        // H* 之后发布的新版本照常指派
+        let op = kop(
+            &chain,
+            4,
+            crate::knowledge::KnowledgeAction::PublishVersion {
+                unit: 1,
+                version: payload(vec![]),
+            },
+        );
+        commit_ops(&mut chain, vec![op]);
+        assert_eq!(chain.state.economy.versions[&(1, 2)].assigned.len(), 4);
+    }
+
+    #[test]
+    fn economy_state_survives_a_snapshot_round_trip_and_replay() {
+        use crate::knowledge::Layer;
+        let mut chain = Chain::new(egenesis(1));
+        let op = kop(&chain, 1, create(Layer::Foundation, 2, vec![]));
+        commit_ops(&mut chain, vec![op]);
+        let a = chain.state.economy.versions[&(1, 1)].assigned.clone();
+        let ops = vec![
+            verify(&chain, a[0], 1, 1, true),
+            verify(&chain, a[1], 1, 1, true),
+        ];
+        commit_ops(&mut chain, ops);
+        // 快照:经济状态原样带过去,补上时刻表后与链上状态根一致
+        let mut back =
+            crate::codec::decode_snapshot(&crate::codec::encode_snapshot(&chain.state)).unwrap();
+        back.upgrades = egenesis(1).upgrades;
+        assert_eq!(back.economy, chain.state.economy);
+        assert_eq!(back.state_root(), chain.state.state_root());
     }
 
     #[test]
