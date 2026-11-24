@@ -1,101 +1,146 @@
 #!/usr/bin/env bash
-# 升级测试网的验证节点(4 个,都在新机 221.130.30.75)。
+# 在服务器上从**社区 main** 拉源码、编译、部署知行图测试网节点。
 #
-#   deploy/deploy-nodes.sh                 # 打包 → 上传 → 解压 → 升级 → 自检
+#   deploy/deploy-nodes.sh                 # 拉社区 main → 编译 → 部署 → 自检
 #   deploy/deploy-nodes.sh --check         # 只看远端状态,不改动
+#   deploy/deploy-nodes.sh --ref <commit>  # 指定社区 main 上的某个提交(默认最新 main)
 #
-# 流程照 deploy/README.md 的「升级(手动执行升级器的流程)」:
-#   打包(本地,只从已提交代码)→ 上传 → 校验 sha256 → 解压 → prepare → 停旧版
-#   → copy-config → post-copy → 启新版 → 健康检查 → finalize → 切软链接 → 冒烟。
+# 流程(约定:代码先合并到社区 main,发布物由服务器自己编译):
+#   1. /root/code/blockchain 拉取社区仓库(yeying-community/blockchain)的 main;
+#   2. 在服务器上 cargo build --release(服务器是 x86_64,直接编,不需要交叉编译);
+#   3. 把二进制与脚本装进 /opt/deploy/<包名>/;
+#   4. 迁移配置与密钥(不动链数据)、停旧版、启新版;
+#   5. 健康检查 → finalize → 切软链接 → 冒烟 → 自检。
 #
-# 设计要点:
-# - 打包只从**已提交**的代码构建(隔离 worktree),不推送、不建 tag;
-# - 链数据与密钥都不动:config/ 由升级器从旧版本目录迁移,数据仍在 /data/zhixing-testnet/;
-# - 每一步都有自检:校验和、4 个节点都在跑、高度在涨、冒烟通过;
-# - 回退:同一套步骤反过来(旧版本目录还在,finalize 之前都可以退)。
+# 不再从本地打包、拷贝二进制过来:发布物与社区 main 的内容天然一致。
+# 前置:服务器上要装好 Rust 工具链(deploy/install-rust.sh)。
 #
 # 环境变量:
-#   HOST       节点机器(默认 root@221.130.30.75,端口 10022)
-#   VERSION    版本号(默认 0.1.6)
-#   REF        要发布的提交(默认当前 HEAD;必须是已提交的)
+#   HOST        节点机器(默认 root@221.130.30.75,端口 10022)
+#   REPO        社区仓库(默认 https://github.com/yeying-community/blockchain.git)
+#   CODE_DIR    服务器上的源码目录(默认 /root/code/blockchain)
+#   VERSION     版本号(默认取社区 main 最近一次 tag,没有则 0.1.0)
+#   REF         要发布的提交(默认社区 main 的最新提交)
+#   SKIP_BUILD  只部署不编译(用于服务器上已经编好、只想重装的情况)
 set -euo pipefail
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
 ROOT="$(cd "$HERE/.." && pwd)"
 HOST="${HOST:-root@221.130.30.75}"
-VERSION="${VERSION:-0.1.6}"
-REF="${REF:-HEAD}"
+REPO="${REPO:-https://github.com/yeying-community/blockchain.git}"
+CODE_DIR="${CODE_DIR:-/root/code/blockchain}"
+VERSION="${VERSION:-}"
+REF="${REF:-}"
 CHECK_ONLY=0
+SKIP_BUILD=0
 [ "${1:-}" = "--check" ] && CHECK_ONLY=1
+[ "${1:-}" = "--skip-build" ] && SKIP_BUILD=1
 
 SSH=(ssh -p 10022 "$HOST")
-PKG_DIR=/tmp/kdg-pkg
-PKG_ROOT="zhixing-testnet-service-v${VERSION}"
+DEPLOY_ROOT=/opt/deploy
+UNIT=zhixing-testnet-service
 
 info() { printf '\n== %s\n' "$*"; }
 fail() { echo "ERROR: $*" >&2; exit 1; }
 
 if [ "$CHECK_ONLY" = 1 ]; then
   info "远端状态($HOST)"
-  "${SSH[@]}" "readlink -f /opt/deploy/zhixing-testnet; /opt/deploy/zhixing-testnet/scripts/starter.sh status; curl -s http://127.0.0.1:9221/height"
+  "${SSH[@]}" "readlink -f $DEPLOY_ROOT/zhixing-testnet; $DEPLOY_ROOT/zhixing-testnet/scripts/starter.sh status; curl -s http://127.0.0.1:9221/height"
   exit 0
 fi
 
-cd "$ROOT"
-COMMIT="$(git rev-parse --verify "${REF}^{commit}")" || fail "$REF 不是一个提交"
+# ---------------------------------------------------------------- 拉社区 main
+info "拉取社区 main: $REPO"
+"${SSH[@]}" "set -e
+  if [ ! -d '$CODE_DIR/.git' ]; then
+    mkdir -p \$(dirname '$CODE_DIR')
+    git clone '$REPO' '$CODE_DIR'
+  fi
+  cd '$CODE_DIR'
+  git remote set-url origin '$REPO'
+  git fetch --prune origin main
+  # 工作区不干净就拒绝:不覆盖服务器上的改动(那是人改的,要先看清楚)
+  if [ -n \"\$(git status --porcelain)\" ]; then
+    echo '工作区有未提交改动,拒绝拉取;先在服务器上处理:' >&2
+    git status --short >&2
+    exit 1
+  fi
+  git checkout -q main 2>/dev/null || git checkout -q -B main origin/main
+  git reset --hard origin/main
+  git clean -fdq
+  echo \"  HEAD = \$(git rev-parse --short HEAD)\"
+  echo \"  提交标题:\$(git log -1 --pretty=%s)\""
+
+# 待发布的提交
+TARGET="${REF:-origin/main}"
+COMMIT="$("${SSH[@]}" "cd '$CODE_DIR' && git rev-parse --verify '${TARGET}^{commit}'" | tr -dc 0-9a-f | head -40)"
+[ -n "$COMMIT" ] || fail "拿不到目标提交 $TARGET"
 SHORT="${COMMIT:0:7}"
-PKG_NAME="${PKG_ROOT}-${SHORT}.tar.gz"
-info "打包 $PKG_NAME(源码 $COMMIT)"
-rm -rf "$PKG_DIR"
-bash "$ROOT/scripts/package.sh" --ref "$COMMIT" --source-commit "$COMMIT" \
-  --version "$VERSION" --output-dir "$PKG_DIR" >/dev/null
-[ -f "$PKG_DIR/$PKG_NAME" ] || fail "打包没产出 $PKG_NAME"
+info "待发布提交 $COMMIT($SHORT)"
 
-info "上传 → $HOST:/opt/package/"
-rsync -az "$PKG_DIR/" -e "ssh -p 10022" "$HOST:/opt/package/"
+# 必须是**社区 main 上**的提交(约定:代码先合并到社区 main 才发布)
+ON_MAIN="$("${SSH[@]}" "cd '$CODE_DIR' && git merge-base --is-ancestor '$COMMIT' origin/main && echo yes || echo no" | tr -dc 'a-z' | head -3)"
+[ "$ON_MAIN" = "yes" ] || fail "提交 $COMMIT 不在社区 main 上——先把代码合并到社区 main 再发布"
+echo "  ✓ 已在社区 main 上"
 
-info "远端校验并解压"
+if [ -z "$VERSION" ]; then
+  VERSION="$("${SSH[@]}" "cd '$CODE_DIR' && (git describe --tags --abbrev=0 2>/dev/null || echo 0.1.0)" | tr -dc '0-9.' | head -20)"
+fi
+PKG_ROOT="${UNIT}-v${VERSION}-${SHORT}"
+TGT="$DEPLOY_ROOT/$PKG_ROOT"
+
+# ---------------------------------------------------------------- 服务器上编译
+if [ "$SKIP_BUILD" = 0 ]; then
+  info "在服务器上编译($CODE_DIR,cargo build --release)"
+  "${SSH[@]}" "set -e
+    cd '$CODE_DIR'
+    # 非交互 ssh 不读 ~/.profile,rustup 装的 cargo 不在 PATH 上:显式加载
+    [ -f \"\$HOME/.cargo/env\" ] && . \"\$HOME/.cargo/env\"
+    command -v cargo >/dev/null || { echo '服务器上没有 cargo:先跑 deploy/install-rust.sh' >&2; exit 1; }
+    (cd node && cargo build --release --locked)
+    test -x node/target/release/node
+    echo \"  编好的二进制:\$(ls -l node/target/release/node | awk '{print \$5}') 字节\"
+    mkdir -p '$TGT/bin' '$TGT/scripts' '$TGT/tools/explorer'
+    install -m 0755 node/target/release/node '$TGT/bin/node'
+    cp scripts/starter.sh scripts/health-check.sh scripts/test.sh scripts/upgrade.sh '$TGT/scripts/'
+    rm -rf '$TGT/tools/explorer'
+    cp -R tools/explorer '$TGT/tools/explorer'
+    rm -rf '$TGT/tools/explorer/node_modules' '$TGT/tools/explorer/reference' '$TGT/tools/explorer/test'
+    mkdir -p '$TGT/testnet' '$TGT/docs'
+    cp testnet/gen.sh '$TGT/testnet/'
+    cp docs/pilot/README.md '$TGT/docs/' 2>/dev/null || true
+    echo '  装好了'"
+fi
+
+info "升级:现有版本 → $PKG_ROOT"
+CUR="$("${SSH[@]}" "readlink -f $DEPLOY_ROOT/zhixing-testnet")"
+echo "  当前:$CUR"
+
 "${SSH[@]}" "set -e
-  cd /opt/package
-  sha256sum -c '${PKG_NAME}.sha256sum'
-  tar -xzf '${PKG_NAME}' -C /opt/deploy/
-  test -d '/opt/deploy/${PKG_ROOT}-${SHORT}'
-  echo 'extracted'"
-
-CUR="$("${SSH[@]}" "readlink -f /opt/deploy/zhixing-testnet")"
-TGT="/opt/deploy/${PKG_ROOT}-${SHORT}"
-info "升级:$CUR → $TGT"
-
-"${SSH[@]}" "set -e
-  bash '${TGT}/scripts/upgrade.sh' prepare '$CUR' '${TGT}'
-  bash '${CUR}/scripts/starter.sh' stop
-  bash '${TGT}/scripts/upgrade.sh' copy-config '$CUR' '${TGT}'
-  bash '${TGT}/scripts/upgrade.sh' post-copy '$CUR' '${TGT}'
-  bash '${TGT}/scripts/starter.sh' start"
+  bash '$TGT/scripts/upgrade.sh' prepare '$CUR' '$TGT'
+  bash '$CUR/scripts/starter.sh' stop
+  bash '$TGT/scripts/upgrade.sh' copy-config '$CUR' '$TGT'
+  bash '$TGT/scripts/upgrade.sh' post-copy '$CUR' '$TGT'
+  bash '$TGT/scripts/starter.sh' start"
 
 info "等节点追上历史(重放 1–2 分钟)"
-"${SSH[@]}" "bash '${TGT}/scripts/health-check.sh' --level all --retries 40 --interval 6" \
+"${SSH[@]}" "bash '$TGT/scripts/health-check.sh' --level all --retries 40 --interval 6" \
   || fail "健康检查没过(节点可能还在重放,过一会儿再跑 deploy-nodes.sh --check 看)"
 
 "${SSH[@]}" "set -e
-  bash '${TGT}/scripts/upgrade.sh' finalize '$CUR' '${TGT}'
-  ln -sfn '${PKG_ROOT}-${SHORT}' /opt/deploy/zhixing-testnet
-  bash /opt/deploy/zhixing-testnet/scripts/test.sh --suite smoke"
+  bash '$TGT/scripts/upgrade.sh' finalize '$CUR' '$TGT'
+  ln -sfn '$PKG_ROOT' $DEPLOY_ROOT/zhixing-testnet
+  bash $DEPLOY_ROOT/zhixing-testnet/scripts/test.sh --suite smoke"
 
-info "自检:4 个节点、换密钥端点、当前版本"
+info "自检"
 "${SSH[@]}" "set -e
-  echo \"版本: \$(readlink -f /opt/deploy/zhixing-testnet)\"
-  /opt/deploy/zhixing-testnet/scripts/starter.sh status
-  echo -n '高度: '; curl -s http://127.0.0.1:9221/height
-  echo
-  # 换密钥端点存在:空请求应返回 400(能解码才 400),不是 404
+  echo \"版本: \$(readlink -f $DEPLOY_ROOT/zhixing-testnet)\"
+  $DEPLOY_ROOT/zhixing-testnet/scripts/starter.sh status
+  echo -n '高度: '; curl -s http://127.0.0.1:9221/height; echo
   CODE=\$(curl -s -o /dev/null -w '%{http_code}' -X POST --data-binary '' http://127.0.0.1:9221/key-rotation)
   echo \"key-rotation 端点: HTTP \$CODE\"
   test \"\$CODE\" != '404' || { echo '换密钥端点不存在' >&2; exit 1; }
   echo -n '高度(再读一次): '; curl -s http://127.0.0.1:9221/height; echo"
 
 echo
-echo "== 完成:节点已升级到 $TGT"
-echo "下一步(换 alice / bob 的密钥):"
-echo "  testnet/rotate-key.sh --account 1 --old-key <alice.seed>"
-echo "  testnet/rotate-key.sh --account 2 --old-key <bob.seed>"
+echo "== 完成:节点已升级到 $PKG_ROOT(社区 main $SHORT,服务器上编译)"

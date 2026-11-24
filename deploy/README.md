@@ -35,15 +35,25 @@ cat config/tokens.env                            # RPC 写令牌(只私下发给
 
 4 个验证节点在同一台机器上:这是**测试网**的取舍(机器宕机即全链停),不是生产拓扑。
 
-### 打包
+### 发布约定:先合并到社区 main,服务器上编译
 
-在有 Rust 的 x86_64 机器上(新机即可),从干净 checkout:
+**每次发布,代码必须先合并到社区仓库 `yeying-community/blockchain` 的 main 分支。**
+服务器上 `/root/code/blockchain` 存放社区项目的源代码,发布时在服务器上拉社区 main 的最新代码、
+**在服务器上编译**,再部署。**不再从本地编译、拷贝二进制到服务器。**
+
+理由:本地编译再拷贝,发布的内容由本地工作区决定;服务器自己从社区 main 拉代码编译,
+发布物与社区仓库的状态天然一致,任何人都能从社区 main 复现出同一个二进制。
 
 ```sh
-scripts/package.sh --ref <commit> --source-commit <commit> --version <x.y.z> --output-dir /opt/package
+deploy/install-rust.sh              # 一次性:在服务器上装 Rust 工具链(rustup stable)
+deploy/deploy-nodes.sh              # 拉社区 main → 服务器上编译 → 部署 → 自检
+deploy/deploy-nodes.sh --check      # 只看远端状态
 ```
 
-只从已提交代码构建(隔离 worktree);不创建 tag、不推送、不部署。在非 x86_64 机器(如 arm64 Mac)上用 Docker 交叉编译。
+`deploy-nodes.sh` 会检查待发布的提交**确实在社区 main 上**,不在就拒绝发布。
+服务器上的源码工作区有未提交改动时也拒绝拉取(不覆盖人改过的东西)。
+
+`scripts/package.sh` 仍保留(社区打包规范),但发布不再走它。
 
 ### 升级(手动执行升级器的流程)
 
