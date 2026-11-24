@@ -106,6 +106,7 @@ power = 1
 ```sh
 node inspect-genesis --config node21.toml   # 人读校验
 node genesis-hash   --config node21.toml    # 记录创世哈希,带外分发给所有运营方比对
+                                            # 最后一行 `upgrades …` 是升级时刻表:它不进创世哈希,要单独比对
 ```
 
 ## 4. 节点配置(每节点一份)

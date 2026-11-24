@@ -1028,6 +1028,10 @@ pub struct GenesisConfig {
     /// (旧 ΔK 提交开启、无见习期、无邀请冷却、未登记领域)。
     #[serde(default)]
     pub knowledge: Option<KnowledgeGenesisConfig>,
+    /// 按高度激活的协议升级,`[[upgrades]] name = "…" height = N`。可选;缺省为空(不排任何升级)。
+    /// **不进创世哈希**——用 `node genesis-hash` 打印出来带外核对。不认识的升级名会被拒绝。
+    #[serde(default)]
+    pub upgrades: Vec<UpgradeConfig>,
     #[serde(default)]
     pub timestamp_days: f32,
     #[serde(default)]
@@ -1160,6 +1164,30 @@ impl GenesisConfig {
             timestamp_days: self.timestamp_days,
             validators,
             bridge_sources: Vec::new(),
+            upgrades: {
+                let bad = |e: crate::upgrade::UpgradeError| ConfigError::BadGenesis {
+                    detail: format!("[[upgrades]]: {e}"),
+                };
+                let mut sched = crate::upgrade::UpgradeSchedule::from_entries(
+                    self.upgrades.iter().map(|u| (u.name.as_str(), u.height)),
+                )
+                .map_err(bad)?;
+                // 节奏只能写在知识经济那一条上
+                if let Some(u) = self
+                    .upgrades
+                    .iter()
+                    .find(|u| u.name == "knowledge-economy-v1")
+                {
+                    let d = crate::upgrade::EconomyCadence::default();
+                    let c = crate::upgrade::EconomyCadence {
+                        period_blocks: u.period_blocks.unwrap_or(d.period_blocks),
+                        lock_blocks: u.lock_blocks.unwrap_or(d.lock_blocks),
+                        topup_blocks: u.topup_blocks.unwrap_or(d.topup_blocks),
+                    };
+                    sched = sched.with_cadence(c).map_err(bad)?;
+                }
+                sched
+            },
         })
     }
 }
@@ -1223,6 +1251,24 @@ pub fn load_node_config(path: &str) -> Result<NodeConfig, ConfigError> {
 }
 
 /// Read + parse a genesis TOML.
+/// 创世 `[[upgrades]]` 的一项。
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
+pub struct UpgradeConfig {
+    /// 升级名,如 `knowledge-economy-v1`。
+    pub name: String,
+    /// 从这个高度的区块起按新规则执行(含该高度)。
+    pub height: u64,
+    /// 知识经济的结算周期(区块数)。可选,默认 86400(约 1 天)。只对 `knowledge-economy-v1` 有意义。
+    #[serde(default)]
+    pub period_blocks: Option<u64>,
+    /// 收益锁定期(区块数)。可选,默认 180 天。
+    #[serde(default)]
+    pub lock_blocks: Option<u64>,
+    /// 追加指派间隔(区块数)。可选,默认 3 天。
+    #[serde(default)]
+    pub topup_blocks: Option<u64>,
+}
+
 /// 测试网阶段 1:创世 `[knowledge]` 段。
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
 pub struct KnowledgeGenesisConfig {
@@ -2459,6 +2505,7 @@ mod tests {
                 })
                 .collect(),
             params: None,
+            upgrades: Vec::new(),
         };
         let g = gc.to_genesis().unwrap();
         assert_eq!(g.accounts.len(), 3);
@@ -2504,6 +2551,7 @@ mod tests {
             timestamp_days: 0.0,
             validators: vec![],
             params: None,
+            upgrades: Vec::new(),
         };
         assert!(matches!(gc.to_genesis(), Err(ConfigError::BadHex { .. })));
 
@@ -2848,6 +2896,7 @@ mod tests {
                 })
                 .collect(),
             params: None,
+            upgrades: Vec::new(),
         };
         std::fs::write(
             dir.join("genesis.toml"),

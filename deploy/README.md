@@ -35,15 +35,30 @@ cat config/tokens.env                            # RPC 写令牌(只私下发给
 
 4 个验证节点在同一台机器上:这是**测试网**的取舍(机器宕机即全链停),不是生产拓扑。
 
-### 打包
+### 发布约定:先合并到社区 main
 
-在有 Rust 的 x86_64 机器上(新机即可),从干净 checkout:
+**每次发布,代码必须先合并到社区仓库 `yeying-community/blockchain` 的 main 分支。**
+
+发布分两个阶段,两者产物目录与升级器接口相同(`/opt/deploy/<unit>-v<版本>-<commit7>/` +
+`scripts/upgrade.sh prepare|copy-config|post-copy|finalize`),切换时只换"包从哪来"这一段:
+
+| 阶段 | 包从哪来 | 怎么升级 |
+|---|---|---|
+| **当前(开发期)** | 节点服务器上直接拉社区 main、在服务器上编译 | `deploy/deploy-nodes.sh` 一步完成 |
+| **稳定后** | 打包机器上 `scripts/package.sh` 出包(社区打包规范) | 上传包 → 校验 sha256 → 解压 → `scripts/upgrade.sh` |
+
+当前阶段为了提升开发效率,直接在节点服务器上编译部署:服务器上 `/root/code/blockchain` 存放社区源代码,
+发布时拉社区 main 的最新代码、编译、部署。**不再从本地(开发机)编译、拷贝二进制。**
+稳定后迁移到打包机器,回到"打包机出包 + `upgrade.sh` 升级"这条规范流程——`scripts/package.sh` 就是为它准备的。
 
 ```sh
-scripts/package.sh --ref <commit> --source-commit <commit> --version <x.y.z> --output-dir /opt/package
+deploy/install-rust.sh              # 一次性:在节点服务器上装 Rust 工具链(rustup stable)
+deploy/deploy-nodes.sh              # 当前:拉社区 main → 服务器上编译 → 部署 → 自检
+deploy/deploy-nodes.sh --check      # 只看远端状态
 ```
 
-只从已提交代码构建(隔离 worktree);不创建 tag、不推送、不部署。在非 x86_64 机器(如 arm64 Mac)上用 Docker 交叉编译。
+`deploy-nodes.sh` 会检查待发布的提交**确实在社区 main 上**,不在就拒绝发布;
+服务器上的源码工作区有未提交改动时也拒绝拉取(不覆盖人改过的东西)。
 
 ### 升级(手动执行升级器的流程)
 
@@ -112,6 +127,36 @@ ZHIXING_SKIP_NODES=1 ZHIXING_CHECK_TUNNEL=1 /opt/zhixing/deploy/monitor-testnet.
 
 链自身的 Prometheus 指标与告警规则见 [`docs/ops/`](../docs/ops/)(`zhixing_height`、`zhixing_peers_connected`、
 `zhixing_slashing_events_total` 等);本机未部署 Prometheus,故用上面的定时脚本覆盖同样的关键指标。
+
+## 正文镜像(新机)
+
+链上只存正文的 SHA-256,正文本身在旧机的正文仓库里(`/opt/zhixing/bodies`)。仓库只有一份时,
+那台机器的盘坏了,链上的哈希就成了空壳。新机上因此留一份**可核对的副本**:
+
+| 项 | 位置 |
+|---|---|
+| 副本目录 | `/data/zhixing-testnet/bodies-mirror/`(正文按哈希存,另有 `STATUS.json` 与 `MANIFEST.json`) |
+| 定时任务 | `/etc/cron.d/zhixing-body-mirror`(每小时第 17 分)→ `/opt/zhixing/deploy/body-mirror.sh` |
+| 工具 | `/opt/zhixing/tools/body_mirror.py`(仓库 `tools/body_mirror.py`,纯标准库) |
+| 监控 | `monitor-testnet.sh` 读 `STATUS.json`:副本是否齐全、是否按时更新、主仓库是否丢了正文;异常照旧发飞书 |
+
+副本收的是链上**全部版本**的正文,以及核验时写了说明的那些说明正文(`note_hash`;全 0 表示没写说明)。
+每份都重新核对 SHA-256,哈希不符的内容一个字节都不落盘。
+
+```sh
+# 手动跑一次(新机)
+/opt/zhixing/deploy/body-mirror.sh
+tail -6 /opt/logs/zhixing-body-mirror.log
+
+# 只检查主仓库是否完整(任何机器;不写盘,缺了就非零退出)
+/opt/zhixing/tools/body_mirror.py --check
+
+# 主仓库丢了正文时,用副本补回去(写入令牌放环境变量,不进命令行)
+ZHIXING_BODY_TOKEN=… python3 /opt/zhixing/tools/body_mirror.py \
+  --dest /data/zhixing-testnet/bodies-mirror --restore-to https://blockchain.yeying.pub
+```
+
+`tools/body_mirror.py` 也能单独用:任何人都能拿链上的引用去核对正文,不需要信任浏览器服务。
 
 ## 已停用
 

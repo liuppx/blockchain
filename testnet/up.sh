@@ -7,7 +7,7 @@ set -euo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 ROOT="$(cd "$HERE/.." && pwd)"
 BIN="$ROOT/node/target/release/node"
-OUT="$HERE/out"
+OUT="${TESTNET_OUT:-$HERE/out}"   # 演练可指到别处,不碰 testnet/out
 [ -f "$OUT/password" ] || { echo "run testnet/gen.sh first" >&2; exit 1; }
 
 export ZHIXING_KEYSTORE_PASSWORD="$(cat "$OUT/password")"

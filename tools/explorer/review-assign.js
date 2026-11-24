@@ -10,7 +10,11 @@
 //
 // 任何人用公开的链上数据都能算出同样的结果,所以它可验证、发布者事先无法预知(区块哈希在发布时
 // 还不存在),但**不是共识强制的**:链目前仍接受所有成员的核验。浏览器据此提示"这一版指派给了谁",
-// 并把被指派者的结论单独标出。等成员 ≥ 6 人、改为共识规则时,算法保持不变,只是从提示变成约束。
+// 并把被指派者的结论单独标出。
+//
+// **知识经济 v1 激活以后**(链上 `/economy` 的 active=true),指派改由**协议**完成、写在链上状态里,
+// 只有被指派者的结论计入确立与报酬。这时一律以链上指派为准(`source: "chain"`,`enforced: true`);
+// 激活之前发布的版本链上没有指派记录,仍用这里的确定性算法提示(`source: "hint"`)。
 const crypto = require("crypto");
 const http = require("http");
 
@@ -66,6 +70,47 @@ class ReviewAssigner {
     });
   }
 
+  /**
+   * 链上的知识经济状态(激活后才有指派)。
+   *
+   * **不做跨请求的时间缓存**:曾经缓存 5 秒,结果激活、确立刚发生的那几秒里,
+   * 浏览器会按旧状态把"已确立"的版本仍列为待核验、把链上指派当成提示。
+   * 一次 `pendingFor` 会对很多版本调 `forVersion`,所以只在**同一次**查询内复用(见 `withEconomy`)。
+   */
+  async economy() {
+    if (this._scoped) return this._scoped;
+    try {
+      return await this.rpcJson("/economy");
+    } catch (_) {
+      return { active: false, versions: [] }; // 旧节点没有 /economy:按未激活处理
+    }
+  }
+
+  /** 在一次查询内固定经济状态:所有版本看到的是同一份链上状态。 */
+  async withEconomy(fn) {
+    const outer = this._scoped;
+    if (!outer) this._scoped = await this.economy();
+    try {
+      return await fn();
+    } finally {
+      if (!outer) this._scoped = null;
+    }
+  }
+
+  /** 链上记录的指派(没有则返回 null)。 */
+  async chainAssignment(unitId, versionN) {
+    const e = await this.economy();
+    if (!e || !e.active) return null;
+    const hit = (e.versions || []).find(
+      (x) => String(x.unit) === String(unitId) && String(x.version) === String(versionN));
+    if (!hit) return null;
+    return {
+      assigned: (hit.assigned || []).map(String),
+      established_height: hit.established_height == null ? null : String(hit.established_height),
+      approvers: (hit.approvers || []).map(String),
+    };
+  }
+
   async blockHash(height) {
     if (this.blockHashCache.has(height)) return this.blockHashCache.get(height);
     const b = await this.rpcJson("/block/" + height);
@@ -90,25 +135,53 @@ class ReviewAssigner {
     const u = await this.rpcJson("/unit/" + unitId);
     const v = u.versions.find((x) => String(x.n) === String(versionN)) || u.versions[u.versions.length - 1];
     const height = Number(v.published_height);
+    const verifs = (v.verifications || []);
+    // 先看链上:激活后发布的版本,指派以链为准
+    const onChain = await this.chainAssignment(unitId, v.n);
+    if (onChain) {
+      const byAssigned = new Set(onChain.assigned);
+      return {
+        unit: String(unitId), version: String(v.n), published_height: String(height),
+        source: "chain", enforced: true,
+        assigned: onChain.assigned,
+        established_height: onChain.established_height,
+        approvers: onChain.approvers,
+        verifications: verifs.map((x) => ({
+          verifier: String(x.verifier), verdict: x.verdict, height: String(x.height),
+          assigned: byAssigned.has(String(x.verifier)),
+        })),
+      };
+    }
+    // 链上没有(未激活,或激活前发布的版本):用确定性算法给出提示
     const blockHash = await this.blockHash(height);
     const members = await this.membersAt(height);
     const r = assign({ blockHash, unit: unitId, version: v.n, publisher: v.publisher, members, k });
     const byAssigned = new Set(r.assigned);
     return {
       unit: String(unitId), version: String(v.n), published_height: String(height),
+      source: "hint", enforced: false,
       block_hash: blockHash, seed: r.seed, k,
       assigned: r.assigned,
-      verifications: (v.verifications || []).map((x) => ({
+      verifications: verifs.map((x) => ({
         verifier: String(x.verifier), verdict: x.verdict, height: String(x.height),
         assigned: byAssigned.has(String(x.verifier)),
       })),
-      // 现阶段只是提示:链仍接受所有成员的核验
-      enforced: false,
     };
   }
 
-  /** 某成员被指派了哪些尚未核验的版本("待我核验")。 */
+  /**
+   * 某成员被指派了哪些尚未核验的版本("待我核验")。
+   *
+   * 知识经济激活以后,只列**链上指派**的版本:激活前发布的版本只有浏览器提示,
+   * 核验它们既不计入确立也不得分,列成"任务"会误导成员。激活之前,列提示(那时全都是提示)。
+   */
   async pendingFor(memberId, k = DEFAULT_K) {
+    return this.withEconomy(() => this._pendingFor(memberId, k));
+  }
+
+  async _pendingFor(memberId, k) {
+    const econ = await this.economy();
+    const active = !!(econ && econ.active);
     const out = [];
     let cursor = null;
     for (let i = 0; i < 20; i++) {
@@ -118,7 +191,11 @@ class ReviewAssigner {
         try {
           const a = await this.forVersion(it.id, it.versions, k);
           const done = a.verifications.some((x) => x.verifier === String(memberId));
-          if (a.assigned.includes(String(memberId)) && !done) out.push(a);
+          // 已确立的版本不再需要核验(链上的确立不可逆;再核验也不计入)
+          const settled = a.source === "chain" && a.established_height != null;
+          // 激活后只列链上指派的版本(提示类不计入、不得分)
+          const counts = !active || a.source === "chain";
+          if (a.assigned.includes(String(memberId)) && !done && !settled && counts) out.push(a);
         } catch (_) { /* 跳过 */ }
       }
       cursor = page.cursor;

@@ -9,7 +9,8 @@
 #   2. 链在出块(高度在增长);
 #   3. 4 个节点高度与 head 一致;
 #   4. 旧机 → 新机的 SSH 通道通(旧机上跑;浏览器依赖它);
-#   5. 磁盘余量。
+#   5. 磁盘余量;
+#   6. 正文镜像(本机有副本目录时):副本是否齐全、按时更新,主正文仓库是否丢了正文。
 set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
@@ -20,6 +21,8 @@ TUNNEL_URL="${ZHIXING_TUNNEL_URL:-http://127.0.0.1:19221}"
 MIN_FREE_MB="${ZHIXING_MIN_FREE_MB:-2000}"
 STALL_SECONDS="${ZHIXING_STALL_SECONDS:-300}"
 STATE_FILE="${STATE_FILE:-/var/lib/zhixing-monitor.state}"
+BODY_MIRROR_DIR="${BODY_MIRROR_DIR:-/data/zhixing-testnet/bodies-mirror}"
+BODY_MIRROR_MAX_AGE="${BODY_MIRROR_MAX_AGE:-10800}"   # 每小时镜像一次;3 小时没更新就告警
 FEISHU_SCENE="monitor_service"
 
 # 飞书通知(社区公共库);缺失时只记日志不报错
@@ -153,6 +156,29 @@ else
   check "disk" 0 "/data 剩余 ${free_mb} MB"
 fi
 
+# 6. 正文镜像:链上只存哈希,正文丢了哈希就成空壳。读 body-mirror.sh 写的 STATUS.json
+if [ -f "$BODY_MIRROR_DIR/STATUS.json" ]; then
+  verdict="$(python3 - "$BODY_MIRROR_DIR/STATUS.json" "$BODY_MIRROR_MAX_AGE" <<'PYEOF' 2>&1
+import json, sys, time
+s = json.load(open(sys.argv[1])); max_age = int(sys.argv[2])
+age = int(time.time()) - int(s.get("unix", 0))
+bad = []
+if age > max_age:
+    bad.append(f"副本 {age // 3600} 小时没有更新")
+if s.get("missing"):
+    bad.append(f"副本缺 {len(s['missing'])} 份(哪里都取不到),例:{s['missing'][0]['refs'][0]}")
+if s.get("source_missing"):
+    bad.append(f"主正文仓库缺 {len(s['source_missing'])} 份,例:{s['source_missing'][0]['refs'][0]}")
+print(("1 " + ";".join(bad)) if bad else f"0 副本 {s.get('have')}/{s.get('refs')} 份齐全,主仓库 {s.get('source_ok', '?')}/{s.get('refs')}")
+PYEOF
+)"
+  case "$verdict" in
+    0\ *) check "bodies" 0 "${verdict#0 }" ;;
+    1\ *) check "bodies" 1 "${verdict#1 }" ;;
+    *)    check "bodies" 1 "正文镜像状态读不了:$verdict" ;;
+  esac
+fi
+
 if [ "${#problems[@]}" -gt 0 ]; then
   {
     echo "【异常通知】知行图测试网异常"
@@ -168,6 +194,7 @@ if [ "${#problems[@]}" -gt 0 ]; then
     echo "1. 检查节点:systemctl status zhixing-testnet;journalctl -u zhixing-testnet -n 50"
     echo "2. 检查健康:cd /opt/deploy/zhixing-testnet && scripts/health-check.sh --level all"
     echo "3. 旧机通道:systemctl status zhixing-tunnel"
+    echo "4. 正文:tail /opt/logs/zhixing-body-mirror.log;主仓库缺的用副本恢复,见 deploy/README.md「正文镜像」"
   } > /tmp/zhixing-alert.$$
   notify "$(cat /tmp/zhixing-alert.$$)"
   rm -f /tmp/zhixing-alert.$$

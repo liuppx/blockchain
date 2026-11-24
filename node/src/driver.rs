@@ -457,6 +457,7 @@ mod tests {
                 .map(|&id| (id, kp(id).public(), 1))
                 .collect(),
             bridge_sources: vec![],
+            upgrades: Default::default(),
         }
     }
 

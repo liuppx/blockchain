@@ -512,6 +512,10 @@ enum Cmd {
         id: u64,
         reply: oneshot::Sender<Option<UnitDetail>>,
     },
+    /// 知识经济 v1 的状态:每个版本的指派与确立、每个单元的重要性。
+    QueryEconomy {
+        reply: oneshot::Sender<EconomySummary>,
+    },
     /// K5:成员目录(按 id 排序),附当前是否已过见习期。
     QueryMembers {
         reply: oneshot::Sender<Vec<(u64, crate::knowledge::Member, bool)>>,
@@ -879,6 +883,7 @@ pub struct Node {
 /// so `Node::start` fails fast without touching the on-disk log.
 fn load_snapshot_boot(
     s: &crate::config::SnapshotBootConfig,
+    upgrades: &crate::upgrade::UpgradeSchedule,
 ) -> io::Result<(crate::ChainState, Hash)> {
     // M141: the authoritative coherence gate (cert XOR trusted-set is an error). Runs
     // here — the one point both the TOML and the CLI keypath converge — because
@@ -886,12 +891,15 @@ fn load_snapshot_boot(
     s.validate()
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
     let bytes = std::fs::read(&s.path)?;
-    let state = crate::codec::decode_snapshot(&bytes).map_err(|e| {
+    let mut state = crate::codec::decode_snapshot(&bytes).map_err(|e| {
         io::Error::new(
             io::ErrorKind::InvalidData,
             format!("decode snapshot {}: {e:?}", s.path),
         )
     })?;
+    // 快照里没有升级时刻表(它来自创世配置)。必须在核对头之前补上:快照高度已过 H* 时,
+    // state_root 折入了已生效的升级,不补就对不上证书签过的根。
+    state.upgrades = upgrades.clone();
     let header_bytes = hex_to_bytes(&s.header_hex).ok_or_else(|| {
         io::Error::new(
             io::ErrorKind::InvalidData,
@@ -1862,6 +1870,62 @@ async fn run_actor(mut actor: Actor, mut rx: mpsc::UnboundedReceiver<Cmd>) {
                     Err(e) => Err(e),
                 };
                 let _ = reply.send(res);
+            }
+            Cmd::QueryEconomy { reply } => {
+                let state = &actor.node.chain.state;
+                let e = &state.economy;
+                let up = crate::upgrade::Upgrade::KnowledgeEconomyV1;
+                let versions = e
+                    .versions
+                    .iter()
+                    .map(|((unit, version), v)| EconomyVersion {
+                        unit: *unit,
+                        version: *version,
+                        assigned: v.assigned.clone(),
+                        established_height: v.established_height,
+                        approvers: v.approvers.clone(),
+                    })
+                    .collect();
+                let importance = e
+                    .importance
+                    .iter()
+                    .map(|(unit, acc)| {
+                        let layer = state
+                            .knowledge
+                            .units
+                            .get(unit)
+                            .map(|u| u.layer)
+                            .unwrap_or(crate::knowledge::Layer::Foundation);
+                        let hl = crate::economy::IMPORTANCE_HALF_LIFE_BLOCKS[layer as usize];
+                        let v = crate::economy::importance_at(acc, hl, state.height);
+                        (
+                            *unit,
+                            crate::hash::hex(&v.to_be_bytes()),
+                            layer_name(layer).to_string(),
+                        )
+                    })
+                    .collect();
+                let review_scores = e.review_scores.iter().map(|(w, s)| (*w, *s)).collect();
+                let locks = e
+                    .locks
+                    .iter()
+                    .map(|(w, l)| (*w, l.locked, l.next_release_height, l.released, l.earned))
+                    .collect();
+                let period = (
+                    state.economy.period.settled,
+                    state.economy.period.total_issued,
+                    state.economy.period.treasury,
+                    state.economy.period.k_history.len(),
+                );
+                let _ = reply.send(EconomySummary {
+                    active: state.economy_active(state.height),
+                    activation_height: state.upgrades.activation(up),
+                    versions,
+                    importance,
+                    review_scores,
+                    locks,
+                    period,
+                });
             }
             Cmd::QueryUnits { reply } => {
                 let k = &actor.node.chain.state.knowledge;
@@ -3439,6 +3503,31 @@ fn knowledge_reject_status(e: &crate::ChainError) -> &'static str {
 }
 
 /// K5:知识单元目录的一项。
+/// 一个版本在知识经济里的状态(给 RPC 用)。
+struct EconomyVersion {
+    unit: u64,
+    version: u32,
+    assigned: Vec<u64>,
+    established_height: Option<u64>,
+    approvers: Vec<u64>,
+}
+
+/// 知识经济 v1 的完整摘要(给 RPC 用)。
+struct EconomySummary {
+    /// 升级是否已激活,以及激活高度。
+    active: bool,
+    activation_height: Option<u64>,
+    versions: Vec<EconomyVersion>,
+    /// 每个单元的当前重要性(已按当前高度惰性衰减)。
+    importance: Vec<(u64, String, String)>, // (单元, 重要性 Q32, 层级)
+    /// 每个账户的核验得分。
+    review_scores: Vec<(u64, u64)>,
+    /// 每个账户的锁定账本:(账户, 锁定额, 释放高度, 已释放, 累计获得)。
+    locks: Vec<(u64, u64, u64, u64, u64)>,
+    /// 结算状态:(已结算期数, 累计增发, 国库, 知识量历史长度)。
+    period: (u64, u64, u64, usize),
+}
+
 struct UnitSummary {
     id: u64,
     author: u64,
@@ -3768,6 +3857,120 @@ fn json_member_listing(ms: &[(u64, crate::knowledge::Member, bool)]) -> String {
     format!("[{items}]")
 }
 
+/// 知识经济状态的文本形式。
+fn format_economy(e: &EconomySummary) -> String {
+    let mut out = String::new();
+    out.push_str(&format!(
+        "active={} activation_height={} versions={} importance={}\n",
+        e.active,
+        e.activation_height
+            .map(|h| h.to_string())
+            .unwrap_or_else(|| "-".into()),
+        e.versions.len(),
+        e.importance.len()
+    ));
+    for v in &e.versions {
+        out.push_str(&format!(
+            "unit={} version={} assigned={} established={} approvers={}\n",
+            v.unit,
+            v.version,
+            v.assigned
+                .iter()
+                .map(|a| a.to_string())
+                .collect::<Vec<_>>()
+                .join(","),
+            v.established_height
+                .map(|h| h.to_string())
+                .unwrap_or_else(|| "-".into()),
+            v.approvers.len()
+        ));
+    }
+    for (unit, value, layer) in &e.importance {
+        out.push_str(&format!(
+            "importance unit={unit} value={value} layer={layer}\n"
+        ));
+    }
+    for (who, score) in &e.review_scores {
+        out.push_str(&format!("score account={who} points={score}\n"));
+    }
+    for (who, locked, release, released, earned) in &e.locks {
+        out.push_str(&format!(
+            "lock account={who} locked={locked} release_height={release} released={released} earned={earned}\n"
+        ));
+    }
+    out.push_str(&format!(
+        "period settled={} issued={} treasury={} k_history={}\n",
+        e.period.0, e.period.1, e.period.2, e.period.3
+    ));
+    out.trim_end().to_string()
+}
+
+/// 知识经济状态的 JSON 形式。
+fn json_economy(e: &EconomySummary) -> String {
+    let versions = e
+        .versions
+        .iter()
+        .map(|v| {
+            format!(
+                "{{\"unit\":{},\"version\":{},\"assigned\":[{}],\"established_height\":{},\"approvers\":[{}]}}",
+                json_u64(v.unit),
+                json_u64(v.version as u64),
+                v.assigned.iter().map(|a| json_u64(*a)).collect::<Vec<_>>().join(","),
+                v.established_height.map(json_u64).unwrap_or_else(|| "null".into()),
+                v.approvers.iter().map(|a| json_u64(*a)).collect::<Vec<_>>().join(",")
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+    let importance = e
+        .importance
+        .iter()
+        .map(|(unit, value, layer)| {
+            format!(
+                "{{\"unit\":{},\"value_q32\":\"{value}\",\"layer\":\"{layer}\"}}",
+                json_u64(*unit)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+    let scores = e
+        .review_scores
+        .iter()
+        .map(|(who, pts)| {
+            format!(
+                "{{\"account\":{},\"points\":{}}}",
+                json_u64(*who),
+                json_u64(*pts)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+    let locks = e
+        .locks
+        .iter()
+        .map(|(who, locked, release, released, earned)| {
+            format!(
+                "{{\"account\":{},\"locked\":{},\"release_height\":{},\"released\":{},\"earned\":{}}}",
+                json_u64(*who),
+                json_u64(*locked),
+                json_u64(*release),
+                json_u64(*released),
+                json_u64(*earned)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+    format!(
+        "{{\"active\":{},\"activation_height\":{},\"versions\":[{versions}],\"importance\":[{importance}],\"review_scores\":[{scores}],\"locks\":[{locks}],\"period\":{{\"settled\":{},\"issued\":{},\"treasury\":{},\"k_history\":{}}}}}",
+        e.active,
+        e.activation_height.map(json_u64).unwrap_or_else(|| "null".into()),
+        json_u64(e.period.0),
+        json_u64(e.period.1),
+        json_u64(e.period.2),
+        json_u64(e.period.3 as u64)
+    )
+}
+
 fn http_response(status_line: &str, body: &str) -> String {
     // M66: delegate to the Content-Type-aware builder with the historic plaintext type,
     // so every pre-M66 caller's output stays byte-identical.
@@ -4006,6 +4209,8 @@ enum GetRoute {
     Unit(u64),
     /// K5:`GET /members` 成员目录。
     Members,
+    /// 知识经济 v1 的状态:每个版本的指派与确立、每个单元的重要性。
+    Economy,
     Health,
     Height,
     Head,
@@ -4535,6 +4740,7 @@ fn route_get(path: &str) -> GetRoute {
         // K5:知识单元目录与成员目录(精确匹配);单个单元走下方 `/unit/` 前缀。
         "/units" => GetRoute::Units,
         "/members" => GetRoute::Members,
+        "/economy" => GetRoute::Economy,
         // M86: the plain cognitive-graph directory. Exact-match; the `/graph/` prefix
         // (single reads/proofs) is handled in the fallthrough arm below, where `/graph/`
         // with an empty id already resolves to `NotFound`.
@@ -5199,6 +5405,7 @@ const READ_ROUTES: &[&str] = &[
     "/proposals",
     "/units",
     "/members",
+    "/economy",
     "/graph",
     "/bonds",
     "/unbonding",
@@ -7405,6 +7612,17 @@ async fn serve_rpc_conn(
                     }
                 }
             }
+            GetRoute::Economy => {
+                let (reply, rx) = oneshot::channel();
+                if cmd.send(Cmd::QueryEconomy { reply }).is_err() {
+                    http_response("503 Service Unavailable", "node stopped")
+                } else {
+                    match rx.await {
+                        Ok(e) => ok_body(fmt, &format_economy(&e), &json_economy(&e)),
+                        Err(_) => http_response("503 Service Unavailable", "node stopped"),
+                    }
+                }
+            }
             GetRoute::Members => {
                 let (reply, rx) = oneshot::channel();
                 if cmd.send(Cmd::QueryMembers { reply }).is_err() {
@@ -8646,7 +8864,7 @@ impl Node {
         // The default path (no `snapshot` config) is byte-identical to pre-M140.
         let snapshot_boot: Option<(crate::ChainState, Hash)> = match cfg.snapshot.as_ref() {
             Some(s) => {
-                let (state, head) = load_snapshot_boot(s)?;
+                let (state, head) = load_snapshot_boot(s, &genesis.upgrades)?;
                 match plan_snapshot_logs(state.height, blocks.first().map(|b| b.height))? {
                     SnapshotLogPlan::EmptyFresh => { /* blocks/certs already empty */ }
                     SnapshotLogPlan::ResumeTail => { /* keep the tail; load_certified below */ }
@@ -9220,6 +9438,7 @@ fn load_light_snapshot_seed(
     s: &crate::config::SnapshotBootConfig,
     my_id: u64,
     peer_ids: &[u64],
+    upgrades: &crate::upgrade::UpgradeSchedule,
 ) -> io::Result<crate::net::LightGossipNode> {
     s.validate()
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
@@ -9230,12 +9449,13 @@ fn load_light_snapshot_seed(
         )
     })?;
     let bytes = std::fs::read(&s.path)?;
-    let state = crate::codec::decode_snapshot(&bytes).map_err(|e| {
+    let mut state = crate::codec::decode_snapshot(&bytes).map_err(|e| {
         io::Error::new(
             io::ErrorKind::InvalidData,
             format!("decode snapshot {}: {e:?}", s.path),
         )
     })?;
+    state.upgrades = upgrades.clone(); // 同上:核对证书签过的根之前补上时刻表
     let header =
         crate::codec::decode_header_any(&hex_to_bytes(&s.header_hex).ok_or_else(|| {
             io::Error::new(io::ErrorKind::InvalidData, "header_hex not valid hex")
@@ -9313,7 +9533,7 @@ impl LightNode {
             ));
         }
         let mut node = match (cfg.snapshot.as_ref(), cfg.checkpoint.as_ref()) {
-            (Some(s), _) => load_light_snapshot_seed(s, my_id, &peer_ids)?,
+            (Some(s), _) => load_light_snapshot_seed(s, my_id, &peer_ids, &genesis.upgrades)?,
             (_, Some(cp)) => {
                 let (head, set) = cp.decode().map_err(cfg_io)?;
                 crate::net::LightGossipNode::from_checkpoint(
@@ -10441,6 +10661,7 @@ mod tests {
                 .map(|&id| (id, kp(id).public(), 1))
                 .collect(),
             bridge_sources: vec![],
+            upgrades: Default::default(),
         }
     }
     fn test_vset() -> ValidatorSet {
@@ -11894,6 +12115,68 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn rpc_economy_reports_the_state() {
+        // 知识经济 v1:GET /economy 返回是否已激活、各版本的指派与确立、各单元的重要性。
+        // 链没排升级时应报告 active=false 且没有任何版本。
+        let dir = tmp_dir("rpc-economy");
+        let mut cfg = node_config(21, 21471, &[21], dir.clone());
+        let rpc_addr = "127.0.0.1:21493";
+        cfg.rpc = Some(crate::config::RpcConfig {
+            enabled: true,
+            listen: rpc_addr.into(),
+            auth_token: String::new(),
+            enable_tls: false,
+        });
+        let mut genesis = test_genesis();
+        genesis.validators = vec![(21, kp(21).public(), 1)];
+        let _node = Node::start(cfg, genesis, Some(kp(21)), None)
+            .await
+            .expect("start node");
+        tokio::time::sleep(Duration::from_millis(150)).await;
+
+        async fn get(addr: &str, path: &str) -> String {
+            let mut s = TcpStream::connect(addr).await.expect("connect rpc");
+            let req =
+                format!("GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
+            s.write_all(req.as_bytes()).await.expect("send");
+            let mut resp = Vec::new();
+            let mut buf = [0u8; 1024];
+            loop {
+                let n = s.read(&mut buf).await.expect("read");
+                if n == 0 {
+                    break;
+                }
+                resp.extend_from_slice(&buf[..n]);
+            }
+            String::from_utf8_lossy(&resp).to_string()
+        }
+
+        let t = get(rpc_addr, "/economy").await;
+        assert!(t.starts_with("HTTP/1.1 200 OK"), "{t}");
+        assert!(t.contains("active=false"), "没排升级时未激活:{t}");
+        assert!(t.contains("versions=0"), "{t}");
+        assert!(t.contains("period settled=0 issued=0"), "还没结算过:{t}");
+        // JSON 形式:整体能解析,并带齐全部字段
+        let j = get(rpc_addr, "/economy?format=json").await;
+        let body = j.split("\r\n\r\n").nth(1).expect("body");
+        let v: serde_json::Value = serde_json::from_str(body).expect("valid JSON");
+        for k in [
+            "active",
+            "versions",
+            "importance",
+            "review_scores",
+            "locks",
+            "period",
+        ] {
+            assert!(v.get(k).is_some(), "JSON 缺字段 {k}:{body}");
+        }
+        // u64 在 JSON 里按项目惯例编码为字符串(JS 超过 2^53 会丢精度)
+        assert_eq!(v["period"]["settled"], serde_json::json!("0"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
     async fn rpc_stake_submit_over_tcp() {
         // M229: `POST /stake` accepts a signed bond StakeOp (200 + op hash), rejects a
         // bad signature and an unknown account (422). Verifies the submit endpoint (decode +
@@ -12830,6 +13113,7 @@ mod tests {
             timestamp_days: 0.0,
             validators: vec![(21, kp(21).public(), 1)],
             bridge_sources: vec![],
+            upgrades: Default::default(),
         };
         // Destination chain B (distinct genesis hash via a different timestamp).
         let mut gb = ga.clone();
@@ -16466,6 +16750,7 @@ mod tests {
             timestamp_days: 0.0,
             validators: vec![(21, kp(21).public(), 1)],
             bridge_sources: vec![],
+            upgrades: Default::default(),
         };
         let mut gb = ga.clone();
         gb.timestamp_days = 1.0;
@@ -17642,6 +17927,7 @@ vote_b.validator=5 vote_b.height=9 vote_b.round=2 vote_b.block_hash={b_h} vote_b
             timestamp_days: 0.0,
             validators: vec![(21, kp(21).public(), 1)],
             bridge_sources: vec![],
+            upgrades: Default::default(),
         };
         fn seed_for(id: u64) -> [u8; 32] {
             let mut s = [0u8; 32];
@@ -20291,7 +20577,8 @@ vote_b.validator=5 vote_b.height=9 vote_b.round=2 vote_b.block_hash={b_h} vote_b
             cert_hex: Some(crate::hash::hex(&crate::codec::encode_commit(&cert))),
             trusted_validators: tv,
         };
-        let (st, head) = load_snapshot_boot(&s).expect("valid quorum cert accepted");
+        let (st, head) =
+            load_snapshot_boot(&s, &Default::default()).expect("valid quorum cert accepted");
         assert_eq!(st.height, state.height);
         assert_eq!(head, header.hash());
         let _ = std::fs::remove_dir_all(&dir);
@@ -20315,7 +20602,7 @@ vote_b.validator=5 vote_b.height=9 vote_b.round=2 vote_b.block_hash={b_h} vote_b
             trusted_validators: tv,
         };
         assert!(
-            load_snapshot_boot(&s).is_err(),
+            load_snapshot_boot(&s, &Default::default()).is_err(),
             "forged snapshot must be rejected"
         );
         let _ = std::fs::remove_dir_all(&dir);
@@ -20350,7 +20637,7 @@ vote_b.validator=5 vote_b.height=9 vote_b.round=2 vote_b.block_hash={b_h} vote_b
             trusted_validators: tv,
         };
         assert!(
-            load_snapshot_boot(&s).is_err(),
+            load_snapshot_boot(&s, &Default::default()).is_err(),
             "cert below quorum must be rejected"
         );
         let _ = std::fs::remove_dir_all(&dir);
@@ -20384,7 +20671,7 @@ vote_b.validator=5 vote_b.height=9 vote_b.round=2 vote_b.block_hash={b_h} vote_b
             trusted_validators: tv,
         };
         assert!(
-            load_snapshot_boot(&s).is_err(),
+            load_snapshot_boot(&s, &Default::default()).is_err(),
             "cert for a different block_hash must be rejected"
         );
         let _ = std::fs::remove_dir_all(&dir);
@@ -20404,7 +20691,7 @@ vote_b.validator=5 vote_b.height=9 vote_b.round=2 vote_b.block_hash={b_h} vote_b
             cert_hex: Some(cert_hex),
             trusted_validators: vec![],
         };
-        match load_snapshot_boot(&cert_only) {
+        match load_snapshot_boot(&cert_only, &Default::default()) {
             Err(e) => assert!(e.to_string().contains("snapshot"), "coherence error: {e}"),
             Ok(_) => panic!("cert without trusted set must be rejected"),
         }
@@ -20415,7 +20702,7 @@ vote_b.validator=5 vote_b.height=9 vote_b.round=2 vote_b.block_hash={b_h} vote_b
             cert_hex: None,
             trusted_validators: tv,
         };
-        assert!(load_snapshot_boot(&set_only).is_err());
+        assert!(load_snapshot_boot(&set_only, &Default::default()).is_err());
     }
 
     #[test]
@@ -20434,7 +20721,7 @@ vote_b.validator=5 vote_b.height=9 vote_b.round=2 vote_b.block_hash={b_h} vote_b
             trusted_validators: vec![],
         };
         assert!(
-            load_snapshot_boot(&ok).is_ok(),
+            load_snapshot_boot(&ok, &Default::default()).is_ok(),
             "M135-only good snapshot accepted"
         );
         // Forged.
@@ -20448,7 +20735,7 @@ vote_b.validator=5 vote_b.height=9 vote_b.round=2 vote_b.block_hash={b_h} vote_b
             trusted_validators: vec![],
         };
         assert!(
-            load_snapshot_boot(&bad).is_err(),
+            load_snapshot_boot(&bad, &Default::default()).is_err(),
             "M135-only forged snapshot rejected"
         );
         let _ = std::fs::remove_dir_all(&dir);

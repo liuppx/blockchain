@@ -1536,6 +1536,7 @@ mod tests {
                 (23, kp(23).public(), 1),
             ],
             bridge_sources: vec![],
+            upgrades: Default::default(),
         }
     }
 

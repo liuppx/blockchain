@@ -13,7 +13,23 @@ testnet/recover.sh 5      # 4) 备份/恢复 + 快照 fast-sync 演练(§11「�
 testnet/chaos.sh          # 5) 混沌/故障注入:崩溃容错 + 崩溃恢复 + 失去法定数的安全停摆 + 恢复
 testnet/soak.sh           # 6) 长跑稳定性:活性 + 不分叉/不漂移 + 供应守恒且跨节点一致 + 无泄漏 + 干净日志
 testnet/down.sh           # 7) 优雅停止
+testnet/upgrade-drill.sh  # 按高度激活的升级演练(独立临时目录,不碰 testnet/out)
 ```
+
+`TESTNET_OUT=DIR` 让 gen/up/down/smoke 改用别的目录;演练一律用它,**不要覆盖 `testnet/out`**(里面有 keystore)。
+`gen.sh --upgrade NAME=HEIGHT` 在创世里排一次升级(`[[upgrades]]`,可重复)。
+
+### 升级激活演练(`upgrade-drill.sh`)
+
+4 个验证人,排 `knowledge-economy-v1` 于高度 H(默认 20),其中 n24 用一份**没排这次升级**的创世
+(创世哈希相同——时刻表不进创世哈希,所以它照常入网),证明:
+1. H\* 之前 4 个节点同一条链(区块哈希逐块相同);
+2. 越过 H\* 后升级的 3 个节点继续出块;n24 **停在 H-1**,日志里说明原因
+   (`certified block does not apply locally — this node's rules differ from the quorum…`),不分叉;
+3. 给 n24 补上时刻表、重启,它重放自己的日志并追上同一条链。
+
+**生产上给已在运行的链排升级**:所有验证节点在 H\* 之前换上新版本、创世里加同一条 `[[upgrades]]`,
+用 `node genesis-hash` 核对每台的 `upgrades` 一行一致。没升级的节点会在 H\* 停下(安全),不会分叉。
 
 ### 混沌演练(M231,`chaos.sh`)
 
