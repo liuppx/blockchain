@@ -61,6 +61,23 @@ remote "cd $DEPLOY && scripts/starter.sh status" | sed 's/^/  /'
 remote "grep -q '^\\[\\[upgrades\\]\\]' $DEPLOY/config/genesis.toml" \
   && fail "远端创世里已经有 [[upgrades]] 了;先用 --check 看清楚,不要重复追加"
 
+# 远端版本必须**真的实现了**这个升级,而不只是认识它的名字。
+# 教训:0.1.7 只有激活机制、没有经济规则,却认识 knowledge-economy-v1 这个名字——
+# 用它排期,到了 H 节点会"激活"一套空规则,之后换新版本也接不上(状态根不同)。
+# 所以要求远端节点已经提供 /economy,且带结算字段(S3 起才有)。
+info "远端版本是否实现了知识经济(要先用 deploy-nodes.sh 部署新版本)"
+VER_DIR="$(remote "readlink -f $DEPLOY")"
+echo "  远端版本:$VER_DIR"
+ECON="$(remote "curl -s --max-time 5 -H 'Accept: application/json' $RPC_LOCAL/economy")"
+case "$ECON" in
+  *'"period"'*) echo "  ✓ /economy 可用且带结算字段" ;;
+  *) fail "远端节点没有实现知识经济(/economy 不可用或缺结算字段):先部署新版本。响应:${ECON:0:120}" ;;
+esac
+if [ -n "${EXPECT_COMMIT:-}" ]; then
+  case "$VER_DIR" in *"$EXPECT_COMMIT"*) echo "  ✓ 版本是预期的提交 $EXPECT_COMMIT" ;;
+    *) fail "远端版本不是预期的提交 $EXPECT_COMMIT" ;; esac
+fi
+
 # 远端版本必须认识这个升级名:在临时副本上试
 info "远端版本是否认识升级 $NAME"
 remote "set -e; cd $DEPLOY; T=\$(mktemp -d)
