@@ -2931,6 +2931,13 @@ impl ChainState {
             units.push(*unit);
         }
         // --- 2. 增发:只前馈,k × (K 本期 − K 上期),用 3 期滑动均值 ---
+        // 激活后的第一次结算:把"激活前"的 K_SMOOTH 期补成 0。激活前的版本不进经济,
+        // 那时的知识量本来就是 0。不补的话,增发 = k·(K[n] − K[n−3])/3 累加起来恰好漏掉
+        // 前三次结算时已有的知识量——激活后头一天半里确立的单元将永远拿不到增发。
+        if self.economy.period.k_history.is_empty() {
+            self.economy.period.k_history = vec![0; K_SMOOTH];
+        }
+        self.economy.period.settled += 1; // 每个结算点都算一期(不论这一期有没有增发)
         self.economy.period.k_history.push(k_q32);
         // 保留 2×K_SMOOTH 期:本期窗口与上期窗口(仿真的 `k_hist[-k_smooth:]` 与 `[-k_smooth-1:-1]`)
         if self.economy.period.k_history.len() > 2 * K_SMOOTH {
@@ -3030,7 +3037,6 @@ impl ChainState {
             .saturating_add(to_treasury)
             .saturating_add(remainder)
             .saturating_add(review_left);
-        self.economy.period.settled += 1;
         // 结算完清空得分表(仿真里每期结算后清空 `review_credits`)
         self.economy.review_scores.clear();
     }
@@ -6755,7 +6761,10 @@ mod tests {
     }
 
     #[test]
-    fn settlement_issues_nothing_until_it_has_enough_periods() {
+    fn settlement_pays_the_opening_knowledge_in_full_over_three_periods() {
+        // 激活后马上确立的单元也要拿到增发:第一次结算时把"激活前"补成 0(那时知识量本来就是 0),
+        // 于是开头那一份知识量分 3 期全额发出;之后知识量不涨就不再增发。
+        // (修复前:增发 = k·(K[n] − K[n−3])/3,累加起来恰好漏掉前三次结算时已有的知识量。)
         use crate::knowledge::Layer;
         let mut chain = Chain::new(egenesis(1));
         let op = kop(&chain, 1, create(Layer::Foundation, 2, vec![]));
@@ -6765,15 +6774,34 @@ mod tests {
             let v = verify(&chain, who, 1, 1, true);
             commit_ops(&mut chain, vec![v]);
         }
-        // 还没到结算周期:不发
-        chain.state.economy_settle(chain.state.height);
-        assert_eq!(chain.state.economy.period.settled, 0);
-        assert_eq!(chain.state.economy.period.total_issued, 0);
-        // 结算了几期、但知识量窗口还没攒够:仍不发
-        for _ in 0..3 {
-            chain.state.economy_settle(chain.state.height + 1);
+        let p = crate::upgrade::EconomyCadence::default().period_blocks;
+        // 一个单元:可信度 0.6(2 位净通过即饱和)、重要性 1 ⇒ 知识量 0.6 ⇒ 全额 0.6 × k
+        let full = crate::economy::K_MONEY as f64 * 0.6;
+        chain.state.economy_settle(p);
+        let first = chain.state.economy.period.total_issued;
+        assert_eq!(chain.state.economy.period.settled, 1);
+        assert!(first > 0, "第一次结算就要发(开头的知识量不能漏)");
+        assert!(
+            (first as f64 - full / 3.0).abs() / full < 0.01,
+            "第一期约 1/3:{first}"
+        );
+        for n in 2..=3u64 {
+            chain.state.economy_settle(n * p);
         }
-        assert_eq!(chain.state.economy.period.total_issued, 0, "窗口不够就不发");
+        let three = chain.state.economy.period.total_issued;
+        assert!(
+            (three as f64 - full).abs() / full < 0.01,
+            "三期发完全额:{three} vs {full}"
+        );
+        // 之后知识量不涨(重要性还在缓慢衰减):不再增发
+        for n in 4..=6u64 {
+            chain.state.economy_settle(n * p);
+        }
+        assert_eq!(
+            chain.state.economy.period.total_issued, three,
+            "知识量没涨就不再增发"
+        );
+        assert_eq!(chain.state.economy.period.settled, 6, "每个结算点都算一期");
     }
 
     #[test]
@@ -6787,16 +6815,13 @@ mod tests {
             let v = verify(&chain, who, 1, 1, true);
             commit_ops(&mut chain, vec![v]);
         }
-        // 先结几期(知识量不变 ⇒ 不增发),再确立第二个单元让知识量涨上去,继续结几期 ⇒ 增发
+        // 先结几期:开头那一份知识量三期内发完,之后知识量不变就不再增发
         for period in 1..=4u64 {
             chain
                 .state
                 .economy_settle(period * crate::upgrade::EconomyCadence::default().period_blocks);
         }
-        assert_eq!(
-            chain.state.economy.period.total_issued, 0,
-            "知识量没涨就不增发"
-        );
+        let before = chain.state.economy.period.total_issued;
         // 第二个单元被确立 ⇒ 知识量上升
         let op = kop(&chain, 2, create(Layer::Foundation, 2, vec![]));
         commit_ops(&mut chain, vec![op]);
@@ -6811,7 +6836,7 @@ mod tests {
                 .economy_settle(period * crate::upgrade::EconomyCadence::default().period_blocks);
         }
         let issued_total = chain.state.economy.period.total_issued;
-        assert!(issued_total > 0, "知识量涨了就要增发");
+        assert!(issued_total > before, "知识量涨了就要增发");
         // 分成:国库拿 15% 左右
         assert!(chain.state.economy.period.treasury > 0);
         // 发布者(账户 1)与核验人都拿到积分
@@ -6885,13 +6910,17 @@ mod tests {
         }
         let h0 = chain.state.height;
         grow(&mut chain, 12);
-        // 这 12 块里跨过了 3 个周期边界(4 的倍数),每个边界记一次知识量
+        // 这 12 块里跨过了 3 个周期边界(4 的倍数),每个边界结算一次
+        // (激活在高度 1,h0 之前没有边界,所以 settled 就是这 12 块里的边界数)
         let boundaries = (h0 + 12) / 4 - h0 / 4;
         assert_eq!(
-            chain.state.economy.period.k_history.len() as u64,
-            boundaries.min(6),
+            chain.state.economy.period.settled, boundaries,
             "每 4 块结算一次:高度 {h0}→{}",
             chain.state.height
+        );
+        assert!(
+            chain.state.economy.period.total_issued > 0,
+            "短周期下真的结算并增发了(激活后确立的单元也拿到增发)"
         );
     }
 
