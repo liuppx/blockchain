@@ -345,10 +345,14 @@ fn main() {
         "status" => cmd_status(&args),
         "verify" => cmd_verify(&args),
         "snapshot" => cmd_snapshot(&args),
-        "inspect-snapshot" => cmd_inspect_snapshot(req_arg(&args, "--snapshot").to_string()),
+        "inspect-snapshot" => cmd_inspect_snapshot(
+            req_arg(&args, "--snapshot").to_string(),
+            snapshot_schedule(&args),
+        ),
         "check-snapshot" => cmd_check_snapshot(
             req_arg(&args, "--snapshot").to_string(),
             req_arg(&args, "--header").to_string(),
+            snapshot_schedule(&args),
         ),
         "inspect-block" => cmd_inspect_block(&args),
         "inspect-cert" => cmd_inspect_cert(&args),
@@ -457,8 +461,8 @@ fn usage() {
     eprintln!("  node status --dir DIR [--config F | --genesis F]   replay the block log and print state (genesis: --config/--genesis, else demo)");
     eprintln!("  node verify --dir DIR [--config F | --genesis F]   replay blocks+certs logs through finality verification; non-zero exit on any integrity error (missing log, length mismatch, cert mismatch, < 2/3 quorum). --config/--genesis select the chain's genesis (default demo) — REQUIRED to audit a production chain");
     eprintln!("  node snapshot --dir DIR --out FILE [--config F | --genesis F]  export the chain (replay-verified) as a M131 snapshot blob; --out - writes to stdout; --config/--genesis select genesis (default demo)");
-    eprintln!("  node inspect-snapshot --snapshot FILE  decode a M131 snapshot blob and print height/roots/supply_conserved; --snapshot - reads stdin");
-    eprintln!("  node check-snapshot --snapshot FILE --header HEX  cross-check a snapshot against a cert-signed BlockHeader hex (GET /header/{{h}}): height + 3 roots must match; non-zero exit on mismatch");
+    eprintln!("  node inspect-snapshot --snapshot FILE [--genesis F]  decode a M131 snapshot blob and print height/roots/supply_conserved; --snapshot - reads stdin; --genesis supplies the upgrade schedule (needed once an upgrade is active)");
+    eprintln!("  node check-snapshot --snapshot FILE --header HEX [--genesis F]  cross-check a snapshot against a cert-signed BlockHeader hex (GET /header/{{h}}): height + 3 roots must match; non-zero exit on mismatch; --genesis supplies the upgrade schedule (needed once an upgrade is active)");
     eprintln!("  node inspect-block --dir DIR [--height N]  read the persisted block log and print a per-block summary, or (with --height) one block's header + contents + tx hashes");
     eprintln!("  node inspect-cert  --dir DIR [--height N]  read the persisted cert log and print a per-cert summary, or (with --height) one finality certificate's height/round/block_hash + precommit voters");
     eprintln!("  node certs  --dir DIR   persist a certified chain (blocks+certs) and re-verify finality on reload");
@@ -5682,7 +5686,23 @@ fn inspect_snapshot(state: &zhixing_node::ChainState) -> String {
 /// M133: `node inspect-snapshot FILE` — decode a M131 snapshot blob and print the
 /// summary. Use `-` to read from stdin (handy for `snapshot --out - | inspect-snapshot -`).
 /// Errors map to non-zero exit + stderr.
-fn cmd_inspect_snapshot(path: String) {
+/// 快照里没有升级时刻表(它来自创世配置)。激活以后,状态根折入了已生效的升级与经济状态,
+/// 不补时刻表就算不对状态根——节点启动路径一直在补,离线工具也要补。
+/// `--genesis F`(创世文件)给出时刻表;不给则按"没有任何升级"处理(激活前的快照这样就对)。
+fn snapshot_schedule(args: &[String]) -> zhixing_node::upgrade::UpgradeSchedule {
+    match opt_arg(args, "--genesis") {
+        None => Default::default(),
+        Some(path) => match config::load_genesis(path).and_then(|g| g.to_genesis()) {
+            Ok(g) => g.upgrades,
+            Err(e) => {
+                eprintln!("error: --genesis {path}: {e}");
+                exit(1);
+            }
+        },
+    }
+}
+
+fn cmd_inspect_snapshot(path: String, upgrades: zhixing_node::upgrade::UpgradeSchedule) {
     let bytes = if path == "-" {
         let mut buf = Vec::new();
         use std::io::Read;
@@ -5700,13 +5720,14 @@ fn cmd_inspect_snapshot(path: String) {
             }
         }
     };
-    let state = match zhixing_node::codec::decode_snapshot(&bytes) {
+    let mut state = match zhixing_node::codec::decode_snapshot(&bytes) {
         Ok(s) => s,
         Err(e) => {
             eprintln!("error: decode snapshot: {e:?}");
             exit(1);
         }
     };
+    state.upgrades = upgrades;
     println!("snapshot  bytes={}", bytes.len());
     println!("{summary}", summary = inspect_snapshot(&state));
 }
@@ -5726,14 +5747,19 @@ enum CheckOutcome {
 /// (the cryptographically strong version lives in `light::verify_snapshot_against_header`,
 /// which requires the cert; M135's helper covers the cert-less case so an operator can
 /// spot a truncated/wrong-version snapshot with nothing but a header).
-fn check_snapshot_against_header(snapshot_bytes: &[u8], header_hex: &str) -> CheckOutcome {
-    let state = match zhixing_node::codec::decode_snapshot(snapshot_bytes) {
+fn check_snapshot_against_header(
+    snapshot_bytes: &[u8],
+    header_hex: &str,
+    upgrades: &zhixing_node::upgrade::UpgradeSchedule,
+) -> CheckOutcome {
+    let mut state = match zhixing_node::codec::decode_snapshot(snapshot_bytes) {
         Ok(s) => s,
         Err(_) => {
             eprintln!("error: decode snapshot failed (corrupt/wrong-version blob)");
             std::process::exit(1);
         }
     };
+    state.upgrades = upgrades.clone();
     let header_bytes = match hex_decode(header_hex) {
         Some(b) => b,
         None => {
@@ -5782,7 +5808,11 @@ fn check_snapshot_against_header(snapshot_bytes: &[u8], header_hex: &str) -> Che
 /// `/headers?from=…` returns). Verifies height + the three cert-signed roots agree; non-zero
 /// exit + stderr on any mismatch. The cert-less part of fast-sync — for the quorum-bound
 /// check use M134's `light::verify_snapshot_against_header` programmatically.
-fn cmd_check_snapshot(snapshot_path: String, header_hex: String) {
+fn cmd_check_snapshot(
+    snapshot_path: String,
+    header_hex: String,
+    upgrades: zhixing_node::upgrade::UpgradeSchedule,
+) {
     let bytes = if snapshot_path == "-" {
         let mut buf = Vec::new();
         use std::io::Read;
@@ -5800,7 +5830,7 @@ fn cmd_check_snapshot(snapshot_path: String, header_hex: String) {
             }
         }
     };
-    match check_snapshot_against_header(&bytes, &header_hex) {
+    match check_snapshot_against_header(&bytes, &header_hex, &upgrades) {
         CheckOutcome::Ok { height } => {
             println!(
                 "ok  height {height}: height + state_root + accounts_root + bridge_root all match"
@@ -6513,6 +6543,46 @@ mod tests {
     }
 
     #[test]
+    fn check_snapshot_needs_the_schedule_once_an_upgrade_is_active() {
+        // S2 回归:快照里没有升级时刻表。升级激活以后,离线检查(check-snapshot / recover.sh)
+        // 必须补上时刻表才算得对状态根——否则备份恢复演练在激活后一定报 state_root mismatch。
+        let mut g = demo_genesis();
+        g.upgrades = zhixing_node::upgrade::UpgradeSchedule::default()
+            .with(zhixing_node::upgrade::Upgrade::KnowledgeEconomyV1, 1);
+        let schedule = g.upgrades.clone();
+        let mut d = ChainDriver::new(g, demo_seeds(), 4);
+        d.submit(tx(
+            1,
+            unit(1),
+            1,
+            reviews(&[(10, 0.9), (11, 0.85), (12, 0.9)]),
+            (3, 3),
+            1.0,
+        ))
+        .unwrap();
+        d.produce_until_drained(1.0, 16).expect("produce");
+        let tip = d.blocks().last().expect("one block").clone();
+        assert!(tip.height >= 1, "过了激活高度");
+        let header = zhixing_node::codec::BlockHeader::from_block(&tip);
+        let header_hex = hex(&zhixing_node::codec::encode_header(&header));
+        let bytes = zhixing_node::codec::encode_snapshot(&d.chain.state);
+        assert!(
+            matches!(
+                check_snapshot_against_header(&bytes, &header_hex, &Default::default()),
+                CheckOutcome::Mismatch { .. }
+            ),
+            "不补时刻表:状态根对不上"
+        );
+        assert!(
+            matches!(
+                check_snapshot_against_header(&bytes, &header_hex, &schedule),
+                CheckOutcome::Ok { .. }
+            ),
+            "补上时刻表:与证书签过的头一致"
+        );
+    }
+
+    #[test]
     fn check_snapshot_matches_tip_header() {
         // M135: a snapshot taken at the tip cross-checks OK against that tip block's
         // cert-signed header (height + the three roots), and a tampered snapshot is rejected.
@@ -6527,7 +6597,7 @@ mod tests {
         let header = zhixing_node::codec::BlockHeader::from_block(tip);
         let header_hex = hex(&zhixing_node::codec::encode_header(&header));
 
-        match check_snapshot_against_header(&bytes, &header_hex) {
+        match check_snapshot_against_header(&bytes, &header_hex, &Default::default()) {
             CheckOutcome::Ok { height } => assert_eq!(height, chain.state.height),
             CheckOutcome::Mismatch { reason, .. } => panic!("expected Ok, got mismatch: {reason}"),
         }
@@ -6538,7 +6608,7 @@ mod tests {
             a.balance += 1;
         }
         let forged_bytes = zhixing_node::codec::encode_snapshot(&forged);
-        match check_snapshot_against_header(&forged_bytes, &header_hex) {
+        match check_snapshot_against_header(&forged_bytes, &header_hex, &Default::default()) {
             CheckOutcome::Mismatch { .. } => {}
             CheckOutcome::Ok { .. } => panic!("expected mismatch for a forged snapshot"),
         }

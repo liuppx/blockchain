@@ -128,6 +128,17 @@ ZHIXING_SKIP_NODES=1 ZHIXING_CHECK_TUNNEL=1 /opt/zhixing/deploy/monitor-testnet.
 链自身的 Prometheus 指标与告警规则见 [`docs/ops/`](../docs/ops/)(`zhixing_height`、`zhixing_peers_connected`、
 `zhixing_slashing_events_total` 等);本机未部署 Prometheus,故用上面的定时脚本覆盖同样的关键指标。
 
+## 协议升级(按高度激活)
+
+排期、激活当天要看什么、出问题怎么办,见 [`docs/ops/upgrades.md`](../docs/ops/upgrades.md)。
+测试网的升级时刻表以那份文档 §1 为准(时刻表不进创世哈希,仓库里要另有记录)。
+
+```sh
+deploy/activate-upgrade.sh --check                  # 看远端当前的时刻表
+deploy/activate-upgrade.sh --height H --dry-run     # 只检查
+deploy/activate-upgrade.sh --height H               # 排期(会重启节点)
+```
+
 ## 正文镜像(新机)
 
 链上只存正文的 SHA-256,正文本身在旧机的正文仓库里(`/opt/zhixing/bodies`)。仓库只有一份时,

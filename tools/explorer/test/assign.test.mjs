@@ -95,7 +95,7 @@ test("激活前发布的版本链上没有指派:退回确定性提示", async (
 
 test("节点没有 /economy(旧版本):按未激活处理,不报错", async () => {
   const a = fakeAssigner({
-    "/economy": () => { throw new Error("404"); },
+    "/economy": () => { const e = new Error("/economy → HTTP 404"); e.status = 404; throw e; },
     "/unit/2": UNIT,
     "/block/20": { hash: "cd".repeat(32) },
     "/members": { items: [{ id: "1", inviter: "0" }, { id: "3", inviter: "0" }] },
@@ -128,4 +128,23 @@ test("激活后,「待我核验」只列链上指派的版本(激活前发布的
   for (const m of ["3", "4", "5", "6"]) {
     assert.equal((await a.pendingFor(m)).length, 0, `成员 ${m}`);
   }
+});
+
+test("节点读不到(不是「不认识这个路径」)时不能当成未激活", async () => {
+  const a = fakeAssigner({
+    "/economy": () => { throw new Error("connect ECONNREFUSED"); },
+    "/unit/2": UNIT,
+  });
+  await assert.rejects(() => a.forVersion("2", "1"), /读不到链上的经济状态/);
+});
+
+test("旧节点对未知路径回 200 \"ok\"(JSON 解析失败):按未激活处理", async () => {
+  const a = fakeAssigner({
+    "/economy": () => JSON.parse("ok"),   // 与真实旧节点的行为一致
+    "/unit/2": UNIT,
+    "/block/20": { hash: "ab".repeat(32) },
+    "/members": { items: [{ id: "1", inviter: "0" }, { id: "3", inviter: "0" }] },
+  });
+  const r = await a.forVersion("2", "1");
+  assert.equal(r.source, "hint");
 });

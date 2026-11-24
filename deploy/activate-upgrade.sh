@@ -68,11 +68,14 @@ remote "grep -q '^\\[\\[upgrades\\]\\]' $DEPLOY/config/genesis.toml" \
 info "远端版本是否实现了知识经济(要先用 deploy-nodes.sh 部署新版本)"
 VER_DIR="$(remote "readlink -f $DEPLOY")"
 echo "  远端版本:$VER_DIR"
-ECON="$(remote "curl -s --max-time 5 -H 'Accept: application/json' $RPC_LOCAL/economy")"
-case "$ECON" in
-  *'"period"'*) echo "  ✓ /economy 可用且带结算字段" ;;
-  *) fail "远端节点没有实现知识经济(/economy 不可用或缺结算字段):先部署新版本。响应:${ECON:0:120}" ;;
-esac
+# 4 个节点都要查:只查 n21 时,某个节点若还跑着旧版本就漏过去了
+for p in 9221 9222 9223 9224; do
+  ECON="$(remote "curl -s --max-time 5 -H 'Accept: application/json' http://127.0.0.1:$p/economy")"
+  case "$ECON" in
+    *'"period"'*) echo "  ✓ :$p /economy 可用且带结算字段" ;;
+    *) fail "节点 :$p 没有实现知识经济(/economy 不可用或缺结算字段):先部署新版本。响应:${ECON:0:120}" ;;
+  esac
+done
 if [ -n "${EXPECT_COMMIT:-}" ]; then
   case "$VER_DIR" in *"$EXPECT_COMMIT"*) echo "  ✓ 版本是预期的提交 $EXPECT_COMMIT" ;;
     *) fail "远端版本不是预期的提交 $EXPECT_COMMIT" ;; esac
@@ -103,6 +106,16 @@ remote "set -e; cd $DEPLOY/config
   printf '\n# 按高度激活的协议升级(deploy/activate-upgrade.sh,%s)\n[[upgrades]]\nname = \"%s\"\nheight = %s\n' '$STAMP' '$NAME' '$HEIGHT' >> genesis.toml
   echo \"  备份:config/genesis.toml.bak-$STAMP\""
 
+# 从这里起创世已经改了:任何一步失败,都要告诉运维怎么退回去(set -e 会直接退出,不会走到末尾的提示)
+on_fail() {
+  echo >&2
+  echo "!! 激活中途失败。创世已追加 [[upgrades]],备份在 config/genesis.toml.bak-$STAMP。" >&2
+  echo "!! 激活高度 $HEIGHT 之前可以安全回退:" >&2
+  echo "!!   ssh -p 10022 $HOST 'cd $DEPLOY && cp config/genesis.toml.bak-$STAMP config/genesis.toml && scripts/starter.sh restart'" >&2
+  echo "!! 回退后用 deploy/activate-upgrade.sh --check 确认 4 个节点都回到 upgrades none。" >&2
+}
+trap on_fail ERR
+
 info "4 个节点的时刻表必须一致"
 LINES="$(remote "cd $DEPLOY && for n in 21 22 23 24; do ./bin/node genesis-hash --config config/node\$n.toml | tail -1; done")"
 echo "$LINES" | sed 's/^/  /'
@@ -114,12 +127,22 @@ remote "cd $DEPLOY && scripts/starter.sh restart" | tail -6 | sed 's/^/  /'
 remote "cd $DEPLOY && scripts/health-check.sh --level all --retries 60 --interval 6" | tail -3 | sed 's/^/  /' \
   || fail "健康检查没通过;回退:cp config/genesis.toml.bak-$STAMP config/genesis.toml && scripts/starter.sh restart"
 
-info "核对"
+info "核对:每个节点都要报同一个激活高度"
+# 逐个节点查:某个节点没换上新时刻表(重启失败、或还拿着旧的内存状态)时会在这里露出来。
+# 只查一个节点是不够的——两个节点停在 H* 就会让链停摆。
+for p in 9221 9222 9223 9224; do
+  E="$(remote "curl -s --max-time 5 -H 'Accept: application/json' http://127.0.0.1:$p/economy")"
+  AH="$(printf '%s' "$E" | sed -n 's/.*"activation_height":"\([0-9]*\)".*/\1/p')"
+  ACTIVE="$(printf '%s' "$E" | sed -n 's/.*"active":\(true\|false\).*/\1/p')"
+  echo "  :$p active=$ACTIVE activation_height=${AH:-?}"
+  [ "$AH" = "$HEIGHT" ] || fail "节点 :$p 的激活高度不是 $HEIGHT(它没换上新时刻表?):$E"
+done
 H1="$(remote "curl -s $RPC_LOCAL/height" | tr -dc 0-9)"; sleep 10
 H2="$(remote "curl -s $RPC_LOCAL/height" | tr -dc 0-9)"
 echo "  高度 $H1 → $H2(在出块)"
 [ "$H2" -gt "$H1" ] || fail "重启后不出块"
 remote "curl -s $RPC_LOCAL/economy | head -1" | sed 's/^/  经济:/'
+trap - ERR
 echo
 echo "完成:$NAME 将在高度 $HEIGHT 激活(还有约 $(( (HEIGHT - H2) / 3600 )) 小时)。"
 echo "回退(激活前):cd $DEPLOY && cp config/genesis.toml.bak-$STAMP config/genesis.toml && scripts/starter.sh restart"
