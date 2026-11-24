@@ -1909,7 +1909,15 @@ async fn run_actor(mut actor: Actor, mut rx: mpsc::UnboundedReceiver<Cmd>) {
                 let locks = e
                     .locks
                     .iter()
-                    .map(|(w, l)| (*w, l.locked, l.next_release_height, l.released, l.earned))
+                    .map(|(w, l)| {
+                        (
+                            *w,
+                            l.locked(),
+                            l.next_release_height(),
+                            l.released,
+                            l.earned,
+                        )
+                    })
                     .collect();
                 let period = (
                     state.economy.period.settled,
