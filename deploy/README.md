@@ -35,25 +35,30 @@ cat config/tokens.env                            # RPC 写令牌(只私下发给
 
 4 个验证节点在同一台机器上:这是**测试网**的取舍(机器宕机即全链停),不是生产拓扑。
 
-### 发布约定:先合并到社区 main,服务器上编译
+### 发布约定:先合并到社区 main
 
 **每次发布,代码必须先合并到社区仓库 `yeying-community/blockchain` 的 main 分支。**
-服务器上 `/root/code/blockchain` 存放社区项目的源代码,发布时在服务器上拉社区 main 的最新代码、
-**在服务器上编译**,再部署。**不再从本地编译、拷贝二进制到服务器。**
 
-理由:本地编译再拷贝,发布的内容由本地工作区决定;服务器自己从社区 main 拉代码编译,
-发布物与社区仓库的状态天然一致,任何人都能从社区 main 复现出同一个二进制。
+发布分两个阶段,两者产物目录与升级器接口相同(`/opt/deploy/<unit>-v<版本>-<commit7>/` +
+`scripts/upgrade.sh prepare|copy-config|post-copy|finalize`),切换时只换"包从哪来"这一段:
+
+| 阶段 | 包从哪来 | 怎么升级 |
+|---|---|---|
+| **当前(开发期)** | 节点服务器上直接拉社区 main、在服务器上编译 | `deploy/deploy-nodes.sh` 一步完成 |
+| **稳定后** | 打包机器上 `scripts/package.sh` 出包(社区打包规范) | 上传包 → 校验 sha256 → 解压 → `scripts/upgrade.sh` |
+
+当前阶段为了提升开发效率,直接在节点服务器上编译部署:服务器上 `/root/code/blockchain` 存放社区源代码,
+发布时拉社区 main 的最新代码、编译、部署。**不再从本地(开发机)编译、拷贝二进制。**
+稳定后迁移到打包机器,回到"打包机出包 + `upgrade.sh` 升级"这条规范流程——`scripts/package.sh` 就是为它准备的。
 
 ```sh
-deploy/install-rust.sh              # 一次性:在服务器上装 Rust 工具链(rustup stable)
-deploy/deploy-nodes.sh              # 拉社区 main → 服务器上编译 → 部署 → 自检
+deploy/install-rust.sh              # 一次性:在节点服务器上装 Rust 工具链(rustup stable)
+deploy/deploy-nodes.sh              # 当前:拉社区 main → 服务器上编译 → 部署 → 自检
 deploy/deploy-nodes.sh --check      # 只看远端状态
 ```
 
-`deploy-nodes.sh` 会检查待发布的提交**确实在社区 main 上**,不在就拒绝发布。
+`deploy-nodes.sh` 会检查待发布的提交**确实在社区 main 上**,不在就拒绝发布;
 服务器上的源码工作区有未提交改动时也拒绝拉取(不覆盖人改过的东西)。
-
-`scripts/package.sh` 仍保留(社区打包规范),但发布不再走它。
 
 ### 升级(手动执行升级器的流程)
 

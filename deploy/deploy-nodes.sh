@@ -5,14 +5,18 @@
 #   deploy/deploy-nodes.sh --check         # 只看远端状态,不改动
 #   deploy/deploy-nodes.sh --ref <commit>  # 指定社区 main 上的某个提交(默认最新 main)
 #
-# 流程(约定:代码先合并到社区 main,发布物由服务器自己编译):
+# 当前阶段(开发期)的流程:代码先合并到社区 main,在节点服务器上直接编译部署,提升开发效率。
+# 稳定后迁移到打包机器:由 scripts/package.sh 在打包机器上出包,再用 scripts/upgrade.sh 升级——
+# 两者的产物目录与升级器接口相同,到时只换下面第 1–3 步("包从哪来")。
+#
+# 流程:
 #   1. /root/code/blockchain 拉取社区仓库(yeying-community/blockchain)的 main;
 #   2. 在服务器上 cargo build --release(服务器是 x86_64,直接编,不需要交叉编译);
 #   3. 把二进制与脚本装进 /opt/deploy/<包名>/;
 #   4. 迁移配置与密钥(不动链数据)、停旧版、启新版;
 #   5. 健康检查 → finalize → 切软链接 → 冒烟 → 自检。
 #
-# 不再从本地打包、拷贝二进制过来:发布物与社区 main 的内容天然一致。
+# 不从本地(开发机)编译、拷贝二进制:发布物由社区 main 决定,而不是某台开发机的工作区。
 # 前置:服务器上要装好 Rust 工具链(deploy/install-rust.sh)。
 #
 # 环境变量:
