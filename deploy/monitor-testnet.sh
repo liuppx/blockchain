@@ -110,7 +110,7 @@ else
 fi
 
 # 一致性:在同一个高度上比较块哈希。
-# 不能直接比各节点的最新 head:链约 0.7 秒出一块,逐个读取的间隙里出了新块,
+# 不能直接比各节点的最新 head:链约 1.2 秒出一块(2026-11-24 实测 1.19 秒),逐个读取的间隙里出了新块,
 # 先读的节点还是旧块、后读的已是新块,会误报"不一致"(2026-11-15~19 共 58 次误报)。
 # 做法与 scripts/health-check.sh 相同:取所有节点都已有的高度(最低高度 - 1),比较该块的哈希。
 min_h=""
@@ -133,6 +133,44 @@ else
     check "node-agreement" 0 "4 个节点在第 $at 块一致($(echo $hashes | awk '{print substr($1,1,16)}')…)"
   else
     check "node-agreement" 1 "节点在第 $at 块不一致:$hashes"
+  fi
+fi
+
+# 4b. 知识经济(升级 knowledge-economy-v1)
+#   - 4 个节点报的激活高度必须相同:不同就说明有节点的时刻表没换上,到了激活高度会停下;
+#   - 激活后,每越过一个结算周期边界就应结算一次:落后两期以上说明结算没在跑。
+# 旧版本节点没有 /economy(返回 200 "ok"),此时整段跳过。
+ECON_PERIOD="${ZHIXING_ECON_PERIOD:-86400}"   # 与创世 [[upgrades]] 的 period_blocks 一致
+econ_lines=""
+for id in $NODES; do
+  first="$(curl -fsS --max-time 5 "http://127.0.0.1:92$id/economy" 2>/dev/null | head -1 || true)"
+  case "$first" in
+    active=*) econ_lines="$econ_lines$id $first"$'\n' ;;
+  esac
+done
+if [ -n "$econ_lines" ]; then
+  ahs="$(printf '%s' "$econ_lines" | sed -n 's/.*activation_height=\([^ ]*\).*/\1/p' | sort -u)"
+  n_nodes="$(printf '%s' "$econ_lines" | grep -c .)"
+  if [ "$(printf '%s\n' "$ahs" | grep -c .)" != 1 ] || [ "$n_nodes" != "$(echo $NODES | wc -w | tr -d ' ')" ]; then
+    check "economy-schedule" 1 "节点的激活高度不一致或有节点读不到:$(printf '%s' "$econ_lines" | tr '\n' ';')"
+  else
+    ah="$(printf '%s' "$ahs" | head -1)"
+    check "economy-schedule" 0 "4 个节点激活高度一致(${ah})"
+    act="$(printf '%s' "$econ_lines" | head -1 | sed -n 's/.*active=\([a-z]*\).*/\1/p')"
+    if [ "$act" = "true" ] && [ "$ah" != "-" ]; then
+      settled="$(curl -fsS --max-time 5 "http://127.0.0.1:92${NODES%% *}/economy" 2>/dev/null | sed -n 's/^period settled=\([0-9]*\).*/\1/p' || true)"
+      hnow="$(curl -fsS --max-time 5 "http://127.0.0.1:92${NODES%% *}/height" 2>/dev/null || true)"
+      if [ -n "$settled" ] && [ -n "$hnow" ]; then
+        # 激活以来越过的周期边界数(边界 = 周期的整数倍,且 ≥ 激活高度)
+        expect=$(( hnow / ECON_PERIOD - (ah - 1) / ECON_PERIOD ))
+        [ "$expect" -lt 0 ] && expect=0
+        if [ "$settled" -lt $(( expect - 1 )) ]; then
+          check "economy-settlement" 1 "结算落后:应已结算 $expect 期,实际 $settled 期(高度 $hnow)"
+        else
+          check "economy-settlement" 0 "已结算 $settled 期(应为 $expect)"
+        fi
+      fi
+    fi
   fi
 fi
 fi

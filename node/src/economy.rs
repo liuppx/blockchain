@@ -180,19 +180,6 @@ pub struct PeriodState {
     pub treasury: u64,
 }
 
-/// 一个账户的积分账本(测试网只记积分、不发币,设计稿决定 #7)。
-#[derive(Clone, Debug, PartialEq, Eq, Default)]
-pub struct PointLedger {
-    /// 累计获得。
-    pub earned: u64,
-    /// 锁定中(还没到释放期)。
-    pub locked: u64,
-    /// 已释放。
-    pub released: u64,
-    /// 释放高度。
-    pub release_height: u64,
-}
-
 /// 按权重分配一个池子:返回每项的份额,以及没分完的零头(归国库)。
 ///
 /// **全程向下取整**,中间用 u128——绝不凭空造钱:分出去的总数不会超过池子。
@@ -235,14 +222,28 @@ fn isqrt_u128(n: u128) -> u128 {
 /// 一个账户的锁定账本。
 #[derive(Clone, Debug, PartialEq, Eq, Default)]
 pub struct LockLedger {
-    /// 尚未释放的锁定额(以"分"为单位,定点)。
-    pub locked: u64,
-    /// 下一笔释放的高度。
-    pub next_release_height: u64,
+    /// 尚未释放的批次:(释放高度, 数额),按释放高度递增。
+    ///
+    /// **每次结算一批,各自计期**(与仿真 `a.locked.append((t + vesting, amt))` 一致)。
+    /// 曾经只记一个"下一次释放高度"、每进一笔就取最晚的那笔:每天都结算,于是只要一直有收入,
+    /// 全部锁定额就永远放不出来——一道整体的悬崖。
+    pub batches: Vec<(u64, u64)>,
     /// 累计已释放。
     pub released: u64,
     /// 累计获得(含仍在锁定的)。
     pub earned: u64,
+}
+
+impl LockLedger {
+    /// 尚未释放的锁定额。
+    pub fn locked(&self) -> u64 {
+        self.batches.iter().map(|(_, a)| *a).sum()
+    }
+
+    /// 最早一批的释放高度;没有锁定时为 0。
+    pub fn next_release_height(&self) -> u64 {
+        self.batches.first().map(|(h, _)| *h).unwrap_or(0)
+    }
 }
 
 impl EconomyState {
@@ -263,11 +264,6 @@ impl EconomyState {
         *self.review_scores.entry(verifier).or_insert(0) += 1;
     }
 
-    /// 把账户的得分清零(结算时把得分转成收益之后调用;仿真里每期结算后清空 `review_credits`)。
-    pub fn take_credits(&mut self, verifier: u64) -> u64 {
-        self.review_scores.get(&verifier).copied().unwrap_or(0)
-    }
-
     /// 记一笔收益:累计 + 锁定,释放期取最晚的那一笔。
     pub fn credit_locked(&mut self, who: u64, amount: u64, release_height: u64) {
         if amount == 0 {
@@ -275,23 +271,25 @@ impl EconomyState {
         }
         let led = self.locks.entry(who).or_default();
         led.earned = led.earned.saturating_add(amount);
-        led.locked = led.locked.saturating_add(amount);
-        led.next_release_height = led.next_release_height.max(release_height);
+        // 同一结算点的几笔(知识池、上溯、核验池)合成一批;新批次的释放高度只会更晚,
+        // 所以追加到末尾即保持递增
+        match led.batches.last_mut() {
+            Some((h, a)) if *h == release_height => *a = a.saturating_add(amount),
+            _ => led.batches.push((release_height, amount)),
+        }
     }
 
     /// 释放到期锁定的收益,返回释放的数额。
     pub fn release_locks(&mut self, height: u64) -> u64 {
         let mut released = 0u64;
         for led in self.locks.values_mut() {
-            if led.locked > 0 && height >= led.next_release_height {
-                released = released.saturating_add(led.locked);
-                led.released = led.released.saturating_add(led.locked);
-                led.locked = 0;
+            // 批次按释放高度递增:从头弹出所有到期的
+            let due = led.batches.iter().take_while(|(h, _)| *h <= height).count();
+            if due > 0 {
+                let amt: u64 = led.batches.drain(..due).map(|(_, a)| a).sum();
+                led.released = led.released.saturating_add(amt);
+                released = released.saturating_add(amt);
             }
-        }
-        if released > 0 {
-            // 清理已释放完的账户,免得账本无限增长
-            self.locks.retain(|_, l| l.locked > 0 || l.released > 0);
         }
         released
     }

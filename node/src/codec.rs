@@ -1290,8 +1290,11 @@ pub(crate) fn enc_economy_state(e: &mut Enc, x: &crate::economy::EconomyState) {
     e.u64(x.locks.len() as u64);
     for (who, led) in &x.locks {
         e.u64(*who);
-        e.u64(led.locked);
-        e.u64(led.next_release_height);
+        e.u64(led.batches.len() as u64);
+        for (h, a) in &led.batches {
+            e.u64(*h);
+            e.u64(*a);
+        }
         e.u64(led.released);
         e.u64(led.earned);
     }
@@ -1361,15 +1364,19 @@ fn dec_economy_state(d: &mut Dec) -> Result<crate::economy::EconomyState, CodecE
     let n = d.count()?;
     for _ in 0..n {
         let who = d.u64()?;
-        let locked = d.u64()?;
-        let next_release_height = d.u64()?;
+        let nb = d.count()?;
+        let mut batches = Vec::with_capacity(prealloc(nb));
+        for _ in 0..nb {
+            let h = d.u64()?;
+            let a = d.u64()?;
+            batches.push((h, a));
+        }
         let released = d.u64()?;
         let earned = d.u64()?;
         locks.insert(
             who,
             crate::economy::LockLedger {
-                locked,
-                next_release_height,
+                batches,
                 released,
                 earned,
             },

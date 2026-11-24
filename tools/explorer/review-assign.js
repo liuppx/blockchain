@@ -61,7 +61,11 @@ class ReviewAssigner {
         let b = "";
         res.on("data", (c) => (b += c));
         res.on("end", () => {
-          if (res.statusCode >= 400) return reject(new Error(p + " → HTTP " + res.statusCode));
+          if (res.statusCode >= 400) {
+            const err = new Error(p + " → HTTP " + res.statusCode);
+            err.status = res.statusCode;
+            return reject(err);
+          }
           try { resolve(JSON.parse(b)); } catch (e) { reject(e); }
         });
       });
@@ -81,8 +85,12 @@ class ReviewAssigner {
     if (this._scoped) return this._scoped;
     try {
       return await this.rpcJson("/economy");
-    } catch (_) {
-      return { active: false, versions: [] }; // 旧节点没有 /economy:按未激活处理
+    } catch (e) {
+      // 只有"节点不认识这个路径"才算未激活:旧版本节点对未知路径一律回 200 "ok"
+      // (解析 JSON 时报 SyntaxError),或者回 404。其他错误(网络不通、节点 5xx)**不能**当成未激活——
+      // 否则节点一宕机,浏览器就悄悄退回"提示"模式,把不计入的版本当任务列给成员。
+      if (e instanceof SyntaxError || e.status === 404) return { active: false, versions: [] };
+      throw new Error("读不到链上的经济状态:" + e.message);
     }
   }
 

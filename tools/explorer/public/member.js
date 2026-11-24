@@ -294,10 +294,24 @@
   async function renderEconomy(me) {
     const box = el("idEcon");
     if (!box) return;
+    // 区分"未激活"与"读不到":旧版本节点对未知路径回 200 "ok"(不是 JSON)或 404,那是未激活;
+    // 网络不通、节点 5xx 是读不到——这时不能说"尚未激活",也不能把提示当任务列出来。
+    const readEcon = async () => {
+      let r;
+      try { r = await fetch("/rpc/economy", { headers: { Accept: "application/json" } }); }
+      catch (_) { return { unreachable: true }; }
+      if (r.status === 404) return { active: false };
+      if (!r.ok) return { unreachable: true };
+      try { return await r.json(); } catch (_) { return { active: false }; }
+    };
     const [econ, pend] = await Promise.all([
-      fetch("/rpc/economy", { headers: { Accept: "application/json" } }).then((r) => r.ok ? r.json() : null).catch(() => null),
+      readEcon(),
       fetch("/assign?member=" + encodeURIComponent(me)).then((r) => r.ok ? r.json() : null).catch(() => null),
     ]);
+    if (econ.unreachable || !pend) {
+      box.innerHTML = "<h3 class='md'>核验任务与积分</h3><p class='err'>暂时读不到链上的经济状态(节点可能在重启或不可达),稍后刷新。</p>";
+      return;
+    }
     const active = !!(econ && econ.active);
     const pts = (v) => (Number(v || 0) / 1e6).toLocaleString("zh-CN", { maximumFractionDigits: 2 });
     const mine = active && econ.locks ? econ.locks.find((x) => String(x.account) === String(me)) : null;

@@ -2891,17 +2891,26 @@ impl ChainState {
             return;
         }
         // --- 1. 知识量 K ---
-        let mut established: Vec<(u64, u32)> = self
-            .economy
-            .versions
-            .iter()
-            .filter(|(_, v)| v.established_height.is_some())
-            .map(|(k, _)| *k)
-            .collect();
-        established.sort(); // 确定性:按 (单元, 版本) 排序
+        // **每个单元只算一次**:取它最新的那个已确立版本(仿真里知识量按单元计)。
+        // 曾经按 (单元, 版本) 遍历,同一单元每确立一个版本就多算一份——作者把同一份正文
+        // 再发一版、拿到 2 位核验人通过,增发就翻倍。
+        // **被取代的单元不计**:它已经退出(仿真里 removed 的单元不进知识量、也不分钱)。
+        let mut latest: std::collections::BTreeMap<u64, u32> = std::collections::BTreeMap::new();
+        for ((unit, version), v) in &self.economy.versions {
+            if v.established_height.is_some() {
+                let e = latest.entry(*unit).or_insert(*version);
+                if *version > *e {
+                    *e = *version;
+                }
+            }
+        }
+        let established: Vec<(u64, u32)> = latest
+            .into_iter()
+            .filter(|(unit, _)| self.knowledge.superseded_by(*unit).is_none())
+            .collect(); // BTreeMap ⇒ 按单元号有序,所有节点一致
         let mut k_q32: u64 = 0;
         let mut weights: Vec<u64> = Vec::with_capacity(established.len());
-        let mut units: Vec<u64> = Vec::with_capacity(established.len());
+        let mut units: Vec<(u64, u32)> = Vec::with_capacity(established.len());
         for (unit, version) in &established {
             let eff_bps = self
                 .knowledge
@@ -2928,7 +2937,7 @@ impl ChainState {
             k_q32 = k_q32.saturating_add(v);
             // 分配权重:√重要性(与仿真的 share_exp=0.5 一致)
             weights.push(crate::economy::sqrt_q32(imp));
-            units.push(*unit);
+            units.push((*unit, *version));
         }
         // --- 2. 增发:只前馈,k × (K 本期 − K 上期),用 3 期滑动均值 ---
         // 激活后的第一次结算:把"激活前"的 K_SMOOTH 期补成 0。激活前的版本不进经济,
@@ -2969,7 +2978,7 @@ impl ChainState {
         let release = height + self.upgrades.cadence().lock_blocks;
         let (shares, remainder) = crate::economy::distribute_by_weight(pool, &weights);
         for (i, share) in shares.iter().enumerate() {
-            let unit = units[i];
+            let (unit, version) = units[i];
             let up = ((*share as u128 * UPSTREAM_BPS as u128) / 10_000) as u64;
             let share = share - up;
             let publisher = self
@@ -2979,14 +2988,16 @@ impl ChainState {
                 .map(|u| u.author)
                 .unwrap_or(0);
             self.economy.credit_locked(publisher, share, release);
-            // 上溯:给这个单元依据的、由别人写的单元的作者
+            // 上溯:给这个单元依据的、由别人写的单元的作者。
+            // 用**计入知识量的那个已确立版本**的依据(与 K 一致),而不是最新版本——
+            // 最新版本可能还没确立,它的引用还没人核验过。
             let cites: Vec<u64> = self
                 .knowledge
                 .units
                 .get(&unit)
-                .map(|u| {
-                    let last = u.versions.last().expect("has version");
-                    last.payload
+                .and_then(|u| u.versions.get((version as usize).wrapping_sub(1)))
+                .map(|v| {
+                    v.payload
                         .cites
                         .iter()
                         .filter(|c| c.kind == crate::knowledge::CiteKind::Basis)
@@ -6978,20 +6989,115 @@ mod tests {
     #[test]
     fn the_lock_ledger_releases_when_it_matures() {
         let mut e = crate::economy::EconomyState::default();
-        e.locks.insert(
-            3,
-            crate::economy::LockLedger {
-                locked: 100,
-                next_release_height: 50,
-                released: 0,
-                earned: 100,
-            },
-        );
+        e.credit_locked(3, 100, 50);
         assert_eq!(e.release_locks(49), 0, "没到期不释放");
         assert_eq!(e.release_locks(50), 100);
-        assert_eq!(e.locks[&3].locked, 0);
+        assert_eq!(e.locks[&3].locked(), 0);
         assert_eq!(e.locks[&3].released, 100);
         assert_eq!(e.release_locks(51), 0, "不会重复释放");
+    }
+
+    #[test]
+    fn each_settlement_vests_on_its_own_schedule() {
+        // B2 回归:每天都有新收益时,早先的那批照样按期释放,不会被后来的收益一直往后推。
+        let mut e = crate::economy::EconomyState::default();
+        let lock = 180u64;
+        for day in 0..200u64 {
+            e.credit_locked(7, 10, day + lock); // 每天结算一次,每次 10
+            e.release_locks(day);
+        }
+        let led = &e.locks[&7];
+        // 第 0..=19 天的 20 批已到期(到期高度 180..=199 ≤ 199),各 10
+        assert_eq!(led.released, 200, "早先的批次按期释放");
+        assert_eq!(led.locked(), 1800, "最近 180 天的批次还锁着");
+        assert_eq!(led.earned, 2000);
+        assert_eq!(led.next_release_height(), 200, "下一批是第 20 天那笔");
+        // 同一结算点的几笔合成一批
+        e.credit_locked(8, 3, 500);
+        e.credit_locked(8, 4, 500);
+        assert_eq!(e.locks[&8].batches, vec![(500, 7)]);
+    }
+
+    #[test]
+    fn a_unit_is_counted_once_however_many_versions_are_established() {
+        // B1 回归:同一单元确立了两个版本,知识量与增发只算一次(取最新的已确立版本)。
+        // 修复前,同一份正文再发一版、拿到 2 位核验人通过,增发就翻倍。
+        use crate::knowledge::{KnowledgeAction, Layer};
+        let p = crate::upgrade::EconomyCadence::default().period_blocks;
+        let mut chain = Chain::new(egenesis(1));
+        let op = kop(&chain, 1, create(Layer::Foundation, 2, vec![]));
+        commit_ops(&mut chain, vec![op]);
+        let a = chain.state.economy.versions[&(1, 1)].assigned.clone();
+        for w in [a[0], a[1]] {
+            let v = verify(&chain, w, 1, 1, true);
+            commit_ops(&mut chain, vec![v]);
+        }
+        let mut one = chain.state.clone();
+        for n in 1..=3u64 {
+            one.economy_settle(n * p);
+        }
+        let op = kop(
+            &chain,
+            1,
+            KnowledgeAction::PublishVersion {
+                unit: 1,
+                version: payload(vec![]),
+            },
+        );
+        commit_ops(&mut chain, vec![op]);
+        let b = chain.state.economy.versions[&(1, 2)].assigned.clone();
+        for w in [b[0], b[1]] {
+            let v = verify(&chain, w, 1, 2, true);
+            commit_ops(&mut chain, vec![v]);
+        }
+        assert_eq!(
+            chain.state.economy.established_count(),
+            2,
+            "两个版本都确立了"
+        );
+        let mut two = chain.state.clone();
+        for n in 1..=3u64 {
+            two.economy_settle(n * p);
+        }
+        assert_eq!(
+            two.economy.period.total_issued, one.economy.period.total_issued,
+            "同一单元只算一次"
+        );
+    }
+
+    #[test]
+    fn a_superseded_unit_drops_out_of_the_knowledge_amount() {
+        // S1 回归:被取代的单元不再计入知识量、也不再分钱。
+        use crate::knowledge::{Cite, CiteKind, Layer};
+        let p = crate::upgrade::EconomyCadence::default().period_blocks;
+        let mut chain = Chain::new(egenesis(1));
+        let op = kop(&chain, 1, create(Layer::Foundation, 2, vec![]));
+        commit_ops(&mut chain, vec![op]);
+        let a = chain.state.economy.versions[&(1, 1)].assigned.clone();
+        for w in [a[0], a[1]] {
+            let v = verify(&chain, w, 1, 1, true);
+            commit_ops(&mut chain, vec![v]);
+        }
+        let mut before = chain.state.clone();
+        before.economy_settle(p);
+        let k_before = *before.economy.period.k_history.last().unwrap();
+        assert!(k_before > 0);
+        // 单元 2 取代单元 1
+        let cites = vec![Cite {
+            unit: 1,
+            version: 1,
+            kind: CiteKind::Supersedes,
+        }];
+        let op = kop(&chain, 2, create(Layer::Foundation, 2, cites));
+        commit_ops(&mut chain, vec![op]);
+        assert_eq!(chain.state.knowledge.superseded_by(1), Some(2));
+        let mut after = chain.state.clone();
+        after.economy_settle(p);
+        assert_eq!(
+            *after.economy.period.k_history.last().unwrap(),
+            0,
+            "被取代的单元退出知识量(单元 2 还没确立)"
+        );
     }
 
     #[test]

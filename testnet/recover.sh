@@ -18,7 +18,7 @@ set -euo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 ROOT="$(cd "$HERE/.." && pwd)"
 BIN="$ROOT/node/target/release/node"
-OUT="$HERE/out"
+OUT="${TESTNET_OUT:-$HERE/out}"
 SNAP_H="${1:-5}"
 TIMEOUT="${2:-120}"
 REBUILD_ID=24   # the validator we destroy + rebuild from the snapshot in Drill B
@@ -68,7 +68,8 @@ echo "-- verify the source log (replay through finality)"
 "$BIN" verify --dir "$SRC" --config "$CFG"
 echo "-- export a snapshot"
 "$BIN" snapshot --dir "$SRC" --out "$BLOB" --config "$CFG"
-SNAP_INFO="$("$BIN" inspect-snapshot --snapshot "$BLOB")"
+# --genesis:快照里没有升级时刻表;升级激活以后不补时刻表就算不对状态根
+SNAP_INFO="$("$BIN" inspect-snapshot --snapshot "$BLOB" --genesis "$OUT/genesis.toml")"
 echo "   $SNAP_INFO"
 echo "$SNAP_INFO" | grep -q "supply_conserved=true" || { echo "snapshot supply not conserved" >&2; exit 1; }
 H_SNAP="$(echo "$SNAP_INFO" | sed -n 's/.*height=\([0-9]*\).*/\1/p')"
@@ -101,7 +102,7 @@ wait_height 21 "$((H_SNAP + 1))"
 echo "-- cross-check the snapshot against the live cert-signed header at height $H_SNAP"
 HDR_HEX="$(get 21 "/header/$H_SNAP" | sed -n 's/^certified_header=//p')"
 [ -n "$HDR_HEX" ] || { echo "could not fetch /header/$H_SNAP from live node" >&2; exit 1; }
-"$BIN" check-snapshot --snapshot "$BLOB" --header "$HDR_HEX"
+"$BIN" check-snapshot --snapshot "$BLOB" --header "$HDR_HEX" --genesis "$OUT/genesis.toml"
 echo "   check-snapshot OK (height + 3 cert-signed roots agree)"
 
 echo "-- boot the rebuilt validator FROM the snapshot (adopts state at base $H_SNAP, no replay)"
