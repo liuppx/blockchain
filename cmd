@@ -25,6 +25,21 @@ build() {
 
 mint_seed() { "$BIN" keygen --out "$1" | awk '$1=="pubkey"{print $2}'; }  # plaintext seed (for encode-*)
 
+# 领域编号列表:读词表(tools/explorer/public/ns/v1/domains.jsonld)。
+# 领域名称只在词表里定义,链上只有编号——加领域不用改这里。
+domain_ids() {
+  python3 - "$ROOT/tools/explorer/public/ns/v1/domains.jsonld" <<'PYEOF' 2>/dev/null || echo "1, 2"
+import json, sys
+try:
+    with open(sys.argv[1], encoding="utf-8") as f:
+        scheme = json.load(f)
+    ids = sorted(int(c["notation"]) for c in scheme.get("concepts", []) if c.get("notation") is not None)
+    print(", ".join(str(i) for i in ids) if ids else "1, 2")
+except Exception:
+    print("1, 2")
+PYEOF
+}
+
 gen() {
   mkdir -p "$D/keys" "$D/data"; chmod 700 "$D"
   echo "generating single-node genesis + config in .localnet/ …"
@@ -45,10 +60,13 @@ gen() {
     done
     echo; echo "[[reviewers]]"; echo "id = 1"; echo "weight = 1.0"   # account 1 = sole reviewer (reputation weight)
     echo; echo "[[validators]]"; echo "id = 1"; echo "pubkey_hex = \"$a1\""; echo "power = 1"  # account 1 = sole validator
-    # K6: knowledge units (testnet stage 1). Domains 1 = LLM app dev, 2 = fitness. The legacy ΔK
-    # path stays ON locally because `./cmd submit` and the governance demo still use it; the
-    # testnet genesis turns it off. Short probation / invite cooldown so the demo is quick.
-    echo; echo "[knowledge]"; echo "domains = [1, 2]"; echo "legacy_submissions = true"
+    # K6: knowledge units (testnet stage 1). The domain list comes from the vocabulary
+    # (tools/explorer/public/ns/v1/domains.jsonld — the one place domain names are defined),
+    # so a new domain needs no change here. The legacy ΔK path stays ON locally because
+    # `./cmd submit` and the governance demo still use it; the testnet genesis turns it off.
+    # Short probation / invite cooldown so the demo is quick.
+    local doms; doms="$(domain_ids)"
+    echo; echo "[knowledge]"; echo "domains = [$doms]"; echo "legacy_submissions = true"
     echo "probation_blocks = 5"; echo "invite_cooldown_blocks = 2"
   } > "$D/genesis.toml"
   {
@@ -195,14 +213,27 @@ vote() {
 }
 gov() { curl -s --max-time 2 "http://127.0.0.1:$RPC_PORT/proposals" || true; echo; }
 
-# K6: knowledge units. `knowledge` imports the fitness pilot (docs/pilot/fitness, domain 2) authored by
-# account 1, storing bodies content-addressed in .localnet/bodies; `kverify` records a verification;
+# K6: knowledge units. `knowledge` imports one pilot domain's drafts, authored by account 1,
+# storing bodies content-addressed in .localnet/bodies; `kverify` records a verification;
 # `units` lists units with their effective credibility (bps, 10000 = 1.0) and bottleneck.
+#
+#   ./cmd knowledge          # 导入全部领域
+#   ./cmd knowledge fitness  # 只导入运动健身(领域 2)
+#
+# 领域编号:1 = 大模型应用开发,2 = 运动健身,3 = 教育。名称只在词表里定义。
 knowledge() {
   running "$D/node.pid" || { echo "node not running (./cmd up)"; exit 1; }
-  python3 "$ROOT/tools/kimport.py" --dir "$ROOT/docs/pilot/fitness" --domain 2 \
-    --config "$D/node.toml" --rpc "http://127.0.0.1:$RPC_PORT" --key "1=$D/keys/acct1.seed" \
-    --store "$D/bodies" --map "$D/kimport-fitness.json" --bin "$BIN"
+  local only="${1:-}"
+  local one
+  for one in "llm:1" "fitness:2" "education:3"; do
+    local dir="${one%%:*}" dom="${one##*:}"
+    if [ -n "$only" ] && [ "$only" != "$dir" ]; then continue; fi
+    [ -d "$ROOT/docs/pilot/$dir" ] || continue
+    echo "== 导入领域 $dom($dir)"
+    python3 "$ROOT/tools/kimport.py" --dir "$ROOT/docs/pilot/$dir" --domain "$dom" \
+      --config "$D/node.toml" --rpc "http://127.0.0.1:$RPC_PORT" --key "1=$D/keys/acct1.seed" \
+      --store "$D/bodies" --map "$D/kimport-$dir.json" --bin "$BIN"
+  done
 }
 kverify() {  # $1=account $2=unit $3=version $4=pass|needs-revision
   running "$D/node.pid" || { echo "node not running (./cmd up)"; exit 1; }
@@ -227,9 +258,9 @@ case "${1:-up}" in
   propose) propose "${2:-1}" "${3:-base_emission=9000000}" "${4:-5}" ;;
   vote) vote "${2:-1}" "${3:-}" "${4:-true}" ;;
   gov) gov ;;
-  knowledge) knowledge ;;
+  knowledge) knowledge "${2:-}" ;;
   kverify) kverify "${2:-2}" "${3:-}" "${4:-1}" "${5:-pass}" ;;
   units) units ;;
   logs) tail -f "$D/node.log" ;;
-  *) echo "usage: ./cmd [up|down|reset|status|submit [acct]|bond [acct amount]|unbond [acct amount]|propose [acct param period]|vote [acct id approve]|gov|knowledge|kverify [acct unit ver verdict]|units|logs]" >&2; exit 2 ;;
+  *) echo "usage: ./cmd [up|down|reset|status|submit [acct]|bond [acct amount]|unbond [acct amount]|propose [acct param period]|vote [acct id approve]|gov|knowledge [domain]|kverify [acct unit ver verdict]|units|logs]" >&2; exit 2 ;;
 esac

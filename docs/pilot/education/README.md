@@ -64,6 +64,10 @@ python3 tools/kimport.py --dir docs/pilot/education --domain 3 \
     --config <节点配置> --key 1=<作者密钥> --store <正文目录>
 ```
 
+本地开发链上更省事:`./cmd knowledge` 会把**三个领域**都导进去
+(`./cmd knowledge education` 只导教育这一块)。本地链的创世领域列表是从词表读的,
+所以加领域不用改 `cmd`。
+
 导入前**先确认链上已激活领域 3**(`GET /domains` 的 `next` 里要有 `"3"`),
 否则节点会以 422 拒绝。领域 3 按高度激活,排期见
 [`docs/ops/upgrades.md`](../../ops/upgrades.md) §1.1。
