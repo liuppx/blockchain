@@ -214,18 +214,6 @@
   // ---- 「我的身份」页 ----------------------------------------------------------
   function msg(id, text, cls = "mut") { const m = el(id); if (m) { m.className = cls; m.textContent = text; } }
 
-  /** 旧版本在浏览器本地存过密钥 ⇒ 提示把它移进钱包。 */
-  function legacyNotice() {
-    if (!U.hasLegacyKey()) return "";
-    return `<div class="banner warn" style="padding:10px 14px;margin:12px 0;border-radius:6px">
-      <p><b>这个浏览器里还留着旧版网页自己保存的密钥。</b>那条路已经下线:现在密钥由夜莺钱包保管,
-      网页不持有私钥,每次签名都在钱包里确认。</p>
-      <p class='mut'>你的链上账户没有变——在钱包「账户管理 → 导入钱包」里网络选「知行图」,用<b>同一组助记词</b>或密钥文件导入,
-      导入后就是同一个账户。导入完成后可以清掉本机这份旧密钥(下面的「清除本机旧密钥」)。</p>
-      <p><button id='idForgetLegacy'>清除本机旧密钥</button> <span id='idForgetMsg'></span></p>
-    </div>`;
-  }
-
   async function showIdentity() {
     const useWallet = (id, msgId) => {
       if (!el(id)) return;
@@ -239,18 +227,11 @@
       setView(`<h2 style='border:0;padding:0 0 8px'>我的身份</h2>
         <p>你的身份是一把密钥,由<b>夜莺钱包</b>保管。组织者和其他任何人都拿不到它。</p>
         ${walletButton("idWallet")}<p><span id='idWMsg'></span></p>
-        ${legacyNotice()}
         <h3 class='md'>写入令牌</h3>
         <p class='mut'>提交核验需要一个写入令牌,由组织者私下提供。它只用于防止刷写入,不代表你的身份(身份由钱包的签名证明)。</p>
         <p><input id='idTok' type='password' size='40' placeholder='${U.token() ? "已保存(输入新值可替换)" : "粘贴写入令牌"}'> <button id='idTokSave'>保存</button> <span id='idTokMsg'></span></p>`);
       useWallet("idWallet", "idWMsg");
       el("idTokSave").addEventListener("click", () => { U.setToken(el("idTok").value); el("idTok").value = ""; msg("idTokMsg", "已保存", "ok"); });
-      if (el("idForgetLegacy")) el("idForgetLegacy").addEventListener("click", () => {
-        if (!confirm("清除这个浏览器里旧版保存的密钥?\n确认已经把同一组助记词导入钱包后再做这一步。")) return;
-        U.removeLegacyKey();
-        msg("idForgetMsg", "已清除", "ok");
-        showIdentity();
-      });
       return;
     }
 
