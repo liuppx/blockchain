@@ -245,7 +245,26 @@ def assignment_compliance(units: list[dict], assignments: dict) -> tuple[int, in
 
 # ---- 报告 ------------------------------------------------------------------------
 
+# 领域名称只在浏览器的词表里定义(tools/explorer/public/ns/v1/domains.jsonld)——
+# 加领域是数据,不是代码,所以这里也不写死编号→名称的对应。
+# 取不到词表就退回显示编号,不影响指标本身。
 DOMAIN = {"1": "大模型应用开发", "2": "运动健身"}
+VOCAB = os.path.join(os.path.dirname(os.path.abspath(__file__)), "explorer", "public", "ns", "v1", "domains.jsonld")
+
+
+def load_domain_names() -> dict:
+    """从领域词表读编号 → 名称。词表读不到就返回空(显示编号)。"""
+    try:
+        with open(VOCAB, encoding="utf-8") as f:
+            scheme = json.load(f)
+        out = {}
+        for c in scheme.get("concepts", []):
+            label = (c.get("prefLabel") or {}).get("zh")
+            if label and c.get("notation") is not None:
+                out[str(c["notation"])] = label
+        return out
+    except Exception:
+        return {}
 
 
 def pct(a: int, b: int) -> str:
@@ -257,18 +276,19 @@ def blocks(n, sec_per_block: float) -> str:
 
 
 def report(units, members, assignments, key, since, sec_per_block) -> str:
+    names = {**DOMAIN, **load_domain_names()}   # 词表优先:加领域不用改代码
     planted = key.get("planted", []) if key else []
     lines = ["# 知行图试运行指标", "", f"统计起点:高度 {since}。只算独立核验(不含发布者自己)。", ""]
     lines += ["## 运转", "", "| 领域 | 发布的版本 | 有独立核验 | 核验次数 | 首次核验等待(中位数) |", "|---|---|---|---|---|"]
     for dom, d in sorted(coverage(units, since).items()):
-        lines.append(f"| {DOMAIN.get(dom, dom)} | {d['versions']} | {pct(d['reviewed'], d['versions'])} | "
+        lines.append(f"| {names.get(dom, dom)} | {d['versions']} | {pct(d['reviewed'], d['versions'])} | "
                      f"{d['reviews']} | {blocks(d['median_wait'], sec_per_block)} |")
     done, total = assignment_compliance(units, assignments)
     lines += ["", f"被指派者完成率:{pct(done, total)}" + ("" if total else "(没有读到指派数据:加 --site)"), ""]
     nq = note_quality(units, since)
     lines += ["### 「需修改」的说明", "", "| 领域 | 写了说明的「需修改」 |", "|---|---|"]
     for dom, d in sorted(nq.items()):
-        lines.append(f"| {DOMAIN.get(dom, dom)} | {pct(d['with_note'], d['needs'])} |")
+        lines.append(f"| {names.get(dom, dom)} | {pct(d['with_note'], d['needs'])} |")
     listed = [n for d in nq.values() for n in d["notes"]]
     if listed:
         lines += ["", "说明原文在正文仓库:`<浏览器>/bodies/<哈希>`。", ""]
@@ -284,7 +304,7 @@ def report(units, members, assignments, key, since, sec_per_block) -> str:
     lines += ["## 1. 审查者发现错误的能力", "",
               "| 领域 | 埋错版本被发现 | 埋错版本上判「需修改」的比例 | 干净版本被误判「需修改」 |", "|---|---|---|---|"]
     for dom, d in sorted(detection(units, planted, since).items()):
-        lines.append(f"| {DOMAIN.get(dom, dom)} | {pct(d['caught'], d['planted'])} | "
+        lines.append(f"| {names.get(dom, dom)} | {pct(d['caught'], d['planted'])} | "
                      f"{pct(d['planted_needs'], d['planted_reviews'])} | {pct(d['clean_needs'], d['clean_reviews'])} |")
     acc = reviewer_accuracy(units, planted, since)
     lines += ["", "| 核验人 | 抓到的埋错 | 误判 |", "|---|---|---|"]
