@@ -223,7 +223,10 @@ def report(units: dict[str, Unit], issues: dict) -> str:
     ]
     ids = {u.file: f"u{i}" for i, u in enumerate(us)}
     for u in us:
-        out.append(f'    {ids[u.file]}["{u.title}<br/>{u.layer} · {u.c_eff:.1f}"]')
+        # mermaid 的节点标签用双引号包起来,标题里的双引号必须转义,否则图渲染不出来
+        # (标题里出现引号是常事,例如"为什么模型会'忘记'")。
+        label = u.title.replace('"', "&quot;")
+        out.append(f'    {ids[u.file]}["{label}<br/>{u.layer} · {u.c_eff:.1f}"]')
     for u in us:
         for c in u.cites:
             if c.target in ids:
