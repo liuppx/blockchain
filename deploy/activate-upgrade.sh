@@ -58,8 +58,10 @@ CUR="$(remote "curl -s --max-time 5 $RPC_LOCAL/height" | tr -dc 0-9)"
 echo "  当前高度 $CUR,激活高度 $HEIGHT(还有 $((HEIGHT - CUR)) 块,约 $(( (HEIGHT - CUR) / 3600 )) 小时)"
 [ "$HEIGHT" -gt $((CUR + MIN_LEAD)) ] || fail "激活高度离现在太近(至少要领先 $MIN_LEAD 块),来不及安全重启"
 remote "cd $DEPLOY && scripts/starter.sh status" | sed 's/^/  /'
-remote "grep -q '^\\[\\[upgrades\\]\\]' $DEPLOY/config/genesis.toml" \
-  && fail "远端创世里已经有 [[upgrades]] 了;先用 --check 看清楚,不要重复追加"
+# 已有别的升级是正常的(例如先排了知识经济,现在再加一个领域):只检查同名的是不是已经排过
+if remote "grep -q '^name = \"$NAME\"$' $DEPLOY/config/genesis.toml"; then
+  fail "远端创世里已经排了 $NAME;先用 --check 看清楚,不要重复追加"
+fi
 
 # 远端版本必须**真的实现了**这个升级,而不只是认识它的名字。
 # 教训:0.1.7 只有激活机制、没有经济规则,却认识 knowledge-economy-v1 这个名字——
@@ -130,12 +132,17 @@ remote "cd $DEPLOY && scripts/health-check.sh --level all --retries 60 --interva
 info "核对:每个节点都要报同一个激活高度"
 # 逐个节点查:某个节点没换上新时刻表(重启失败、或还拿着旧的内存状态)时会在这里露出来。
 # 只查一个节点是不够的——两个节点停在 H* 就会让链停摆。
+# 每个节点都单独算一遍它自己的时刻表(节点可能排了多个升级,/economy 只报其中一个的高度)
 for p in 9221 9222 9223 9224; do
   E="$(remote "curl -s --max-time 5 -H 'Accept: application/json' http://127.0.0.1:$p/economy")"
-  AH="$(printf '%s' "$E" | sed -n 's/.*"activation_height":"\([0-9]*\)".*/\1/p')"
   ACTIVE="$(printf '%s' "$E" | sed -n 's/.*"active":\(true\|false\).*/\1/p')"
-  echo "  :$p active=$ACTIVE activation_height=${AH:-?}"
-  [ "$AH" = "$HEIGHT" ] || fail "节点 :$p 的激活高度不是 $HEIGHT(它没换上新时刻表?):$E"
+  AH="$(printf '%s' "$E" | sed -n 's/.*"activation_height":"\([0-9]*\)".*/\1/p')"
+  SCHED="$(remote "cd $DEPLOY && ./bin/node genesis-hash --config config/node$((p - 9220)).toml | tail -1")"
+  echo "  :$p active=$ACTIVE activation_height=${AH:-?} 时刻表:$SCHED"
+  case "$SCHED" in
+    *"$NAME@$HEIGHT"*) ;;
+    *) fail "节点 :$p 的时刻表里没有 $NAME@$HEIGHT(它没换上新时刻表?):$SCHED" ;;
+  esac
 done
 H1="$(remote "curl -s $RPC_LOCAL/height" | tr -dc 0-9)"; sleep 10
 H2="$(remote "curl -s $RPC_LOCAL/height" | tr -dc 0-9)"

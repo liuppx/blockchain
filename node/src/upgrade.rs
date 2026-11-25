@@ -27,16 +27,22 @@ use std::fmt;
 pub enum Upgrade {
     /// 知识经济上链 v1(`docs/design/knowledge-economy-v1.md`)。
     KnowledgeEconomyV1,
+    /// 新增领域:教育(`docs/design/knowledge-economy-v1.md` 之外的独立改动)。
+    ///
+    /// 领域登记在**创世**里(`[knowledge] domains`),而创世哈希是链的身份。给已在运行的链
+    /// 加领域,只能按高度激活:从 H\* 起,领域集合里多一个编号。
+    AddEducationDomain,
 }
 
 impl Upgrade {
     /// 全部已知升级(按标签递增)。
-    pub const ALL: [Upgrade; 1] = [Upgrade::KnowledgeEconomyV1];
+    pub const ALL: [Upgrade; 2] = [Upgrade::KnowledgeEconomyV1, Upgrade::AddEducationDomain];
 
     /// 创世文件 `[[upgrades]] name = "…"` 里用的名字。
     pub fn name(self) -> &'static str {
         match self {
             Upgrade::KnowledgeEconomyV1 => "knowledge-economy-v1",
+            Upgrade::AddEducationDomain => "add-education-domain",
         }
     }
 
@@ -44,6 +50,7 @@ impl Upgrade {
     pub fn tag(self) -> u8 {
         match self {
             Upgrade::KnowledgeEconomyV1 => 1,
+            Upgrade::AddEducationDomain => 2,
         }
     }
 

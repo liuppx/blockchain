@@ -247,13 +247,26 @@ function lifecycleLabel(s) {
   if (!s || s === "active") return "";
   return `<span class='lc ${esc(s)}'>${esc(LIFECYCLE_ZH[s] || s)}</span>`;
 }
-// 领域名称只在 /ns/v1/domains.jsonld 定义(知识互操作词表的领域概念方案);启动时载入
+// 领域名称只在 /ns/v1/domains.jsonld 定义(知识互操作词表的领域概念方案);启动时载入。
+// 词表里有名字 ≠ 链已接受:新增领域按高度激活,激活前链会拒绝。所以再问一次链
+// (/rpc/domains,旧节点没有就退回词表),把还没激活的领域标出来,不让成员选。
 const DOMAIN_ZH = {};
+const DOMAIN_PENDING = new Set();   // 词表里有、但链还没接受的领域
 async function loadDomains() {
   try {
     const scheme = await (await fetch("/ns/v1/domains.jsonld")).json();
     for (const c of scheme.concepts || []) DOMAIN_ZH[c.notation] = (c.prefLabel && c.prefLabel.zh) || c.notation;
   } catch (_) { /* 取不到就只显示编号 */ }
+  try {
+    const r = await fetch("/rpc/domains", { headers: { Accept: "application/json" } });
+    if (r.ok) {
+      const d = await r.json();
+      if (d && Array.isArray(d.next)) {
+        const ok = new Set(d.next.map(String));
+        for (const k of Object.keys(DOMAIN_ZH)) if (!ok.has(String(k))) DOMAIN_PENDING.add(String(k));
+      }
+    }
+  } catch (_) { /* 旧节点没有 /domains:当作全都可用 */ }
 }
 const domainName = d => DOMAIN_ZH[d] ? `${DOMAIN_ZH[d]} (${d})` : String(d);
 function credBar(bps) {
@@ -352,7 +365,7 @@ async function tabKnowledge() {
     setView(`<h2 style='border:0;padding:0 0 8px'>Knowledge units</h2>
       <div class='searchbar'>
         <input id='kSearch' placeholder='搜索标题与正文(中英文均可)' size='40' autocomplete='off'>
-        <select id='kDomain'><option value=''>全部领域</option>${Object.entries(DOMAIN_ZH).map(([k, v]) => `<option value='${esc(k)}'>${esc(v)}</option>`).join("")}</select>
+        <select id='kDomain'><option value=''>全部领域</option>${Object.entries(DOMAIN_ZH).map(([k, v]) => `<option value='${esc(k)}'>${esc(v)}${DOMAIN_PENDING.has(String(k)) ? "(尚未激活)" : ""}</option>`).join("")}</select>
         <select id='kLayer'><option value=''>全部层级</option><option value='foundation'>基础</option><option value='explanation'>解释</option><option value='scenario'>场景</option><option value='application'>应用</option></select>
         <button id='kSearchGo'>搜索</button>
         <a id='kExport' class='link' href='/export/units' download>导出全部(JSONL)</a>

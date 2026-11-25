@@ -512,6 +512,10 @@ enum Cmd {
         id: u64,
         reply: oneshot::Sender<Option<UnitDetail>>,
     },
+    /// 这一刻链上接受的领域(创世登记的 + 按高度激活新增的),以及下一块起接受的。
+    QueryDomains {
+        reply: oneshot::Sender<(Vec<u32>, Vec<u32>)>,
+    },
     /// 知识经济 v1 的状态:每个版本的指派与确立、每个单元的重要性。
     QueryEconomy {
         reply: oneshot::Sender<EconomySummary>,
@@ -1990,6 +1994,16 @@ async fn run_actor(mut actor: Actor, mut rx: mpsc::UnboundedReceiver<Cmd>) {
                         .collect(),
                 });
                 let _ = reply.send(detail);
+            }
+            Cmd::QueryDomains { reply } => {
+                let state = &actor.node.chain.state;
+                let now: Vec<u32> = state.effective_domains(state.height).into_iter().collect();
+                // 新单元最早在下一块入块:网页据此决定能不能选这个领域
+                let next: Vec<u32> = state
+                    .effective_domains(state.height + 1)
+                    .into_iter()
+                    .collect();
+                let _ = reply.send((now, next));
             }
             Cmd::QueryMembers { reply } => {
                 let state = &actor.node.chain.state;
@@ -4217,6 +4231,8 @@ enum GetRoute {
     Unit(u64),
     /// K5:`GET /members` 成员目录。
     Members,
+    /// `GET /domains` 链上接受的领域编号(名称在浏览器的领域词表里)。
+    Domains,
     /// 知识经济 v1 的状态:每个版本的指派与确立、每个单元的重要性。
     Economy,
     Health,
@@ -4748,6 +4764,7 @@ fn route_get(path: &str) -> GetRoute {
         // K5:知识单元目录与成员目录(精确匹配);单个单元走下方 `/unit/` 前缀。
         "/units" => GetRoute::Units,
         "/members" => GetRoute::Members,
+        "/domains" => GetRoute::Domains,
         "/economy" => GetRoute::Economy,
         // M86: the plain cognitive-graph directory. Exact-match; the `/graph/` prefix
         // (single reads/proofs) is handled in the fallthrough arm below, where `/graph/`
@@ -5413,6 +5430,7 @@ const READ_ROUTES: &[&str] = &[
     "/proposals",
     "/units",
     "/members",
+    "/domains",
     "/economy",
     "/graph",
     "/bonds",
@@ -7615,6 +7633,38 @@ async fn serve_rpc_conn(
                         Ok(Some(d)) => ok_body(fmt, &format_unit_detail(&d), &json_unit_detail(&d)),
                         Ok(None) => {
                             error_body(fmt, "404 Not Found", &format!("no knowledge unit {id}"))
+                        }
+                        Err(_) => http_response("503 Service Unavailable", "node stopped"),
+                    }
+                }
+            }
+            GetRoute::Domains => {
+                let (reply, rx) = oneshot::channel();
+                if cmd.send(Cmd::QueryDomains { reply }).is_err() {
+                    http_response("503 Service Unavailable", "node stopped")
+                } else {
+                    match rx.await {
+                        Ok((now, next)) => {
+                            let j = |v: &[u32]| v.iter().map(|d| d.to_string()).collect::<Vec<_>>();
+                            let text = format!(
+                                "domains={}\nnext={}",
+                                j(&now).join(","),
+                                j(&next).join(",")
+                            );
+                            let json = format!(
+                                "{{\"domains\":[{}],\"next\":[{}]}}",
+                                j(&now)
+                                    .iter()
+                                    .map(|d| json_str(d))
+                                    .collect::<Vec<_>>()
+                                    .join(","),
+                                j(&next)
+                                    .iter()
+                                    .map(|d| json_str(d))
+                                    .collect::<Vec<_>>()
+                                    .join(",")
+                            );
+                            ok_body(fmt, &text, &json)
                         }
                         Err(_) => http_response("503 Service Unavailable", "node stopped"),
                     }
@@ -12118,6 +12168,54 @@ mod tests {
         }
         let t = post(rpc_addr, &enc(&prop(1, 999))).await;
         assert!(t.starts_with("HTTP/1.1 429"), "expected 429, got: {t}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn rpc_domains_lists_what_the_chain_accepts() {
+        // 领域按高度激活:激活前 /domains 只给创世登记的那些,激活后多一个教育领域。
+        let dir = tmp_dir("rpc-domains");
+        let mut cfg = node_config(21, 21474, &[21], dir.clone());
+        let rpc_addr = "127.0.0.1:21495";
+        cfg.rpc = Some(crate::config::RpcConfig {
+            enabled: true,
+            listen: rpc_addr.into(),
+            auth_token: String::new(),
+            enable_tls: false,
+        });
+        let mut genesis = test_genesis();
+        genesis.validators = vec![(21, kp(21).public(), 1)];
+        let _node = Node::start(cfg, genesis, Some(kp(21)), None)
+            .await
+            .expect("start node");
+        tokio::time::sleep(Duration::from_millis(150)).await;
+
+        async fn get(addr: &str, path: &str) -> String {
+            let mut s = TcpStream::connect(addr).await.expect("connect rpc");
+            let req =
+                format!("GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
+            s.write_all(req.as_bytes()).await.expect("send");
+            let mut resp = Vec::new();
+            let mut buf = [0u8; 1024];
+            loop {
+                let n = s.read(&mut buf).await.expect("read");
+                if n == 0 {
+                    break;
+                }
+                resp.extend_from_slice(&buf[..n]);
+            }
+            String::from_utf8_lossy(&resp).to_string()
+        }
+
+        let t = get(rpc_addr, "/domains").await;
+        assert!(t.starts_with("HTTP/1.1 200 OK"), "{t}");
+        assert!(t.contains("domains="), "{t}");
+        let j = get(rpc_addr, "/domains?format=json").await;
+        let body = j.split("\r\n\r\n").nth(1).expect("body");
+        let v: serde_json::Value = serde_json::from_str(body).expect("valid JSON");
+        assert!(v.get("domains").is_some(), "{body}");
+        assert!(v.get("next").is_some(), "{body}");
 
         let _ = std::fs::remove_dir_all(&dir);
     }

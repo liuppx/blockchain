@@ -66,6 +66,10 @@ use validator::{Validator, ValidatorSet, ValidatorUpdate};
 pub const MICRO: u64 = 1_000_000;
 
 pub type Hash = [u8; 32];
+
+/// 教育领域的编号(升级 `add-education-domain` 激活后可用)。
+/// 1 = 大模型应用开发,2 = 运动健身,3 = 教育(名称只在 `tools/explorer/public/ns/v1/domains.jsonld` 定义)。
+pub const EDUCATION_DOMAIN: u32 = 3;
 pub type Embedding = [f32; DIM];
 
 /// M31: one bridge-source registration in [`Genesis`] — a source chain's
@@ -2381,6 +2385,24 @@ impl ChainState {
             .is_active(crate::upgrade::Upgrade::KnowledgeEconomyV1, height)
     }
 
+    /// 教育领域(编号 [`EDUCATION_DOMAIN`])是否已登记(升级 `add-education-domain` 到了 H*)。
+    pub(crate) fn education_domain_active(&self, height: u64) -> bool {
+        self.upgrades
+            .is_active(crate::upgrade::Upgrade::AddEducationDomain, height)
+    }
+
+    /// 某高度的**有效**领域集合:创世登记的,加上按高度激活新增的。
+    ///
+    /// 领域集合本身(`knowledge.domains`)**不改**:它是创世状态,改了状态根就不对了。
+    /// 新增的领域只在"判断这个领域能不能用"时并进来——所以 H* 之前的每个字节都与升级前相同。
+    pub fn effective_domains(&self, height: u64) -> std::collections::BTreeSet<u32> {
+        let mut d = self.knowledge.domains.clone();
+        if self.education_domain_active(height) {
+            d.insert(EDUCATION_DOMAIN);
+        }
+        d
+    }
+
     /// 在区块里执行一条知识 op;`prev_hash` 是这块的上一块哈希(知识经济的指派种子)。
     pub(crate) fn apply_knowledge_op_in_block(
         &mut self,
@@ -2418,7 +2440,7 @@ impl ChainState {
                 domain,
                 version,
             } => {
-                if !self.knowledge.domains.contains(domain) {
+                if !self.effective_domains(height).contains(domain) {
                     return Err(ChainError::UnknownDomain(*domain));
                 }
                 self.check_knowledge_cites(None, &version.cites)?;
@@ -2587,8 +2609,9 @@ impl ChainState {
         use crate::knowledge::KnowledgeAction;
         match &op.action {
             KnowledgeAction::CreateUnit { domain, .. } => {
-                // 阶段 1 领域只在创世登记,不会新增
-                if !self.knowledge.domains.contains(domain) {
+                // 领域在创世登记;按高度激活的升级可以新增(如教育)。入池时还不知道哪一块收它,
+                // 按**下一块**的高度判断——它最早就在下一块入块。
+                if !self.effective_domains(self.height + 1).contains(domain) {
                     return Err(ChainError::UnknownDomain(*domain));
                 }
             }
@@ -4212,6 +4235,17 @@ impl ChainState {
         if self.economy_active(self.height) {
             e.string("economy");
             codec::enc_economy_state(&mut e, &self.economy);
+        }
+        // 按高度激活的新增领域:折入的是**有效领域集合**(创世登记的 + 激活后新增的)。
+        // 领域集合本身在 knowledge.domains 里、属于创世状态,不能改;折进状态根的是"这一刻能用哪些领域",
+        // 这样时刻表不一致的节点在 H* 当块就会算出不同的根、停下而不是分叉。
+        if self.education_domain_active(self.height) {
+            e.string("domains");
+            let d = self.effective_domains(self.height);
+            e.u64(d.len() as u64);
+            for x in d {
+                e.u32(x);
+            }
         }
         sha256(&e.0)
     }
@@ -6485,6 +6519,104 @@ mod tests {
             6,
             "候选用完就停"
         );
+    }
+
+    // ---- 新增领域(教育):按高度激活 ------------------------------------------
+
+    fn edu_genesis(h: u64) -> Genesis {
+        let mut g = egenesis(h);
+        g.upgrades = g
+            .upgrades
+            .with(crate::upgrade::Upgrade::AddEducationDomain, h);
+        g
+    }
+
+    #[test]
+    fn the_education_domain_is_usable_only_after_its_activation() {
+        use crate::knowledge::KnowledgeAction;
+        let mut chain = Chain::new(edu_genesis(3));
+        // 激活前:教育领域不可用
+        let op = kop(
+            &chain,
+            1,
+            KnowledgeAction::CreateUnit {
+                layer: crate::knowledge::Layer::Foundation,
+                domain: crate::EDUCATION_DOMAIN,
+                version: payload(vec![]),
+            },
+        );
+        assert!(
+            chain.state.knowledge_op_admissible(&op).is_err(),
+            "激活前不能用教育领域"
+        );
+        // 激活后:可以
+        grow(&mut chain, 2);
+        assert_eq!(chain.state.height, 2);
+        let op = kop(
+            &chain,
+            1,
+            KnowledgeAction::CreateUnit {
+                layer: crate::knowledge::Layer::Foundation,
+                domain: crate::EDUCATION_DOMAIN,
+                version: payload(vec![]),
+            },
+        );
+        assert!(
+            chain.state.knowledge_op_admissible(&op).is_ok(),
+            "激活后可以用教育领域"
+        );
+        let mut b = kblock(&chain, vec![op]);
+        chain.commit(&mut b).expect("创建教育领域的单元");
+        assert!(chain.state.knowledge.units.contains_key(&1));
+    }
+
+    #[test]
+    fn adding_a_domain_changes_nothing_before_its_activation_height() {
+        // 关键性质:加领域这个升级,在 H* 之前每个字节都与升级前相同(创世哈希也不变)。
+        let mut plain = Chain::new(egenesis(1000));
+        let mut edu = Chain::new(edu_genesis(1000));
+        assert_eq!(
+            plain.genesis_hash, edu.genesis_hash,
+            "创世哈希不受时刻表影响"
+        );
+        for _ in 0..5 {
+            let mut a = block(&plain, plain.state.height + 1, vec![]);
+            let mut b = block(&edu, edu.state.height + 1, vec![]);
+            plain.commit(&mut a).expect("a");
+            edu.commit(&mut b).expect("b");
+            assert_eq!(a.state_root, b.state_root, "高度 {} 的状态根", a.height);
+            assert_eq!(a.hash(), b.hash(), "高度 {} 的区块哈希", a.height);
+        }
+        // 激活前:有效领域集合 = 创世登记的那些(教育不在其中)
+        assert!(!edu
+            .state
+            .effective_domains(edu.state.height)
+            .contains(&crate::EDUCATION_DOMAIN));
+        assert_eq!(
+            edu.state.effective_domains(edu.state.height).len(),
+            edu.state.knowledge.domains.len(),
+            "激活前领域集合不变"
+        );
+    }
+
+    #[test]
+    fn nodes_with_different_domain_schedules_stop_at_activation() {
+        // 时刻表不一致 ⇒ H* 当块状态根不同 ⇒ 停下,不分叉。
+        let mut edu = Chain::new(edu_genesis(4));
+        let blocks = {
+            let mut v = Vec::new();
+            for _ in 0..5 {
+                let mut b = block(&edu, edu.state.height + 1, vec![]);
+                edu.commit(&mut b).expect("commit");
+                v.push(b);
+            }
+            v
+        };
+        let (g, gh) = ChainState::genesis(egenesis(4)); // 没有这个升级
+        match Chain::replay_from(g, gh, &blocks) {
+            Err(ChainError::StateRootMismatch { height }) => assert_eq!(height, 4),
+            other => panic!("应当在 H* 停下,实际 {:?}", other.map(|c| c.state.height)),
+        }
     }
 
     #[test]

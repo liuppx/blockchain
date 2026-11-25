@@ -115,10 +115,30 @@
   }
 
   // ---- 表单 -------------------------------------------------------------------
+  /**
+   * 链上**下一块**起接受的领域(新单元最早就在下一块入块)。
+   * 领域词表里有名字,不等于链已经接受:新增领域按高度激活,激活前创建会被链拒绝。
+   * 读不到(旧版节点没有 /domains)时退回词表里的全部领域。
+   */
+  async function acceptedDomains() {
+    try {
+      const r = await fetch("/rpc/domains", { headers: { Accept: "application/json" } });
+      if (r.ok) {
+        const d = await r.json();
+        if (d && Array.isArray(d.next)) return new Set(d.next.map(String));
+      }
+    } catch (_) { /* 旧节点:退回词表 */ }
+    return null;
+  }
+
   async function openEditor(state) {
     if (!M() || !M().hasVault()) return M().showIdentity();
     const isNew = !state.unit;
-    const domains = Object.entries(DOMAIN_ZH).map(([k, v]) =>
+    const accepted = isNew ? await acceptedDomains() : null;
+    const usable = Object.entries(DOMAIN_ZH).filter(([k]) => !accepted || accepted.has(String(k)));
+    // 默认领域不可用(例如还停在一个链不接受的领域)时,改选第一个可用的
+    if (usable.length && !usable.some(([k]) => Number(k) === Number(state.domain))) state.domain = Number(usable[0][0]);
+    const domains = usable.map(([k, v]) =>
       `<option value='${k}'${Number(k) === Number(state.domain) ? " selected" : ""}>${esc(v)} (${k})</option>`).join("");
     const layers = Object.entries(LAYER_ZH).map(([k, v]) =>
       `<option value='${k}'${k === state.layer ? " selected" : ""}>${esc(v)}</option>`).join("");
