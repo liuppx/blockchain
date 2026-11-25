@@ -89,15 +89,52 @@ class Metrics(unittest.TestCase):
         self.assertIn("运动健身", text)
         self.assertIn("没有答案文件", text)
 
-    def test_commitment_mismatch_is_refused(self):
-        with tempfile.NamedTemporaryFile("wb", suffix=".json", delete=False) as f:
-            f.write(json.dumps(KEY).encode())
-        try:
-            bad = "00" * 32
-            self.assertEqual(pm.main(["--answer-key", f.name, "--commitment", bad, "--rpc", "http://127.0.0.1:1"]), 1)
-            self.assertNotEqual(hashlib.sha256(open(f.name, "rb").read()).hexdigest(), bad)
-        finally:
-            os.unlink(f.name)
+    def test_commitment_without_plants_is_refused(self):
+        # 承诺的是埋错清单(发布前定稿),不是答案文件(发布后才有版本号):只给承诺不给清单,拒绝
+        self.assertEqual(pm.main(["--commitment", "00" * 32, "--rpc", "http://127.0.0.1:1"]), 2)
+
+
+class AnswerKey(unittest.TestCase):
+    """先承诺、后公开:答案文件里每个埋错版本,必须正是前一版按清单替换的结果。"""
+
+    PREV = "组间休息 60–90 秒。"
+    PLANS = {"plants": [{"id": "F1", "unit": 2, "old": "60–90 秒", "new": "10–15 秒"}]}
+
+    def setUp(self):
+        self.bodies = {}
+        good = self.PREV.replace("60–90 秒", "10–15 秒")
+        self.h_prev = self._put(self.PREV)
+        self.h_good = self._put(good)
+        self.h_other = self._put("别的什么正文")
+
+    def _put(self, text):
+        h = hashlib.sha256(text.encode("utf-8")).hexdigest()
+        self.bodies[h] = text
+        return h
+
+    def units(self, v2_hash):
+        return [{"id": "2", "versions": [
+            {"n": "1", "bodies": [{"hash": self.h_prev}]},
+            {"n": "2", "bodies": [{"hash": v2_hash}]}]}]
+
+    def test_a_version_published_from_the_list_passes(self):
+        key = {"planted": [{"unit": 2, "version": 2}]}
+        probs = pm.verify_answer_key(self.units(self.h_good), self.PLANS, key, self.bodies.__getitem__)
+        self.assertEqual(probs, [])
+
+    def test_a_version_not_produced_by_the_list_is_caught(self):
+        # 组织者事后挑一个"恰好有人判了需修改"的版本,声称那就是埋错:正文对不上清单,被抓出来
+        key = {"planted": [{"unit": 2, "version": 2}]}
+        probs = pm.verify_answer_key(self.units(self.h_other), self.PLANS, key, self.bodies.__getitem__)
+        self.assertEqual(len(probs), 1)
+        self.assertIn("不是前一版按清单替换的结果", probs[0])
+
+    def test_a_unit_that_was_never_listed_is_caught(self):
+        key = {"planted": [{"unit": 9, "version": 2}]}
+        units = self.units(self.h_good) + [{"id": "9", "versions": [
+            {"n": "1", "bodies": [{"hash": self.h_prev}]}, {"n": "2", "bodies": [{"hash": self.h_good}]}]}]
+        probs = pm.verify_answer_key(units, self.PLANS, key, self.bodies.__getitem__)
+        self.assertTrue(any("不在承诺过的清单里" in p for p in probs))
 
 
 if __name__ == "__main__":

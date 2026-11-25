@@ -12,8 +12,17 @@
     python3 tools/pilot_metrics.py --rpc http://127.0.0.1:9221 --since-height 1000 \\
         --answer-key key.json --commitment <sha256>
 
-答案文件(试运行结束前只有组织者持有,开始时公布它的 SHA-256):
-    {"planted":  [{"unit": 3, "version": 2, "note": "把组间休息写成 10 秒"}],
+先承诺、后公开(与 tools/pilot_plant.py 一致):
+  - 试运行开始时公布的是**埋错清单 plants.json** 的 SHA-256——它在发布前就定稿,那时版本号还不知道;
+  - 答案文件 key.json 由 pilot_plant.py 在发布后写出(带实际版本号),结束时与 plants.json 一起公开。
+  核对分两步:① plants.json 的 SHA-256 等于公布的承诺;② key.json 里每个埋错版本的正文,
+  确实等于前一版正文按清单做了那几处替换(从链上与正文仓库逐个重算)。两步都过才算指标。
+
+    python3 tools/pilot_metrics.py --rpc … --site … --since-height H \\
+        --plants plants.json --commitment <sha256> --answer-key key.json
+
+答案文件格式(pilot_plant.py 写出):
+    {"planted":  [{"unit": 3, "version": 2, "body_sha256": "…", "plants": [{"id": "F1", "note": "…"}]}],
      "red_team": [7, 8]}
 """
 from __future__ import annotations
@@ -23,6 +32,7 @@ import hashlib
 import json
 import statistics
 import sys
+import os
 import urllib.request
 
 PASS, NEEDS = "pass", "needs-revision"
@@ -52,6 +62,46 @@ def fetch(rpc: str, site: str | None):
                 except Exception:  # 浏览器服务不可用时不报指派完成率
                     pass
     return units, members, assignments
+
+
+# ---- 核对答案(先承诺、后公开)------------------------------------------------------
+
+def verify_answer_key(units: list[dict], plans: dict, key: dict, fetch_body) -> list[str]:
+    """核对 key.json 是按承诺过的清单发布的:每个埋错版本的正文 = 前一版正文做了清单里那几处替换。
+
+    返回问题列表(空 = 全部对得上)。`fetch_body(sha256) -> str` 从正文仓库取正文。
+    这一步防的是:组织者事后挑一个"有人恰好判了需修改"的版本,声称那就是埋错。
+    """
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    import pilot_plant  # 同一套替换规则(原文必须恰好出现一次)
+
+    by_id = {str(u["id"]): u for u in units}
+    by_unit = pilot_plant.by_unit(plans)
+    problems = []
+    for p in key.get("planted", []):
+        uid, n = str(p["unit"]), int(p["version"])
+        u = by_id.get(uid)
+        if not u:
+            problems.append(f"单元 #{uid} 在链上不存在")
+            continue
+        vs = {int(v["n"]): v for v in u["versions"]}
+        if n not in vs or (n - 1) not in vs:
+            problems.append(f"单元 #{uid} 没有 v{n} 或它的前一版")
+            continue
+        listed = by_unit.get(int(uid))
+        if not listed:
+            problems.append(f"单元 #{uid} v{n} 不在承诺过的清单里")
+            continue
+        try:
+            prev = fetch_body(vs[n - 1]["bodies"][0]["hash"])
+            want = pilot_plant.apply_all(prev, listed)
+        except Exception as e:  # noqa: BLE001
+            problems.append(f"单元 #{uid} v{n}:按清单重算失败({e})")
+            continue
+        got = vs[n]["bodies"][0]["hash"]
+        if hashlib.sha256(want.encode("utf-8")).hexdigest() != got:
+            problems.append(f"单元 #{uid} v{n} 的正文不是前一版按清单替换的结果")
+    return problems
 
 
 # ---- 指标(纯函数,方便测试)--------------------------------------------------------
@@ -259,19 +309,45 @@ def main(argv=None) -> int:
     ap.add_argument("--rpc", default="http://127.0.0.1:9221", help="节点 RPC(线上:https://blockchain.yeying.pub/rpc)")
     ap.add_argument("--site", help="浏览器服务地址,用来读核验人指派(可选)")
     ap.add_argument("--since-height", type=int, default=0, help="只算这个高度之后的活动(试运行开始的高度)")
-    ap.add_argument("--answer-key", help="埋错与红队的答案文件(JSON)")
-    ap.add_argument("--commitment", help="试运行开始时公布的答案文件 SHA-256;给了就先核对")
+    ap.add_argument("--answer-key", help="埋错与红队的答案文件 key.json(pilot_plant.py 发布后写出)")
+    ap.add_argument("--plants", help="埋错清单 plants.json(试运行开始时公布了它的 SHA-256)")
+    ap.add_argument("--commitment", help="试运行开始时公布的埋错清单 SHA-256;给了就核对 --plants")
     ap.add_argument("--seconds-per-block", type=float, default=1.0, help="把块数换算成时间(测试网 1 秒一块)")
     args = ap.parse_args(argv)
 
     key = None
     if args.answer_key:
-        raw = open(args.answer_key, "rb").read()
-        if args.commitment and hashlib.sha256(raw).hexdigest() != args.commitment.lower():
-            print("答案文件与公布的 SHA-256 不一致:不能用它算指标", file=sys.stderr)
+        key = json.loads(open(args.answer_key, "rb").read())
+    # 参数与本地文件先核对完,再去读链(给错参数不该先打一遍网络)
+    raw = None
+    if args.commitment:
+        # 承诺的是清单,不是答案文件:答案文件带版本号,发布前根本不存在
+        if not args.plants:
+            print("给了 --commitment 就要给 --plants(承诺的是埋错清单的 SHA-256)", file=sys.stderr)
+            return 2
+        raw = open(args.plants, "rb").read()
+        if hashlib.sha256(raw).hexdigest() != args.commitment.lower():
+            print("埋错清单与公布的 SHA-256 不一致:清单被改过,不能用它算指标", file=sys.stderr)
             return 1
-        key = json.loads(raw)
+        if key is not None and not args.site:
+            print("核对答案文件要从正文仓库取正文:请给 --site", file=sys.stderr)
+            return 2
     units, members, assignments = fetch(args.rpc, args.site)
+    if args.commitment:
+        if key is not None:
+            site = args.site.rstrip("/")
+
+            def fetch_body(h: str) -> str:
+                with urllib.request.urlopen(f"{site}/bodies/{h}", timeout=30) as r:
+                    return r.read().decode("utf-8")
+
+            problems = verify_answer_key(units, json.loads(raw), key, fetch_body)
+            if problems:
+                print("答案文件与承诺的清单对不上,不能用它算指标:", file=sys.stderr)
+                for p in problems:
+                    print("  - " + p, file=sys.stderr)
+                return 1
+        print("承诺核对通过:清单未被改过,答案文件里的每个埋错版本都是按清单发布的。\n")
     print(report(units, members, assignments, key, args.since_height, args.seconds_per_block))
     return 0
 

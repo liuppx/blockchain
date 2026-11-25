@@ -76,8 +76,9 @@ test("用钱包登录:页面显示的就是钱包里那把密钥的公钥", { sk
   await ctx.close();
 });
 
-// 旧版网页在浏览器里存过密钥的成员:不再给口令解锁,而是提示把密钥移进钱包;钱包登录照常可用。
-test("浏览器里留着旧版密钥时:提示移进钱包,钱包登录照常可用", { skip: skip() }, async () => {
+// 所有成员的密钥都已切换到夜莺钱包,网页里不再有任何「旧密钥」的提示。
+// 即使某个浏览器里还残留旧版网页存的密钥,页面也不提它、不给口令框,钱包登录照常可用。
+test("浏览器里残留旧版密钥时:不再有提示,钱包登录照常可用", { skip: skip() }, async () => {
   const ctx = await browser.createBrowserContext();
   const page = await ctx.newPage();
   await injectFakeWallet(page, TEST_KEY);
@@ -96,14 +97,9 @@ test("浏览器里留着旧版密钥时:提示移进钱包,钱包登录照常可
   await page.waitForSelector("#idWallet", { timeout: 10000 });
   const view = await page.$eval("#view", (e) => e.innerText);
   assert.match(view, /已检测到夜莺钱包/);
-  assert.match(view, /旧版网页自己保存的密钥/, "应提示把旧密钥移进钱包");
+  assert.doesNotMatch(view, /旧版网页自己保存的密钥/, "不应再提示旧密钥");
+  assert.equal(await page.$("#idForgetLegacy"), null, "不应再有「清除本机旧密钥」按钮");
   assert.equal(await page.$("#idPw"), null, "不应再有口令解锁框");
-
-  // 「清除本机旧密钥」:确认后删掉旧密钥,提示随之消失
-  page.once("dialog", (d) => d.accept());
-  await page.click("#idForgetLegacy");
-  await page.waitForFunction(() => !document.getElementById("idForgetLegacy"), { timeout: 10000 });
-  assert.equal(await page.evaluate(() => localStorage.getItem("zhixing.vault.v1")), null, "旧密钥应已删除");
 
   await page.click("#idWalletTop");
   await page.waitForSelector("#idState", { timeout: 30000 });

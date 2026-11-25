@@ -24,7 +24,11 @@ export TESTNET_OUT="$DRILL_DIR/net"
 OUT="$TESTNET_OUT"
 
 cleanup() {
-  [ -f "$DRILL_DIR/explorer.pid" ] && kill "$(cat "$DRILL_DIR/explorer.pid")" 2>/dev/null || true
+  # 停浏览器服务并等它退出(wait 吞掉 bash 的 "Terminated" 提示)
+  if [ -f "$DRILL_DIR/explorer.pid" ]; then
+    kill "$(cat "$DRILL_DIR/explorer.pid")" 2>/dev/null || true
+    wait "$(cat "$DRILL_DIR/explorer.pid")" 2>/dev/null || true
+  fi
   "$HERE/down.sh" >/dev/null 2>&1 || true
   if [ "${KEEP:-0}" = 1 ]; then echo "(保留演练目录 $OUT)"; else rm -rf "$DRILL_DIR"; fi
 }
