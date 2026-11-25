@@ -175,6 +175,27 @@ if [ -n "$econ_lines" ]; then
 fi
 fi
 
+# 4c. 新增领域(按高度激活)
+#   领域时刻表写在创世的 `[[domains]]` 里,同样不进创世哈希、要带外核对。
+#   4 个节点报的领域集合必须相同:不同就说明有节点没换上创世,到了激活高度会停下。
+#   旧版本节点没有 /domains(返回 404),此时整段跳过。
+dom_lines=""
+for id in $NODES; do
+  first="$(curl -fsS --max-time 5 -H 'Accept: application/json' "http://127.0.0.1:92$id/domains" 2>/dev/null | head -1 || true)"
+  case "$first" in
+    *domains*) dom_lines="$dom_lines$id $first"$'\n' ;;
+  esac
+done
+if [ -n "$dom_lines" ]; then
+  nexts="$(printf '%s' "$dom_lines" | sed -n 's/.*"next":\[\([^]]*\)\].*/\1/p' | sort -u)"
+  n_nodes="$(printf '%s' "$dom_lines" | grep -c .)"
+  if [ "$(printf '%s\n' "$nexts" | grep -c .)" != 1 ] || [ "$n_nodes" != "$(echo $NODES | wc -w | tr -d ' ')" ]; then
+    check "domain-schedule" 1 "节点的有效领域集合不一致:$(printf '%s' "$dom_lines" | tr '\n' ';')"
+  else
+    check "domain-schedule" 0 "4 个节点的有效领域集合一致(next=$nexts)"
+  fi
+fi
+
 # 4. 通道(在旧机上跑才有意义;本机跑时跳过)
 if [ -n "${ZHIXING_CHECK_TUNNEL:-}" ]; then
   if curl -fsS --max-time 5 "$TUNNEL_URL/height" >/dev/null 2>&1; then

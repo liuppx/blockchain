@@ -12,11 +12,12 @@
 import { test, before, after } from "node:test";
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { existsSync, mkdtempSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import { createRequire } from "node:module";
+import { createHash } from "node:crypto";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const require = createRequire(import.meta.url);
@@ -25,6 +26,7 @@ const CHROME = process.env.CHROME_PATH ||
 const RPC = process.env.TEST_RPC || "http://127.0.0.1:9221";
 const WEB = process.env.TEST_WEB || "http://127.0.0.1:8080";
 const ZERO24 = Array(23).fill("abandon").join(" ") + " art"; // 公开测试助记词
+const RUN = Date.now().toString(36);   // 本次运行的编号:正文与检索都用它做标记
 import { injectFakeWallet, memberKeyFromMnemonic } from "./fake-wallet.mjs";
 const TEST_KEY = await memberKeyFromMnemonic(ZERO24);
 
@@ -113,6 +115,47 @@ async function ensureMember() {
   return true;
 }
 
+// 造一个"别人发布的单元"——核验面板那个用例要有一个**别的作者**发布的单元才能验。
+// 之前这个单元是碰巧由前一个用例创建(本地开发链上还有旧的导入单元),
+// 在**全新的链**上(CI 每次都是新链)就没有这样的单元,用例断言失败。
+// 这里显式用账户 2 的种子发一条 create,保证与被测账户(TestKey,会被邀请成成员)不是同一个人。
+async function ensureForeignUnit() {
+  const repoRoot = join(here, "../../..");
+  const bin = join(repoRoot, "node/target/release/node");
+  const seed = join(repoRoot, ".localnet/keys/acct2.seed");
+  if (!existsSync(bin) || !existsSync(seed)) return null;
+
+  // 正文按哈希存进正文仓库(与网页写作的路径一致);哈希用内容寻址,自己算。
+  const text = `端到端测试夹具:由账户 2 发布的单元(${RUN})。\n\n## 核心陈述\n\n这个单元由另一个作者发布,用来验证核验面板。\n`;
+  const hash = await sha256hex(new TextEncoder().encode(text));
+  const up = await fetch(WEB + "/bodies/" + hash, {
+    method: "PUT",
+    headers: { "Content-Type": "text/markdown; charset=utf-8", "Authorization": "Bearer " + (process.env.TEST_WRITE_TOKEN || "local-dev-token") },
+    body: text,
+  });
+  if (!up.ok) throw new Error("上传夹具正文失败:HTTP " + up.status);
+
+  const nonce = (await rpc("/account/2")).nonce;
+  const out = join(mkdtempSync(join(tmpdir(), "zxfix-")), "op.bin");
+  execFileSync(bin, ["encode-knowledge-op", "--key-file", seed, "--out", out,
+    "--actor", "2", "--nonce", String(nonce), "--action", "create",
+    "--layer", "foundation", "--domain", "1",
+    "--body", "zh:" + hash, "--source", "human"],
+    { stdio: "ignore" });
+  const body = readFileSync(out);
+  const r = await fetch(RPC + "/knowledge", {
+    method: "POST",
+    headers: { "Content-Type": "application/octet-stream", "Authorization": "Bearer " + (process.env.TEST_WRITE_TOKEN || "local-dev-token") },
+    body,
+  });
+  if (!r.ok) throw new Error("发布夹具单元失败:HTTP " + r.status + " " + (await r.text()).slice(0, 200));
+  // 等它入块:按作者(2)找到它
+  return await waitFor(async () => {
+    const items = (await rpc("/units?limit=50")).items;
+    return items.find((u) => Number(u.author) === 2) || null;
+  }, 30000, 500);
+}
+
 async function isTestKeyMember() {
   const members = (await rpc("/members?limit=200")).items;
   for (const m of members) {
@@ -125,6 +168,10 @@ async function isTestKeyMember() {
 }
 
 // 链上读:走节点 RPC
+function sha256hex(bytes) {
+  return createHash("sha256").update(bytes).digest("hex");
+}
+
 async function rpc(path) {
   const r = await fetch(RPC + path, { headers: { Accept: "application/json" } });
   if (!r.ok) throw new Error(path + " → HTTP " + r.status);
@@ -170,7 +217,6 @@ test("浏览器:导入身份 → 写作 → 修订 → 核验 → 邀请 → 检
     // ---- 写作:创建单元 ------------------------------------------------------
     // 正文每次运行都不同:U2 规定同一份正文不能被当作新单元重复提交(否则会被 DuplicateBody 拒绝),
     // 而本地链会在多次运行之间保留,所以用运行编号让正文唯一。
-    const RUN = Date.now().toString(36);
     const BODY = `# 端到端测试单元 ${RUN}
 
 | 字段 | 内容 |
@@ -272,16 +318,21 @@ test("浏览器:核验面板 —— 勾选全部核验要点后才能通过;不�
     const token = process.env.TEST_WRITE_TOKEN || "local-dev-token";
     if (token) { await p.type("#idTok", token); await p.click("#idTokSave"); }
 
-    // 找一个不是本账户发布的单元
+    // 找一个不是本账户发布的单元。
+    // 新链上没有任何现成的单元,所以先造一个"别人发布的"——用账户 2 的种子发一条 create。
+    // (之前这个单元靠本地开发链上的旧导入单元,CI 的全新链上没有,断言一直失败。)
     const me = await p.$eval("#idState", (e) => e.textContent);
-    // The first browser flow may have just created the fixture unit. Wait for it
-    // instead of racing the block commit when the suite runs against a fresh chain.
+    const myId = (me.match(/账户\s*(\d+)/) || [])[1];
     const units = (await waitFor(async () => {
       const items = (await rpc("/units?limit=50")).items;
       return items.length ? items : null;
     }, 30000, 500)) || [];
-    const target = units.find((u) => !me.includes("账户 " + u.author + " "));
-    assert.ok(target, "应存在其他作者发布的单元");
+    let target = units.find((u) => String(u.author) !== String(myId));
+    if (!target) {
+      target = await ensureForeignUnit();
+      assert.ok(target, "应能造出一个其他作者发布的单元");
+    }
+    assert.notEqual(String(target.author), String(myId), "夹具单元应来自另一个作者");
     await p.goto(WEB + "/#unit/" + target.id, { waitUntil: "networkidle0" });
     await p.waitForSelector("#reviewSlot", { timeout: 20000 });
 

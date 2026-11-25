@@ -1032,6 +1032,10 @@ pub struct GenesisConfig {
     /// **不进创世哈希**——用 `node genesis-hash` 打印出来带外核对。不认识的升级名会被拒绝。
     #[serde(default)]
     pub upgrades: Vec<UpgradeConfig>,
+    /// 按高度新增的领域,`[[domains]] id = N height = H`。可选;缺省为没有新增领域。
+    /// **加领域不需要改代码、不需要发新版本**——在创世里写一行就行。
+    #[serde(default)]
+    pub domains: Vec<DomainConfig>,
     #[serde(default)]
     pub timestamp_days: f32,
     #[serde(default)]
@@ -1186,6 +1190,12 @@ impl GenesisConfig {
                     };
                     sched = sched.with_cadence(c).map_err(bad)?;
                 }
+                // 按高度新增的领域:同一编号只能出现一次
+                sched = sched
+                    .with_domains(self.domains.iter().map(|d| (d.id, d.height)))
+                    .map_err(|e| ConfigError::BadGenesis {
+                        detail: format!("[[domains]]: {e}"),
+                    })?;
                 sched
             },
         })
@@ -1250,7 +1260,15 @@ pub fn load_node_config(path: &str) -> Result<NodeConfig, ConfigError> {
     Ok(cfg)
 }
 
-/// Read + parse a genesis TOML.
+/// 创世 `[[domains]]` 的一项:领域编号从哪个高度起可用。
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
+pub struct DomainConfig {
+    /// 领域编号(如 3 = 教育)。名称只在浏览器的领域词表里定义,不上链。
+    pub id: u32,
+    /// 从这个高度的区块起,这个领域可以用了(含该高度)。
+    pub height: u64,
+}
+
 /// 创世 `[[upgrades]]` 的一项。
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
 pub struct UpgradeConfig {
@@ -2506,6 +2524,7 @@ mod tests {
                 .collect(),
             params: None,
             upgrades: Vec::new(),
+            domains: Vec::new(),
         };
         let g = gc.to_genesis().unwrap();
         assert_eq!(g.accounts.len(), 3);
@@ -2533,6 +2552,60 @@ mod tests {
     }
 
     #[test]
+    fn domains_section_parses_and_rejects_duplicates() {
+        // **加领域是数据,不是代码**:创世里写一行 `[[domains]] id = 3 height = H` 就够,
+        // 不需要改节点、不需要发新版本。重复的编号要报错(否则哪个生效说不清)。
+        let toml = r#"
+base_emission_micro = 8000000
+slash_bps = 10000
+
+[[domains]]
+id = 3
+height = 100
+
+[[domains]]
+id = 4
+height = 200
+"#;
+        let cfg: GenesisConfig = toml::from_str(toml).expect("parse");
+        assert_eq!(cfg.domains.len(), 2);
+        assert_eq!(cfg.domains[0], DomainConfig { id: 3, height: 100 });
+        let g = cfg.to_genesis().expect("to_genesis");
+        assert_eq!(g.upgrades.domains_active_at(99).count(), 0);
+        assert_eq!(
+            g.upgrades.domains_active_at(100).collect::<Vec<_>>(),
+            vec![3]
+        );
+        assert_eq!(
+            g.upgrades.domains_active_at(200).collect::<Vec<_>>(),
+            vec![3, 4]
+        );
+        assert!(
+            g.upgrades.describe().contains("domain-3@100"),
+            "时刻表里要能看出新增领域:{}",
+            g.upgrades.describe()
+        );
+
+        let dup = r#"
+base_emission_micro = 8000000
+slash_bps = 10000
+
+[[domains]]
+id = 3
+height = 100
+
+[[domains]]
+id = 3
+height = 200
+"#;
+        let cfg: GenesisConfig = toml::from_str(dup).expect("parse");
+        assert!(
+            matches!(cfg.to_genesis(), Err(ConfigError::BadGenesis { .. })),
+            "同一个领域编号不能排两次"
+        );
+    }
+
+    #[test]
     fn bad_hex_and_addr_are_typed_errors() {
         let bad_pk = AccountConfig {
             id: 1,
@@ -2552,6 +2625,7 @@ mod tests {
             validators: vec![],
             params: None,
             upgrades: Vec::new(),
+            domains: Vec::new(),
         };
         assert!(matches!(gc.to_genesis(), Err(ConfigError::BadHex { .. })));
 
@@ -2897,6 +2971,7 @@ mod tests {
                 .collect(),
             params: None,
             upgrades: Vec::new(),
+            domains: Vec::new(),
         };
         std::fs::write(
             dir.join("genesis.toml"),

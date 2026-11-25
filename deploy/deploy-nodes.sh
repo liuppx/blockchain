@@ -127,9 +127,21 @@ echo "  当前:$CUR"
   bash '$TGT/scripts/upgrade.sh' post-copy '$CUR' '$TGT'
   bash '$TGT/scripts/starter.sh' start"
 
-info "等节点追上历史(重放 1–2 分钟)"
-"${SSH[@]}" "bash '$TGT/scripts/health-check.sh' --level all --retries 40 --interval 6" \
-  || fail "健康检查没过(节点可能还在重放,过一会儿再跑 deploy-nodes.sh --check 看)"
+# 重放时间随链长增长:2026-11-25 在 118 万块上实测超过 6 分钟(原来按 1–2 分钟估,只等了 4 分钟,
+# 健康检查超时退出,留下"进程已是新版、软链接还指着旧版"的半截状态——节点一重启就会跑回旧版本)。
+# 现在等 20 分钟;真的等不到时,明确告诉运维当前处于哪一步、怎么补完或回退。
+info "等节点追上历史(重放全部历史,链越长越久;最多等 20 分钟)"
+if ! "${SSH[@]}" "bash '$TGT/scripts/health-check.sh' --level all --retries 200 --interval 6"; then
+  echo >&2
+  echo "!! 健康检查在 20 分钟内没通过。当前状态:" >&2
+  echo "!!   节点进程已经是新版本($TGT),但软链接仍指向旧版本($CUR),finalize 还没做。" >&2
+  echo "!!   这时节点一重启就会跑回旧版本——不要停在这一步。" >&2
+  echo "!! 若节点其实还在重放:等它追上后补完(健康检查通过才做):" >&2
+  echo "!!   ssh -p 10022 $HOST 'bash $TGT/scripts/health-check.sh --level all && bash $TGT/scripts/upgrade.sh finalize $CUR $TGT && ln -sfn $(basename "$TGT") $DEPLOY_ROOT/zhixing-testnet'" >&2
+  echo "!! 若新版本有问题:回退到旧版本:" >&2
+  echo "!!   ssh -p 10022 $HOST 'bash $TGT/scripts/starter.sh stop && bash $CUR/scripts/upgrade.sh copy-config $TGT $CUR && bash $CUR/scripts/starter.sh start'" >&2
+  exit 1
+fi
 
 "${SSH[@]}" "set -e
   bash '$TGT/scripts/upgrade.sh' finalize '$CUR' '$TGT'

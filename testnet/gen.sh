@@ -15,6 +15,10 @@
 #   --upgrade NAME=HEIGHT
 #                   schedule a height-activated protocol upgrade (genesis `[[upgrades]]`; repeatable).
 #                   It does not change the genesis hash — `genesis-hash` prints it on its own line.
+#   --domain ID=HEIGHT
+#                   schedule a domain addition (genesis `[[domains]] id = N height = H`; repeatable).
+#                   Adding a domain is DATA, not code: no new build is needed. It does not
+#                   change the genesis hash — `genesis-hash` prints it on its own line.
 #   --economy-cadence PERIOD,LOCK,TOPUP
 #                   blocks per settlement / lock / verifier top-up for knowledge-economy-v1
 #                   (default 86400,15552000,259200 = 1 day / 180 days / 3 days). Drills use short ones.
@@ -39,6 +43,7 @@ MEMBERS=""      # K7: --members FILE ⇒ genesis accounts from a member list (me
 PROBATION_BLOCKS=604800      # 7 days at 1 block/s (VISION §4d; sim round 3: newcomer weight starts near zero)
 INVITE_COOLDOWN_BLOCKS=86400 # 1 day: each member invites at most one person per day
 UPGRADES=()                  # --upgrade NAME=HEIGHT (repeatable)
+DOMAINS=()                   # --domain ID=HEIGHT (repeatable)
 CADENCE=""                   # --economy-cadence PERIOD,LOCK,TOPUP
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -49,9 +54,10 @@ while [ $# -gt 0 ]; do
     --members) MEMBERS="$2"; shift 2 ;;
     --drill) PROBATION_BLOCKS=60; INVITE_COOLDOWN_BLOCKS=30; shift ;;
     --upgrade) UPGRADES+=("$2"); shift 2 ;;
+    --domain) DOMAINS+=("$2"); shift 2 ;;
     --economy-cadence) CADENCE="$2"; shift 2 ;;
     --force) FORCE=1; shift ;;
-    *) echo "usage: $0 [-n VALIDATORS] [-a ACCOUNTS] [--signer id1,id2,...] [--permissioned] [--members FILE] [--drill] [--force]" >&2; exit 2 ;;
+    *) echo "usage: $0 [-n VALIDATORS] [-a ACCOUNTS] [--signer id1,id2,...] [--permissioned] [--members FILE] [--drill] [--upgrade NAME=H] [--domain ID=H] [--economy-cadence P,L,T] [--force]" >&2; exit 2 ;;
   esac
 done
 if [ "$N" -lt 4 ]; then echo "need at least 4 validators (BFT 3f+1)" >&2; exit 2; fi
@@ -168,6 +174,11 @@ GEN="$OUT/genesis.toml"
       IFS=, read -r cp cl ct <<< "$CADENCE"
       echo "period_blocks = $cp"; echo "lock_blocks = $cl"; echo "topup_blocks = $ct"
     fi
+  done
+  # Height-activated domain additions (genesis `[[domains]]`). Not part of the genesis hash.
+  for d in ${DOMAINS[@]+"${DOMAINS[@]}"}; do
+    case "$d" in *=*) ;; *) echo "--domain expects ID=HEIGHT, got: $d" >&2; exit 2 ;; esac
+    echo; echo "[[domains]]"; echo "id = ${d%%=*}"; echo "height = ${d#*=}"
   done
 } > "$GEN"
 # Off-chain member registry (names never go on chain): id ↔ name ↔ focus.
