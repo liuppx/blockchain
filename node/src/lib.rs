@@ -67,9 +67,6 @@ pub const MICRO: u64 = 1_000_000;
 
 pub type Hash = [u8; 32];
 
-/// 教育领域的编号(升级 `add-education-domain` 激活后可用)。
-/// 1 = 大模型应用开发,2 = 运动健身,3 = 教育(名称只在 `tools/explorer/public/ns/v1/domains.jsonld` 定义)。
-pub const EDUCATION_DOMAIN: u32 = 3;
 pub type Embedding = [f32; DIM];
 
 /// M31: one bridge-source registration in [`Genesis`] — a source chain's
@@ -2385,21 +2382,13 @@ impl ChainState {
             .is_active(crate::upgrade::Upgrade::KnowledgeEconomyV1, height)
     }
 
-    /// 教育领域(编号 [`EDUCATION_DOMAIN`])是否已登记(升级 `add-education-domain` 到了 H*)。
-    pub(crate) fn education_domain_active(&self, height: u64) -> bool {
-        self.upgrades
-            .is_active(crate::upgrade::Upgrade::AddEducationDomain, height)
-    }
-
-    /// 某高度的**有效**领域集合:创世登记的,加上按高度激活新增的。
+    /// 某高度的**有效**领域集合:创世登记的,加上按高度新增的。
     ///
     /// 领域集合本身(`knowledge.domains`)**不改**:它是创世状态,改了状态根就不对了。
     /// 新增的领域只在"判断这个领域能不能用"时并进来——所以 H* 之前的每个字节都与升级前相同。
     pub fn effective_domains(&self, height: u64) -> std::collections::BTreeSet<u32> {
         let mut d = self.knowledge.domains.clone();
-        if self.education_domain_active(height) {
-            d.insert(EDUCATION_DOMAIN);
-        }
+        d.extend(self.upgrades.domains_active_at(height));
         d
     }
 
@@ -4236,15 +4225,21 @@ impl ChainState {
             e.string("economy");
             codec::enc_economy_state(&mut e, &self.economy);
         }
-        // 按高度激活的新增领域:折入的是**有效领域集合**(创世登记的 + 激活后新增的)。
-        // 领域集合本身在 knowledge.domains 里、属于创世状态,不能改;折进状态根的是"这一刻能用哪些领域",
-        // 这样时刻表不一致的节点在 H* 当块就会算出不同的根、停下而不是分叉。
-        if self.education_domain_active(self.height) {
-            e.string("domains");
-            let d = self.effective_domains(self.height);
-            e.u64(d.len() as u64);
-            for x in d {
-                e.u32(x);
+        // 按高度新增的领域:折入"这一刻已生效的新增领域"(编号 + 生效高度)。
+        // knowledge.domains 本身属于创世状态、不能改;没有新增领域时一个字节都不追加,
+        // 时刻表不一致的节点在 H* 当块就会算出不同的根、停下而不是分叉。
+        {
+            let extra: Vec<(u32, u64)> = self
+                .upgrades
+                .domain_entries_active_at(self.height)
+                .collect();
+            if !extra.is_empty() {
+                e.string("domains");
+                e.u64(extra.len() as u64);
+                for (d, h) in extra {
+                    e.u32(d);
+                    e.u64(h);
+                }
             }
         }
         sha256(&e.0)
@@ -6523,11 +6518,13 @@ mod tests {
 
     // ---- 新增领域(教育):按高度激活 ------------------------------------------
 
+    /// 教育领域的编号。链上领域是数字;名称只在浏览器的领域词表里定义。
+    const EDU_DOMAIN: u32 = 3;
+
+    /// 排了「从 h 起可用领域 3」的创世。**加领域是数据,不是代码**:创世里写一行就够。
     fn edu_genesis(h: u64) -> Genesis {
         let mut g = egenesis(h);
-        g.upgrades = g
-            .upgrades
-            .with(crate::upgrade::Upgrade::AddEducationDomain, h);
+        g.upgrades = g.upgrades.with_domains([(EDU_DOMAIN, h)]).unwrap();
         g
     }
 
@@ -6541,7 +6538,7 @@ mod tests {
             1,
             KnowledgeAction::CreateUnit {
                 layer: crate::knowledge::Layer::Foundation,
-                domain: crate::EDUCATION_DOMAIN,
+                domain: EDU_DOMAIN,
                 version: payload(vec![]),
             },
         );
@@ -6557,7 +6554,7 @@ mod tests {
             1,
             KnowledgeAction::CreateUnit {
                 layer: crate::knowledge::Layer::Foundation,
-                domain: crate::EDUCATION_DOMAIN,
+                domain: EDU_DOMAIN,
                 version: payload(vec![]),
             },
         );
@@ -6591,7 +6588,7 @@ mod tests {
         assert!(!edu
             .state
             .effective_domains(edu.state.height)
-            .contains(&crate::EDUCATION_DOMAIN));
+            .contains(&EDU_DOMAIN));
         assert_eq!(
             edu.state.effective_domains(edu.state.height).len(),
             edu.state.knowledge.domains.len(),

@@ -139,6 +139,15 @@ deploy/activate-upgrade.sh --height H --dry-run     # 只检查
 deploy/activate-upgrade.sh --height H               # 排期(会重启节点)
 ```
 
+**新增领域不用改代码、不用发新版本**:领域集合写在创世的 `[[domains]] id = N height = H` 里,
+和 `[[upgrades]]` 一样不进创世哈希,按高度生效。
+
+```sh
+deploy/activate-domain.sh --check                       # 看远端当前的领域时刻表
+deploy/activate-domain.sh --id 3 --height H --dry-run   # 只检查
+deploy/activate-domain.sh --id 3 --height H             # 排期(会重启节点)
+```
+
 ## 正文镜像(新机)
 
 链上只存正文的 SHA-256,正文本身在旧机的正文仓库里(`/opt/zhixing/bodies`)。仓库只有一份时,

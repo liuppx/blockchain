@@ -27,22 +27,16 @@ use std::fmt;
 pub enum Upgrade {
     /// 知识经济上链 v1(`docs/design/knowledge-economy-v1.md`)。
     KnowledgeEconomyV1,
-    /// 新增领域:教育(`docs/design/knowledge-economy-v1.md` 之外的独立改动)。
-    ///
-    /// 领域登记在**创世**里(`[knowledge] domains`),而创世哈希是链的身份。给已在运行的链
-    /// 加领域,只能按高度激活:从 H\* 起,领域集合里多一个编号。
-    AddEducationDomain,
 }
 
 impl Upgrade {
     /// 全部已知升级(按标签递增)。
-    pub const ALL: [Upgrade; 2] = [Upgrade::KnowledgeEconomyV1, Upgrade::AddEducationDomain];
+    pub const ALL: [Upgrade; 1] = [Upgrade::KnowledgeEconomyV1];
 
     /// 创世文件 `[[upgrades]] name = "…"` 里用的名字。
     pub fn name(self) -> &'static str {
         match self {
             Upgrade::KnowledgeEconomyV1 => "knowledge-economy-v1",
-            Upgrade::AddEducationDomain => "add-education-domain",
         }
     }
 
@@ -50,7 +44,6 @@ impl Upgrade {
     pub fn tag(self) -> u8 {
         match self {
             Upgrade::KnowledgeEconomyV1 => 1,
-            Upgrade::AddEducationDomain => 2,
         }
     }
 
@@ -73,6 +66,8 @@ pub enum UpgradeError {
     Duplicate(Upgrade),
     /// 节奏参数里有 0。
     BadCadence,
+    /// 同一个领域编号新增了两次。
+    DuplicateDomain(u32),
 }
 
 impl fmt::Display for UpgradeError {
@@ -93,6 +88,7 @@ impl fmt::Display for UpgradeError {
                     "economy cadence (period/lock/topup blocks) must all be > 0"
                 )
             }
+            UpgradeError::DuplicateDomain(d) => write!(f, "domain {d} is added twice"),
         }
     }
 }
@@ -125,6 +121,13 @@ pub struct UpgradeSchedule {
     heights: BTreeMap<Upgrade, u64>,
     /// 知识经济 v1 的节奏(未设置时用默认值)。
     cadence: EconomyCadence,
+    /// 按高度新增的领域:领域编号 → 从哪个高度起可用。
+    ///
+    /// **新增领域是数据,不是代码**:创世里写一行 `[[domains]] id = 3 height = H`,
+    /// 不需要改节点、不需要发新版本。领域登记在创世的 `[knowledge] domains` 里,而创世
+    /// 决定链的身份(创世哈希),所以给已在运行的链加领域只能按高度生效——这一项不进创世哈希,
+    /// 但从 H\* 起折入状态根(与升级时刻表同理:不一致的节点在 H\* 停下,不分叉)。
+    domains: BTreeMap<u32, u64>,
 }
 
 impl UpgradeSchedule {
@@ -143,7 +146,37 @@ impl UpgradeSchedule {
         Ok(UpgradeSchedule {
             heights,
             cadence: EconomyCadence::default(),
+            domains: BTreeMap::new(),
         })
+    }
+
+    /// 加上按高度新增的领域(`(领域编号, 生效高度)`);同一编号出现两次就报错。
+    pub fn with_domains(
+        mut self,
+        entries: impl IntoIterator<Item = (u32, u64)>,
+    ) -> Result<Self, UpgradeError> {
+        for (d, h) in entries {
+            if self.domains.insert(d, h).is_some() {
+                return Err(UpgradeError::DuplicateDomain(d));
+            }
+        }
+        Ok(self)
+    }
+
+    /// 在 `height` 已生效的新增领域(按编号递增)。
+    pub fn domains_active_at(&self, height: u64) -> impl Iterator<Item = u32> + '_ {
+        self.domains
+            .iter()
+            .filter(move |(_, h)| height >= **h)
+            .map(|(d, _)| *d)
+    }
+
+    /// 在 `height` 已生效的新增领域,附生效高度(折入状态根用)。
+    pub fn domain_entries_active_at(&self, height: u64) -> impl Iterator<Item = (u32, u64)> + '_ {
+        self.domains
+            .iter()
+            .filter(move |(_, h)| height >= **h)
+            .map(|(d, h)| (*d, *h))
     }
 
     /// 覆盖知识经济的节奏。0 值无效(会让结算每块都跑、或锁定立即到期),拒绝。
@@ -167,7 +200,7 @@ impl UpgradeSchedule {
     }
 
     pub fn is_empty(&self) -> bool {
-        self.heights.is_empty()
+        self.heights.is_empty() && self.domains.is_empty()
     }
 
     /// 某升级的激活高度;没排期则为 `None`。
@@ -199,11 +232,10 @@ impl UpgradeSchedule {
         if self.is_empty() {
             return "none".to_string();
         }
-        let mut out = self
-            .entries()
-            .map(|(u, h)| format!("{u}@{h}"))
-            .collect::<Vec<_>>()
-            .join(",");
+        let mut parts: Vec<String> = self.entries().map(|(u, h)| format!("{u}@{h}")).collect();
+        // 新增领域:domain-<编号>@<高度>
+        parts.extend(self.domains.iter().map(|(d, h)| format!("domain-{d}@{h}")));
+        let mut out = parts.join(",");
         if self.cadence != EconomyCadence::default() {
             let c = self.cadence;
             out.push_str(&format!(
