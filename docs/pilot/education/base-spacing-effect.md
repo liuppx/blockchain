@@ -51,7 +51,7 @@
 - 常见做法是**随着掌握程度提高,把间隔拉长**:今天、明天、三天后、一周后、两周后……
 - 停止的信号通常是**连续两次提取都顺利**(而不是"看一遍觉得眼熟")。
 
-有一个常见的量级参考:在理想条件下,记忆保持率大致随时间呈**指数衰减**,半衰期可以按天算。
+有一个常见的量级参考:在理想条件下,记忆保持率随时间衰减,**衰减的快慢可以用"半衰期"来刻画**(即过多久保持率减半)。
 Cepeda 等人 2006 年的综述里,不同材料与任务上的半衰期从几小时到几天不等(实验设置差异很大)。
 **这些数字只能当作起点,不能当作计划表**——每个人、材料、测验难度都不同。
 
@@ -106,9 +106,9 @@ Cepeda 等人 2006 年的综述里,不同材料与任务上的半衰期从几小
 
 | 论断 | 出处 | 证据类型 |
 |---|---|---|
-| 分散练习在长期保持上优于集中练习 | Cepeda et al. (2006) *Distributed Practice in Verbal Recall Tasks: A Review and Quantitative Synthesis*, Psychological Bulletin;Roediger & Karpicke (2006) *Test-Enhanced Learning*, Psychological Science | 元分析 / 实验研究 |
-| 保持率随间隔呈指数衰减、存在最优间隔 | Cepeda et al. (2008) *Spacing Effects in Learning: A Temporal Ridgeline of Optimal Retention*, Psychological Science | 实验研究 |
-| 提取时的适度困难比轻松重读效果更好 | Bjork & Bjork (2011) *Making Things Hard on Yourself, But in a Good Way*, American Psychologist | 综述性论述 |
+| 分散练习在长期保持上优于集中练习 | Cepeda et al. (2006) *Distributed Practice in Verbal Recall Tasks: A Review and Quantitative Synthesis*, Psychological Bulletin | 元分析 |
+| 存在一个"最优间隔",且最优间隔随测验延迟而变长("脊线"形状) | Cepeda, Vul, Rohrer, Wixted & Pashler (2008) *Spacing Effects in Learning: A Temporal Ridgeline of Optimal Retention*, Psychological Science | 实验研究 |
+| 提取时的适度困难比轻松重读效果更好 | Bjork & Bjork (2011) *Making Things Hard on Yourself, But in a Good Way: Creating Desirable Difficulties to Enhance Learning*, in Gernsbacher 等 (编) *Psychology and the Real World*, Worth, pp. 56–64(**书章节,不是期刊论文**) | 综述性论述 |
 | 提取练习与间隔效应常被放在一起使用,两者作用不同(前者检验与巩固,后者安排时间) | Karpicke & Roediger (2008) *The Critical Importance of Retrieval for Learning*, Science | 实验研究 |
 
 ## 争议
@@ -124,6 +124,8 @@ Cepeda 等人 2006 年的综述里,不同材料与任务上的半衰期从几小
 1. **Cepeda 2006/2008 的具体结论**:2006 元分析的效应量与调节变量(材料类型、间隔长度、保留间隔)是否被准确概括?2008 的"最优间隔"结论是否被我讲得过于确定?
 2. **"间隔重复优于重读"**:这一比较的证据来自哪类研究?我的表述有没有把"长期保持"这一条件漏掉,让读者以为当场默写也一定更好?
 3. **半衰期从几小时到几天**:这个量级范围是否准确?不同任务的差异我是否写得太笼统?
+   (另:我原来写"保持率随时间呈指数衰减",引的是 Cepeda 等 2008。那篇的结论其实是"存在最优间隔,
+   且最优间隔随测验延迟变长"的脊线形状,**没有**给出指数衰减的结论。已把证据表与正文都改成半衰期的说法。)
 4. **"连续两次提取顺利就停"**:这个停止规则是我的经验性建议,**出处待补**。是否应改为"以具体材料为准"?
 5. **"流畅 vs 想得起来"的区分**:这个说法准确吗?有没有把它讲得太绝对(例如断言重读毫无用处)?
 6. **心理学复制危机的影响**:Cepeda、Bjork 等文献是否受到大规模复制研究的影响?这是 2010 年代末以来教育心理学的一个普遍问题,审查者应判断本单元是否需要更强的限定语。

@@ -107,10 +107,10 @@
 
 | 论断 | 出处 | 证据类型 |
 |---|---|---|
-| 交错练习在随后测验中的迁移表现优于分块练习 | Rohrer & Taylor (2007) *The Shuffling of Mathematics Problems Improves Learning*, Instructional Science | 实验研究 |
-| 交错练习在训练当下表现更差、长期表现更好 | Shephard (1967) *Information Search as a Learning Process*, Journal of Educational Psychology;Rohrer 等 (2013) *Interleaved Practice Improves Mathematics Learning*, Journal of Educational Psychology | 实验研究 |
-| 交错的效果受领域与年龄调节(低龄学习者有时相反) | Birnbaum 等 (2006) *The Teaching of Multiplicative Reasoning: A Structured Intervention Emphasizing Interleaving*, Journal of Educational Psychology;Rohrer 等 (2015) *A randomized controlled trial of interleaved mathematics practice*, Journal of Educational Psychology | 实验研究 |
-| 辨别(selecting)与生成(generating)策略的迁移差异 | Rohrer 等 (2010) *The Strategy to Select Problems*, Instructional Science | 实验研究 |
+| 交错练习在随后测验中的迁移表现优于分块练习 | Rohrer & Taylor (2007) *The Shuffling of Mathematics Problems Improves Learning*, Instructional Science(**注意:原文的最终测验用的是同类题目,"迁移"这个说法偏强**) | 实验研究 |
+| 交错练习在训练当下表现更差、长期表现更好 | Rohrer & Taylor (2007) *The Shuffling of Mathematics Problems Improves Learning*, Instructional Science;Rohrer, Dedrick, Hartwig & Cheung (2020) *Effects of Interleaved Practice on Mathematics Learning*, Journal of Educational Psychology | 实验研究 |
+| 交错的效果受领域与年龄调节(低龄学习者有时相反) | Birnbaum 等 (2006) *The Teaching of Multiplicative Reasoning: A Structured Intervention Emphasizing Interleaving*, Journal of Educational Psychology(**出处待核**);Rohrer, Dedrick, Hartwig & Cheung (2020) *Effects of Interleaved Practice on Mathematics Learning*, Journal of Educational Psychology | 实验研究 |
+| 辨别(selecting)与生成(generating)策略的迁移差异 | Rohrer, Dedrick, Hartwig & Cheung (2020) *Effects of Interleaved Practice on Mathematics Learning*, Journal of Educational Psychology | 实验研究 |
 
 ## 争议
 
@@ -123,8 +123,11 @@
 ## 核验要点(给人类审查者)
 
 1. **Rohrer & Taylor (2007) 的实验**:他们的结论基于什么测验、什么题型?我的"当下更差、长期更好"概括是否准确?
-2. **Shephard (1967) 的出处**:这篇文献常被引作交错效应的源头,它的原文结论是否如我所述?年代久远,是否需要更近的综述支撑?
-3. **年龄调节效应**:Birnbaum 2006 与 Rohrer 2015 的结论方向是否一致?我写的"低龄有时相反"是否需要更精确?
+2. **交错练习的年代跨度**:我原来引的源头文献(Shephard 1967)经核查**在《Journal of Educational Psychology》1967 年那一期里查不到**,
+   已从证据表删除,改引 Rohrer & Taylor (2007)。核验人请查:Rohrer 一系关于交错的证据是否还需要更早的源头文献支撑?
+   另外:Rohrer & Taylor (2007) 的最终测验用的是**同类题目**,所以"迁移"这个说法偏强,
+   证据表里已标注;核验人请判断这个限定是否够,还是应当换成真正跨任务的证据。
+3. **年龄调节效应**:Birnbaum 2006(出处待核)与 Rohrer 等 2020 的结论方向是否一致?我写的"低龄有时相反"是否需要更精确?
 4. **"顺序依赖的内容不适合交错"**:这条是我基于概念推理提出的,**出处待补**。是否成立?有没有反例?
 5. **"先分块后交错"的具体分界**:我用"已经见过每一类"来描述,这个判据是否太松?有没有更准确的说法?
 6. **自我验证实验的设计**:12 道题、3 类,这个设计能不能真的测出差别?会不会因为题太少而完全测不出?需不需要给出更可操作的方案?

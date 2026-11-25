@@ -72,7 +72,8 @@
 
 "举一反三"是自发发生的——所以不用管,学一样就会一样。
 反例很多:大量研究显示,教学方式不同,迁移表现差得很远;
-而且迁移水平随时间下降(隔得越久越不容易迁移出去)。
+而且"学的时候表现得好"与"隔段时间还记得、用得出"常常不是一回事——
+学习与表现之间的差距会随时间拉大(Soderstrom & Bjork 2015 的核心论点)。
 
 这不是说迁移不会自然发生,而是说**它有条件**,而且这些条件可以人为创造。
 这正是"举一反三"这个说法的问题:它描述了现象,没有解释机制,所以没法指导怎么改。
@@ -120,10 +121,10 @@
 
 | 论断 | 出处 | 证据类型 |
 |---|---|---|
-| 迁移取决于学习与测试的情境相似度,自发迁移有限 | Barnett & Ceci (2002) *When and where do we apply what we learn?*, Learning and Instruction | 实验研究与综述 |
-| 辨别(选择方法)比执行(用方法)更难 | Rohrer 等 (2010) *The Strategy to Select Problems*, Instructional Science | 实验研究 |
-| 迁移随时间下降,需要线索支持 | Soderstrom & Bjork (2015) *Learning versus performance: An integrative review*, Perspectives on Psychological Science | 综述 |
-| 多种例子学习促进迁移 | Gick & Holyoak (1983) *Schema Induction and the Transfer of Problem-Solving Structures*, Cognitive Psychology | 实验研究 |
+| 迁移取决于学习与测试的情境相似度,自发迁移有限 | Barnett & Ceci (2002) *When and where do we apply what we learn? Taxonomy for far transfer*, Psychological Bulletin | 实验研究与综述 |
+| 辨别(选择方法)比执行(用方法)更难 | Rohrer, Dedrick, Hartwig & Cheung (2020) *Effects of Interleaved Practice on Mathematics Learning*, Journal of Educational Psychology | 实验研究 |
+| "学习"与"表现"是两回事:同样水平的知识,在学习当下表现出来的与隔段时间表现出来的可能不同 | Soderstrom & Bjork (2015) *Learning versus performance: An integrative review*, Perspectives on Psychological Science | 综述 |
+| 多种例子学习促进迁移 | Gick & Holyoak (1983) *Schema induction and analogical transfer*, Cognitive Psychology | 实验研究 |
 | 领域知识不足限制问题解决(专家-新手差异) | Chi, Feltovich & Glaser (1981) *Categorization and Representation of Physics Problems by Experts and Novices*, Cognitive Science | 实验研究 |
 
 ## 争议
@@ -136,14 +137,19 @@
 
 ## 核验要点(给人类审查者)
 
-1. **Barnett & Ceci 2002 的框架**:他们的"情境相似度"分类是二维的(内容 × 学习目标),
-   我概括成"线索"是否失真?
+1. **Barnett & Ceci 2002 的框架**:我原来写的期刊是错的(是 *Psychological Bulletin* 128(4):612–637,
+   不是 *Learning and Instruction*),已改正。另外他们的框架有**九个维度**(3 个内容维度 + 6 个情境维度),
+   我概括成"线索"和"二维"都太粗,请判断该怎么改。
 2. **Gick & Holyoak 1983 的经典实验**:辐射问题(桌面问题 vs 故事问题)是其核心,
    我把它概括成"多例子学习"是否准确?原文的机制解释是什么(类比/图式诱导)?
+   (题名我原来写错了:是 *Schema induction and analogical transfer*,已改。原文还有一个关键条件——
+   **同时看两个例子**才会诱导出图式并迁移;只看一个例子迁移效果很差。这条是否该写进正文?)
 3. **"辨别比执行难"**:Rohrer 等 2010 的实验里,"选择问题"与"生成问题"具体怎么操作?
    我写的"辨别/执行"术语是不是与原文的 select/generate 对应准确?
-4. **"迁移随时间下降"**:Soderstrom & Bjork 2015 是综述,它的结论是"迁移随时间下降"还是别的
-   (例如"学习与表现的差异随时间扩大")?这一条我写得太快,需要核对。
+4. **"迁移随时间下降"这条我写错了**:Soderstrom & Bjork (2015) 的论点不是这个,
+   它讲的是"学习"与"表现"的区分(在有辅助时看起来学会了,隔段时间裸考却不行)。
+   证据表与正文都已改成它真正支持的论断("学习与表现的差距随时间拉大")。
+   核验人请确认:这样改是否准确反映了原文,有没有再次夸大?
 5. **"能力不足其实是知识不足"**:这一条争议很大,而且 Kirschner 等人的工作本身是心理学复制危机的中心案例。
    我是否需要更强的限定语?是否应该补充反方证据?
 6. **"有些领域天然难迁移"**:我举了写作风格、审美、道德直觉,这些例子有出处吗?还是我的经验判断?

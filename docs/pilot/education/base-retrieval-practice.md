@@ -103,8 +103,8 @@
 | 提取练习比重复学习(重读、概念图)产生更多学习 | Karpicke & Blunt (2011) *Retrieval Practice Produces More Learning than Elaborative Studying with Concept Mapping*, Science | 实验研究 |
 | 提取练习的巩固作用(不只是测验作用) | Karpicke & Roediger (2008) *The Critical Importance of Retrieval for Learning*, Science | 实验研究 |
 | 提取练习在随后测验中的成绩比重复学习更好 | Roediger & Karpicke (2006) *Test-Enhanced Learning: Taking Memory Tests Improves Long-Term Retention*, Psychological Science | 实验研究 |
-| 提取时的适度困难比轻松提取效果更好 | Bjork & Bjork (2011) *Making Things Hard on Yourself, But in a Good Way*, American Psychologist | 综述性论述 |
-| 提取练习的效果受反馈质量调节 | Pashler et al. (2007) *Enhancing Learning and Retrieval of New Information: A Critical Component of Instruction*, Educational Psychologist | 实验研究 / 综述 |
+| 提取时的适度困难比轻松提取效果更好 | Bjork & Bjork (2011) *Making Things Hard on Yourself, But in a Good Way: Creating Desirable Difficulties to Enhance Learning*, in Gernsbacher 等 (编) *Psychology and the Real World*, Worth, pp. 56–64(**书章节,不是期刊论文**) | 综述性论述 |
+| 提取练习的效果受反馈质量调节 | Metcalfe (2017) *Learning from Errors*, Annual Review of Psychology;Butler, Karpicke & Roediger (2007) *The effect of type and timing of feedback on learning from multiple-choice tests*, Journal of Experimental Psychology: Applied | 综述 / 实验研究 |
 
 ## 争议
 

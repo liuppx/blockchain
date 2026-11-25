@@ -110,10 +110,10 @@
 
 | 论断 | 出处 | 证据类型 |
 |---|---|---|
-| 识别(看懂解法)与生成(独立解题)表现不同,后者更难 | Rohrer 等 (2010) *The Strategy to Select Problems*, Instructional Science;Kornell & Bjork (2008) *Learning concepts and categories: Is spacing the enemy of induction?*, Learning and Instruction | 实验研究 |
-| 自我解释(self-explanation)能改善后续测验表现 | Chi et al. (1989) *Self-explanations: How students study and use examples in learning to solve problems*, Cognitive Science;Bisra et al. (2018) *Inducing Self-Explanation: a Meta-Analysis*, Educational Psychology Review | 实验研究 / 元分析 |
+| 识别(看懂解法)与生成(独立解题)表现不同,后者更难 | Rohrer, Dedrick, Hartwig & Cheung (2020) *Effects of Interleaved Practice on Mathematics Learning*, Journal of Educational Psychology | 实验研究 |
+| 自我解释(self-explanation)能改善后续测验表现 | Chi et al. (1989) *Self-explanations: How students study and use examples in learning to solve problems*, Cognitive Science;Bisra, Liu, Nesbit, Salimi & Winne (2018) *Inducing Self-Explanation: a Meta-Analysis*, Educational Psychology Review | 实验研究 / 元分析 |
 | "流畅感"会让人高估自己的理解 | 心理学中的流畅性(fluency)文献;与"学习错觉(illusion of learning)"相关 | 综述 |
-| 例题学习本身的效果有限,需要配练习 | Renkl (2014) *Toward an instructionally oriented theory of example-based learning*, Cognitive Science;Kapur (2018) *Interleaving and problem solving...* 相关的例子研究综述 | 综述 |
+| 例题学习本身的效果有限,需要配练习 | Renkl (2014) *Toward an instructionally oriented theory of example-based learning*, Cognitive Science(**注意:该文其实是在为"尽早研究例题"辩护,不是"例题效果有限";这条论断我原来引错了**) | 综述 |
 
 ## 争议
 
@@ -126,12 +126,16 @@
 ## 核验要点(给人类审查者)
 
 1. **Rohrer 等 2010 的实验设计**:"select vs generate"的操纵是什么?我的概括是否准确?
-2. **Kornell & Bjork 2008**:这篇讲的是概念与类别学习,与"看懂 vs 会做"的关系被我用得对吗?
+2. **Kornell & Bjork (2008) 这条我引错了**:经核查,它是 Kornell & Bjork (2008) *Learning concepts and categories:
+   Is spacing the enemy of induction?*, **Psychological Science** 19(6):585–592(期刊不是 *Learning and Instruction*,
+   第二作者是 Robert A. Bjork)。内容是**把不同画风配对来学类别**,跟"识别 vs 生成"没有关系。已从证据表删除。
+   核验人请查:它是否真的不支持本单元的任何论断?若还有可用之处,该怎么用?
 3. **"流畅性导致高估理解"**:我的表述是否有直接出处?需要更具体的引用还是可以作为通识?
 4. **Chi et al. 1989 的自我解释研究**:原文是在什么任务上做的?我把它当"看懂 → 会做"的证据,
    是否越过了原文的结论范围?
-5. **Renkl 2014 与例题学习**:现代对 worked example 的看法是"例题有效但不能替代练习",
-   这个表述准确吗?
+5. **Renkl 2014 与例题学习**:我原来拿它支持"例题效果有限",但它其实是在**为尽早研究例题辩护**——
+   论断与出处方向相反。核验人请查:该文实际支持什么?我该怎么改这一条(或者它是否该被删除)?
+   另外我提到的 Kapur (2018) 也没能核实,已删。
 6. **"遮住答案"对新手可能挫败**:这条我要审查者特别确认。它有没有直接证据,还是我的推论?
 7. **这一层是否守住"只讲一件事"**:本单元同时讲了"识别 vs 生成"和"造生成机会的方法"。
    是否应该把方法部分拆到场景层?

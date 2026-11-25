@@ -142,10 +142,10 @@
 
 | 论断 | 出处 | 证据类型 |
 |---|---|---|
-| 做例题/项目比只读材料学得更多 | Renkl (2014) *Toward an instructionally oriented theory of example-based learning*, Cognitive Science;Kapur (2018) *Interleaving and problem solving: The effects of worked examples on transfer*, Instructional Science | 综述 / 实验研究 |
-| 自我解释能改善后续测验表现 | Chi et al. (1989) *Self-explanations: How students study and use examples in learning to solve problems*, Cognitive Science;Bisra et al. (2018) *Inducing Self-Explanation: A Meta-Analysis*, Educational Psychology Review | 实验研究 / 元分析 |
+| 做例题/项目比只读材料学得更多 | Renkl (2014) *Toward an instructionally oriented theory of example-based learning*, Cognitive Science(**注意:该文是在为"尽早研究例题"辩护,不是支持"做项目优于读书";出处与论断方向不一致**) | 综述 |
+| 自我解释能改善后续测验表现 | Chi et al. (1989) *Self-explanations: How students study and use examples in learning to solve problems*, Cognitive Science;Bisra, Liu, Nesbit, Salimi & Winne (2018) *Inducing Self-Explanation: A Meta-Analysis*, Educational Psychology Review | 实验研究 / 元分析 |
 | 提取练习与间隔效应 | Karpicke & Blunt (2011);Cepeda et al. (2006) | 实验研究 / 元分析 |
-| 对照范例学习(带错误示范的"对照学习")的效果 | Kornell & Bjork (2008) *Learning concepts and categories: Is spacing the enemy of induction?*, Learning and Instruction | 实验研究 |
+| 对照范例学习(带错误示范的"对照学习")的效果 | **出处待补**。我原来引的 Kornell & Bjork (2008) 讲的是把不同画风配对来学类别,不是对照范例,已删除 | 待补 |
 
 ## 争议
 
@@ -157,8 +157,9 @@
 ## 核验要点(给人类审查者)
 
 1. **"每 3–5 步做一个完整产出"**:这个数字从哪来?是经验还是研究?需不需要给出更宽松的表述?
-2. **worked example vs 项目驱动**:我引用了 Renkl 与 Kapur,但"新手先看完整示例"的证据我没展开。
-   这是否会让我的做法在新手身上失效?
+2. **worked example vs 项目驱动**:我原来引的 Renkl (2014) 其实是**为"尽早研究例题"辩护**的,
+   与我"做项目优于读书"的论断方向相反;我提到的 Kapur (2018) 没能核实,已删。核验人请查:
+   "新手先看完整示例"与"边做边学"各自有什么证据?我的做法对新手是否成立?
 3. **"卡 20 分钟以上的题就是该练的"**:这个时间阈值是我的经验值,**出处待补**。
    是否合适?不同任务差别很大。
 4. **"照抄教程 → 改一个条件再跑"**:这个改动的粒度够吗?有没有更好的检查方法?

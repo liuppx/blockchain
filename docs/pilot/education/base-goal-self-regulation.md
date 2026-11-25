@@ -131,10 +131,10 @@
 
 | 论断 | 出处 | 证据类型 |
 |---|---|---|
-| 具体、困难的目标比模糊或容易的目标带来更好表现 | Locke & Latham (2002) *Building a practically useful theory of goal setting and task motivation: A 50-year retrospective*, American Psychologist | 综述 |
-| 目标的效果依赖反馈与能力,没有反馈的具体目标未必有效 | Locke & Latham (2002)(同上); Locke et al. (1968) *Goal Setting and Task Performance*, Psychological Bulletin | 综述 / 实验研究 |
+| 具体、困难的目标比模糊或容易的目标带来更好表现 | Locke & Latham (2002) *Building a practically useful theory of goal setting and task motivation: A 35-year odyssey*, American Psychologist | 综述 |
+| 目标的效果依赖反馈与能力,没有反馈的具体目标未必有效 | Locke & Latham (2002)(同上) | 综述 |
 | 自我监测(self-monitoring)与目标达成的关系 | Locke & Latham (2002)(同上) | 综述 |
-| 自我评估的乐观偏差(人们高估自己的进度) | 例如 Schwartz (1999) *Optimism about efficacy*, in Locke et al. (eds.) *The Psychology of Action*;相关证据分散在自我评估文献中 | 综述 |
+| 自我评估的乐观偏差(人们高估自己的进度) | **出处待补**。相关证据分散在自我评估与自我效能文献里,核验人需补一条可查证的出处 | 待补 |
 | 自主感与胜任感影响持续投入 | Deci & Ryan (2000) *The "what" and "why" of goal pursuits: Human needs and the self-determination of behavior*, Psychological Inquiry | 理论综述 |
 
 ## 争议
@@ -150,8 +150,9 @@
 1. **Locke & Latham 2002 的结论范围**:他们说的"具体困难目标"多指**绩效任务**。
    迁移到"学习知识"上是否成立?我在正文里有没有把绩效任务的结论直接套到学习上?
 2. **"难一点更好"的前提**:我写了"跳一跳够得着"和"有反馈",这是原文的意思还是我的推论?
-3. **乐观偏差的出处**:我给的 Schwartz 1999 是二手的、需要审查者去找更直接的证据;
-   这个论断是否应该改写得更谨慎,或者标注"出处待补"?
+3. **乐观偏差的出处**:我原来给的 Schwartz (1999) *Optimism about efficacy*, in Locke et al. (eds.)
+   *The Psychology of Action* 经核查**查不到**——这本书由 Gollwitzer & Bargh 编,没有这个章节。已删除并改成"出处待补"。
+   核验人必须补上一条可查证的出处,否则这一条应当删掉。
 4. **"外部大目标 + 自己拆细"的建议**:这是我把自我决定论与目标设定拼起来的,
    有没有研究直接支持这种组合?还是我的经验之谈?
 5. **"更细的检查频率不一定更好"**:我提到"长期目标不适合高频检查",这句有依据吗?

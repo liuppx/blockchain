@@ -108,9 +108,9 @@
 |---|---|---|
 | 工作记忆容量约 4 个组块 | Cowan (2001) *The Magical Number 4 in Short-Term Memory*, Behavioral and Brain Sciences | 实验研究与综述 |
 | 容量约 7±2 个信息单元,组块可扩展容量 | Miller (1956) *The Magical Number Seven, Plus or Minus Two*, Psychological Review | 实验研究(年代久远) |
-| 认知负荷分内在、外在、有效三类;教学应减少外在负荷 | Sweller, van Merriënboer & Paas (2019) *Cognitive Architecture and Instructional Design: 20 Years Later*, Educational Psychology Review | 综述 |
-| 教学应先学一般部分再学细节(新手),专家相反 | Sweller, van Merriënboer & Paas (2019)(同上);Kalyuga 等 (2003) *The Expertise Reversal Effect*, Educational Psychologist | 实验研究与综述 |
-| 冗余信息对新手有害、对专家中性或有益 | Kalyuga 等 (2003)(同上);Sweller 等 (2011) *Cognitive Load During Problem Solving*, Cognitive Science | 实验研究 |
+| 认知负荷分内在、外在、有效三类;教学应减少外在负荷 | Sweller, van Merriënboer & Paas (2019) *Cognitive Architecture and Instructional Design: 20 Years Later*, Educational Psychology Review(**注:该文对"有效负荷(germane load)"作了重新定义,不再把它当作独立的第三类负荷;正文里的三分法是较早版本的表述**) | 综述 |
+| 教学应先学一般部分再学细节(新手),专家相反 | Sweller, van Merriënboer & Paas (2019)(同上);Kalyuga, Ayres & Chandler (2003) *The Expertise Reversal Effect*, Educational Psychologist | 实验研究与综述 |
+| 对新手有帮助的引导,对专家会变成冗余甚至有害 | Kalyuga, Ayres & Chandler (2003) *The Expertise Reversal Effect*, Educational Psychologist | 实验研究 |
 
 ## 争议
 
@@ -127,8 +127,15 @@
    我把两者混用了吗?
 2. **Miller 1956 的"7±2"**:它关于的是什么、后来为什么被批评?我在正文里说"后来的研究普遍认为更接近 4",
    这个"普遍"有出处吗?
-3. **Sweller 等 2019 与 2011 两篇的关系**:2019 综述里的三分法与 2011 的问题解决框架是否被我讲混了?
-4. **冗余信息的例外**:我说"对初学者有时确实有帮助",出处是否准确?Kalyuga 的专家逆效应说的是"冗余"还是别的?
+3. **Sweller 2019 综述里的三分法**:2019 那篇对"有效负荷"作了重新定义(不再当作独立的第三类),
+   我在正文里用的三分法是较早版本的表述。核验人请判断:正文该怎么改才既准确又不啰嗦?
+4. **证据表里冗余信息这一条原来写反了**:证据表写的是"冗余信息对新手有害、对专家中性或有益",
+   但 Kalyuga 等 (2003) 说的是**反过来**——对新手有帮助的引导,对专家会变成冗余并可能有害。
+   (正文里"对初学者冗余信息有时有帮助"的说法方向是对的,两处原来自相矛盾。)
+   证据表已改正。核验人请确认这个方向,以及"冗余"在原文里的确切含义。
+   另外我原来引的 Sweller, Ayres & Kalyuga (2011) *Cognitive Load During Problem Solving*,
+   *Cognitive Science* —— 经核查**该文不存在**:那是 Sweller (1988) 单作者在 *Cognitive Science* 12(2) 的文章,
+   讲的是问题解决挤占图式学习,不涉及冗余;而 Sweller, Ayres & Kalyuga (2011) 是 Springer 出版的**书**。已删除。
 5. **"先拆分后综合"的出处**:这是新手/专家差异的推论,原文的措辞是什么?我在正文里有没有把它讲得过于绝对?
 6. **认知负荷理论的争议**:批评意见(过于宽泛、难以证伪)的具体出处是什么?我的争议表是否公允?
 7. **"拆分过度会只见树不见林"**:这是我基于经验的说法,**出处待补**。是否成立?
