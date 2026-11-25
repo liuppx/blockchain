@@ -135,11 +135,11 @@
 | 1 | alice | fitness | (创世) | 0 | 已过 |
 | 2 | bob | llm | (创世) | 0 | 已过 |
 | 3 | mary | llm | alice | 939106 | 11-30 07:21 |
-| 4 | member-4 | fitness | bob | 939169 | 11-30 07:23 |
-| 5 | member-5 | llm | alice | 1033289 | 12-01 14:29 |
-| 6 | member-6 | fitness | bob | 1033328 | 12-01 14:30 |
-| 7 | member-7 | llm | alice | 1120485 | 12-02 19:19 |
-| 8 | member-8 | fitness | bob | 1120492 | 12-02 19:19 |
+| 4 | amy | fitness | bob | 939169 | 11-30 07:23 |
+| 5 | rose | llm | alice | 1033289 | 12-01 14:29 |
+| 6 | jack | fitness | bob | 1033328 | 12-01 14:30 |
+| 7 | tom | llm | alice | 1120485 | 12-02 19:19 |
+| 8 | tony | fitness | bob | 1120492 | 12-02 19:19 |
 
 **对试运行的影响**:
 
