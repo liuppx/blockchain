@@ -57,12 +57,13 @@ OpenAlex、ERIC 与出版社页面,拿不准的一律以登记表为准)。结�
 |---|---|---|
 | 引用真实、著录正确、支撑所引论断 | 13 | 保留 |
 | **论文真实,但著录有误**(期刊、作者、题名、年份) | 9 | 已改正 |
-| **根本不存在**(编造的出处) | 6 | 已删除,换成真实文献或改写为"出处待补" |
+| **根本不存在**(编造的出处) | 7 | 已删除,换成真实文献或改写为"出处待补" |
 | 论文真实,但**不支撑所引的论断** | 2 | 已改写论断或换出处 |
 
-被删掉的 6 条(都已在对应单元的「核验要点」里写明):Butler et al. (2007) *Retrieving "In the Moment"
+被删掉的 7 条(都已在对应单元的「核验要点」里写明):Butler et al. (2007) *Retrieving "In the Moment"
 and Later*、Hyman & Tranel (2012)、Shephard (1967)、Rohrer, Dedrick & Hartwig (2010)、
-Pashler et al. (2007) *Enhancing Learning and Retrieval of New Information*、Schwartz (1999)。
+Pashler et al. (2007) *Enhancing Learning and Retrieval of New Information*、Schwartz (1999),
+以及第二轮补查出的 Birnbaum 等 (2006) *The Teaching of Multiplicative Reasoning*。
 
 **这对核验工作意味着什么**:
 

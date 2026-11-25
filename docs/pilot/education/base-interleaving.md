@@ -109,7 +109,7 @@
 |---|---|---|
 | 交错练习在随后测验中的迁移表现优于分块练习 | Rohrer & Taylor (2007) *The Shuffling of Mathematics Problems Improves Learning*, Instructional Science(**注意:原文的最终测验用的是同类题目,"迁移"这个说法偏强**) | 实验研究 |
 | 交错练习在训练当下表现更差、长期表现更好 | Rohrer & Taylor (2007) *The Shuffling of Mathematics Problems Improves Learning*, Instructional Science;Rohrer, Dedrick, Hartwig & Cheung (2020) *Effects of Interleaved Practice on Mathematics Learning*, Journal of Educational Psychology | 实验研究 |
-| 交错的效果受领域与年龄调节(低龄学习者有时相反) | Birnbaum 等 (2006) *The Teaching of Multiplicative Reasoning: A Structured Intervention Emphasizing Interleaving*, Journal of Educational Psychology(**出处待核**);Rohrer, Dedrick, Hartwig & Cheung (2020) *Effects of Interleaved Practice on Mathematics Learning*, Journal of Educational Psychology | 实验研究 |
+| 交错的效果受领域与年龄调节(低龄学习者有时相反) | Rohrer, Dedrick, Hartwig & Cheung (2020) *Effects of Interleaved Practice on Mathematics Learning*, Journal of Educational Psychology;Rohrer, Dedrick & Stershic (2015) *Interleaved Practice Improves Mathematics Learning*, Journal of Educational Psychology 107(3):900–908 | 实验研究 |
 | 辨别(selecting)与生成(generating)策略的迁移差异 | Rohrer, Dedrick, Hartwig & Cheung (2020) *Effects of Interleaved Practice on Mathematics Learning*, Journal of Educational Psychology | 实验研究 |
 
 ## 争议
@@ -127,7 +127,14 @@
    已从证据表删除,改引 Rohrer & Taylor (2007)。核验人请查:Rohrer 一系关于交错的证据是否还需要更早的源头文献支撑?
    另外:Rohrer & Taylor (2007) 的最终测验用的是**同类题目**,所以"迁移"这个说法偏强,
    证据表里已标注;核验人请判断这个限定是否够,还是应当换成真正跨任务的证据。
-3. **年龄调节效应**:Birnbaum 2006(出处待核)与 Rohrer 等 2020 的结论方向是否一致?我写的"低龄有时相反"是否需要更精确?
+3. **年龄调节效应**:我原来引的 Birnbaum 等 (2006) *The Teaching of Multiplicative Reasoning:
+   A Structured Intervention Emphasizing Interleaving* 经核查**查不到**——没有任何登记表里有这篇
+   *Journal of Educational Psychology* 的 2006 年论文,已删除,改引 Rohrer, Dedrick & Stershic (2015)
+   (七年级学生、三个月的课堂研究)与 Rohrer 等 (2020)(随机对照试验,787 名学生、54 个班)。
+   核验人请查:这两篇与 Birnbaum 等 (2013) *Why interleaving enhances inductive learning:
+   The roles of discrimination and retrieval*, Memory & Cognition 41(3):392–402(交错有效是因为**凸显类别之间的差别**)
+   一起看,"低龄学习者有时相反"的结论方向是否一致?我写的"低龄有时相反"到底有没有可靠出处?
+   如果没有,这一条应当删掉,而不是换个引用。
 4. **"顺序依赖的内容不适合交错"**:这条是我基于概念推理提出的,**出处待补**。是否成立?有没有反例?
 5. **"先分块后交错"的具体分界**:我用"已经见过每一类"来描述,这个判据是否太松?有没有更准确的说法?
 6. **自我验证实验的设计**:12 道题、3 类,这个设计能不能真的测出差别?会不会因为题太少而完全测不出?需不需要给出更可操作的方案?

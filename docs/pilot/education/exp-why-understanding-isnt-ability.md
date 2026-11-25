@@ -125,7 +125,10 @@
 
 ## 核验要点(给人类审查者)
 
-1. **Rohrer 等 2010 的实验设计**:"select vs generate"的操纵是什么?我的概括是否准确?
+1. **"识别 vs 生成"这条我原来的出处是编造的**:我引的 Rohrer 等 (2010) *The Strategy to Select Problems*
+   经核查**在 Instructional Science 里查不到**——这三个人首次合著是 2020 年。已改引
+   Rohrer, Dedrick, Hartwig & Cheung (2020)。核验人请查:该文里"辨别(select)与生成(generate)"
+   具体怎么操作?我写的"识别(看懂解法)与生成(独立解题)表现不同,后者更难"是否准确?
 2. **Kornell & Bjork (2008) 这条我引错了**:经核查,它是 Kornell & Bjork (2008) *Learning concepts and categories:
    Is spacing the enemy of induction?*, **Psychological Science** 19(6):585–592(期刊不是 *Learning and Instruction*,
    第二作者是 Robert A. Bjork)。内容是**把不同画风配对来学类别**,跟"识别 vs 生成"没有关系。已从证据表删除。
