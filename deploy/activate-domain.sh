@@ -128,14 +128,27 @@ remote "cd $DEPLOY && scripts/health-check.sh --level all --retries 60 --interva
   || fail "健康检查没通过;回退:cp config/genesis.toml.bak-$STAMP config/genesis.toml && scripts/starter.sh restart"
 
 info "核对:每个节点都要报同一个领域集合"
+# 注意:领域从激活高度起才出现在 next 里。现在还没到 H*,next 里**没有** $DOMAIN_ID 是正常的——
+# 那一刻要查的是"四个节点的 next 完全一致"(说明它们换上了同一份时刻表),
+# 而不是"next 里有 3"。到 H* 之后再查一次,那时才应该有 3。
+DOMS=""
 for p in 9221 9222 9223 9224; do
   DOM="$(remote "curl -s --max-time 5 -H 'Accept: application/json' http://127.0.0.1:$p/domains")"
   echo "  :$p $DOM"
-  case "$DOM" in
-    *"\"$DOMAIN_ID\""*) ;;
-    *) fail "节点 :$p 的领域集合里没有 $DOMAIN_ID(它没换上新时刻表?):$DOM" ;;
-  esac
+  NEXT="$(printf '%s' "$DOM" | sed -n 's/.*"next":\[\([^]]*\)\].*/\1/p')"
+  DOMS="$DOMS $NEXT"
 done
+if [ "$(printf '%s' "$DOMS" | tr ' ' '\n' | grep -v '^$' | sort -u | wc -l | tr -d ' ')" != 1 ]; then
+  fail "4 个节点的有效领域集合不一致:$DOMS"
+fi
+echo "  4 个节点一致(next=$DOMS)"
+# 时刻表里必须写着这一条(这是"排上了"的直接证据)
+SCHED="$(remote "cd $DEPLOY && ./bin/node genesis-hash --config config/node21.toml | tail -1")"
+echo "  时刻表:$SCHED"
+case "$SCHED" in
+  *"domain-$DOMAIN_ID@$HEIGHT"*) ;;
+  *) fail "时刻表里没有 domain-$DOMAIN_ID@$HEIGHT:$SCHED" ;;
+esac
 H1="$(remote "curl -s $RPC_LOCAL/height" | tr -dc 0-9)"; sleep 10
 H2="$(remote "curl -s $RPC_LOCAL/height" | tr -dc 0-9)"
 echo "  高度 $H1 → $H2(在出块)"
@@ -143,4 +156,6 @@ echo "  高度 $H1 → $H2(在出块)"
 trap - ERR
 echo
 echo "完成:领域 $DOMAIN_ID 将在高度 $HEIGHT 激活(还有约 $(( (HEIGHT - H2) / 3600 )) 小时)。"
+echo "到 H* 之后再核对一次(那时 next 里才会出现 $DOMAIN_ID):"
+echo "  deploy/activate-domain.sh --check"
 echo "回退(激活前):cd $DEPLOY && cp config/genesis.toml.bak-$STAMP config/genesis.toml && scripts/starter.sh restart"
