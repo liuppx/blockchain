@@ -154,14 +154,18 @@
 
 | 账户 | 称呼 | 方向 | 邀请人 | 加入高度 | 见习期满 |
 |---|---|---|---|---|---|
-| 1 | alice | fitness | (创世) | 0 | 已过 |
+| 1 | alice | fitness、education | (创世) | 0 | 已过 |
 | 2 | bob | llm | (创世) | 0 | 已过 |
 | 3 | mary | llm | alice | 939106 | 11-30 07:21 |
 | 4 | amy | fitness | bob | 939169 | 11-30 07:23 |
-| 5 | rose | llm | alice | 1033289 | 12-01 14:29 |
-| 6 | jack | fitness | bob | 1033328 | 12-01 14:30 |
-| 7 | tom | llm | alice | 1120485 | 12-02 19:19 |
+| 5 | rose | llm、education | alice | 1033289 | 12-01 14:29 |
+| 6 | jack | fitness、education | bob | 1033328 | 12-01 14:30 |
+| 7 | tom | llm、education | alice | 1120485 | 12-02 19:19 |
 | 8 | tony | fitness | bob | 1120492 | 12-02 19:19 |
+
+**教育领域的核验人是 alice、jack、rose、tom**(2026-11-26 定)。四个人原本各在一个方向,
+现在多带一个教育方向——这样教育领域一开就有 4 位可指派的核验人,
+不必等新成员加入。
 
 **对试运行的影响**:
 

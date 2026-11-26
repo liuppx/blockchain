@@ -66,7 +66,7 @@ SLIP-0044 的编号),与夜莺钱包「创建钱包 → 知行图钱包」逐字
 
 ```
 称呼:张三
-方向:fitness(运动健身)或 llm(大模型应用开发)
+方向:llm(大模型应用开发)、fitness(运动健身)或 education(教育);可以填多个,用逗号隔开
 公钥:03d330c69dabf7000b34af803bd9da850da0ac808d80d10e2952e84e5b74e35e
 ```
 
@@ -145,7 +145,7 @@ curl -s -X PUT -H "Authorization: Bearer $ZHIXING_RPC_TOKEN" --data-binary @单�
 
 ```sh
 python3 tools/kimport.py --rpc $RPC --bodies https://blockchain.yeying.pub/bodies \
-  --key 你的编号=zhixing-member.json --dir 单元目录 --domain 领域编号   # 1 大模型应用开发,2 运动健身
+  --key 你的编号=zhixing-member.json --dir 单元目录 --domain 领域编号   # 1 大模型应用开发,2 运动健身,3 教育
 ```
 
 ### 怎么阅读与核验
