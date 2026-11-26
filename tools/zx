@@ -153,24 +153,21 @@ class NonceTracker:
         return False
 
 
-def wait_nonce(rpc: str, actor: str, want: int, timeout: float = 90.0):
-    deadline = time.time() + timeout
-    while time.time() < deadline:
-        acct = rpc_get(rpc, f"/account/{actor}")
-        if acct and int(acct["nonce"]) >= want:
-            return True
-        time.sleep(0.6)
-    return False
-
-
 # ---- 确认 -------------------------------------------------------------------
 
-def confirm(what: str) -> bool:
-    """显示要签的内容,等回车确认。返回 True 表示确认。"""
+def confirm(what: str, assume_yes: bool = False) -> bool:
+    """显示要签的内容,等回车确认。返回 True 表示确认。
+
+    `assume_yes` 是给脚本化用的:调用方要显式传 --yes(授权写在命令里,
+    而不是从管道喂一个 "yes" 进去——后者说不清是谁授权的)。
+    """
     print()
     print("──" * 3)
     print(what)
     print("──" * 3)
+    if assume_yes:
+        print("(--yes:已按命令行里的授权直接确认)")
+        return True
     try:
         answer = input("以上内容将签名并永久写入链上。确认发布?输入 yes 回车: ")
     except (EOFError, KeyboardInterrupt):
@@ -258,7 +255,7 @@ def cmd_publish(a) -> int:
     print()
     print("注意:上面按「依据」的依赖顺序排列。链上一个版本只能引用**已存在**的版本,")
     print("      所以指向尚未创建单元的「参见」要等全部建完后再发一版补上(工具会自动处理)。")
-    if not confirm(f"共 {len(order)} 个单元,作者为账户 {a.account}"):
+    if not confirm(f"共 {len(order)} 个单元,作者为账户 {a.account}", a.yes):
         print("已取消,没有签任何东西。")
         return 1
 
@@ -335,15 +332,16 @@ def cmd_revise(a) -> int:
     print(f"修订 #{a.unit}(当前 v{len(unit['versions'])})→ 将发布 v{len(unit['versions']) + 1}")
     print(f"  正文 {len(data)} 字节 · SHA-256 {h[:16]}…")
     print(f"  来源 {a.source}")
-    if not confirm(f"以账户 {a.account} 的身份修订单元 #{a.unit}"):
+    if not confirm(f"以账户 {a.account} 的身份修订单元 #{a.unit}", a.yes):
         print("已取消。")
         return 1
     upload_body(a.bodies, data, token())
-    signed = sign(a.bin, a.key, a.account, account_nonce(a.rpc, a.account),
+    tracker = NonceTracker(a.rpc, a.account)
+    signed = sign(a.bin, a.key, a.account, tracker.take(),
                   ["--action", "publish", "--unit", str(a.unit),
                    "--body", f"zh:{h}", "--source", a.source])
     submit_knowledge(a.rpc, signed)
-    if wait_nonce(a.rpc, a.account, account_nonce(a.rpc, a.account) + 1):
+    if tracker.wait_in_block():
         print(f"已入块:单元 #{a.unit} 的新版本。")
     else:
         print("已提交,稍后刷新查看。")
@@ -374,18 +372,92 @@ def cmd_verify(a) -> int:
     if note_text:
         print(f"  说明:{note_text[:120]}{'…' if len(note_text) > 120 else ''}")
         print(f"  说明正文哈希 {note_hash[:16]}…(原文存正文仓库)")
-    if not confirm(f"以账户 {a.account} 的身份,对单元 #{a.unit} 的 v{a.version} 给出「{label}」"):
+    if not confirm(f"以账户 {a.account} 的身份,对单元 #{a.unit} 的 v{a.version} 给出「{label}」", a.yes):
         print("已取消。")
         return 1
-    signed = sign(a.bin, a.key, a.account, account_nonce(a.rpc, a.account),
+    # 自己记着序号:链上 nonce 只在入块后才前进,连发多条会撞号
+    tracker = NonceTracker(a.rpc, a.account)
+    signed = sign(a.bin, a.key, a.account, tracker.take(),
                   ["--action", "verify", "--unit", str(a.unit), "--version", str(a.version),
                    "--verdict", verdict, "--note-hash", note_hash])
     submit_knowledge(a.rpc, signed)
     print("已提交,等待入块…")
-    if wait_nonce(a.rpc, a.account, account_nonce(a.rpc, a.account) + 1):
+    if tracker.wait_in_block():
         print(f"已入块:单元 #{a.unit} v{a.version} 的核验结论。")
     else:
         print("已提交,稍后刷新查看。")
+    return 0
+
+
+def body_title(bodies: str, h: str) -> str:
+    """从正文仓库取正文,返回第一行 "# 标题"。取不到就返回空串(只用于显示)。"""
+    if not h:
+        return ""
+    try:
+        with urllib.request.urlopen(bodies.rstrip("/") + "/" + h, timeout=10) as r:
+            for line in r.read().decode("utf-8", errors="replace").splitlines():
+                if line.startswith("# "):
+                    return line[2:].strip()
+    except Exception:
+        pass
+    return ""
+
+
+def cmd_verify_many(a) -> int:
+    """一次核验多个单元(同一份说明)。
+
+    逐个签、逐个等入块——链上 nonce 只在入块后才前进,连发会撞号。
+    批量时先列出全部要核验的单元与版本,一次确认后逐个提交。
+    """
+    # 直接按链上的单元号来(单元号是链的身份,标题会改):--unit 17,18,20
+    ids = [int(x) for x in a.units.split(",") if x.strip()]
+    if not ids:
+        raise SystemExit("用 --unit 给出链上的单元号(逗号分隔),例如 --unit 17,18,20")
+    plan = []
+    for uid in ids:
+        detail = rpc_get(a.rpc, f"/unit/{uid}")
+        if detail is None:
+            raise SystemExit(f"链上没有单元 #{uid}")
+        ver = len(detail["versions"])
+        # /unit/{id} 不返回标题(链上只存正文哈希);标题是正文的第一行 "# ..."
+        h = (detail["versions"][-1].get("bodies") or [{}])[0].get("hash", "")
+        plan.append((uid, ver, body_title(a.bodies, h) or f"#{uid}"))
+    # 同一个单元只核验一次
+    seen, dedup = set(), []
+    for item in plan:
+        if item[0] in seen:
+            continue
+        seen.add(item[0])
+        dedup.append(item)
+    plan = dedup
+
+    note_text = open(a.note, encoding="utf-8").read().strip() if a.note else ""
+    if note_text:
+        note_hash = upload_body(a.bodies, note_text.encode("utf-8"), token())
+    else:
+        note_hash = "00" * 32
+
+    print(f"准备核验 {len(plan)} 个单元(账户 {a.account},结论:通过):")
+    for uid, ver, title in plan:
+        print(f"  #{uid} v{ver}  {title}")
+    if note_text:
+        print(f"\n说明(每个单元都用这一份):{note_text[:100]}{'…' if len(note_text) > 100 else ''}")
+        print(f"说明正文哈希 {note_hash[:16]}…(原文存正文仓库)")
+    if not confirm(f"共 {len(plan)} 个单元,账户 {a.account}", a.yes):
+        print("已取消。")
+        return 1
+
+    tracker = NonceTracker(a.rpc, a.account)
+    for uid, ver, title in plan:
+        signed = sign(a.bin, a.key, a.account, tracker.take(),
+                      ["--action", "verify", "--unit", str(uid), "--version", str(ver),
+                       "--verdict", "pass", "--note-hash", note_hash])
+        submit_knowledge(a.rpc, signed)
+        if not tracker.wait_in_block():
+            raise SystemExit(f"#{uid} 的核验 op 迟迟没入块(链上 nonce 没前进);稍后再试剩下的")
+        print(f"  已核验 #{uid} v{ver}")
+    print()
+    print(f"完成:{len(plan)} 个单元的核验结论已入块。")
     return 0
 
 
@@ -401,14 +473,15 @@ def cmd_invite(a) -> int:
             raise SystemExit(f"这个公钥已经是链上成员了(账户 #{m['id']}),不用再邀请。")
     print(f"邀请新成员:公钥 {pk[:16]}…")
     print("  对方加入后会有自己的账户号与见习期(见习期内的核验照常记录,但暂不计入可信度)。")
-    if not confirm(f"以账户 {a.account} 的身份邀请这个公钥"):
+    if not confirm(f"以账户 {a.account} 的身份邀请这个公钥", a.yes):
         print("已取消。")
         return 1
-    signed = sign(a.bin, a.key, a.account, account_nonce(a.rpc, a.account),
+    tracker = NonceTracker(a.rpc, a.account)
+    signed = sign(a.bin, a.key, a.account, tracker.take(),
                   ["--action", "invite", "--pubkey", pk])
     submit_knowledge(a.rpc, signed)
     print("已提交,等待入块…")
-    if wait_nonce(a.rpc, a.account, account_nonce(a.rpc, a.account) + 1):
+    if tracker.wait_in_block():
         members = (rpc_get(a.rpc, "/members?limit=200") or {}).get("items", [])
         for m in members:
             if m.get("pubkey") == pk:
@@ -461,7 +534,7 @@ def cmd_follow(a) -> int:
         print(f"  依据 #{c['unit']}: v{c['version']} → v{ver}")
     print()
     print("确认被依据单元的新版本没有改变本单元赖以成立的内容。")
-    if not confirm(f"以账户 {a.account} 的身份跟进单元 #{a.unit}"):
+    if not confirm(f"以账户 {a.account} 的身份跟进单元 #{a.unit}", a.yes):
         print("已取消。")
         return 1
     # 来源与正文原样带上(链上记的就是 source 字段,形如 "human" / "model:ID")
@@ -473,10 +546,11 @@ def cmd_follow(a) -> int:
     for c in latest.get("cites", []):
         ver = updated.get(c["unit"], c["version"])
         argv += ["--cite", f"{c['unit']}:{ver}:{c['kind']}"]
-    signed = sign(a.bin, a.key, a.account, account_nonce(a.rpc, a.account), argv)
+    tracker = NonceTracker(a.rpc, a.account)
+    signed = sign(a.bin, a.key, a.account, tracker.take(), argv)
     submit_knowledge(a.rpc, signed)
     print("已提交,等待入块…")
-    if wait_nonce(a.rpc, a.account, account_nonce(a.rpc, a.account) + 1):
+    if tracker.wait_in_block():
         print(f"已入块:单元 #{a.unit} 的新版本。")
         print("依据本单元的下游单元现在可能过时了,再运行一次 zx follow 查看。")
     else:
@@ -517,6 +591,9 @@ def main(argv=None) -> int:
                     help="你的密钥文件:加密 keystore(推荐)、或 64 位十六进制种子(可带 0x 前缀)")
     ap.add_argument("--bin", default=os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                                   "..", "node", "target", "release", "node"))
+    ap.add_argument("--yes", action="store_true",
+                    help="按命令行里的授权直接确认,不再等回车(脚本化用;"
+                         "链上记录不可撤销,确认的内容仍会完整打印)")
     sub = ap.add_subparsers(dest="cmd", required=True)
 
     p = sub.add_parser("publish", help="发布一个目录下的单元(按依据的拓扑序)")
@@ -538,6 +615,12 @@ def main(argv=None) -> int:
     g.add_argument("--needs-revision", dest="needs_revision", action="store_true", help="结论:需修改")
     p.add_argument("--note", help="核验说明文件(判「需修改」时必填)")
     p.set_defaults(func=cmd_verify)
+
+    p = sub.add_parser("verify-many", help="一次核验多个单元(同一份说明)")
+    p.add_argument("--unit", dest="units", required=True,
+                   help="链上的单元号(逗号分隔),例如 --unit 17,18,20")
+    p.add_argument("--note", help="核验说明文件(每个单元都用这一份)")
+    p.set_defaults(func=cmd_verify_many)
 
     p = sub.add_parser("invite", help="邀请新成员")
     p.add_argument("--pubkey", required=True, help="对方的 64 位十六进制公钥")
