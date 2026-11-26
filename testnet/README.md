@@ -85,9 +85,22 @@ testnet/soak.sh [DURATION_S=180] [INTERVAL_S=10] [LAG=2] [LEAK_PCT=50] [load]
 testnet/gen.sh --members testnet/members.toml --force    # 账户 1..N = 名单顺序,不生成任何成员密钥
 ```
 
-生成时会校验每个公钥(64 位十六进制、不重复)与方向(fitness / llm);称呼只写入链下名单
+生成时会校验每个公钥(64 位十六进制、不重复)与方向(llm / fitness / education,可填多个,逗号分隔);
+称呼只写入链下名单
 `testnet/out/members.md`,不上链。第一批成员即创世成员,不需要见习期;之后加入的人由他们邀请,须经见习期。
 实测:两名成员各用自己的密钥文件,一人创建单元、另一人核验,可信度 0.1 → 0.4;组织者全程不接触任何成员私钥。
+
+**三个领域的核验分工**(方向是链下记录,不上链):
+
+| 领域 | 编号 | 核验人 |
+|---|---|---|
+| 大模型应用开发 | 1 | bob、mary、rose、tom |
+| 运动健身 | 2 | alice、amy、jack、tony |
+| 教育 | 3 | **alice、jack、rose、tom**(2026-11-26 定;这四位原本各在一个方向,现在多带教育方向) |
+
+教育领域的第一批 10 个单元由 **jack** 发布(他用自己的密钥,组织者不接触私钥),
+操作步骤见 [`EDUCATION-PUBLISH-NOTES.md`](EDUCATION-PUBLISH-NOTES.md);
+核验人按 [`REVIEWER-GUIDE-EDUCATION.md`](REVIEWER-GUIDE-EDUCATION.md) 走。
 
 ```sh
 # 把运动健身试运行单元导入测试网(作者为账户 1,经令牌保护的 /knowledge 提交,从加密 keystore 签名)

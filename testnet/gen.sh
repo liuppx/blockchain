@@ -114,11 +114,24 @@ if not ms:
     sys.exit("member list has no [[members]] entries")
 seen = set()
 for i, m in enumerate(ms, 1):
-    name, focus, pk = m.get("name", "").strip(), m.get("focus", "").strip(), m.get("pubkey", "").strip().lower()
+    name, pk = m.get("name", "").strip(), m.get("pubkey", "").strip().lower()
     if not name:
         sys.exit(f"member #{i}: name is required")
-    if focus not in ("fitness", "llm"):
-        sys.exit(f"member #{i} ({name}): focus must be fitness or llm, got {focus!r}")
+    # focus 可以是单个方向,也可以是列表(一个人可以负责多个领域)。
+    # 领域编号:1 大模型应用开发,2 运动健身,3 教育。名字只在词表里定义。
+    focus = m.get("focus", "")
+    if isinstance(focus, str):
+        focus = [f.strip() for f in focus.split(",") if f.strip()]
+    elif isinstance(focus, list):
+        focus = [str(f).strip() for f in focus if str(f).strip()]
+    else:
+        sys.exit(f"member #{i} ({name}): focus must be a string or a list")
+    if not focus:
+        sys.exit(f"member #{i} ({name}): focus is required")
+    for f in focus:
+        if f not in ("llm", "fitness", "education"):
+            sys.exit(f"member #{i} ({name}): focus must be llm / fitness / education, got {f!r}")
+    focus = ",".join(focus)
     if not re.fullmatch(r"[0-9a-f]{64}", pk):
         sys.exit(f"member #{i} ({name}): pubkey must be 64 hex chars (the line `pubkey ...` printed by keygen)")
     if pk in seen:
