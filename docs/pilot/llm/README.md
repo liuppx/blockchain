@@ -15,6 +15,8 @@
 | [采样与温度](base-sampling-temperature.md) | 基础 | 模型生成 · 待核验 |
 | [模型本身不保存对话](base-stateless.md) | 基础 | 模型生成 · 待核验 |
 | [嵌入(embedding)](base-embedding.md) | 基础 | 模型生成 · 待核验 |
+| [工具调用:模型提出请求,应用执行工具](base-tool-calling.md) | 基础 | 模型生成 · 待核验 |
+| [多轮智能体评测](app-agent-evaluation.md) | 应用 | 模型生成 · 待核验 |
 | [为什么聊久了,模型会"忘记"前面说过的话](exp-why-model-forgets.md) | 解释 | 模型生成 · 待核验 |
 | [资料太多放不进上下文:检索增强,还是长上下文](scn-rag-or-long-context.md) | 场景 | 模型生成 · 待核验 |
 | [按词元预算管理对话历史](app-conversation-history-budget.md) | 应用 | 模型生成 · 待核验 |
@@ -33,6 +35,8 @@
 | 词元 | tiktoken 分词演示 | ✅ 已运行,结果写入单元 |
 | 采样与温度 | 标准库 softmax 演示 | ✅ 已运行,与"预期"一致 |
 | 按词元预算管理对话历史 | 标准库实现 + 自检 | ✅ 已运行,与"预期输出"一致 |
+| 工具调用 | 标准库模拟应用执行、参数校验和权限检查 | ✅ 已运行 |
+| 多轮智能体评测 | 标准库环境状态评分,分别检查成功与越权写入 | ✅ 已运行 |
 | 预测下一个词元 | GPT-2 本地演示 | ❌ 未运行(需下载约 500 MB 模型) |
 | 其余单元 | 需要调用模型接口的对比实验 | ❌ 需审查者用自己的接口运行 |
 
@@ -50,7 +54,8 @@
 
 ```sh
 export ZHIXING_RPC_TOKEN=...   # 组织者私下提供
-python3 tools/kimport.py --dir docs/pilot/llm --domain 1 \
-  --rpc https://blockchain.yeying.pub/rpc --bodies https://blockchain.yeying.pub/bodies \
-  --key 你的编号=你的密钥文件.json
+./tools/zx --account 你的编号 --key 你的密钥.json publish docs/pilot/llm --domain 1
 ```
+
+[`tools/zx`](../tools/zx.md) 是签名提交工具:私钥只在本机,只把签好的字节发到节点;
+每次签名前显示要签的内容并等确认。

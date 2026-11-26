@@ -46,23 +46,25 @@ curl -s -H 'Accept: application/json' https://blockchain.yeying.pub/rpc/domains
 git clone https://github.com/yeying-community/blockchain.git
 cd blockchain
 
-# 2. 准备你的密钥文件
-#    钱包导出的知行图账户密钥,或 node keygen --encrypt --out zhixing-member.json 生成的
-#    (助记词按 SLIP-0010 派生,与钱包里的账户是同一个)
+# 2. 准备你的密钥文件(二选一)
+#    a) 从夜莺钱包导出:知行图首页的「导出密钥文件」。产出的是与 node keygen --encrypt
+#       同格式的文件,链侧工具直接能用。口令是**那个文件自己的**,与钱包密码无关。
+#    b) 自己生成:node keygen --encrypt --out zhixing-member.json
+#       (助记词按 SLIP-0010 派生,与钱包里的账户是同一个)
 
-# 3. 导入(会自动上传正文、取序号、等入块)
+# 3. 先确认这把密钥就是账户 6
 export ZHIXING_RPC_TOKEN=<组织者给你的写入令牌>
-python3 tools/kimport.py \
-  --rpc https://blockchain.yeying.pub/rpc \
-  --bodies https://blockchain.yeying.pub/bodies \
-  --key 6=zhixing-member.json \
-  --dir docs/pilot/education \
-  --domain 3
+./tools/zx --account 6 --key zhixing-member.json whoami
+
+# 4. 发布(会显示整批清单,输入 yes 回车确认后才签名)
+./tools/zx --account 6 --key zhixing-member.json publish docs/pilot/education --domain 3
 ```
 
-输出里会看到每个单元的 `created unit N`,以及几个单元的 `published unit N v2`
-——那是导入工具在补"参见"引用:链上一个版本只能引用已存在的版本,
-所以指向还没建的单元的"参见"要等全部建完再发 v2 补上。这是正常的。
+`zx` 会先列出 10 个单元的标题、层级、正文哈希与引用,等你确认;确认后逐个上传正文、签名、
+提交并等入块。最后几个单元会再发一个 v2——那是在补"参见"引用:链上一个版本只能引用已存在的版本,
+所以指向还没建的单元的"参见"要等全部建完再补。这是正常的。
+
+工具说明见 [`docs/tools/zx.md`](../docs/tools/zx.md)。
 
 ## 4. 导入之后
 

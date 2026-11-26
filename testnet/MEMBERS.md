@@ -141,12 +141,17 @@ curl -s -X PUT -H "Authorization: Bearer $ZHIXING_RPC_TOKEN" --data-binary @单�
   https://blockchain.yeying.pub/bodies/$H
 ```
 
-批量导入一个目录下的单元文件,用 `tools/kimport.py`,它会自动上传正文、取序号、等待入块:
+在终端里做,用 **`tools/zx`**(签名提交工具,说明见 [`docs/tools/zx.md`](../docs/tools/zx.md))。
+私钥只在本机,工具只把签好的字节发到节点;每次签名前都显示要签的内容并等你确认:
 
 ```sh
-python3 tools/kimport.py --rpc $RPC --bodies https://blockchain.yeying.pub/bodies \
-  --key 你的编号=zhixing-member.json --dir 单元目录 --domain 领域编号   # 1 大模型应用开发,2 运动健身,3 教育
+export ZHIXING_RPC_TOKEN=<写入令牌>
+./tools/zx --account 你的编号 --key zhixing-member.json whoami              # 先确认身份
+./tools/zx --account 你的编号 --key zhixing-member.json publish 单元目录 --domain 领域编号
+./tools/zx --account 你的编号 --key zhixing-member.json verify --unit N --version V --pass
 ```
+
+领域编号:1 大模型应用开发,2 运动健身,3 教育。
 
 ### 怎么阅读与核验
 

@@ -1369,7 +1369,20 @@ pub fn decode_pubkey(s: &str, field: &str) -> Result<PubKey, ConfigError> {
 /// Public so the `encode-tx` CLI parses a `--key-file` with the exact same format
 /// and `ConfigError::BadHex` errors as a validator's `seed_hex`.
 pub fn decode_seed(s: &str, field: &str) -> Result<[u8; 32], ConfigError> {
-    decode_hex_n::<32>(s, field)
+    decode_hex_n::<32>(strip_0x(s), field)
+}
+
+/// 去掉十六进制串开头的 `0x`(大小写都认)。
+///
+/// 夜莺钱包把知行图账户的私钥存成 `0x` 开头的十六进制(ethers 的惯例),
+/// 用户从钱包复制出来直接存成文件交给 `--key-file` 是很自然的做法——
+/// 链侧不认 `0x` 就会把它当成加密 keystore,然后报一个和真实原因无关的
+/// "读不到口令"。所以这里统一剥掉。
+pub fn strip_0x(s: &str) -> &str {
+    let t = s.trim();
+    t.strip_prefix("0x")
+        .or_else(|| t.strip_prefix("0X"))
+        .unwrap_or(t)
 }
 
 fn decode_hex(s: &str, field: &str) -> Result<Vec<u8>, ConfigError> {

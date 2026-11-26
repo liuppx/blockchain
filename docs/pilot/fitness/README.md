@@ -12,6 +12,7 @@
 | [核心稳定](base-core-stability.md) | 基础 | 模型生成 · 待核验 |
 | [关节的稳定与灵活](base-joint-stability-mobility.md) | 基础 | 模型生成 · 待核验 |
 | [运动前自我评估](base-preparticipation-screening.md) | 基础 | 模型生成 · 待核验 |
+| [热身](base-warm-up.md) | 基础 | 模型生成 · 待核验 |
 | [深蹲](app-squat.md) | 应用(力量训练) | 模型生成 · 待核验 |
 
 **图谱与可信度**见 [`GRAPH.md`](GRAPH.md),由 `python3 tools/kgraph.py docs/pilot/fitness` 生成。
@@ -38,6 +39,6 @@
 ./cmd units         # 查看各单元的链上可信度与瓶颈
 ```
 
-导入工具 [`tools/kimport.py`](../../../tools/kimport.py) 与 `kgraph.py` 共用解析器。"渐进超负荷"与"超量恢复"
+导入工具 [`tools/zx`](../../../docs/tools/zx.md) 与 `kgraph.py` 共用解析器。"渐进超负荷"与"超量恢复"
 互为"参见",而链上一个版本只能引用已存在的版本,所以导入时先创建、再为"渐进超负荷"发布 **v2** 补上参见。
 因此它的 v1 核验不会带到 v2(核验只对当时的版本有效),而"深蹲"锁定引用的是 v1,不受影响,并提示"引用已过时"。

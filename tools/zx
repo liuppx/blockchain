@@ -1,0 +1,532 @@
+#!/usr/bin/env python3
+"""知行图命令行:签名并提交知识操作(发布/修订/核验/邀请/跟进依据)。
+
+    zx publish  单元目录            # 发布一个目录下的单元(按"依据"拓扑序)
+    zx revise   单元文件 --unit N   # 为已有单元发布新版本
+    zx verify   --unit N --version V [--pass|--needs-revision] [--note 文件]
+    zx invite   --pubkey HEX
+    zx follow   [--unit N]          # 列出/跟进依据已过时的单元
+    zx whoami                        # 看看这把密钥对应链上哪个账户
+
+**密钥只在本机**:签名用 `node encode-knowledge-op`,它读加密 keystore,口令在终端无回显输入
+(或用环境变量 ZHIXING_KEYSTORE_PASSWORD)。私钥从不离开本机,也不经过网络——工具只把**签好的字节**
+发到节点的 /knowledge。
+
+**每次签名前都显示要签的内容并等回车确认**。链上记录不可撤销,所以这一步不能省。
+批量发布时一次确认整批清单,而不是一个一个问。
+
+纯 Python 标准库(不依赖第三方包)。
+"""
+from __future__ import annotations
+
+import argparse
+import getpass
+import hashlib
+import json
+import os
+import subprocess
+import sys
+import tempfile
+import time
+import urllib.error
+import urllib.request
+
+TESTNET_RPC = "https://blockchain.yeying.pub/rpc"
+TESTNET_BODIES = "https://blockchain.yeying.pub/bodies"
+LAYERS = {"基础": "foundation", "解释": "explanation", "场景": "scenario", "应用": "application"}
+LAYER_NAMES = {"foundation": "基础", "explanation": "解释", "scenario": "场景", "application": "应用"}
+DEFAULT_MODEL = "claude-opus-5-5"
+
+
+# ---- 链上读写 ----------------------------------------------------------------
+
+def rpc_get(rpc: str, path: str):
+    req = urllib.request.Request(rpc + path, headers={"Accept": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=15) as r:
+            return json.loads(r.read().decode())
+    except urllib.error.HTTPError as e:
+        if e.code == 404:
+            return None
+        raise
+
+
+def rpc_post(rpc: str, path: str, data: bytes, token: str = ""):
+    headers = {"Content-Type": "application/octet-stream"}
+    if token:
+        headers["Authorization"] = "Bearer " + token
+    req = urllib.request.Request(rpc + path, data=data, headers=headers, method="POST")
+    try:
+        with urllib.request.urlopen(req, timeout=20) as r:
+            return r.read().decode().strip()
+    except urllib.error.HTTPError as e:
+        detail = e.read().decode(errors="replace").strip()
+        raise SystemExit(f"提交失败: HTTP {e.code} {detail}")
+
+
+def upload_body(bodies: str, data: bytes, token: str = "") -> str:
+    """把正文存进内容寻址的正文仓库,返回它的 SHA-256。"""
+    h = hashlib.sha256(data).hexdigest()
+    headers = {"Content-Type": "text/markdown; charset=utf-8"}
+    if token:
+        headers["Authorization"] = "Bearer " + token
+    req = urllib.request.Request(bodies.rstrip("/") + "/" + h, data=data, headers=headers, method="PUT")
+    try:
+        with urllib.request.urlopen(req, timeout=20) as r:
+            r.read()
+    except urllib.error.HTTPError as e:
+        raise SystemExit(f"正文上传失败: HTTP {e.code} {e.read().decode(errors='replace').strip()}")
+    return h
+
+
+def token() -> str:
+    """写入令牌。ZHIXING_LOCAL=1 时用本地开发链的固定令牌(否则优先环境变量)。"""
+    if os.environ.get("ZHIXING_LOCAL") == "1":
+        return "local-dev-token"
+    t = os.environ.get("ZHIXING_RPC_TOKEN", "")
+    if t:
+        return t
+    raise SystemExit(
+        "需要写入令牌:请设置环境变量 ZHIXING_RPC_TOKEN(向组织者要)。\n"
+        "本地开发链可用 ZHIXING_LOCAL=1(令牌是 local-dev-token)。"
+    )
+
+
+# ---- 签名 -------------------------------------------------------------------
+
+def sign(bin_path: str, keyfile: str, actor: str, nonce: int, argv: list[str]) -> bytes:
+    """调用 node encode-knowledge-op 签名。口令由 node 自己无回显提示(除非给了环境变量)。"""
+    with tempfile.NamedTemporaryFile(suffix=".bin", delete=False) as t:
+        out = t.name
+    try:
+        enc = subprocess.run(
+            [bin_path, "encode-knowledge-op", "--key-file", keyfile, "--out", out,
+             "--actor", str(actor), "--nonce", str(nonce), *argv],
+            capture_output=True, text=True,
+        )
+        if enc.returncode != 0:
+            raise SystemExit("签名失败: " + (enc.stderr or enc.stdout).strip())
+        return open(out, "rb").read()
+    finally:
+        if os.path.exists(out):
+            os.unlink(out)
+
+
+def submit_knowledge(rpc: str, signed: bytes) -> str:
+    return rpc_post(rpc, "/knowledge", signed, token())
+
+
+def account_nonce(rpc: str, actor: str) -> int:
+    acct = rpc_get(rpc, f"/account/{actor}")
+    if acct is None:
+        raise SystemExit(f"链上找不到账户 {actor}")
+    return int(acct["nonce"])
+
+
+def wait_nonce(rpc: str, actor: str, want: int, timeout: float = 90.0):
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        acct = rpc_get(rpc, f"/account/{actor}")
+        if acct and int(acct["nonce"]) >= want:
+            return True
+        time.sleep(0.6)
+    return False
+
+
+# ---- 确认 -------------------------------------------------------------------
+
+def confirm(what: str) -> bool:
+    """显示要签的内容,等回车确认。返回 True 表示确认。"""
+    print()
+    print("──" * 3)
+    print(what)
+    print("──" * 3)
+    try:
+        answer = input("以上内容将签名并永久写入链上。确认发布?输入 yes 回车: ")
+    except (EOFError, KeyboardInterrupt):
+        print()
+        return False
+    return answer.strip().lower() in ("yes", "y")
+
+
+# ---- 单元解析(与 kgraph 共用同一套规则) -------------------------------------
+
+def parse_units(directory: str) -> dict:
+    """读一个目录下的单元文件,返回 {文件名: 单元}。解析规则与 tools/kgraph.py 一致。"""
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    import kgraph  # noqa: E402
+
+    units = {}
+    for f in sorted(os.listdir(directory)):
+        if not f.endswith(".md") or f in ("README.md", "GRAPH.md"):
+            continue
+        u = kgraph.parse(os.path.join(directory, f))
+        if "层级" in u.meta:
+            units[f] = u
+    if not units:
+        raise SystemExit(f"{directory} 里没有找到知识单元(要带「层级」字段的 .md 文件)")
+    return units
+
+
+def topo_order(units: dict) -> list:
+    """按"依据"的拓扑序;"依据"成环或目标缺失即报错(链上规则:依据无环)。"""
+    order, state = [], {}
+
+    def visit(f, stack):
+        if state.get(f) == 2:
+            return
+        if state.get(f) == 1:
+            raise SystemExit("依据成环: " + " → ".join(stack + [f]))
+        state[f] = 1
+        for c in units[f].cites:
+            if c.kind == "依据":
+                if c.target not in units:
+                    raise SystemExit(f"{f} 依据的 {c.target} 不存在")
+                visit(c.target, stack + [f])
+        state[f] = 2
+        order.append(f)
+
+    for f in sorted(units):
+        visit(f, [])
+    return order
+
+
+def source_arg(src: str) -> str:
+    """把单元头部的"来源"映射为 CLI 的 --source,保留明确标注的模型名称。"""
+    import re
+    m = re.search(r"模型生成\s*\(([^)]+)\)", src)
+    model_id = re.sub(r"[^a-z0-9]+", "-", m.group(1).strip().lower()).strip("-") if m else DEFAULT_MODEL
+    if "人工核验过的模型生成" in src:
+        return f"model-verified:{model_id}"
+    if "模型生成" in src:
+        return f"model:{model_id}"
+    return "human"
+
+
+# ---- 各条子命令 -------------------------------------------------------------
+
+def cmd_publish(a) -> int:
+    units = parse_units(a.dir)
+    order = topo_order(units)
+    bodies = {}
+    for f in order:
+        data = open(os.path.join(a.dir, f), "rb").read()
+        bodies[f] = (data, hashlib.sha256(data).hexdigest())
+
+    print(f"准备发布 {len(order)} 个单元(领域 {a.domain})到 {a.rpc}")
+    print()
+    for f in order:
+        u = units[f]
+        data, h = bodies[f]
+        cites = []
+        for c in u.cites:
+            cites.append(f"#{c.target.replace('.md', '')} v1 {c.kind}")
+        print(f"  {u.title}")
+        print(f"    层级 {u.layer} · 正文 {len(data)} 字节 · SHA-256 {h[:16]}…")
+        if cites:
+            print(f"    引用: {'; '.join(cites)}")
+    print()
+    print("注意:上面按「依据」的依赖顺序排列。链上一个版本只能引用**已存在**的版本,")
+    print("      所以指向尚未创建单元的「参见」要等全部建完后再发一版补上(工具会自动处理)。")
+    if not confirm(f"共 {len(order)} 个单元,作者为账户 {a.account}"):
+        print("已取消,没有签任何东西。")
+        return 1
+
+    actor = a.account
+    ids: dict[str, int] = {}
+    deferred: dict[str, list] = {}
+    for f in order:
+        u = units[f]
+        data, h = bodies[f]
+        upload_body(a.bodies, data, token())
+        cites, later = [], []
+        for c in u.cites:
+            kind = "basis" if c.kind == "依据" else "see-also"
+            if c.target in ids:
+                cites += ["--cite", f"{ids[c.target]}:1:{kind}"]
+            else:
+                later.append((c.target, kind))
+        if later:
+            deferred[f] = later
+        layer = LAYERS.get(u.layer)
+        if not layer:
+            raise SystemExit(f"{f}: 未知层级 {u.layer}")
+        expect = int((rpc_get(a.rpc, "/units?limit=1") or {}).get("total", "0")) + 1
+        signed = sign(a.bin, a.key, actor, account_nonce(a.rpc, actor),
+                      ["--action", "create", "--layer", layer, "--domain", str(a.domain),
+                       "--body", f"zh:{h}", "--source", source_arg(u.source), *cites])
+        submit_knowledge(a.rpc, signed)
+        deadline = time.time() + 60
+        while time.time() < deadline:
+            if rpc_get(a.rpc, f"/unit/{expect}"):
+                break
+            time.sleep(0.6)
+        else:
+            raise SystemExit(f"单元 {expect}({f}) 没能在 60 秒内入块;用 zx follow 查状态")
+        ids[f] = expect
+        print(f"  已发布 #{expect} {u.title}")
+
+    # 第二遍:补上「参见」与过时的「依据」——为需要的单元发布新版本。
+    ver = {f: 1 for f in ids}
+    for f in order:
+        u = units[f]
+        needs = f in deferred
+        if not needs:
+            continue
+        cites = []
+        for c in u.cites:
+            kind = "basis" if c.kind == "依据" else "see-also"
+            if c.target in ids:
+                cites += ["--cite", f"{ids[c.target]}:{ver[c.target]}:{kind}"]
+        signed = sign(a.bin, a.key, actor, account_nonce(a.rpc, actor),
+                      ["--action", "publish", "--unit", str(ids[f]),
+                       "--body", f"zh:{bodies[f][1]}", "--source", source_arg(u.source), *cites])
+        submit_knowledge(a.rpc, signed)
+        ver[f] = 2
+        print(f"  已发布 #{ids[f]} v2(补上参见)")
+    print()
+    print(f"完成:共 {len(ids)} 个单元。用 zx follow 看有没有依据过时的单元。")
+    return 0
+
+
+def cmd_revise(a) -> int:
+    data = open(a.file, "rb").read()
+    h = hashlib.sha256(data).hexdigest()
+    unit = rpc_get(a.rpc, f"/unit/{a.unit}")
+    if unit is None:
+        raise SystemExit(f"链上没有单元 #{a.unit}")
+    print(f"修订 #{a.unit}(当前 v{len(unit['versions'])})→ 将发布 v{len(unit['versions']) + 1}")
+    print(f"  正文 {len(data)} 字节 · SHA-256 {h[:16]}…")
+    print(f"  来源 {a.source}")
+    if not confirm(f"以账户 {a.account} 的身份修订单元 #{a.unit}"):
+        print("已取消。")
+        return 1
+    upload_body(a.bodies, data, token())
+    signed = sign(a.bin, a.key, a.account, account_nonce(a.rpc, a.account),
+                  ["--action", "publish", "--unit", str(a.unit),
+                   "--body", f"zh:{h}", "--source", a.source])
+    submit_knowledge(a.rpc, signed)
+    if wait_nonce(a.rpc, a.account, account_nonce(a.rpc, a.account) + 1):
+        print(f"已入块:单元 #{a.unit} 的新版本。")
+    else:
+        print("已提交,稍后刷新查看。")
+    return 0
+
+
+def cmd_verify(a) -> int:
+    unit = rpc_get(a.rpc, f"/unit/{a.unit}")
+    if unit is None:
+        raise SystemExit(f"链上没有单元 #{a.unit}")
+    verdict = "needs-revision" if a.needs_revision else "pass"
+    label = "需修改" if a.needs_revision else "通过"
+    if len(unit["versions"]) < a.version:
+        raise SystemExit(f"单元 #{a.unit} 只有 {len(unit['versions'])} 个版本,没有 v{a.version}")
+    note_hash = "00" * 32
+    note_text = ""
+    if a.note:
+        note_text = open(a.note, encoding="utf-8").read().strip()
+        if not note_text:
+            raise SystemExit(f"说明文件 {a.note} 是空的")
+        if a.needs_revision and len(note_text) < 5:
+            raise SystemExit("判「需修改」必须写一句具体是什么不对(网页版也这么要求)")
+        note_hash = upload_body(a.bodies, note_text.encode("utf-8"), token())
+    print(f"核验 单元 #{a.unit} v{a.version} → {label}")
+    print(f"  当前版本作者:账户 {unit['author']}")
+    if str(unit["author"]) == str(a.account):
+        raise SystemExit("不能核验自己发布的版本(链上规则)。")
+    if note_text:
+        print(f"  说明:{note_text[:120]}{'…' if len(note_text) > 120 else ''}")
+        print(f"  说明正文哈希 {note_hash[:16]}…(原文存正文仓库)")
+    if not confirm(f"以账户 {a.account} 的身份,对单元 #{a.unit} 的 v{a.version} 给出「{label}」"):
+        print("已取消。")
+        return 1
+    signed = sign(a.bin, a.key, a.account, account_nonce(a.rpc, a.account),
+                  ["--action", "verify", "--unit", str(a.unit), "--version", str(a.version),
+                   "--verdict", verdict, "--note-hash", note_hash])
+    submit_knowledge(a.rpc, signed)
+    print("已提交,等待入块…")
+    if wait_nonce(a.rpc, a.account, account_nonce(a.rpc, a.account) + 1):
+        print(f"已入块:单元 #{a.unit} v{a.version} 的核验结论。")
+    else:
+        print("已提交,稍后刷新查看。")
+    return 0
+
+
+def cmd_invite(a) -> int:
+    pk = a.pubkey.strip().lower()
+    if len(pk) != 64 or any(c not in "0123456789abcdef" for c in pk):
+        raise SystemExit("--pubkey 应是 64 位十六进制公钥")
+    # 已经是成员就别再邀请(邀请一个已在链上的公钥会被链拒)
+    members = (rpc_get(a.rpc, "/members?limit=500") or {}).get("items", [])
+    for m in members:
+        acct = rpc_get(a.rpc, f"/account/{m['id']}")
+        if acct and str(acct.get("pubkey", "")).lower() == pk:
+            raise SystemExit(f"这个公钥已经是链上成员了(账户 #{m['id']}),不用再邀请。")
+    print(f"邀请新成员:公钥 {pk[:16]}…")
+    print("  对方加入后会有自己的账户号与见习期(见习期内的核验照常记录,但暂不计入可信度)。")
+    if not confirm(f"以账户 {a.account} 的身份邀请这个公钥"):
+        print("已取消。")
+        return 1
+    signed = sign(a.bin, a.key, a.account, account_nonce(a.rpc, a.account),
+                  ["--action", "invite", "--pubkey", pk])
+    submit_knowledge(a.rpc, signed)
+    print("已提交,等待入块…")
+    if wait_nonce(a.rpc, a.account, account_nonce(a.rpc, a.account) + 1):
+        members = (rpc_get(a.rpc, "/members?limit=200") or {}).get("items", [])
+        for m in members:
+            if m.get("pubkey") == pk:
+                print(f"已入块:新成员的账户号是 #{m['id']}。")
+                break
+    else:
+        print("已提交,稍后刷新查看。")
+    return 0
+
+
+def stale_units(rpc: str) -> list:
+    out = []
+    for it in (rpc_get(rpc, "/units?limit=500") or {}).get("items", []):
+        if it.get("credibility", {}).get("stale_cites"):
+            out.append(it)
+    return out
+
+
+def cmd_follow(a) -> int:
+    units = stale_units(a.rpc)
+    if a.unit is None:
+        if not units:
+            print("没有依据已过时的单元。")
+            return 0
+        print("以下单元的依据指向了被引用单元的旧版本(核验新版本后,它们的有效可信度仍会被卡住):")
+        for u in units:
+            stale = u["credibility"]["stale_cites"]
+            # 形如 {"unit":"1","cited":"1","current":"2"}
+            desc = ", ".join(f"#{x['unit']} v{x['cited']}→v{x['current']}" for x in stale)
+            print(f"  #{u['id']} v{u['versions']}: 过时依据 {desc}")
+        print()
+        print("跟进是**一个判断,不是机械操作**:发布前请确认被依据单元的新版本")
+        print("      没有改变本单元赖以成立的内容。zx follow --unit N 会显示要改什么。")
+        return 0
+
+    unit = rpc_get(a.rpc, f"/unit/{a.unit}")
+    if unit is None:
+        raise SystemExit(f"链上没有单元 #{a.unit}")
+    latest = unit["versions"][-1]
+    stale = []
+    for c in latest.get("cites", []):
+        target = rpc_get(a.rpc, f"/unit/{c['unit']}")
+        if target and len(target["versions"]) != int(c["version"]):
+            stale.append((c, len(target["versions"])))
+    if not stale:
+        print(f"#{a.unit} 的依据都已是当前版本,无需跟进。")
+        return 0
+    print(f"#{a.unit} 将发布 v{len(unit['versions']) + 1}(正文与来源不变,只更新引用的版本号):")
+    for c, ver in stale:
+        print(f"  依据 #{c['unit']}: v{c['version']} → v{ver}")
+    print()
+    print("确认被依据单元的新版本没有改变本单元赖以成立的内容。")
+    if not confirm(f"以账户 {a.account} 的身份跟进单元 #{a.unit}"):
+        print("已取消。")
+        return 1
+    # 来源与正文原样带上(链上记的就是 source 字段,形如 "human" / "model:ID")
+    argv = ["--action", "publish", "--unit", str(a.unit),
+            "--body", f"zh:{latest['bodies'][0]['hash']}",
+            "--source", latest.get("source") or "human"]
+    # 引用要指向被引用单元的**当前**版本——这就是"跟进"要做的事
+    updated = {c["unit"]: ver for c, ver in stale}
+    for c in latest.get("cites", []):
+        ver = updated.get(c["unit"], c["version"])
+        argv += ["--cite", f"{c['unit']}:{ver}:{c['kind']}"]
+    signed = sign(a.bin, a.key, a.account, account_nonce(a.rpc, a.account), argv)
+    submit_knowledge(a.rpc, signed)
+    print("已提交,等待入块…")
+    if wait_nonce(a.rpc, a.account, account_nonce(a.rpc, a.account) + 1):
+        print(f"已入块:单元 #{a.unit} 的新版本。")
+        print("依据本单元的下游单元现在可能过时了,再运行一次 zx follow 查看。")
+    else:
+        print("已提交,稍后刷新查看。")
+    return 0
+
+
+def cmd_whoami(a) -> int:
+    # node pubkey 与 encode-* 一样,认明文种子也认加密 keystore(M233)。
+    pk = subprocess.run([a.bin, "pubkey", "--key-file", a.key], capture_output=True, text=True)
+    if pk.returncode != 0:
+        raise SystemExit("读密钥失败: " + (pk.stderr or pk.stdout).strip())
+    pub = pk.stdout.split()[-1].strip().lower()
+    print(f"公钥 {pub}")
+    # /members 不带公钥,公钥在 /account/{id} 里(换钥会变,所以每次都现查)
+    members = (rpc_get(a.rpc, "/members?limit=500") or {}).get("items", [])
+    for m in members:
+        acct = rpc_get(a.rpc, f"/account/{m['id']}")
+        if acct and str(acct.get("pubkey", "")).lower() == pub:
+            print(f"链上账户号:#{m['id']}")
+            print(f"见习期:{'已过' if m.get('established') else '未过(核验照常记录,但暂不计入可信度)'}")
+            if str(m["id"]) != str(a.account):
+                print(f"⚠ 你的 --account 写的是 {a.account},但这把密钥对应的是 #{m['id']}。")
+            return 0
+    print("这个公钥还不是链上成员——需要有人邀请你(对方用 zx invite --pubkey <你的公钥>)。")
+    return 1
+
+
+# ---- 入口 -------------------------------------------------------------------
+
+def main(argv=None) -> int:
+    ap = argparse.ArgumentParser(
+        prog="zx", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--rpc", default=TESTNET_RPC, help=f"节点 RPC(默认测试网 {TESTNET_RPC})")
+    ap.add_argument("--bodies", default=TESTNET_BODIES, help=f"正文仓库(默认 {TESTNET_BODIES})")
+    ap.add_argument("--account", required=True, help="你的账户编号(用 zx whoami 查)")
+    ap.add_argument("--key", required=True,
+                    help="你的密钥文件:加密 keystore(推荐)、或 64 位十六进制种子(可带 0x 前缀)")
+    ap.add_argument("--bin", default=os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                                  "..", "node", "target", "release", "node"))
+    sub = ap.add_subparsers(dest="cmd", required=True)
+
+    p = sub.add_parser("publish", help="发布一个目录下的单元(按依据的拓扑序)")
+    p.add_argument("dir", help="单元目录")
+    p.add_argument("--domain", type=int, required=True, help="领域编号(1 大模型,2 健身,3 教育)")
+    p.set_defaults(func=cmd_publish)
+
+    p = sub.add_parser("revise", help="为已有单元发布新版本")
+    p.add_argument("file", help="新版本的 Markdown 文件")
+    p.add_argument("--unit", type=int, required=True, help="单元编号")
+    p.add_argument("--source", default="human", help="human | model:ID | model-verified:ID")
+    p.set_defaults(func=cmd_revise)
+
+    p = sub.add_parser("verify", help="核验某个版本")
+    p.add_argument("--unit", type=int, required=True, help="单元编号")
+    p.add_argument("--version", type=int, required=True, help="版本号(从 1 开始)")
+    g = p.add_mutually_exclusive_group(required=True)
+    g.add_argument("--pass", dest="passed", action="store_true", help="结论:通过")
+    g.add_argument("--needs-revision", dest="needs_revision", action="store_true", help="结论:需修改")
+    p.add_argument("--note", help="核验说明文件(判「需修改」时必填)")
+    p.set_defaults(func=cmd_verify)
+
+    p = sub.add_parser("invite", help="邀请新成员")
+    p.add_argument("--pubkey", required=True, help="对方的 64 位十六进制公钥")
+    p.set_defaults(func=cmd_invite)
+
+    p = sub.add_parser("follow", help="列出/跟进依据已过时的单元")
+    p.add_argument("--unit", type=int, help="要跟进的单元;不给则只列出")
+    p.set_defaults(func=cmd_follow)
+
+    p = sub.add_parser("whoami", help="这把密钥对应链上哪个账户")
+    p.set_defaults(func=cmd_whoami)
+
+    a = ap.parse_args(argv)
+    a.rpc = a.rpc.rstrip("/")
+    a.bodies = a.bodies.rstrip("/")
+    if not os.path.exists(a.bin):
+        raise SystemExit(f"找不到节点二进制 {a.bin};先 cargo build --release --manifest-path node/Cargo.toml")
+    if not os.path.exists(a.key):
+        raise SystemExit(f"找不到密钥文件 {a.key}")
+    try:
+        return a.func(a)
+    except SystemExit:
+        raise
+    except (OSError, ValueError, KeyError) as e:
+        raise SystemExit(f"{e}")
+
+
+if __name__ == "__main__":
+    sys.exit(main())

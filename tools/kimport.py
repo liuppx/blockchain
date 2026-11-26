@@ -24,6 +24,9 @@
 
 纯 Python 标准库。作者账户由 `--key ID=SEEDFILE` 指定(种子文件或加密 keystore 均可,后者需
 ZHIXING_KEYSTORE_PASSWORD)。
+
+**已被 [`zx`](zx.md) 取代**(2026-11-26):`zx publish` 做同样的事,还多两样——
+签名前显示清单让你确认、以及核验/邀请/跟进也能在命令行做。这个工具仍然可用。
 """
 from __future__ import annotations
 

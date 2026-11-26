@@ -84,6 +84,15 @@ jobs:
           node --test tools/explorer/test/wallet.test.mjs
           node --test tools/explorer/test/ontology.test.mjs
 
+      - name: knowledge tooling (import / graph / zx CLI) — gate
+        # 这三个工具共用同一套单元解析规则(kgraph),所以对同一个目录必须读出同样的结果。
+        # zx 是命令行签名提交工具:私钥只在本机,工具只把签好的字节发到节点。
+        run: |
+          python3 -m unittest discover -s tools -p 'test_*.py' -v
+          python3 tools/kgraph.py docs/pilot/education
+          python3 tools/kgraph.py docs/pilot/llm
+          python3 tools/kgraph.py docs/pilot/fitness
+
       - name: browser end-to-end (member flows in a real browser)
         # 起一条本地链,导入知识单元,然后用 Chrome 走一遍成员流程:身份 → 写作 → 修订 →
         # 核验 → 邀请 → 检索 → 导出。没有 Chrome 时整个套件跳过(不算失败)。

@@ -3979,8 +3979,12 @@ fn read_seed_from_key_file(path: &str) -> [u8; 32] {
         .filter(|l| !l.is_empty() && !l.starts_with('#'))
         .collect();
     if let [only] = seed_lines.as_slice() {
-        if only.len() == 64 && only.bytes().all(|b| b.is_ascii_hexdigit()) {
-            return config::decode_seed(only, "--key-file")
+        // `0x` 前缀要剥掉:夜莺钱包把知行图私钥存成 `0x` 开头的十六进制,
+        // 用户从钱包复制出来直接存成文件是很自然的做法。不剥的话这里会当成
+        // 加密 keystore,然后报一个和真实原因无关的"读不到口令"。
+        let bare = config::strip_0x(only);
+        if bare.len() == 64 && bare.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return config::decode_seed(bare, "--key-file")
                 .unwrap_or_else(|e| fail_msg("decode key seed", &e));
         }
     }
@@ -3993,18 +3997,21 @@ fn read_seed_from_key_file(path: &str) -> [u8; 32] {
 /// pubkey for an existing seed **without writing any file** (unlike `keygen`, which recovers a
 /// pubkey only as a side effect of writing a seed file). Read-only; pairs with
 /// `inspect-tx --pubkey`. With `--genesis-id`, also prints the M95 genesis entry.
+///
+/// M236: `--key-file` accepts an encrypted keystore too (same as the `encode-*` commands, M233) —
+/// the password comes from `ZHIXING_KEYSTORE_PASSWORD` or a no-echo prompt. Before this, only the
+/// offline op-authoring commands could read a keystore, so asking "which account is this key?"
+/// meant going to the keystore JSON by hand.
 fn cmd_pubkey(args: &[String]) {
-    let (seed_hex, field) = if let Some(s) = opt_arg(args, "--seed") {
-        (s.to_string(), "--seed")
+    let pub_hex = if let Some(s) = opt_arg(args, "--seed") {
+        // `--seed` 也接受 `0x` 前缀(ethers 惯例;钱包里的私钥就是那个形式)
+        derive_pubkey(config::strip_0x(s), "--seed").unwrap_or_else(|e| fail_msg("pubkey", &e))
     } else if let Some(path) = opt_arg(args, "--key-file") {
-        (
-            std::fs::read_to_string(path).unwrap_or_else(|e| fail("read key file", e)),
-            "--key-file",
-        )
+        let seed = read_seed_from_key_file(path);
+        hex(&Keypair::from_seed(seed).public())
     } else {
         fail_msg("pubkey", &"requires --key-file <path> or --seed <64hex>");
     };
-    let pub_hex = derive_pubkey(&seed_hex, field).unwrap_or_else(|e| fail_msg("pubkey", &e));
     println!("pubkey {pub_hex}");
     if let Some(entries) = keygen_genesis_entries(args, &pub_hex) {
         print!("{entries}");
@@ -6189,6 +6196,60 @@ mod tests {
         std::env::set_var(var, "");
         assert!(std::env::var(var).unwrap().is_empty());
         std::env::remove_var(var);
+    }
+
+    #[test]
+    fn pubkey_reads_an_encrypted_keystore() {
+        // M236: `node pubkey --key-file` accepts an encrypted keystore, like the
+        // `encode-*` commands do (M233). Before this, "which account is this key?"
+        // meant opening the keystore JSON by hand.
+        let seed = seed_for(11);
+        let dir = std::env::temp_dir();
+        let ks = dir.join(format!("zx-m236-{}.json", std::process::id()));
+        let password = "zx-pubkey-password";
+        let json = zhixing_node::keystore::to_json(
+            &zhixing_node::keystore::encrypt_seed(&seed, password)
+                .unwrap_or_else(|e| panic!("encrypt seed: {e}")),
+        )
+        .unwrap_or_else(|e| panic!("keystore to json: {e}"));
+        std::fs::write(&ks, json).unwrap();
+
+        let want = hex(&Keypair::from_seed(seed).public());
+        // The password comes from the env var (unattended) — `cmd_pubkey` reads it
+        // through the same helper as the other key-file commands.
+        let prev = std::env::var("ZHIXING_KEYSTORE_PASSWORD").ok();
+        std::env::set_var("ZHIXING_KEYSTORE_PASSWORD", password);
+        let got = read_seed_from_key_file(ks.to_str().unwrap());
+        match prev {
+            Some(p) => std::env::set_var("ZHIXING_KEYSTORE_PASSWORD", p),
+            None => std::env::remove_var("ZHIXING_KEYSTORE_PASSWORD"),
+        }
+        assert_eq!(hex(&Keypair::from_seed(got).public()), want);
+        let _ = std::fs::remove_file(&ks);
+    }
+
+    #[test]
+    fn key_file_accepts_a_wallet_style_0x_prefixed_seed() {
+        // 夜莺钱包把知行图私钥存成 `0x` 开头的十六进制。用户从钱包复制出来直接存成文件,
+        // 再交给 `--key-file`,是很自然的做法——链侧必须认,否则会当成加密 keystore
+        // 然后报一个和真实原因无关的"读不到口令"。
+        let seed = seed_for(13);
+        let bare = zhixing_node::hash::hex(&seed);
+        let dir = std::env::temp_dir();
+        let prefixed = dir.join(format!("zx-0x-{}.seed", std::process::id()));
+        std::fs::write(&prefixed, format!("0x{bare}\n")).unwrap();
+        assert_eq!(
+            read_seed_from_key_file(prefixed.to_str().unwrap()),
+            seed,
+            "带 0x 前缀的种子文件应当能读出同一个种子"
+        );
+        let _ = std::fs::remove_file(&prefixed);
+
+        // 大写的 0X 也认
+        let upper = dir.join(format!("zx-0X-{}.seed", std::process::id()));
+        std::fs::write(&upper, format!("0X{bare}\n")).unwrap();
+        assert_eq!(read_seed_from_key_file(upper.to_str().unwrap()), seed);
+        let _ = std::fs::remove_file(&upper);
     }
 
     #[test]
