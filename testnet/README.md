@@ -104,9 +104,11 @@ testnet/gen.sh --members testnet/members.toml --force    # 账户 1..N = 名单�
 
 ```sh
 # 把运动健身试运行单元导入测试网(作者为账户 1,经令牌保护的 /knowledge 提交,从加密 keystore 签名)
-ZHIXING_KEYSTORE_PASSWORD=$(cat testnet/out/password) python3 tools/kimport.py \
-  --dir docs/pilot/fitness --domain 2 --config testnet/out/n21/node.toml \
-  --rpc http://127.0.0.1:9221 --key "1=testnet/out/keys/acct1.json"
+# zx 是签名提交工具:私钥只在本机,只把签好的字节发到节点;每次签名前显示清单并等确认。
+ZHIXING_LOCAL=1 ZHIXING_KEYSTORE_PASSWORD=$(cat testnet/out/password) ./tools/zx \
+  --account 1 --key testnet/out/keys/acct1.json \
+  --rpc http://127.0.0.1:9221 --bodies http://127.0.0.1:8080/bodies \
+  publish docs/pilot/fitness --domain 2
 curl -s http://127.0.0.1:9221/units      # 任一节点:单元列表与链上可信度
 ```
 

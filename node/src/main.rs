@@ -3993,18 +3993,20 @@ fn read_seed_from_key_file(path: &str) -> [u8; 32] {
 /// pubkey for an existing seed **without writing any file** (unlike `keygen`, which recovers a
 /// pubkey only as a side effect of writing a seed file). Read-only; pairs with
 /// `inspect-tx --pubkey`. With `--genesis-id`, also prints the M95 genesis entry.
+///
+/// M236: `--key-file` accepts an encrypted keystore too (same as the `encode-*` commands, M233) —
+/// the password comes from `ZHIXING_KEYSTORE_PASSWORD` or a no-echo prompt. Before this, only the
+/// offline op-authoring commands could read a keystore, so asking "which account is this key?"
+/// meant going to the keystore JSON by hand.
 fn cmd_pubkey(args: &[String]) {
-    let (seed_hex, field) = if let Some(s) = opt_arg(args, "--seed") {
-        (s.to_string(), "--seed")
+    let pub_hex = if let Some(s) = opt_arg(args, "--seed") {
+        derive_pubkey(s, "--seed").unwrap_or_else(|e| fail_msg("pubkey", &e))
     } else if let Some(path) = opt_arg(args, "--key-file") {
-        (
-            std::fs::read_to_string(path).unwrap_or_else(|e| fail("read key file", e)),
-            "--key-file",
-        )
+        let seed = read_seed_from_key_file(path);
+        hex(&Keypair::from_seed(seed).public())
     } else {
         fail_msg("pubkey", &"requires --key-file <path> or --seed <64hex>");
     };
-    let pub_hex = derive_pubkey(&seed_hex, field).unwrap_or_else(|e| fail_msg("pubkey", &e));
     println!("pubkey {pub_hex}");
     if let Some(entries) = keygen_genesis_entries(args, &pub_hex) {
         print!("{entries}");
@@ -6189,6 +6191,36 @@ mod tests {
         std::env::set_var(var, "");
         assert!(std::env::var(var).unwrap().is_empty());
         std::env::remove_var(var);
+    }
+
+    #[test]
+    fn pubkey_reads_an_encrypted_keystore() {
+        // M236: `node pubkey --key-file` accepts an encrypted keystore, like the
+        // `encode-*` commands do (M233). Before this, "which account is this key?"
+        // meant opening the keystore JSON by hand.
+        let seed = seed_for(11);
+        let dir = std::env::temp_dir();
+        let ks = dir.join(format!("zx-m236-{}.json", std::process::id()));
+        let password = "zx-pubkey-password";
+        let json = zhixing_node::keystore::to_json(
+            &zhixing_node::keystore::encrypt_seed(&seed, password)
+                .unwrap_or_else(|e| panic!("encrypt seed: {e}")),
+        )
+        .unwrap_or_else(|e| panic!("keystore to json: {e}"));
+        std::fs::write(&ks, json).unwrap();
+
+        let want = hex(&Keypair::from_seed(seed).public());
+        // The password comes from the env var (unattended) — `cmd_pubkey` reads it
+        // through the same helper as the other key-file commands.
+        let prev = std::env::var("ZHIXING_KEYSTORE_PASSWORD").ok();
+        std::env::set_var("ZHIXING_KEYSTORE_PASSWORD", password);
+        let got = read_seed_from_key_file(ks.to_str().unwrap());
+        match prev {
+            Some(p) => std::env::set_var("ZHIXING_KEYSTORE_PASSWORD", p),
+            None => std::env::remove_var("ZHIXING_KEYSTORE_PASSWORD"),
+        }
+        assert_eq!(hex(&Keypair::from_seed(got).public()), want);
+        let _ = std::fs::remove_file(&ks);
     }
 
     #[test]

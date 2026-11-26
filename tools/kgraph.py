@@ -105,7 +105,8 @@ def section(text: str, title: str) -> list[str]:
 
 
 def parse(path: str) -> Unit:
-    text = open(path, encoding="utf-8").read()
+    with open(path, encoding="utf-8") as f:
+        text = f.read()
     u = Unit(file=os.path.basename(path))
     m = re.search(r"^# (.+)$", text, re.M)
     u.title = m.group(1).strip() if m else u.file
