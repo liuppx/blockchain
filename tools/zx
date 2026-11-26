@@ -476,7 +476,8 @@ def main(argv=None) -> int:
     ap.add_argument("--rpc", default=TESTNET_RPC, help=f"节点 RPC(默认测试网 {TESTNET_RPC})")
     ap.add_argument("--bodies", default=TESTNET_BODIES, help=f"正文仓库(默认 {TESTNET_BODIES})")
     ap.add_argument("--account", required=True, help="你的账户编号(用 zx whoami 查)")
-    ap.add_argument("--key", required=True, help="你的加密密钥文件(keystore)")
+    ap.add_argument("--key", required=True,
+                    help="你的密钥文件:加密 keystore(推荐)、或 64 位十六进制种子(可带 0x 前缀)")
     ap.add_argument("--bin", default=os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                                   "..", "node", "target", "release", "node"))
     sub = ap.add_subparsers(dest="cmd", required=True)

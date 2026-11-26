@@ -3979,8 +3979,12 @@ fn read_seed_from_key_file(path: &str) -> [u8; 32] {
         .filter(|l| !l.is_empty() && !l.starts_with('#'))
         .collect();
     if let [only] = seed_lines.as_slice() {
-        if only.len() == 64 && only.bytes().all(|b| b.is_ascii_hexdigit()) {
-            return config::decode_seed(only, "--key-file")
+        // `0x` 前缀要剥掉:夜莺钱包把知行图私钥存成 `0x` 开头的十六进制,
+        // 用户从钱包复制出来直接存成文件是很自然的做法。不剥的话这里会当成
+        // 加密 keystore,然后报一个和真实原因无关的"读不到口令"。
+        let bare = config::strip_0x(only);
+        if bare.len() == 64 && bare.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return config::decode_seed(bare, "--key-file")
                 .unwrap_or_else(|e| fail_msg("decode key seed", &e));
         }
     }
@@ -4000,7 +4004,8 @@ fn read_seed_from_key_file(path: &str) -> [u8; 32] {
 /// meant going to the keystore JSON by hand.
 fn cmd_pubkey(args: &[String]) {
     let pub_hex = if let Some(s) = opt_arg(args, "--seed") {
-        derive_pubkey(s, "--seed").unwrap_or_else(|e| fail_msg("pubkey", &e))
+        // `--seed` 也接受 `0x` 前缀(ethers 惯例;钱包里的私钥就是那个形式)
+        derive_pubkey(config::strip_0x(s), "--seed").unwrap_or_else(|e| fail_msg("pubkey", &e))
     } else if let Some(path) = opt_arg(args, "--key-file") {
         let seed = read_seed_from_key_file(path);
         hex(&Keypair::from_seed(seed).public())
@@ -6221,6 +6226,30 @@ mod tests {
         }
         assert_eq!(hex(&Keypair::from_seed(got).public()), want);
         let _ = std::fs::remove_file(&ks);
+    }
+
+    #[test]
+    fn key_file_accepts_a_wallet_style_0x_prefixed_seed() {
+        // 夜莺钱包把知行图私钥存成 `0x` 开头的十六进制。用户从钱包复制出来直接存成文件,
+        // 再交给 `--key-file`,是很自然的做法——链侧必须认,否则会当成加密 keystore
+        // 然后报一个和真实原因无关的"读不到口令"。
+        let seed = seed_for(13);
+        let bare = zhixing_node::hash::hex(&seed);
+        let dir = std::env::temp_dir();
+        let prefixed = dir.join(format!("zx-0x-{}.seed", std::process::id()));
+        std::fs::write(&prefixed, format!("0x{bare}\n")).unwrap();
+        assert_eq!(
+            read_seed_from_key_file(prefixed.to_str().unwrap()),
+            seed,
+            "带 0x 前缀的种子文件应当能读出同一个种子"
+        );
+        let _ = std::fs::remove_file(&prefixed);
+
+        // 大写的 0X 也认
+        let upper = dir.join(format!("zx-0X-{}.seed", std::process::id()));
+        std::fs::write(&upper, format!("0X{bare}\n")).unwrap();
+        assert_eq!(read_seed_from_key_file(upper.to_str().unwrap()), seed);
+        let _ = std::fs::remove_file(&upper);
     }
 
     #[test]
