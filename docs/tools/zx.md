@@ -63,11 +63,21 @@ export ZHIXING_RPC_TOKEN=<写入令牌>     # 向组织者要
 
 | 形式 | 说明 |
 |---|---|
-| 加密 keystore(`node keygen --encrypt` 写的) | **推荐**。口令在终端无回显输入,或用 `ZHIXING_KEYSTORE_PASSWORD`(无人值守时) |
-| 明文种子(64 位十六进制) | 本地开发用。生产环境别用 |
+| 加密 keystore(Web3 Secret Storage v3) | **推荐**。口令在终端无回显输入,或用 `ZHIXING_KEYSTORE_PASSWORD`(无人值守时) |
+| 明文种子(64 位十六进制,可带 `0x` 前缀) | 本地开发用。生产环境别用 |
+
+两种形式的来源:
+
+- **从钱包导出**:夜莺钱包的知行图首页有「导出密钥文件」,产出的文件与
+  `node keygen --encrypt` 同格式,可直接给 `--key`。口令是**那个文件自己的**,
+  与钱包密码无关——钱包不知道链侧的口令,链侧也不知道钱包密码;
+- **自己生成**:`ZHIXING_KEYSTORE_PASSWORD=... node keygen --encrypt --out zhixing.json`。
 
 密钥文件不要进版本库、不要发给别人。成员自己生成密钥、只把公钥给组织者——
 这是链的设计意图,`zx` 也不改变它。
+
+> 钱包存私钥用的是 ethers 的 `0x` 前缀惯例,而节点原来不认这个前缀(会当成加密
+> keystore 然后报一个和真实原因无关的"读不到口令")。链侧已修:带不带 `0x` 都认。
 
 ## 与浏览器的关系
 

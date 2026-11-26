@@ -46,9 +46,11 @@ curl -s -H 'Accept: application/json' https://blockchain.yeying.pub/rpc/domains
 git clone https://github.com/yeying-community/blockchain.git
 cd blockchain
 
-# 2. 准备你的密钥文件
-#    钱包导出的知行图账户密钥,或 node keygen --encrypt --out zhixing-member.json 生成的
-#    (助记词按 SLIP-0010 派生,与钱包里的账户是同一个)
+# 2. 准备你的密钥文件(二选一)
+#    a) 从夜莺钱包导出:知行图首页的「导出密钥文件」。产出的是与 node keygen --encrypt
+#       同格式的文件,链侧工具直接能用。口令是**那个文件自己的**,与钱包密码无关。
+#    b) 自己生成:node keygen --encrypt --out zhixing-member.json
+#       (助记词按 SLIP-0010 派生,与钱包里的账户是同一个)
 
 # 3. 先确认这把密钥就是账户 6
 export ZHIXING_RPC_TOKEN=<组织者给你的写入令牌>
