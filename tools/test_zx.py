@@ -169,6 +169,54 @@ class SourceArgTests(unittest.TestCase):
         self.assertEqual(zx.source_arg("模型生成"), "model:claude-opus-5-5")
 
 
+class NonceTrackerTests(unittest.TestCase):
+    """序号跟踪:链上 nonce 只在入块后才前进,连发多条会撞号。
+
+    2026-11-26 实测:发布 10 个教育单元时,#17/#18 补版成功,第三条 op 报
+    HTTP 422 account 6 nonce mismatch: expected 12, got 11 —— 前一条还没入块,
+    从链上读到的 nonce 还是旧的。
+    """
+
+    class FakeRpc:
+        """假链:nonce 只在 wait_in_block 之后才前进。"""
+
+        def __init__(self, start=5):
+            self.chain_nonce = start
+
+    def test_take_increments_locally(self):
+        tracker = zx.NonceTracker.__new__(zx.NonceTracker)
+        tracker.rpc = "http://x"
+        tracker.actor = "6"
+        tracker.nonce = 5
+        self.assertEqual(tracker.take(), 5)
+        self.assertEqual(tracker.take(), 6)
+        self.assertEqual(tracker.nonce, 7)
+
+    def test_sequences_do_not_repeat(self):
+        tracker = zx.NonceTracker.__new__(zx.NonceTracker)
+        tracker.rpc = "http://x"
+        tracker.actor = "6"
+        tracker.nonce = 0
+        seen = [tracker.take() for _ in range(10)]
+        self.assertEqual(seen, list(range(10)), "每条 op 的序号必须不同")
+
+    def test_wait_in_block_returns_true_once_the_chain_catches_up(self):
+        tracker = zx.NonceTracker.__new__(zx.NonceTracker)
+        tracker.rpc = "http://x"
+        tracker.actor = "6"
+        tracker.nonce = 7
+        # 链上 nonce 还没追上 → 等不到(用极短超时,只验证它不误报成功)
+        original = zx.account_nonce
+        zx.account_nonce = lambda rpc, actor: 5
+        try:
+            self.assertFalse(tracker.wait_in_block(timeout=0.2))
+            # 链上追上 → 成功
+            zx.account_nonce = lambda rpc, actor: 7
+            self.assertTrue(tracker.wait_in_block(timeout=1.0))
+        finally:
+            zx.account_nonce = original
+
+
 class TokenTests(unittest.TestCase):
     def test_local_flag_wins_over_the_environment(self):
         # 本地开发链的令牌是固定的;环境变量里若有测试网令牌,本地模式下不该用它。

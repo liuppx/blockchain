@@ -123,6 +123,36 @@ def account_nonce(rpc: str, actor: str) -> int:
     return int(acct["nonce"])
 
 
+class NonceTracker:
+    """跟踪本进程发出的 op 的序号。
+
+    链上账户的 nonce 只在**入块后**才前进。刚提交一条 op、下一条还没入块时,
+    从链上读到的 nonce 还是旧的——两条 op 就用了同一个 nonce,第二条被链拒
+    (HTTP 422 account N nonce mismatch)。所以本地自己记着:每发一条就 +1,
+    并等它入块(链上 nonce 追上)再发下一条。
+    """
+
+    def __init__(self, rpc: str, actor: str):
+        self.rpc = rpc
+        self.actor = str(actor)
+        self.nonce = account_nonce(rpc, actor)
+
+    def take(self) -> int:
+        """取本次要用的序号,并把它记为已用。"""
+        n = self.nonce
+        self.nonce += 1
+        return n
+
+    def wait_in_block(self, timeout: float = 90.0) -> bool:
+        """等已发出的 op 全部入块(链上 nonce 追上本地计数)。"""
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            if account_nonce(self.rpc, self.actor) >= self.nonce:
+                return True
+            time.sleep(0.4)
+        return False
+
+
 def wait_nonce(rpc: str, actor: str, want: int, timeout: float = 90.0):
     deadline = time.time() + timeout
     while time.time() < deadline:
@@ -233,6 +263,8 @@ def cmd_publish(a) -> int:
         return 1
 
     actor = a.account
+    # 自己记着序号:链上 nonce 只在入块后才前进,连发多条会撞号
+    tracker = NonceTracker(a.rpc, actor)
     ids: dict[str, int] = {}
     deferred: dict[str, list] = {}
     for f in order:
@@ -252,7 +284,7 @@ def cmd_publish(a) -> int:
         if not layer:
             raise SystemExit(f"{f}: 未知层级 {u.layer}")
         expect = int((rpc_get(a.rpc, "/units?limit=1") or {}).get("total", "0")) + 1
-        signed = sign(a.bin, a.key, actor, account_nonce(a.rpc, actor),
+        signed = sign(a.bin, a.key, actor, tracker.take(),
                       ["--action", "create", "--layer", layer, "--domain", str(a.domain),
                        "--body", f"zh:{h}", "--source", source_arg(u.source), *cites])
         submit_knowledge(a.rpc, signed)
@@ -263,6 +295,9 @@ def cmd_publish(a) -> int:
             time.sleep(0.6)
         else:
             raise SystemExit(f"单元 {expect}({f}) 没能在 60 秒内入块;用 zx follow 查状态")
+        # 等这条 op 入块(链上 nonce 追上),下一条才不会撞号
+        if not tracker.wait_in_block():
+            raise SystemExit(f"单元 {expect}({f}) 的 op 迟迟没入块(链上 nonce 没前进);稍后再试")
         ids[f] = expect
         print(f"  已发布 #{expect} {u.title}")
 
@@ -278,10 +313,12 @@ def cmd_publish(a) -> int:
             kind = "basis" if c.kind == "依据" else "see-also"
             if c.target in ids:
                 cites += ["--cite", f"{ids[c.target]}:{ver[c.target]}:{kind}"]
-        signed = sign(a.bin, a.key, actor, account_nonce(a.rpc, actor),
+        signed = sign(a.bin, a.key, actor, tracker.take(),
                       ["--action", "publish", "--unit", str(ids[f]),
                        "--body", f"zh:{bodies[f][1]}", "--source", source_arg(u.source), *cites])
         submit_knowledge(a.rpc, signed)
+        if not tracker.wait_in_block():
+            raise SystemExit(f"#{ids[f]} 的补版 op 迟迟没入块;稍后再试")
         ver[f] = 2
         print(f"  已发布 #{ids[f]} v2(补上参见)")
     print()
