@@ -72,6 +72,24 @@ PORT=8080 NODE_RPC=http://127.0.0.1:9221 npm start      # 或: node server.js
 - **支持**:核验(通过 / 需修改,"通过"须先勾选单元的全部核验要点)、邀请、写新单元与修订。批量导入目录仍用 `tools/kimport.py`。
 - 提交需要写入令牌(组织者私下提供),保存在本机 `localStorage`。本地开发链(`./cmd up`)的写入令牌是 `local-dev-token`。
 
+### 从 Markdown 代填新单元（macOS + Edge）
+
+用 [`tools/fill-zhixing.py`](../fill-zhixing.py) 把本地 Markdown 填入新单元表单。脚本使用 Python 3 标准库，可以由贡献者或 Agent 运行。先在 Edge 打开 [知行图测试网](https://blockchain.yeying.pub/)，用夜莺钱包登录自己的账户。在 macOS 的 Edge 菜单打开「视图 → 开发人员 → 允许 Apple 活动中的 JavaScript」。
+
+在仓库根目录运行。预览示例使用仓库内的文稿，你可以替换账户、领域和来源。
+
+```bash
+python3 tools/fill-zhixing.py docs/pilot/llm/base-context-window.md \
+  --account 3 --domain 1 --source 'model:Claude Opus 5.5' --preview
+```
+
+- `--account` 填网页显示的账户编号，`--domain` 填新单元的领域编号。
+- `--source` 填 `human`（人工撰写）、`model:模型标识`（模型生成）或 `model-verified:模型标识`（模型生成且人工修改过）。
+- `--layer` 可选 `foundation`、`explanation`、`scenario`、`application`，默认是 `foundation`。
+- 有引用时，每条引用增加一个 `--cite 单元:版本:类型`。例如 `--cite 12:2:see-also` 表示参见 #12 v2。类型还可用 `basis`（依据）和 `supersedes`（取代）。
+
+`--preview` 只在终端显示参数和正文 SHA-256。代填时换成新稿路径并去掉 `--preview`，脚本会检查已发布的相同正文和引用版本。表单就绪后，在 Edge 核对内容，点「创建单元」，确认公开许可，再用夜莺钱包签名。
+
 ## 知识互操作词表(JSON-LD)
 
 链上的知识单元可以用 JSON-LD 公开取用,规范见 [`docs/design/ontology-v0.1.md`](../../docs/design/ontology-v0.1.md):

@@ -29,6 +29,7 @@ import sys
 import tempfile
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 
 TESTNET_RPC = "https://blockchain.yeying.pub/rpc"
@@ -219,18 +220,139 @@ def topo_order(units: dict) -> list:
 
 
 def source_arg(src: str) -> str:
-    """把单元头部的"来源"映射为 CLI 的 --source,保留明确标注的模型名称。"""
-    import re
-    m = re.search(r"模型生成\s*\(([^)]+)\)", src)
-    model_id = re.sub(r"[^a-z0-9]+", "-", m.group(1).strip().lower()).strip("-") if m else DEFAULT_MODEL
-    if "人工核验过的模型生成" in src:
-        return f"model-verified:{model_id}"
-    if "模型生成" in src:
-        return f"model:{model_id}"
-    return "human"
+    """把单元头部的"来源"映射为 CLI 的 --source,保留明确标注的模型名称。
+
+    规则在 kgraph.source_arg 里(与 kimport 共用):模型名转成小写连字符的标识,
+    所以同一个模型在任何工具、任何入口下都是同一个标识。
+    """
+    import kgraph
+    return kgraph.source_arg(src, DEFAULT_MODEL)
+
+
+def parse_create_cite(value: str) -> tuple[int, int, str]:
+    """Parse an existing chain citation supplied for a single-unit create."""
+    try:
+        unit, version, kind = value.split(":")
+        unit_id, version_id = int(unit), int(version)
+        if not 1 <= unit_id < 2**53 or not 1 <= version_id < 2**32:
+            raise ValueError
+        if kind not in ("basis", "see-also", "supersedes"):
+            raise ValueError
+    except ValueError:
+        raise argparse.ArgumentTypeError(
+            "引用格式应为 单元编号:版本号:basis|see-also|supersedes"
+        ) from None
+    return unit_id, version_id, kind
+
+
+def check_create_cites(document_cites: list, requested_cites: list) -> None:
+    """Require explicit chain IDs for each reference declared in the Markdown."""
+    if len(document_cites) != len(requested_cites):
+        raise SystemExit(
+            f"Markdown 声明了 {len(document_cites)} 条引用,需提供相同数量的 --cite"
+        )
+    kinds = {"依据": "basis", "参见": "see-also", "取代": "supersedes"}
+    for document_cite, requested in zip(document_cites, requested_cites):
+        if kinds.get(document_cite.kind) != requested[2]:
+            raise SystemExit(
+                f"Markdown 中 {document_cite.target} 的引用类型与 --cite {requested[0]} 不一致"
+            )
+
+
+def unit_for_body(rpc: str, actor: str | None, body_hash: str):
+    """Find a published unit by body hash and optional author, across RPC pages."""
+    cursor = None
+    while True:
+        path = "/units?limit=500"
+        if cursor is not None:
+            path += "&cursor=" + urllib.parse.quote(str(cursor), safe="")
+        page = rpc_get(rpc, path) or {}
+        for unit in page.get("items", []):
+            author_matches = actor is None or str(unit.get("author")) == str(actor)
+            if author_matches and body_hash in unit.get("body_hashes", []):
+                return unit
+        next_cursor = page.get("cursor")
+        if not page.get("items") or next_cursor is None or str(next_cursor) == str(cursor):
+            return None
+        cursor = next_cursor
 
 
 # ---- 各条子命令 -------------------------------------------------------------
+
+def cmd_create(a) -> int:
+    """Create one new unit while preserving explicit citations to existing chain units."""
+    import kgraph
+
+    data = open(a.file, "rb").read()
+    try:
+        text = data.decode("utf-8")
+    except UnicodeDecodeError:
+        raise SystemExit("正文必须是 UTF-8 Markdown") from None
+    if len(data) > 64 * 1024 or not text.startswith("# "):
+        raise SystemExit("正文需以一级标题开头,且不超过 64 KiB")
+
+    unit = kgraph.parse(a.file)
+    layer = LAYERS.get(unit.layer)
+    if not layer:
+        raise SystemExit(f"无法从 Markdown 读取有效层级: {unit.layer}")
+    check_create_cites(unit.cites, a.cites)
+    body_hash = hashlib.sha256(data).hexdigest()
+    existing = unit_for_body(a.rpc, None, body_hash)
+    if existing:
+        raise SystemExit(
+            f"正文已由账户 {a.account} 发布为单元 #{existing['id']},不重复创建"
+        )
+
+    total = rpc_get(a.rpc, "/units?limit=1") or {}
+    expected_id = int(total.get("total", "0")) + 1
+    chain_cites = []
+    for unit_id, version, kind in a.cites:
+        if unit_id == expected_id:
+            raise SystemExit("新单元不能引用自己")
+        target = rpc_get(a.rpc, f"/unit/{unit_id}")
+        if target is None:
+            raise SystemExit(f"链上没有被引用的单元 #{unit_id}")
+        if len(target["versions"]) != version:
+            raise SystemExit(
+                f"引用版本过时:单元 #{unit_id} 当前是 v{len(target['versions'])},"
+                f"你指定了 v{version}"
+            )
+        title = body_title(a.bodies, target["versions"][-1]["bodies"][0]["hash"])
+        chain_cites += ["--cite", f"{unit_id}:{version}:{kind}"]
+        print(f"  引用 #{unit_id} v{version} {kind}" + (f" · {title}" if title else ""))
+
+    source = a.source or source_arg(unit.source)
+    if source != "human" and not source.startswith(("model:", "model-verified:")):
+        raise SystemExit("--source 应为 human、model:标识 或 model-verified:标识")
+    print(f"准备在领域 {a.domain} 创建一个{unit.layer}单元")
+    print(f"  {unit.title}")
+    print(f"  来源 {source}")
+    print(f"  正文 {len(data)} 字节 · SHA-256 {body_hash}")
+    if not confirm(f"作者为账户 {a.account} · CC BY 4.0"):
+        print("已取消,没有签名或提交。")
+        return 1
+
+    upload_body(a.bodies, data, token())
+    tracker = NonceTracker(a.rpc, a.account)
+    signed = sign(
+        a.bin,
+        a.key,
+        a.account,
+        tracker.take(),
+        ["--action", "create", "--layer", layer, "--domain", str(a.domain),
+         "--body", f"zh:{body_hash}", "--source", source, *chain_cites],
+    )
+    submit_knowledge(a.rpc, signed)
+    print("已提交,等待入块…")
+    if not tracker.wait_in_block():
+        print("尚未确认入块,稍后用正文哈希查询操作状态。")
+        return 0
+
+    created = unit_for_body(a.rpc, a.account, body_hash)
+    if created is None:
+        raise SystemExit("账户序号已前进,但暂未找到匹配正文;请用正文哈希查询后再重试。")
+    print(f"已入块:单元 #{created['id']} v{created['versions']}")
+    return 0
 
 def cmd_publish(a) -> int:
     units = parse_units(a.dir)
@@ -600,6 +722,14 @@ def main(argv=None) -> int:
     p.add_argument("dir", help="单元目录")
     p.add_argument("--domain", type=int, required=True, help="领域编号(1 大模型,2 健身,3 教育)")
     p.set_defaults(func=cmd_publish)
+
+    p = sub.add_parser("create", help="创建一个单元并引用现有链上版本")
+    p.add_argument("file", help="知识单元的 Markdown 文件")
+    p.add_argument("--domain", type=int, required=True, help="领域编号")
+    p.add_argument("--source", help="覆盖 Markdown 来源，例如 model:GPT-6")
+    p.add_argument("--cite", dest="cites", action="append", type=parse_create_cite, default=[],
+                   help="链上引用:单元:版本:basis|see-also|supersedes;可多次指定")
+    p.set_defaults(func=cmd_create)
 
     p = sub.add_parser("revise", help="为已有单元发布新版本")
     p.add_argument("file", help="新版本的 Markdown 文件")

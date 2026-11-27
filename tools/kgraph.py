@@ -36,6 +36,38 @@ C_HUMAN = 0.2
 C_STEP = 0.2
 C_MAX = 0.9
 
+# 未标注模型时的默认模型标识(旧单元没有写明是哪个模型生成的)。
+DEFAULT_MODEL_ID = "claude-opus-5-5"
+
+
+def model_id(name: str) -> str:
+    """把模型名转成链上的模型标识。
+
+    链上原样存这个字符串、不做归一化,所以**同一个模型必须总是得到同一个标识**——
+    否则「按模型统计来源」会把一个模型拆成两个。约定:小写,非字母数字折成连字符。
+
+        "Claude Opus 5.5" → "claude-opus-5-5"
+        "GPT-6"           → "gpt-6"
+        "OpenAI GPT-6"    → "openai-gpt-6"
+    """
+    return re.sub(r"[^a-z0-9]+", "-", str(name or "").strip().lower()).strip("-")
+
+
+def source_arg(src: str, default_model: str = DEFAULT_MODEL_ID) -> str:
+    """把单元头部的「来源」映射为链上的 source 字段。
+
+    形如 `human` / `model:<标识>` / `model-verified:<标识>`。
+    单元里写明模型名的("模型生成(GPT-6)")就用那个名字,没写就用默认的。
+    """
+    text = str(src or "")
+    m = re.search(r"模型生成\s*\(([^)]+)\)", text)
+    mid = model_id(m.group(1)) or default_model if m else default_model
+    if "人工核验过的模型生成" in text:
+        return f"model-verified:{mid}"
+    if "模型生成" in text:
+        return f"model:{mid}"
+    return "human"
+
 
 @dataclass
 class Cite:

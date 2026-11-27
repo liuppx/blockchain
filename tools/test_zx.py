@@ -13,6 +13,7 @@ import os
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
@@ -167,6 +168,79 @@ class SourceArgTests(unittest.TestCase):
 
     def test_bare_model_uses_the_default(self):
         self.assertEqual(zx.source_arg("模型生成"), "model:claude-opus-5-5")
+
+
+class SingleCreateTests(unittest.TestCase):
+    def test_cli_parses_repeated_citations_for_create_handler(self):
+        captured = {}
+
+        def capture_args(args):
+            captured["cites"] = args.cites
+            return 0
+
+        with tempfile.NamedTemporaryFile() as key_file, mock.patch.object(
+            zx, "cmd_create", capture_args
+        ):
+            result = zx.main([
+                "--account", "3", "--key", key_file.name, "--bin", key_file.name,
+                "create", "document.md", "--domain", "1",
+                "--cite", "16:1:see-also", "--cite", "12:2:basis",
+            ])
+
+        self.assertEqual(result, 0)
+        self.assertEqual(captured["cites"], [(16, 1, "see-also"), (12, 2, "basis")])
+
+    def test_parses_chain_citation(self):
+        self.assertEqual(zx.parse_create_cite("16:1:see-also"), (16, 1, "see-also"))
+
+    def test_rejects_invalid_chain_citation(self):
+        for value in ("0:1:basis", "1:0:basis", "1:1:unknown", "one:1:basis"):
+            with self.subTest(value=value), self.assertRaises(zx.argparse.ArgumentTypeError):
+                zx.parse_create_cite(value)
+
+    def test_explicit_chain_references_match_markdown_order_and_kind(self):
+        document_cites = [
+            kgraph.Cite("tool-calling.md", "参见", "v1"),
+            kgraph.Cite("token.md", "依据", "v2"),
+        ]
+        zx.check_create_cites(
+            document_cites,
+            [(16, 1, "see-also"), (8, 2, "basis")],
+        )
+
+    def test_chain_references_must_cover_markdown_references(self):
+        document_cites = [kgraph.Cite("tool-calling.md", "参见", "v1")]
+        with self.assertRaisesRegex(SystemExit, "相同数量"):
+            zx.check_create_cites(document_cites, [])
+
+    def test_chain_reference_kind_must_match_markdown(self):
+        document_cites = [kgraph.Cite("tool-calling.md", "参见", "v1")]
+        with self.assertRaisesRegex(SystemExit, "引用类型"):
+            zx.check_create_cites(document_cites, [(16, 1, "basis")])
+
+    def test_body_lookup_follows_rpc_cursors(self):
+        original = zx.rpc_get
+        pages = []
+
+        def fake_rpc_get(_rpc, path):
+            pages.append(path)
+            if len(pages) == 1:
+                return {
+                    "items": [{"id": "500", "author": "2", "body_hashes": []}],
+                    "cursor": "500",
+                }
+            return {
+                "items": [{"id": "501", "author": "3", "body_hashes": ["ab" * 32]}],
+                "cursor": "501",
+            }
+
+        zx.rpc_get = fake_rpc_get
+        try:
+            found = zx.unit_for_body("https://example.test/rpc", "3", "ab" * 32)
+        finally:
+            zx.rpc_get = original
+        self.assertEqual(found["id"], "501")
+        self.assertIn("cursor=500", pages[1])
 
 
 class NonceTrackerTests(unittest.TestCase):

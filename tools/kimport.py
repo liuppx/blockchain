@@ -48,12 +48,12 @@ DEFAULT_MODEL = "claude-opus-5-5"
 
 
 def source_arg(src: str) -> str:
-    """把单元头部的"来源"映射为 CLI 的 --source。"""
-    if "人工核验过的模型生成" in src:
-        return f"model-verified:{DEFAULT_MODEL}"
-    if "模型生成" in src:
-        return f"model:{DEFAULT_MODEL}"
-    return "human"
+    """把单元头部的"来源"映射为 CLI 的 --source,保留明确标注的模型名称。
+
+    规则在 kgraph.source_arg 里(与 zx 共用):模型名转成小写连字符的标识,
+    所以同一个模型在任何工具、任何入口下都是同一个标识。
+    """
+    return kgraph.source_arg(src, DEFAULT_MODEL)
 
 
 def get_json(rpc: str, path: str):

@@ -16,9 +16,11 @@ graph BT
     u3["采样与温度:从概率分布里选出下一个词元<br/>基础 · 0.1"]
     u4["模型本身不保存对话<br/>基础 · 0.1"]
     u5["词元(token):模型读写文字的基本单位<br/>基础 · 0.1"]
-    u6["为什么聊久了,模型会"忘记"前面说过的话<br/>解释 · 0.1"]
-    u7["资料太多放不进上下文:检索增强,还是直接用长上下文<br/>场景 · 0.1"]
-    u8["按词元预算管理对话历史<br/>应用 · 0.1"]
+    u6["工具调用:模型提出请求,应用执行工具<br/>基础 · 0.1"]
+    u7["为什么聊久了,模型会&quot;忘记&quot;前面说过的话<br/>解释 · 0.1"]
+    u8["资料太多放不进上下文:检索增强,还是直接用长上下文<br/>场景 · 0.1"]
+    u9["多轮智能体评测:同时检查任务结果与执行过程<br/>应用 · 0.1"]
+    u10["按词元预算管理对话历史<br/>应用 · 0.1"]
     u0 --> u5
     u0 -.-> u4
     u1 -.-> u5
@@ -28,31 +30,35 @@ graph BT
     u4 -.-> u0
     u5 -.-> u0
     u5 -.-> u2
-    u6 --> u4
-    u6 --> u0
-    u6 -.-> u8
+    u6 -.-> u2
+    u7 --> u4
     u7 --> u0
-    u7 --> u1
-    u7 -.-> u4
-    u8 --> u4
+    u7 -.-> u10
     u8 --> u0
-    u8 --> u5
-    u8 -.-> u6
+    u8 -.-> u1
+    u8 -.-> u4
+    u9 -.-> u6
+    u10 --> u4
+    u10 --> u0
+    u10 --> u5
+    u10 -.-> u7
 ```
 
 ## 单元一览
 
 | 单元 | 层级 | 来源 | 当前版本 | 核验通过人数 | 自身可信度 | 有效可信度 | 被谁卡住 |
 |---|---|---|---|---|---|---|---|
-| [上下文窗口:模型一次能看到的词元上限](base-context-window.md) | 基础 | 模型生成(Claude Opus 5.5) | v1 | 0 | 0.1 | **0.1** | —(取决于自身) |
+| [上下文窗口:模型一次能看到的词元上限](base-context-window.md) | 基础 | 模型生成(Claude Opus 5.5) | v2 | 0 | 0.1 | **0.1** | —(取决于自身) |
 | [嵌入(embedding):把文字变成可以比较远近的向量](base-embedding.md) | 基础 | 模型生成(Claude Opus 5.5) | v1 | 0 | 0.1 | **0.1** | —(取决于自身) |
-| [预测下一个词元:生成式语言模型的基本工作](base-next-token-prediction.md) | 基础 | 模型生成(Claude Opus 5.5) | v1 | 0 | 0.1 | **0.1** | —(取决于自身) |
-| [采样与温度:从概率分布里选出下一个词元](base-sampling-temperature.md) | 基础 | 模型生成(Claude Opus 5.5) | v1 | 0 | 0.1 | **0.1** | —(取决于自身) |
-| [模型本身不保存对话](base-stateless.md) | 基础 | 模型生成(Claude Opus 5.5) | v1 | 0 | 0.1 | **0.1** | —(取决于自身) |
-| [词元(token):模型读写文字的基本单位](base-token.md) | 基础 | 模型生成(Claude Opus 5.5) | v1 | 0 | 0.1 | **0.1** | —(取决于自身) |
-| [为什么聊久了,模型会"忘记"前面说过的话](exp-why-model-forgets.md) | 解释 | 模型生成(Claude Opus 5.5) | v1 | 0 | 0.1 | **0.1** | —(取决于自身) |
-| [资料太多放不进上下文:检索增强,还是直接用长上下文](scn-rag-or-long-context.md) | 场景 | 模型生成(Claude Opus 5.5) | v1 | 0 | 0.1 | **0.1** | —(取决于自身) |
-| [按词元预算管理对话历史](app-conversation-history-budget.md) | 应用 | 模型生成(Claude Opus 5.5) | v1 | 0 | 0.1 | **0.1** | —(取决于自身) |
+| [预测下一个词元:生成式语言模型的基本工作](base-next-token-prediction.md) | 基础 | 模型生成(Claude Opus 5.5) | v2 | 0 | 0.1 | **0.1** | —(取决于自身) |
+| [采样与温度:从概率分布里选出下一个词元](base-sampling-temperature.md) | 基础 | 模型生成(Claude Opus 5.5) | v2 | 0 | 0.1 | **0.1** | —(取决于自身) |
+| [模型本身不保存对话](base-stateless.md) | 基础 | 模型生成(Claude Opus 5.5) | v2 | 0 | 0.1 | **0.1** | —(取决于自身) |
+| [词元(token):模型读写文字的基本单位](base-token.md) | 基础 | 模型生成(Claude Opus 5.5) | v2 | 0 | 0.1 | **0.1** | —(取决于自身) |
+| [工具调用:模型提出请求,应用执行工具](base-tool-calling.md) | 基础 | 模型生成(GPT-6) | v1 | 0 | 0.1 | **0.1** | —(取决于自身) |
+| [为什么聊久了,模型会"忘记"前面说过的话](exp-why-model-forgets.md) | 解释 | 模型生成(Claude Opus 5.5) | v2 | 0 | 0.1 | **0.1** | —(取决于自身) |
+| [资料太多放不进上下文:检索增强,还是直接用长上下文](scn-rag-or-long-context.md) | 场景 | 模型生成(Claude Opus 5.5) | v2 | 0 | 0.1 | **0.1** | —(取决于自身) |
+| [多轮智能体评测:同时检查任务结果与执行过程](app-agent-evaluation.md) | 应用 | 模型生成(GPT-6) | v1 | 0 | 0.1 | **0.1** | —(取决于自身) |
+| [按词元预算管理对话历史](app-conversation-history-budget.md) | 应用 | 模型生成(Claude Opus 5.5) | v2 | 0 | 0.1 | **0.1** | —(取决于自身) |
 
 ## 优先核验顺序
 
@@ -63,13 +69,32 @@ graph BT
 | 1 | 词元(token):模型读写文字的基本单位 | 基础 | 6 | 0.1 |
 | 2 | 上下文窗口:模型一次能看到的词元上限 | 基础 | 3 | 0.1 |
 | 3 | 模型本身不保存对话 | 基础 | 2 | 0.1 |
-| 4 | 嵌入(embedding):把文字变成可以比较远近的向量 | 基础 | 1 | 0.1 |
-| 5 | 预测下一个词元:生成式语言模型的基本工作 | 基础 | 1 | 0.1 |
+| 4 | 预测下一个词元:生成式语言模型的基本工作 | 基础 | 1 | 0.1 |
+| 5 | 嵌入(embedding):把文字变成可以比较远近的向量 | 基础 | 0 | 0.1 |
 | 6 | 采样与温度:从概率分布里选出下一个词元 | 基础 | 0 | 0.1 |
-| 7 | 为什么聊久了,模型会"忘记"前面说过的话 | 解释 | 0 | 0.1 |
-| 8 | 资料太多放不进上下文:检索增强,还是直接用长上下文 | 场景 | 0 | 0.1 |
-| 9 | 按词元预算管理对话历史 | 应用 | 0 | 0.1 |
+| 7 | 工具调用:模型提出请求,应用执行工具 | 基础 | 0 | 0.1 |
+| 8 | 为什么聊久了,模型会"忘记"前面说过的话 | 解释 | 0 | 0.1 |
+| 9 | 资料太多放不进上下文:检索增强,还是直接用长上下文 | 场景 | 0 | 0.1 |
+| 10 | 多轮智能体评测:同时检查任务结果与执行过程 | 应用 | 0 | 0.1 |
+| 11 | 按词元预算管理对话历史 | 应用 | 0 | 0.1 |
 
 ## 完整性检查
 
-- 无问题:引用目标齐全,"依据"无环,引用版本均为最新。
+- ⚠️ 引用版本落后:`app-conversation-history-budget.md` 引用 `base-stateless.md` 的 v1,当前为 v2,请确认是否跟进
+- ⚠️ 引用版本落后:`app-conversation-history-budget.md` 引用 `base-context-window.md` 的 v1,当前为 v2,请确认是否跟进
+- ⚠️ 引用版本落后:`app-conversation-history-budget.md` 引用 `base-token.md` 的 v1,当前为 v2,请确认是否跟进
+- ⚠️ 引用版本落后:`app-conversation-history-budget.md` 引用 `exp-why-model-forgets.md` 的 v1,当前为 v2,请确认是否跟进
+- ⚠️ 引用版本落后:`base-context-window.md` 引用 `base-token.md` 的 v1,当前为 v2,请确认是否跟进
+- ⚠️ 引用版本落后:`base-context-window.md` 引用 `base-stateless.md` 的 v1,当前为 v2,请确认是否跟进
+- ⚠️ 引用版本落后:`base-embedding.md` 引用 `base-token.md` 的 v1,当前为 v2,请确认是否跟进
+- ⚠️ 引用版本落后:`base-next-token-prediction.md` 引用 `base-token.md` 的 v1,当前为 v2,请确认是否跟进
+- ⚠️ 引用版本落后:`base-next-token-prediction.md` 引用 `base-sampling-temperature.md` 的 v1,当前为 v2,请确认是否跟进
+- ⚠️ 引用版本落后:`base-sampling-temperature.md` 引用 `base-next-token-prediction.md` 的 v1,当前为 v2,请确认是否跟进
+- ⚠️ 引用版本落后:`base-stateless.md` 引用 `base-context-window.md` 的 v1,当前为 v2,请确认是否跟进
+- ⚠️ 引用版本落后:`base-token.md` 引用 `base-context-window.md` 的 v1,当前为 v2,请确认是否跟进
+- ⚠️ 引用版本落后:`base-token.md` 引用 `base-next-token-prediction.md` 的 v1,当前为 v2,请确认是否跟进
+- ⚠️ 引用版本落后:`exp-why-model-forgets.md` 引用 `base-stateless.md` 的 v1,当前为 v2,请确认是否跟进
+- ⚠️ 引用版本落后:`exp-why-model-forgets.md` 引用 `base-context-window.md` 的 v1,当前为 v2,请确认是否跟进
+- ⚠️ 引用版本落后:`exp-why-model-forgets.md` 引用 `app-conversation-history-budget.md` 的 v1,当前为 v2,请确认是否跟进
+- ⚠️ 引用版本落后:`scn-rag-or-long-context.md` 引用 `base-context-window.md` 的 v1,当前为 v2,请确认是否跟进
+- ⚠️ 引用版本落后:`scn-rag-or-long-context.md` 引用 `base-stateless.md` 的 v1,当前为 v2,请确认是否跟进
