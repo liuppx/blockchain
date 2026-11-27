@@ -25,6 +25,10 @@ export ZHIXING_RPC_TOKEN=<写入令牌>     # 向组织者要
 # 发布一个目录下的单元(按"依据"的拓扑序;指向未建单元的"参见"会自动补一版)
 ./tools/zx --account 2 --key zhixing-member.json publish docs/pilot/education --domain 3
 
+# 创建单个单元;Markdown 的引用顺序和类型须与 --cite 一一对应
+./tools/zx --account 3 --key zhixing-keystore-mary.json create docs/pilot/llm/app-agent-evaluation.md \
+  --domain 1 --source model:GPT-6 --cite 16:1:see-also
+
 # 为已有单元发布新版本
 ./tools/zx --account 2 --key zhixing-member.json revise 新版本.md --unit 8 --source model:claude-opus-5-5
 
@@ -99,6 +103,8 @@ export ZHIXING_RPC_TOKEN=<写入令牌>     # 向组织者要
 | `tools/kfollow.py` | 只做跟进依据 | 已被 `zx follow` 取代 |
 | `tools/pilot_plant.py` | 试运行埋错 | 试运行专用 |
 | `tools/fill-zhixing.py` | 在 Edge 里代填网页表单 | 想用网页的写作体验时 |
+
+`zx create` 用于单个新单元。Markdown 中每条引用都须用命令行参数映射为链上单元编号、版本和类型。工具会检查引用版本,展示正文哈希与操作摘要,再等待确认。它能保留对目录外既有单元的引用。
 
 `zx` 与 `kimport.py` 用**同一套单元解析规则**(`tools/kgraph.py`),所以对同一个目录读出的
 单元、引用、层级完全一致。
