@@ -15,16 +15,19 @@ graph BT
     u2["运动前自我评估<br/>基础 · 0.1"]
     u3["渐进超负荷<br/>基础 · 0.1"]
     u4["超量恢复<br/>基础 · 0.1"]
-    u5["深蹲<br/>应用 · 0.1"]
+    u5["热身<br/>基础 · 0.1"]
+    u6["深蹲<br/>应用 · 0.1"]
     u2 -.-> u3
     u3 -.-> u4
     u3 -.-> u2
     u4 -.-> u3
-    u5 --> u3
-    u5 --> u4
-    u5 --> u0
-    u5 --> u1
-    u5 --> u2
+    u5 -.-> u2
+    u5 -.-> u6
+    u6 --> u3
+    u6 --> u4
+    u6 --> u0
+    u6 --> u1
+    u6 --> u2
 ```
 
 ## 单元一览
@@ -34,9 +37,10 @@ graph BT
 | [核心稳定](base-core-stability.md) | 基础 | 模型生成(Claude Opus 5.5) | v1 | 0 | 0.1 | **0.1** | —(取决于自身) |
 | [关节的稳定与灵活](base-joint-stability-mobility.md) | 基础 | 模型生成(Claude Opus 5.5) | v1 | 0 | 0.1 | **0.1** | —(取决于自身) |
 | [运动前自我评估](base-preparticipation-screening.md) | 基础 | 模型生成(Claude Opus 5.5) | v1 | 0 | 0.1 | **0.1** | —(取决于自身) |
-| [渐进超负荷](base-progressive-overload.md) | 基础 | 模型生成(Claude Opus 5.5) | v1 | 0 | 0.1 | **0.1** | —(取决于自身) |
+| [渐进超负荷](base-progressive-overload.md) | 基础 | 模型生成(Claude Opus 5.5) | v2 | 0 | 0.1 | **0.1** | —(取决于自身) |
 | [超量恢复](base-supercompensation.md) | 基础 | 模型生成(Claude Opus 5.5) | v1 | 0 | 0.1 | **0.1** | —(取决于自身) |
-| [深蹲](app-squat.md) | 应用 | 模型生成(Claude Opus 5.5) | v1 | 0 | 0.1 | **0.1** | —(取决于自身) |
+| [热身](base-warm-up.md) | 基础 | 模型生成(GPT-6) | v1 | 0 | 0.1 | **0.1** | —(取决于自身) |
+| [深蹲](app-squat.md) | 应用 | 模型生成(Claude Opus 5.5) | v2 | 0 | 0.1 | **0.1** | —(取决于自身) |
 
 ## 优先核验顺序
 
@@ -49,8 +53,11 @@ graph BT
 | 3 | 运动前自我评估 | 基础 | 1 | 0.1 |
 | 4 | 渐进超负荷 | 基础 | 1 | 0.1 |
 | 5 | 超量恢复 | 基础 | 1 | 0.1 |
-| 6 | 深蹲 | 应用 | 0 | 0.1 |
+| 6 | 热身 | 基础 | 0 | 0.1 |
+| 7 | 深蹲 | 应用 | 0 | 0.1 |
 
 ## 完整性检查
 
-- 无问题:引用目标齐全,"依据"无环,引用版本均为最新。
+- ⚠️ 引用版本落后:`app-squat.md` 引用 `base-progressive-overload.md` 的 v1,当前为 v2,请确认是否跟进
+- ⚠️ 引用版本落后:`base-preparticipation-screening.md` 引用 `base-progressive-overload.md` 的 v1,当前为 v2,请确认是否跟进
+- ⚠️ 引用版本落后:`base-supercompensation.md` 引用 `base-progressive-overload.md` 的 v1,当前为 v2,请确认是否跟进
