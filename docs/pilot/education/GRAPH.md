@@ -76,12 +76,5 @@ graph BT
 
 ## 完整性检查
 
-- ⚠️ 引用版本落后:`app-self-teaching-a-skill.md` 引用 `base-retrieval-practice.md` 的 v1,当前为 v2,请确认是否跟进
-- ⚠️ 引用版本落后:`app-self-teaching-a-skill.md` 引用 `base-transfer-cues.md` 的 v1,当前为 v2,请确认是否跟进
-- ⚠️ 引用版本落后:`app-self-teaching-a-skill.md` 引用 `exp-why-failed-retrieval-helps.md` 的 v1,当前为 v2,请确认是否跟进
-- ⚠️ 引用版本落后:`base-cognitive-load.md` 引用 `base-transfer-cues.md` 的 v1,当前为 v2,请确认是否跟进
-- ⚠️ 引用版本落后:`base-interleaving.md` 引用 `base-retrieval-practice.md` 的 v1,当前为 v2,请确认是否跟进
-- ⚠️ 引用版本落后:`base-spacing-effect.md` 引用 `base-retrieval-practice.md` 的 v1,当前为 v2,请确认是否跟进
-- ⚠️ 引用版本落后:`exp-why-failed-retrieval-helps.md` 引用 `base-retrieval-practice.md` 的 v1,当前为 v2,请确认是否跟进
-- ⚠️ 引用版本落后:`exp-why-understanding-isnt-ability.md` 引用 `base-transfer-cues.md` 的 v1,当前为 v2,请确认是否跟进
-- ⚠️ 引用版本落后:`scn-exam-prep-schedule.md` 引用 `base-retrieval-practice.md` 的 v1,当前为 v2,请确认是否跟进
+- 无问题:引用目标齐全,"依据"无环,依据的引用版本均为最新。
+- ℹ️ 有 3 处「参见」指向了旧版本。「参见」不传递可信度,不卡任何指标,所以不必跟进;而且引用图里存在互相引用的单元对,跟进一个就轮到另一个,追不平(链上的 stale_cites 同样只统计「依据」)。

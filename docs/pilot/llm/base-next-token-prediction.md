@@ -67,7 +67,7 @@ for p, i in zip(top.values, top.indices):
 
 | 单元 | 类型 | 引用时的版本 | 为什么引用 |
 |---|---|---|---|
-| [词元(token):模型读写文字的基本单位](base-token.md) | 依据 | v1 | 模型预测的单位是词元 |
+| [词元(token):模型读写文字的基本单位](base-token.md) | 依据 | v2 | 模型预测的单位是词元 |
 | [采样与温度](base-sampling-temperature.md) | 参见 | v1 | 从概率分布里怎么选出一个词元 |
 
 ## 证据

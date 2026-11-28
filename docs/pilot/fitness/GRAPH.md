@@ -58,6 +58,5 @@ graph BT
 
 ## 完整性检查
 
-- ⚠️ 引用版本落后:`app-squat.md` 引用 `base-progressive-overload.md` 的 v1,当前为 v2,请确认是否跟进
-- ⚠️ 引用版本落后:`base-preparticipation-screening.md` 引用 `base-progressive-overload.md` 的 v1,当前为 v2,请确认是否跟进
-- ⚠️ 引用版本落后:`base-supercompensation.md` 引用 `base-progressive-overload.md` 的 v1,当前为 v2,请确认是否跟进
+- 无问题:引用目标齐全,"依据"无环,依据的引用版本均为最新。
+- ℹ️ 有 2 处「参见」指向了旧版本。「参见」不传递可信度,不卡任何指标,所以不必跟进;而且引用图里存在互相引用的单元对,跟进一个就轮到另一个,追不平(链上的 stale_cites 同样只统计「依据」)。
