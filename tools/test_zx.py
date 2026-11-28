@@ -496,6 +496,7 @@ class ReviseKeepsCitesTests(unittest.TestCase):
              mock.patch.object(zx, "rpc_get", lambda rpc, path: unit), \
              mock.patch.object(zx, "account_nonce", lambda rpc, actor: 5), \
              mock.patch.object(zx, "upload_body", lambda bodies, data, token="": "new"), \
+             mock.patch.object(zx, "token", lambda: "test-token"), \
              mock.patch.object(zx, "sign", fake_sign), \
              mock.patch.object(zx, "submit_knowledge", lambda rpc, signed: None), \
              mock.patch.object(zx, "confirm", lambda what, assume_yes=False: True), \
