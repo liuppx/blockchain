@@ -85,21 +85,5 @@ graph BT
 
 ## 完整性检查
 
-- ⚠️ 引用版本落后:`app-conversation-history-budget.md` 引用 `base-stateless.md` 的 v1,当前为 v2,请确认是否跟进
-- ⚠️ 引用版本落后:`app-conversation-history-budget.md` 引用 `base-context-window.md` 的 v1,当前为 v2,请确认是否跟进
-- ⚠️ 引用版本落后:`app-conversation-history-budget.md` 引用 `base-token.md` 的 v1,当前为 v2,请确认是否跟进
-- ⚠️ 引用版本落后:`app-conversation-history-budget.md` 引用 `exp-why-model-forgets.md` 的 v1,当前为 v2,请确认是否跟进
-- ⚠️ 引用版本落后:`base-context-window.md` 引用 `base-token.md` 的 v1,当前为 v2,请确认是否跟进
-- ⚠️ 引用版本落后:`base-context-window.md` 引用 `base-stateless.md` 的 v1,当前为 v2,请确认是否跟进
-- ⚠️ 引用版本落后:`base-embedding.md` 引用 `base-token.md` 的 v1,当前为 v2,请确认是否跟进
-- ⚠️ 引用版本落后:`base-next-token-prediction.md` 引用 `base-token.md` 的 v1,当前为 v2,请确认是否跟进
-- ⚠️ 引用版本落后:`base-next-token-prediction.md` 引用 `base-sampling-temperature.md` 的 v1,当前为 v2,请确认是否跟进
-- ⚠️ 引用版本落后:`base-sampling-temperature.md` 引用 `base-next-token-prediction.md` 的 v1,当前为 v2,请确认是否跟进
-- ⚠️ 引用版本落后:`base-stateless.md` 引用 `base-context-window.md` 的 v1,当前为 v2,请确认是否跟进
-- ⚠️ 引用版本落后:`base-token.md` 引用 `base-context-window.md` 的 v1,当前为 v2,请确认是否跟进
-- ⚠️ 引用版本落后:`base-token.md` 引用 `base-next-token-prediction.md` 的 v1,当前为 v2,请确认是否跟进
-- ⚠️ 引用版本落后:`exp-why-model-forgets.md` 引用 `base-stateless.md` 的 v1,当前为 v2,请确认是否跟进
-- ⚠️ 引用版本落后:`exp-why-model-forgets.md` 引用 `base-context-window.md` 的 v1,当前为 v2,请确认是否跟进
-- ⚠️ 引用版本落后:`exp-why-model-forgets.md` 引用 `app-conversation-history-budget.md` 的 v1,当前为 v2,请确认是否跟进
-- ⚠️ 引用版本落后:`scn-rag-or-long-context.md` 引用 `base-context-window.md` 的 v1,当前为 v2,请确认是否跟进
-- ⚠️ 引用版本落后:`scn-rag-or-long-context.md` 引用 `base-stateless.md` 的 v1,当前为 v2,请确认是否跟进
+- 无问题:引用目标齐全,"依据"无环,依据的引用版本均为最新。
+- ℹ️ 有 9 处「参见」指向了旧版本。「参见」不传递可信度,不卡任何指标,所以不必跟进;而且引用图里存在互相引用的单元对,跟进一个就轮到另一个,追不平(链上的 stale_cites 同样只统计「依据」)。

@@ -87,7 +87,7 @@
 
 | 单元 | 类型 | 引用时的版本 | 为什么引用 |
 |---|---|---|---|
-| [渐进超负荷](base-progressive-overload.md) | 依据 | v1 | 进阶方式的依据 |
+| [渐进超负荷](base-progressive-overload.md) | 依据 | v2 | 进阶方式的依据 |
 | [超量恢复](base-supercompensation.md) | 依据 | v1 | 训练频率的依据 |
 | [核心稳定](base-core-stability.md) | 依据 | v1 | 收紧躯干的依据 |
 | [关节的稳定与灵活](base-joint-stability-mobility.md) | 依据 | v1 | 膝盖方向与下蹲深度的依据 |

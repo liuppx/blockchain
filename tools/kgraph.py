@@ -179,14 +179,22 @@ def self_credibility(u: Unit) -> float:
 
 
 def analyze(units: dict[str, Unit]) -> dict:
-    issues = {"missing": [], "cycles": [], "stale": []}
+    issues = {"missing": [], "cycles": [], "stale": [], "stale_see_also": []}
     deps = {f: [c.target for c in u.cites if c.kind == "依据"] for f, u in units.items()}
     for f, u in units.items():
         for c in u.cites:
             if c.target not in units:
                 issues["missing"].append((f, c.target))
             elif c.version != units[c.target].version:
-                issues["stale"].append((f, c.target, c.version, units[c.target].version))
+                # 只有「依据」过时才是要处理的事:依据传递可信度,指向旧版本会卡住
+                # 上层单元的有效可信度。链上的 stale_cites 也只算依据
+                # (node/src/knowledge.rs 的 credibility_memo 只遍历 CiteKind::Basis)。
+                # 「参见」不传递可信度,版本落后不影响任何指标——单独记一笔,
+                # 不混进要跟进的清单里,免得让人去追一个追不平的循环。
+                if c.kind == "依据":
+                    issues["stale"].append((f, c.target, c.version, units[c.target].version))
+                else:
+                    issues["stale_see_also"].append((f, c.target, c.version, units[c.target].version))
         u.c_self = self_credibility(u)
 
     # 有效可信度:沿"依据"做记忆化 DFS,同时检测环
@@ -281,13 +289,21 @@ def report(units: dict[str, Unit], issues: dict) -> str:
         out.append(f"| {i} | {u.title} | {u.layer} | {issues['leverage'][u.file]} | {u.c_self:.1f} |")
     out += ["", "## 完整性检查", ""]
     if not any(issues[k] for k in ("missing", "cycles", "stale")):
-        out.append("- 无问题:引用目标齐全,\"依据\"无环,引用版本均为最新。")
+        out.append("- 无问题:引用目标齐全,\"依据\"无环,依据的引用版本均为最新。")
     for f, t in issues["missing"]:
         out.append(f"- ❌ 引用目标不存在:`{f}` → `{t}`")
     for cyc in issues["cycles"]:
         out.append("- ❌ \"依据\"成环:" + " → ".join(f"`{x}`" for x in cyc))
     for f, t, cv, tv in issues["stale"]:
-        out.append(f"- ⚠️ 引用版本落后:`{f}` 引用 `{t}` 的 {cv},当前为 {tv},请确认是否跟进")
+        out.append(f"- ⚠️ 依据的引用版本落后:`{f}` 依据 `{t}` 的 {cv},当前为 {tv},请确认是否跟进")
+    if issues["stale_see_also"]:
+        # 「参见」的版本落后不处理,但要说清楚为什么——不然下一个人会以为漏了。
+        out.append(
+            f"- ℹ️ 有 {len(issues['stale_see_also'])} 处「参见」指向了旧版本。"
+            "「参见」不传递可信度,不卡任何指标,所以不必跟进;"
+            "而且引用图里存在互相引用的单元对,跟进一个就轮到另一个,追不平"
+            "(链上的 stale_cites 同样只统计「依据」)。"
+        )
     return "\n".join(out) + "\n"
 
 

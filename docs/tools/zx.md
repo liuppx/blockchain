@@ -103,8 +103,22 @@ export ZHIXING_RPC_TOKEN=<写入令牌>     # 向组织者要
 | `tools/kfollow.py` | 只做跟进依据 | 已被 `zx follow` 取代 |
 | `tools/pilot_plant.py` | 试运行埋错 | 试运行专用 |
 | `tools/fill-zhixing.py` | 在 Edge 里代填网页表单 | 想用网页的写作体验时 |
+| `tools/fix_source.py` | 把链上单元的模型标识改成统一写法 | 早期单元的标识写法不一致时 |
 
 `zx create` 用于单个新单元。Markdown 中每条引用都须用命令行参数映射为链上单元编号、版本和类型。工具会检查引用版本,展示正文哈希与操作摘要,再等待确认。它能保留对目录外既有单元的引用。
+
+`tools/fix_source.py` 修的是**来源字段里的模型标识**:链上原样存这个字符串、不做归一化,
+所以「同一个模型」必须处处得到同一个标识(规则在 `tools/kgraph.py` 的 `model_id()`)。
+早期用网页表单发布的单元写成了 `model:GPT-6`,而命令行产出的是 `model:gpt-6`——
+按来源统计时一个模型会被拆成两个。链上记录不可改,所以只能**发新版本**:正文哈希
+原样带上(内容一个字不改),引用原样带上,只把 source 换掉。
+
+```bash
+# 先看要改什么(不签名、不提交)
+python3 tools/fix_source.py --account 3 --key zhixing-keystore-mary.json --dry-run
+# 真的改
+python3 tools/fix_source.py --account 3 --key zhixing-keystore-mary.json
+```
 
 `zx` 与 `kimport.py` 用**同一套单元解析规则**(`tools/kgraph.py`),所以对同一个目录读出的
 单元、引用、层级完全一致。
