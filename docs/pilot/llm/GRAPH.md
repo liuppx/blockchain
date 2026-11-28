@@ -57,11 +57,11 @@ graph BT
 | [采样与温度:从概率分布里选出下一个词元](base-sampling-temperature.md) | 基础 | 模型生成(Claude Opus 5.5) | v2 | 0 | 0.1 | **0.1** | —(取决于自身) |
 | [模型本身不保存对话](base-stateless.md) | 基础 | 模型生成(Claude Opus 5.5) | v2 | 0 | 0.1 | **0.1** | —(取决于自身) |
 | [词元(token):模型读写文字的基本单位](base-token.md) | 基础 | 模型生成(Claude Opus 5.5) | v2 | 0 | 0.1 | **0.1** | —(取决于自身) |
-| [工具调用:模型提出请求,应用执行工具](base-tool-calling.md) | 基础 | 模型生成(GPT-6) | v1 | 0 | 0.1 | **0.1** | —(取决于自身) |
+| [工具调用:模型提出请求,应用执行工具](base-tool-calling.md) | 基础 | 模型生成(GPT-6) | v2 | 0 | 0.1 | **0.1** | —(取决于自身) |
 | [为什么聊久了,模型会"忘记"前面说过的话](exp-why-model-forgets.md) | 解释 | 模型生成(Claude Opus 5.5) | v2 | 0 | 0.1 | **0.1** | —(取决于自身) |
-| [资料太多放不进上下文:检索增强,还是直接用长上下文](scn-rag-or-long-context.md) | 场景 | 模型生成(Claude Opus 5.5) | v2 | 0 | 0.1 | **0.1** | —(取决于自身) |
-| [多轮智能体评测:同时检查任务结果与执行过程](app-agent-evaluation.md) | 应用 | 模型生成(GPT-6) | v1 | 0 | 0.1 | **0.1** | —(取决于自身) |
-| [智能体提示注入防护:限制不可信内容影响工具操作](app-agent-prompt-injection-controls.md) | 应用 | 模型生成(GPT-6) | v1 | 0 | 0.1 | **0.1** | —(取决于自身) |
+| [资料太多放不进上下文:检索增强,还是直接用长上下文](scn-rag-or-long-context.md) | 场景 | 模型生成(Claude Opus 5.5) | v3 | 0 | 0.1 | **0.1** | —(取决于自身) |
+| [多轮智能体评测:同时检查任务结果与执行过程](app-agent-evaluation.md) | 应用 | 模型生成(GPT-6) | v2 | 0 | 0.1 | **0.1** | —(取决于自身) |
+| [智能体提示注入防护:限制不可信内容影响工具操作](app-agent-prompt-injection-controls.md) | 应用 | 模型生成(GPT-6) | v2 | 0 | 0.1 | **0.1** | —(取决于自身) |
 | [按词元预算管理对话历史](app-conversation-history-budget.md) | 应用 | 模型生成(Claude Opus 5.5) | v2 | 0 | 0.1 | **0.1** | —(取决于自身) |
 
 ## 优先核验顺序
