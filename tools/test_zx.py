@@ -378,7 +378,7 @@ class ReviseCitesTests(unittest.TestCase):
             ],
         }
 
-    def _run(self, change):
+    def _run(self, change, drop=None):
         captured = {}
 
         def fake_sign(bin_path, keyfile, actor, nonce, argv):
@@ -391,8 +391,8 @@ class ReviseCitesTests(unittest.TestCase):
              mock.patch.object(zx, "submit_knowledge", lambda rpc, signed: None), \
              mock.patch.object(zx, "confirm", lambda what, assume_yes=False: True), \
              mock.patch.object(zx.NonceTracker, "wait_in_block", lambda self, timeout=90.0: True):
-            args = mock.Mock(rpc="http://x", unit=15, change=change, account="2",
-                             yes=True, key="k", bin="b")
+            args = mock.Mock(rpc="http://x", unit=15, change=change, drop=drop or [],
+                             account="2", yes=True, key="k", bin="b")
             zx.cmd_revise_cites(args)
         return captured["argv"]
 
@@ -432,3 +432,34 @@ class ReviseCitesTests(unittest.TestCase):
             zx.main(["--account", "2", "--key", key_file.name, "revise-cites", "--unit", "15",
                      "--cite", "11:1:see-also"])
         self.assertEqual(captured["change"], [(11, 1, "see-also")])
+
+    def test_adds_a_citation_the_unit_did_not_have(self):
+        # 「参见 → #24」这类漏发的引用,`follow` 做不到(它只改已有的),这里能加
+        argv = self._run([(24, 1, "see-also")])
+        cites = [argv[i + 1] for i, v in enumerate(argv) if v == "--cite"]
+        self.assertIn("24:1:see-also", cites)
+        self.assertEqual(len(cites), 4, "原有的三条 + 新增一条")
+
+    def test_drops_a_citation(self):
+        argv = self._run([], drop=[11])
+        cites = [argv[i + 1] for i, v in enumerate(argv) if v == "--cite"]
+        self.assertNotIn("11:1:basis", cites)
+        self.assertEqual(cites, ["9:2:basis", "7:2:see-also"])
+
+    def test_drop_and_add_together(self):
+        argv = self._run([(24, 1, "see-also")], drop=[11])
+        cites = [argv[i + 1] for i, v in enumerate(argv) if v == "--cite"]
+        self.assertEqual(cites, ["9:2:basis", "7:2:see-also", "24:1:see-also"])
+
+    def test_cli_parses_the_drop_argument(self):
+        captured = {}
+
+        def capture_args(args):
+            captured["drop"] = args.drop
+            return 0
+
+        with tempfile.NamedTemporaryFile() as key_file, \
+             mock.patch.object(zx, "cmd_revise_cites", capture_args):
+            zx.main(["--account", "2", "--key", key_file.name, "revise-cites", "--unit", "15",
+                     "--drop", "11"])
+        self.assertEqual(captured["drop"], [11])
