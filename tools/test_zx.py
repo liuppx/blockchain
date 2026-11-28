@@ -349,3 +349,86 @@ class BodyHashTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ReviseCitesTests(unittest.TestCase):
+    """`zx revise-cites`:发新版本只改引用,正文与来源原样。
+
+    为什么单独一个命令:`revise` 只发正文与来源、不带引用——那会把单元的引用
+    全部清空;`follow` 会带上全部引用,但只在有依据过时的时候才动,改不了类型。
+    """
+
+    def _unit(self):
+        # /unit/{id} 的形状:versions 是**当前版本**的数组(链上 /unit 返回最新版本)
+        return {
+            "id": "15",
+            "versions": [self._latest()],
+        }
+
+    def _latest(self):
+        return {
+            "n": "2",
+            "publisher": "2",
+            "source": "model:claude-opus-5-5",
+            "bodies": [{"lang": "zh", "hash": "8e835142fd63d63f8095dff74ca85cf8ddb2a77d691b303aef3550b7b5980217"}],
+            "cites": [
+                {"unit": "9", "version": "2", "kind": "basis"},
+                {"unit": "11", "version": "1", "kind": "basis"},
+                {"unit": "7", "version": "2", "kind": "see-also"},
+            ],
+        }
+
+    def _run(self, change):
+        captured = {}
+
+        def fake_sign(bin_path, keyfile, actor, nonce, argv):
+            captured["argv"] = list(argv)
+            return b"\x00"
+
+        with mock.patch.object(zx, "rpc_get", lambda rpc, path: self._unit()), \
+             mock.patch.object(zx, "account_nonce", lambda rpc, actor: 39), \
+             mock.patch.object(zx, "sign", fake_sign), \
+             mock.patch.object(zx, "submit_knowledge", lambda rpc, signed: None), \
+             mock.patch.object(zx, "confirm", lambda what, assume_yes=False: True), \
+             mock.patch.object(zx.NonceTracker, "wait_in_block", lambda self, timeout=90.0: True):
+            args = mock.Mock(rpc="http://x", unit=15, change=change, account="2",
+                             yes=True, key="k", bin="b")
+            zx.cmd_revise_cites(args)
+        return captured["argv"]
+
+    def test_flips_only_the_named_citation(self):
+        argv = self._run([(11, 1, "see-also")])
+        cites = [argv[i + 1] for i, v in enumerate(argv) if v == "--cite"]
+        self.assertEqual(cites, ["9:2:basis", "11:1:see-also", "7:2:see-also"])
+
+    def test_body_and_source_are_carried_over_unchanged(self):
+        argv = self._run([(11, 1, "see-also")])
+        self.assertIn("--body", argv)
+        body = argv[argv.index("--body") + 1]
+        self.assertEqual(body, "zh:8e835142fd63d63f8095dff74ca85cf8ddb2a77d691b303aef3550b7b5980217")
+        source = argv[argv.index("--source") + 1]
+        self.assertEqual(source, "model:claude-opus-5-5")
+
+    def test_citation_order_follows_the_current_version(self):
+        # 顺序变了就看不出只改了一处,所以按当前版本的顺序来
+        argv = self._run([(11, 1, "see-also")])
+        cites = [argv[i + 1] for i, v in enumerate(argv) if v == "--cite"]
+        self.assertEqual(cites[0], "9:2:basis")
+        self.assertEqual(cites[-1], "7:2:see-also")
+
+    def test_no_change_requested_is_an_error(self):
+        with self.assertRaises(SystemExit):
+            self._run([])
+
+    def test_cli_parses_the_change_argument(self):
+        captured = {}
+
+        def capture_args(args):
+            captured["change"] = args.change
+            return 0
+
+        with tempfile.NamedTemporaryFile() as key_file, \
+             mock.patch.object(zx, "cmd_revise_cites", capture_args):
+            zx.main(["--account", "2", "--key", key_file.name, "revise-cites", "--unit", "15",
+                     "--cite", "11:1:see-also"])
+        self.assertEqual(captured["change"], [(11, 1, "see-also")])
