@@ -514,22 +514,37 @@ def cmd_revise_cites(a) -> int:
 
 
 def cmd_revise(a) -> int:
+    """为已有单元发新版本:新正文 + (可选)新的来源。
+
+    **引用要原样带上**:链上的引用是这一版自己的,不带 `--cite` 发出去的新版本
+    引用是**空的**——原来那个单元的引用关系就断了。所以这里默认把当前版本的
+    引用原样重发;要用 `--cite` 改引用(增删改类型或版本号)就用 `revise-cites`,
+    它只改引用、不换正文。
+    """
     data = open(a.file, "rb").read()
     h = hashlib.sha256(data).hexdigest()
     unit = rpc_get(a.rpc, f"/unit/{a.unit}")
     if unit is None:
         raise SystemExit(f"链上没有单元 #{a.unit}")
+    latest = unit["versions"][-1]
     print(f"修订 #{a.unit}(当前 v{len(unit['versions'])})→ 将发布 v{len(unit['versions']) + 1}")
     print(f"  正文 {len(data)} 字节 · SHA-256 {h[:16]}…")
     print(f"  来源 {a.source}")
+    cites = latest.get("cites", [])
+    if cites:
+        print(f"  引用 {len(cites)} 条(原样带上):")
+        for c in cites:
+            print(f"    #{c['unit']} v{c['version']} {c['kind']}")
     if not confirm(f"以账户 {a.account} 的身份修订单元 #{a.unit}", a.yes):
         print("已取消。")
         return 1
     upload_body(a.bodies, data, token())
     tracker = NonceTracker(a.rpc, a.account)
-    signed = sign(a.bin, a.key, a.account, tracker.take(),
-                  ["--action", "publish", "--unit", str(a.unit),
-                   "--body", f"zh:{h}", "--source", a.source])
+    argv = ["--action", "publish", "--unit", str(a.unit),
+            "--body", f"zh:{h}", "--source", a.source]
+    for c in cites:
+        argv += ["--cite", f"{c['unit']}:{c['version']}:{c['kind']}"]
+    signed = sign(a.bin, a.key, a.account, tracker.take(), argv)
     submit_knowledge(a.rpc, signed)
     if tracker.wait_in_block():
         print(f"已入块:单元 #{a.unit} 的新版本。")

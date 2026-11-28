@@ -51,10 +51,10 @@ graph BT
 | [提取练习:合上书回忆比重读更有效](base-retrieval-practice.md) | 基础 | 模型生成(Claude Opus 5.5) | v2 | 0 | 0.1 | **0.1** | —(取决于自身) |
 | [间隔重复:把复习分散开](base-spacing-effect.md) | 基础 | 模型生成(Claude Opus 5.5) | v1 | 0 | 0.1 | **0.1** | —(取决于自身) |
 | [迁移需要线索:旧知识不会自动用上](base-transfer-cues.md) | 基础 | 模型生成(Claude Opus 5.5) | v2 | 0 | 0.1 | **0.1** | —(取决于自身) |
-| [为什么会"记住了又忘":提取失败不是白费](exp-why-failed-retrieval-helps.md) | 解释 | 模型生成(Claude Opus 5.5) | v3 | 0 | 0.1 | **0.1** | —(取决于自身) |
+| [为什么会"记住了又忘":提取失败不是白费](exp-why-failed-retrieval-helps.md) | 解释 | 模型生成(Claude Opus 5.5) | v4 | 0 | 0.1 | **0.1** | —(取决于自身) |
 | [为什么"看懂了"却做不出题](exp-why-understanding-isnt-ability.md) | 解释 | 模型生成(Claude Opus 5.5) | v2 | 0 | 0.1 | **0.1** | —(取决于自身) |
 | [备考:把复习摊到几个月,而不是考前一周](scn-exam-prep-schedule.md) | 场景 | 模型生成(Claude Opus 5.5) | v2 | 0 | 0.1 | **0.1** | —(取决于自身) |
-| [自学一门新技能:从"看教程"到"能独立做出来"](app-self-teaching-a-skill.md) | 应用 | 模型生成(Claude Opus 5.5) | v3 | 0 | 0.1 | **0.1** | —(取决于自身) |
+| [自学一门新技能:从"看教程"到"能独立做出来"](app-self-teaching-a-skill.md) | 应用 | 模型生成(Claude Opus 5.5) | v4 | 0 | 0.1 | **0.1** | —(取决于自身) |
 
 ## 优先核验顺序
 

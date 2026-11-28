@@ -463,3 +463,59 @@ class ReviseCitesTests(unittest.TestCase):
             zx.main(["--account", "2", "--key", key_file.name, "revise-cites", "--unit", "15",
                      "--drop", "11"])
         self.assertEqual(captured["drop"], [11])
+
+
+class ReviseKeepsCitesTests(unittest.TestCase):
+    """`zx revise` 必须把当前版本的引用原样带上。
+
+    链上的引用是**这一版自己的**:不带 `--cite` 发出去的新版本引用是空的,
+    原单元的引用关系就断了。这是个静默的破坏——单元还在,引用没了。
+    """
+
+    def _run(self, body):
+        captured = {}
+
+        def fake_sign(bin_path, keyfile, actor, nonce, argv):
+            captured["argv"] = list(argv)
+            return b"\x00"
+
+        unit = {
+            "id": "20",
+            "versions": [{
+                "n": "3",
+                "publisher": "6",
+                "source": "model:claude-opus-5-5",
+                "bodies": [{"lang": "zh", "hash": "old"}],
+                "cites": [
+                    {"unit": "17", "version": "2", "kind": "basis"},
+                    {"unit": "24", "version": "1", "kind": "see-also"},
+                ],
+            }],
+        }
+        with tempfile.NamedTemporaryFile(suffix=".md", mode="w+", encoding="utf-8") as md, \
+             mock.patch.object(zx, "rpc_get", lambda rpc, path: unit), \
+             mock.patch.object(zx, "account_nonce", lambda rpc, actor: 5), \
+             mock.patch.object(zx, "upload_body", lambda bodies, data, token="": "new"), \
+             mock.patch.object(zx, "sign", fake_sign), \
+             mock.patch.object(zx, "submit_knowledge", lambda rpc, signed: None), \
+             mock.patch.object(zx, "confirm", lambda what, assume_yes=False: True), \
+             mock.patch.object(zx.NonceTracker, "wait_in_block", lambda self, timeout=90.0: True):
+            md.write(body); md.flush()
+            args = mock.Mock(rpc="http://x", unit=20, file=md.name,
+                             source="model:claude-opus-5-5", account="6",
+                             yes=True, key="k", bin="b")
+            zx.cmd_revise(args)
+        return captured["argv"]
+
+    def test_cites_are_carried_over(self):
+        argv = self._run("新正文")
+        cites = [argv[i + 1] for i, v in enumerate(argv) if v == "--cite"]
+        self.assertEqual(cites, ["17:2:basis", "24:1:see-also"])
+
+    def test_body_and_source_are_the_new_ones(self):
+        import hashlib
+        argv = self._run("新正文")
+        # 正文哈希是新正文的哈希(不是旧版本的)
+        want = hashlib.sha256("新正文".encode("utf-8")).hexdigest()
+        self.assertEqual(argv[argv.index("--body") + 1], f"zh:{want}")
+        self.assertEqual(argv[argv.index("--source") + 1], "model:claude-opus-5-5")
