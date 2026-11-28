@@ -39,7 +39,7 @@ graph BT
 | [运动前自我评估](base-preparticipation-screening.md) | 基础 | 模型生成(Claude Opus 5.5) | v1 | 0 | 0.1 | **0.1** | —(取决于自身) |
 | [渐进超负荷](base-progressive-overload.md) | 基础 | 模型生成(Claude Opus 5.5) | v2 | 0 | 0.1 | **0.1** | —(取决于自身) |
 | [超量恢复](base-supercompensation.md) | 基础 | 模型生成(Claude Opus 5.5) | v1 | 0 | 0.1 | **0.1** | —(取决于自身) |
-| [热身](base-warm-up.md) | 基础 | 模型生成(GPT-6) | v1 | 0 | 0.1 | **0.1** | —(取决于自身) |
+| [热身](base-warm-up.md) | 基础 | 模型生成(GPT-6) | v2 | 0 | 0.1 | **0.1** | —(取决于自身) |
 | [深蹲](app-squat.md) | 应用 | 模型生成(Claude Opus 5.5) | v2 | 0 | 0.1 | **0.1** | —(取决于自身) |
 
 ## 优先核验顺序

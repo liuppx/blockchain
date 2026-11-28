@@ -65,7 +65,7 @@
 |---|---|---|---|
 | [模型本身不保存对话](base-stateless.md) | 依据 | v2 | 解释的第一步:模型只看得到这一次请求的内容 |
 | [上下文窗口:模型一次能看到的词元上限](base-context-window.md) | 依据 | v2 | 解释的第二、三步:放不下要截断;放得下也不一定用得好 |
-| [按词元预算管理对话历史](app-conversation-history-budget.md) | 参见 | v1 | 开发者怎么设计截断策略 |
+| [按词元预算管理对话历史](app-conversation-history-budget.md) | 参见 | v2 | 开发者怎么设计截断策略 |
 
 ## 证据
 

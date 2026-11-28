@@ -445,6 +445,74 @@ def cmd_publish(a) -> int:
     return 0
 
 
+def cmd_revise_cites(a) -> int:
+    """发一个新版本,**只改引用**(增删改类型或版本号),正文与来源原样。
+
+    为什么单独一个命令:`revise` 只发正文与来源、不带引用——那会把单元的引用
+    全部清空;`follow` 会带上全部引用,但只在有依据过时的时候才动,改不了类型。
+    引用类型改错时(比如把「参见」记成了「依据」,或者反过来)只有这里能做。
+
+    引用类型改错要特别当心:「依据」传递可信度,「参见」不传。
+    把「参见」写成「依据」,等于宣称"我建立在它之上",于是本单元的有效可信度
+    被那个单元卡住;反过来,本来是依据的改成参见,等于松开了地基。
+
+    `--cite` 指定的是**改成的**样子:
+      - 已有的引用 → 改成给定的版本与类型;
+      - 本单元没有的引用 → **新增**一条(这是 `follow` 做不到的);
+      - `--drop 单元` → 删掉某条引用。
+    """
+    unit = rpc_get(a.rpc, f"/unit/{a.unit}")
+    if unit is None:
+        raise SystemExit(f"链上没有单元 #{a.unit}")
+    latest = unit["versions"][-1]
+    changes = {}
+    for unit_id, version, kind in a.change:
+        changes[str(unit_id)] = (version, kind)
+    drops = {str(x) for x in (a.drop or [])}
+    existing = {str(c["unit"]) for c in latest.get("cites", [])}
+    added = [k for k in changes if k not in existing]
+    if not changes and not drops:
+        raise SystemExit("没有要改的引用(用 --cite 单元:版本:类型 指定,或 --drop 单元)")
+    # 引用的顺序按当前版本的顺序来,免得顺序变了看不出差别
+    argv = ["--action", "publish", "--unit", str(a.unit),
+            "--body", f"zh:{latest['bodies'][0]['hash']}",
+            "--source", latest.get("source") or "human"]
+    print(f"#{a.unit} 将发布 v{len(unit['versions']) + 1}(正文与来源不变,只改引用):")
+    for c in latest.get("cites", []):
+        key = str(c["unit"])
+        if key in drops:
+            print(f"  #{key} v{c['version']} {c['kind']} → 删除")
+            continue
+        if key in changes:
+            ver, kind = changes[key]
+            argv += ["--cite", f"{key}:{ver}:{kind}"]
+            print(f"  #{key} v{c['version']} {c['kind']} → v{ver} {kind}")
+        else:
+            argv += ["--cite", f"{key}:{c['version']}:{c['kind']}"]
+            print(f"  #{key} v{c['version']} {c['kind']}(不变)")
+    for key in added:
+        if key in drops:
+            continue
+        ver, kind = changes[key]
+        argv += ["--cite", f"{key}:{ver}:{kind}"]
+        print(f"  #{key} → **新增** v{ver} {kind}")
+    print()
+    print("确认这处改动符合正文的意思:「依据」= 我建立在它之上(传递可信度),")
+    print("            「参见」= 相关但互不依赖(不传递可信度)。")
+    if not confirm(f"以账户 {a.account} 的身份修改单元 #{a.unit} 的引用", a.yes):
+        print("已取消。")
+        return 1
+    tracker = NonceTracker(a.rpc, a.account)
+    signed = sign(a.bin, a.key, a.account, tracker.take(), argv)
+    submit_knowledge(a.rpc, signed)
+    print("已提交,等待入块…")
+    if tracker.wait_in_block():
+        print(f"已入块:单元 #{a.unit} 的新版本。")
+    else:
+        print("已提交,稍后刷新查看。")
+    return 0
+
+
 def cmd_revise(a) -> int:
     data = open(a.file, "rb").read()
     h = hashlib.sha256(data).hexdigest()
@@ -736,6 +804,15 @@ def main(argv=None) -> int:
     p.add_argument("--unit", type=int, required=True, help="单元编号")
     p.add_argument("--source", default="human", help="human | model:ID | model-verified:ID")
     p.set_defaults(func=cmd_revise)
+
+    p = sub.add_parser("revise-cites", help="发新版本,只改引用(增删改类型或版本号);正文与来源不变")
+    p.add_argument("--unit", type=int, required=True, help="单元编号")
+    p.add_argument("--cite", dest="change", action="append", type=parse_create_cite, default=[],
+                   help="要改成的引用:单元:版本:basis|see-also|supersedes;可多次指定。"
+                        "已有的引用改成给定的样子;本单元没有的引用则新增一条")
+    p.add_argument("--drop", action="append", type=int, default=[],
+                   help="要删掉的引用(单元编号);可多次指定")
+    p.set_defaults(func=cmd_revise_cites)
 
     p = sub.add_parser("verify", help="核验某个版本")
     p.add_argument("--unit", type=int, required=True, help="单元编号")

@@ -108,9 +108,9 @@
 | 论断 | 出处 | 证据类型 |
 |---|---|---|
 | 交错练习在随后测验中的迁移表现优于分块练习 | Rohrer & Taylor (2007) *The Shuffling of Mathematics Problems Improves Learning*, Instructional Science(**注意:原文的最终测验用的是同类题目,"迁移"这个说法偏强**) | 实验研究 |
-| 交错练习在训练当下表现更差、长期表现更好 | Rohrer & Taylor (2007) *The Shuffling of Mathematics Problems Improves Learning*, Instructional Science;Rohrer, Dedrick, Hartwig & Cheung (2020) *Effects of Interleaved Practice on Mathematics Learning*, Journal of Educational Psychology | 实验研究 |
-| 交错的效果受领域与年龄调节(低龄学习者有时相反) | Rohrer, Dedrick, Hartwig & Cheung (2020) *Effects of Interleaved Practice on Mathematics Learning*, Journal of Educational Psychology;Rohrer, Dedrick & Stershic (2015) *Interleaved Practice Improves Mathematics Learning*, Journal of Educational Psychology 107(3):900–908 | 实验研究 |
-| 辨别(selecting)与生成(generating)策略的迁移差异 | Rohrer, Dedrick, Hartwig & Cheung (2020) *Effects of Interleaved Practice on Mathematics Learning*, Journal of Educational Psychology | 实验研究 |
+| 交错练习在训练当下表现更差、长期表现更好 | Rohrer & Taylor (2007) *The Shuffling of Mathematics Problems Improves Learning*, Instructional Science;Rohrer, Dedrick, Hartwig & Cheung (2020) *A randomized controlled trial of interleaved mathematics practice*, Journal of Educational Psychology | 实验研究 |
+| 交错的效果受领域与年龄调节(低龄学习者有时相反) | Rohrer, Dedrick, Hartwig & Cheung (2020) *A randomized controlled trial of interleaved mathematics practice*, Journal of Educational Psychology;Rohrer, Dedrick & Stershic (2015) *Interleaved Practice Improves Mathematics Learning*, Journal of Educational Psychology 107(3):900–908 | 实验研究 |
+| 辨别(selecting)与生成(generating)策略的迁移差异 | Rohrer, Dedrick, Hartwig & Cheung (2020) *A randomized controlled trial of interleaved mathematics practice*, Journal of Educational Psychology | 实验研究 |
 
 ## 争议
 

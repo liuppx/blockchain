@@ -6,7 +6,7 @@
 | 主题 | 记忆与巩固 |
 | 来源 | 模型生成(Claude Opus 5.5) |
 | 状态 | **待核验** |
-| 版本 | v2 |
+| 版本 | v3 |
 | 语言 | zh |
 
 ## 核心陈述
@@ -108,7 +108,7 @@
 
 | 论断 | 出处 | 证据类型 |
 |---|---|---|
-| 提取失败后给出正确答案,能提升后续的学习与记忆 | Metcalfe (2017) *Learning from Errors*, Annual Review of Psychology;Potts, Davies & Shanks (2018) *The latent structure of errors in human learning*, Journal of Experimental Psychology: Learning, Memory, and Cognition | 综述 / 实验研究 |
+| 提取失败后给出正确答案,能提升后续的学习与记忆 | Metcalfe (2017) *Learning from Errors*, Annual Review of Psychology;Potts, Davies & Shanks (2019) *The benefit of generating errors during learning: What is the locus of the effect?*, Journal of Experimental Psychology: Learning, Memory, and Cognition | 综述 / 实验研究 |
 | 错误信息与正确信息一起呈现,能产生更好的后续测验表现 | Metcalfe (2017) *Learning from Errors*, Annual Review of Psychology | 综述 |
 | 记忆的再巩固是一个重新编码过程,可能被新信息污染 | Nader, Schafe & LeDoux (2000) *Fear memories require protein synthesis in the amygdala for reconsolidation after retrieval*, Nature(**大鼠恐惧条件反射实验,不是人的证据**) | 实验研究 |
 
@@ -117,17 +117,31 @@
 | 观点 | 支持证据 | 目前共识程度 |
 |---|---|---|
 | "错误信息效应"普遍成立,给错误答案和给正确答案一样好 | 有一系列实验研究支持 | **不成立**。目前较一致的结论是:**错误本身没有增益,增益来自紧随其后的纠正信息**
-  (Metcalfe 2017 综述;Potts, Davies & Shanks 2018)。没有纠正的错误猜测不带来好处。
+  (Metcalfe 2017 综述;Potts, Davies & Shanks 2019)。没有纠正的错误猜测不带来好处。
   我原来引的 Butler et al. (2007) *Retrieving "In the Moment" and Later* 经核查**并不存在**(该刊 2007 年无此文),已删除 |
 | "再巩固是记忆被重新编码" | 动物实验证据(Nader, Schafe & LeDoux 2000) | **较有支持,但主要是动物证据**。人身上的再巩固证据弱得多、结论也不一致;再巩固的边界条件与时间窗仍在研究中 |
 | "错误解释会被存进去并反复出现" | 记忆的误改写(reconsolidation)文献与临床研究 | **有支持**,但"回去又来了"是否就是这个机制,常被过度归因 |
+
+**2026-11-28 核验发现的第二处编造出处**(两位核验人一致,判「需修改」):
+我原来引的 Potts, Davies & Shanks (2018) *The latent structure of errors in
+human learning*, Journal of Experimental Psychology: Learning, Memory, and
+Cognition —— **在 Crossref 查不到**(按题名查、按"作者 + 期刊 + 2018 年"查,
+都没有对应论文)。同三位作者确有一篇高度相关的真论文,但**题名与年份都不是
+我写的这一条**:*The benefit of generating errors during learning: What is the
+locus of the effect?*, JEP: LMC, **2019**, 45(4):1023–1041,
+doi:10.1037/xlm0000637(在线发表于 2018)。上面两处已按真实著录改正。
+
+其余出处( Metcalfe 2017 *Learning from Errors*, Annual Review of Psychology
+68:465–489;Nader, Schafe & LeDoux 2000, Nature 406:722–726)经核验著录正确。
 
 ## 核验要点(给人类审查者)
 
 1. **错误信息效应的结论**:我原来引的 Butler et al. (2007) *Retrieving "In the Moment" and Later* 经核查**并不存在**,
    我提到的"Butler et al. 2018 元分析"**也不存在**——两条都是编造的,已删除。现在引的是 Metcalfe 2017 综述与
-   Potts, Davies & Shanks 2018。核验人请查:这两篇对"增益来自纠正而非错误本身"的表述是否准确?
+   Potts, Davies & Shanks 2019。核验人请查:这两篇对"增益来自纠正而非错误本身"的表述是否准确?
    **这一条是本单元最可能出错的地方**,它直接决定"提取失败不是白费"这个核心说法。
+   (2026-11-28 核验:上面引的 Potts et al. 那条也是编造的,已改为真实的
+   2019 年那篇;剩下这两篇的**表述**是否准确,请核验人接着查。)
 2. **"再巩固"在人身上是否成立**:我原来引的 Hyman & Tranel 2012 *A Critical and Necessary Role of Memory
    Reconsolidation for Memory Modification* 经核查**查不到这篇论文**——两位作者是不同领域的研究者,没合著过。
    已删除,改引 Nader, Schafe & LeDoux 2000,但**那是大鼠恐惧条件反射实验**,不是人的证据。
