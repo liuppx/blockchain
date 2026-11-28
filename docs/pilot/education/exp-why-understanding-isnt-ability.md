@@ -110,7 +110,7 @@
 
 | 论断 | 出处 | 证据类型 |
 |---|---|---|
-| 识别(看懂解法)与生成(独立解题)表现不同,后者更难 | Rohrer, Dedrick, Hartwig & Cheung (2020) *Effects of Interleaved Practice on Mathematics Learning*, Journal of Educational Psychology | 实验研究 |
+| 识别(看懂解法)与生成(独立解题)表现不同,后者更难 | Rohrer, Dedrick, Hartwig & Cheung (2020) *A randomized controlled trial of interleaved mathematics practice*, Journal of Educational Psychology | 实验研究 |
 | 自我解释(self-explanation)能改善后续测验表现 | Chi et al. (1989) *Self-explanations: How students study and use examples in learning to solve problems*, Cognitive Science;Bisra, Liu, Nesbit, Salimi & Winne (2018) *Inducing Self-Explanation: a Meta-Analysis*, Educational Psychology Review | 实验研究 / 元分析 |
 | "流畅感"会让人高估自己的理解 | 心理学中的流畅性(fluency)文献;与"学习错觉(illusion of learning)"相关 | 综述 |
 | 例题学习本身的效果有限,需要配练习 | Renkl (2014) *Toward an instructionally oriented theory of example-based learning*, Cognitive Science(**注意:该文其实是在为"尽早研究例题"辩护,不是"例题效果有限";这条论断我原来引错了**) | 综述 |

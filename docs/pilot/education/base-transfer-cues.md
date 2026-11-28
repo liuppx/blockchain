@@ -122,7 +122,7 @@
 | 论断 | 出处 | 证据类型 |
 |---|---|---|
 | 迁移取决于学习与测试的情境相似度,自发迁移有限 | Barnett & Ceci (2002) *When and where do we apply what we learn? Taxonomy for far transfer*, Psychological Bulletin | 实验研究与综述 |
-| 辨别(选择方法)比执行(用方法)更难 | Rohrer, Dedrick, Hartwig & Cheung (2020) *Effects of Interleaved Practice on Mathematics Learning*, Journal of Educational Psychology | 实验研究 |
+| 辨别(选择方法)比执行(用方法)更难 | Rohrer, Dedrick, Hartwig & Cheung (2020) *A randomized controlled trial of interleaved mathematics practice*, Journal of Educational Psychology | 实验研究 |
 | "学习"与"表现"是两回事:同样水平的知识,在学习当下表现出来的与隔段时间表现出来的可能不同 | Soderstrom & Bjork (2015) *Learning versus performance: An integrative review*, Perspectives on Psychological Science | 综述 |
 | 多种例子学习促进迁移 | Gick & Holyoak (1983) *Schema induction and analogical transfer*, Cognitive Psychology | 实验研究 |
 | 领域知识不足限制问题解决(专家-新手差异) | Chi, Feltovich & Glaser (1981) *Categorization and Representation of Physics Problems by Experts and Novices*, Cognitive Science | 实验研究 |
